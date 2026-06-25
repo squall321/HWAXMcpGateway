@@ -2,8 +2,10 @@
 import json
 import logging
 import os
+import time
 from collections import Counter
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import anyio
@@ -31,6 +33,20 @@ GW, BACKENDS = _load_config()
 GW_TOKEN = GW["token"]
 HOST = GW.get("host", "127.0.0.1")
 PORT = int(GW.get("port", 9110))
+AUDIT_PATH = os.environ.get("GATEWAY_AUDIT", str(Path(__file__).with_name("audit.jsonl")))
+
+
+def _audit(tool, backend, ok, err, ms):
+    """도구 호출 1건을 JSONL 감사 로그에 append (감사 실패가 호출을 막지 않게)."""
+    try:
+        rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+               "tool": tool, "backend": backend, "ok": ok, "ms": ms}
+        if err:
+            rec["error"] = err[:200]
+        with open(AUDIT_PATH, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class _Backend:
@@ -146,7 +162,9 @@ async def _list_tools():
 
 @_low.call_tool(validate_input=False)
 async def _call_tool(name: str, arguments: dict):
+    t0 = time.monotonic()
     if name not in route:
+        _audit(name, None, False, "unknown tool", 0)
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=f"unknown tool: {name}")],
             isError=True,
@@ -156,7 +174,10 @@ async def _call_tool(name: str, arguments: dict):
     try:
         if b.session is None:
             raise RuntimeError("backend session down")
-        return await b.session.call_tool(original, arguments)
+        res = await b.session.call_tool(original, arguments)
+        _audit(name, backend_key, not getattr(res, "isError", False), None,
+               round((time.monotonic() - t0) * 1000))
+        return res
     except Exception as e:  # noqa: BLE001
         log.warning("call %s on %s failed (%r), reconnecting once", name, backend_key, e)
         tg = _task_group_holder.get("tg")
@@ -164,7 +185,11 @@ async def _call_tool(name: str, arguments: dict):
             await b.reconnect(tg)
             await b._ready.wait()
             if b.session is not None:
-                return await b.session.call_tool(original, arguments)
+                res = await b.session.call_tool(original, arguments)
+                _audit(name, backend_key, not getattr(res, "isError", False), "reconnected",
+                       round((time.monotonic() - t0) * 1000))
+                return res
+        _audit(name, backend_key, False, repr(e), round((time.monotonic() - t0) * 1000))
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=f"backend {backend_key} unavailable: {e!r}")],
             isError=True,
@@ -178,6 +203,17 @@ def _bearer_gate(app):
     async def middleware(scope, receive, send):
         if scope["type"] != "http":
             await app(scope, receive, send)
+            return
+        if scope.get("path") == "/health":
+            # 무인증 헬스: 오케스트레이터가 MCP 핸드셰이크 없이 싸게 프로브
+            body = json.dumps({
+                "status": "ok",
+                "tools": len(exposed_tools),
+                "backends": {k: (b.session is not None) for k, b in backends.items()},
+            }).encode()
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": body})
             return
         headers = dict(scope.get("headers") or [])
         auth = headers.get(b"authorization", b"").decode("latin-1")

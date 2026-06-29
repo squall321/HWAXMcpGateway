@@ -35,6 +35,11 @@ HOST = GW.get("host", "127.0.0.1")
 PORT = int(GW.get("port", 9110))
 AUDIT_PATH = os.environ.get("GATEWAY_AUDIT", str(Path(__file__).with_name("audit.jsonl")))
 
+# 그룹 기반 도구 인가: Agent Server가 사용자 groups를 X-HWAX-Groups(콤마구분)로 실어 보낸다.
+# 백엔드별 allowed_groups가 비었거나 없으면 전체 공개, 있으면 caller groups와 교집합이 있어야 노출/호출.
+GROUPS_HEADER = "x-hwax-groups"
+POLICY: dict[str, list[str]] = {k: list(v.get("allowed_groups", [])) for k, v in BACKENDS.items()}
+
 
 def _audit(tool, backend, ok, err, ms):
     """도구 호출 1건을 JSONL 감사 로그에 append (감사 실패가 호출을 막지 않게)."""
@@ -155,9 +160,36 @@ fm = FastMCP("hwax-mcp-gateway")
 _low = fm._mcp_server
 
 
+def _parse_groups(raw: str | None) -> list[str]:
+    """콤마 구분 헤더 → 그룹 리스트(공백·빈값 제거)."""
+    return [g.strip() for g in (raw or "").split(",") if g.strip()]
+
+
+def _backend_allowed(backend_key: str, groups: list[str]) -> bool:
+    """백엔드 공개 여부: allowed_groups 비었으면 전체 공개, 아니면 caller groups와 교집합 필요."""
+    allowed = POLICY.get(backend_key, [])
+    return (not allowed) or bool(set(groups) & set(allowed))
+
+
+def _visible_tools(groups: list[str]) -> list[types.Tool]:
+    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)]
+
+
+def _request_groups() -> list[str]:
+    """현재 요청 헤더(X-HWAX-Groups)에서 caller groups 추출.
+    요청 컨텍스트·헤더가 없으면 [](=제한 백엔드는 숨김 → fail-closed)."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return []
+    raw = req.headers.get(GROUPS_HEADER) if req is not None else None
+    return _parse_groups(raw)
+
+
 @_low.list_tools()
 async def _list_tools():
-    return list(exposed_tools)
+    # 도구 목록을 caller groups로 필터(보이지 않는 도구는 LLM이 알 수도 없음).
+    return _visible_tools(_request_groups())
 
 
 @_low.call_tool(validate_input=False)
@@ -170,6 +202,13 @@ async def _call_tool(name: str, arguments: dict):
             isError=True,
         )
     backend_key, original = route[name]
+    # tools/list에서 숨겼더라도 직접 호출을 시도할 수 있으니 호출 시점에도 인가 재확인(enforcement).
+    if not _backend_allowed(backend_key, _request_groups()):
+        _audit(name, backend_key, False, "forbidden", 0)
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=f"forbidden: {name}")],
+            isError=True,
+        )
     b = backends[backend_key]
     try:
         if b.session is None:
@@ -210,6 +249,7 @@ def _bearer_gate(app):
                 "status": "ok",
                 "tools": len(exposed_tools),
                 "backends": {k: (b.session is not None) for k, b in backends.items()},
+                "policy": POLICY,
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

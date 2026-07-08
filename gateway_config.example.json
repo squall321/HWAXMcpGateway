@@ -1,0 +1,30 @@
+{
+  "_gateway": { "host": "127.0.0.1", "port": 9110, "token": "REPLACE_WITH_LONG_RANDOM_GW_TOKEN" },
+
+  "reportarchive": {
+    "url": "http://127.0.0.1:3002/mcp",
+    "transport": "streamable_http",
+    "headers": { "Authorization": "Bearer rat_REPLACE", "X-Workspace-Slug": "dev" }
+  },
+  "signalforge": {
+    "url": "http://127.0.0.1:8013/mcp",
+    "transport": "streamable_http",
+    "headers": { "Authorization": "Bearer sfmcp_REPLACE" }
+  },
+  "mx-white-paper": {
+    "url": "http://127.0.0.1:8765/mcp",
+    "transport": "streamable_http",
+    "headers": { "Authorization": "Bearer mxwp_REPLACE" }
+  },
+
+  "rest": {
+    "mx-white-paper": { "base": "http://127.0.0.1:8800", "inject": { "header": "Authorization", "value": "Bearer mxwp_REPLACE_READWRITE_SERVICE_TOKEN" } },
+    "ai-data-hub":    { "base": "http://127.0.0.1:8001" },
+    "signalforge":    { "base": "http://127.0.0.1:17370", "inject": { "header": "X-API-Key", "value": "REPLACE_WITH_SIGNALFORGE_API_KEY" } }
+  },
+  "portal": {
+    "jwks_url": "http://127.0.0.1:8723/.well-known/jwks.json",
+    "revoked_url": "http://127.0.0.1:8723/auth/pat/revoked.json",
+    "audience_ok": ["mx-white-paper", "ai-data-hub", "signalforge"]
+  }
+}

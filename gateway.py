@@ -25,11 +25,13 @@ def _load_config():
     with open(CONFIG_PATH, "r") as f:
         cfg = json.load(f)
     gw = cfg.pop("_gateway")
+    rest = cfg.pop("rest", {})       # REST 프록시 백엔드(site -> base+inject) — MCP 백엔드 아님
+    portal = cfg.pop("portal", {})   # 포털 JWKS/폐기목록/aud allowlist (PAT 검증용)
     backends = {k: v for k, v in cfg.items() if isinstance(v, dict) and "url" in v}
-    return gw, backends
+    return gw, backends, rest, portal
 
 
-GW, BACKENDS = _load_config()
+GW, BACKENDS, REST, PORTAL = _load_config()
 GW_TOKEN = GW["token"]
 HOST = GW.get("host", "127.0.0.1")
 PORT = int(GW.get("port", 9110))
@@ -41,11 +43,13 @@ GROUPS_HEADER = "x-hwax-groups"
 POLICY: dict[str, list[str]] = {k: list(v.get("allowed_groups", [])) for k, v in BACKENDS.items()}
 
 
-def _audit(tool, backend, ok, err, ms):
-    """도구 호출 1건을 JSONL 감사 로그에 append (감사 실패가 호출을 막지 않게)."""
+def _audit(tool, backend, ok, err, ms, caller=None):
+    """호출 1건을 JSONL 감사 로그에 append (감사 실패가 호출을 막지 않게). caller=REST PAT 주체."""
     try:
         rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                "tool": tool, "backend": backend, "ok": ok, "ms": ms}
+        if caller:
+            rec["caller"] = caller
         if err:
             rec["error"] = err[:200]
         with open(AUDIT_PATH, "a") as f:
@@ -255,6 +259,10 @@ def _bearer_gate(app):
                         "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": body})
             return
+        if scope.get("path", "").startswith("/api/"):
+            # REST 프록시: GW_TOKEN이 아니라 라우트 핸들러가 포털 PAT(JWKS)로 자체 인증.
+            await app(scope, receive, send)
+            return
         headers = dict(scope.get("headers") or [])
         auth = headers.get(b"authorization", b"").decode("latin-1")
         if auth != expected:
@@ -275,6 +283,12 @@ def _bearer_gate(app):
 
 def main():
     star = fm.streamable_http_app()
+    # REST 프록시 라우트(/api/<site>/<path>) 를 MCP 마운트보다 먼저 매칭되게 삽입.
+    if REST:
+        from rest_proxy import RestProxy
+        proxy = RestProxy(REST, PORTAL, _audit)
+        star.router.routes[:0] = proxy.routes()
+        log.info("REST proxy enabled: %d sites (%s)", len(REST), ", ".join(REST))
     # streamable_http_app 의 lifespan 은 세션매니저 run() 만 돈다. 백엔드 집계 lifespan 을 함께 묶는다.
     sm_lifespan = star.router.lifespan_context
 

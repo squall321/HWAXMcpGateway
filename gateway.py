@@ -22,6 +22,14 @@ CONFIG_PATH = os.environ.get("GATEWAY_CONFIG", str(Path(__file__).with_name("gat
 
 
 def _load_config():
+    if not os.path.exists(CONFIG_PATH):
+        # traceback 크래시-루프 대신 명확한 프로비저닝 안내 후 종료 (fresh 서버에서 가장 흔한 실수)
+        log.error("설정 파일 없음: %s", CONFIG_PATH)
+        log.error("이 파일은 시크릿이라 git 에 없습니다. 같은 디렉토리의 gateway_config.example.json 을")
+        log.error("복사한 뒤 실토큰(GW_TOKEN·백엔드 Authorization·rest.inject)을 채우세요:")
+        log.error("  cp %s %s && chmod 600 %s",
+                  str(Path(CONFIG_PATH).with_name("gateway_config.example.json")), CONFIG_PATH, CONFIG_PATH)
+        raise SystemExit(1)
     with open(CONFIG_PATH, "r") as f:
         cfg = json.load(f)
     gw = cfg.pop("_gateway")

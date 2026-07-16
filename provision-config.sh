@@ -96,6 +96,7 @@ fi
 echo "▶ 4) config 파일 작성"
 GW_TOKEN="$GW_TOKEN" SF_MCP_TOKEN="$SF_MCP_TOKEN" SF_API_KEY="$SF_API_KEY" \
 MXWP_MCP="$MXWP_MCP" MXWP_REST="$MXWP_REST" RAT_TOKEN="${RAT_TOKEN:-}" \
+HEAX_MCP_TOKEN="${HEAX_MCP_TOKEN:-}" HEAX_MCP_SERVERS_URL="${HEAX_MCP_SERVERS_URL:-}" HEAX_MCP_BASE="${HEAX_MCP_BASE:-}" \
 CFG="$CFG" AGENT_DIR="$AGENT_DIR" python3 - <<'PYEOF'
 import json, os
 e = os.environ
@@ -123,6 +124,14 @@ cfg["rest"] = rest
 cfg["portal"] = {"jwks_url": "http://127.0.0.1:8723/.well-known/jwks.json",
                  "revoked_url": "http://127.0.0.1:8723/auth/pat/revoked.json",
                  "audience_ok": ["mx-white-paper", "ai-data-hub", "signalforge"]}
+# heax-hub MCP 앱 자동탐지(옵션) — heax registry 를 폴링해 mcp:{expose} 앱을 heax-<id> 백엔드로 흡수.
+#   token: HEAX_MCP_TOKEN env(heax 'MCP 토큰' 메뉴/PAT). 없으면 heax_registry 생략(그 기능만 빠짐).
+#   servers_url/base: dev 기본 localhost. prod 은 HEAX_MCP_SERVERS_URL/HEAX_MCP_BASE(도메인)로 오버라이드.
+if e.get("HEAX_MCP_TOKEN"):
+    cfg["heax_registry"] = {
+        "servers_url": e.get("HEAX_MCP_SERVERS_URL") or "http://127.0.0.1:4040/api/v1/mcp/servers",
+        "base": e.get("HEAX_MCP_BASE") or "http://127.0.0.1:4180",
+        "token": e["HEAX_MCP_TOKEN"]}
 with open(e["CFG"], "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False); f.write("\n")
 print(f"  ✓ {e['CFG']}")

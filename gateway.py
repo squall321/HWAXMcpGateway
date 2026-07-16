@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anyio
+import httpx
 import uvicorn
 import mcp.types as types
 from mcp.client.session import ClientSession
@@ -35,11 +36,12 @@ def _load_config():
     gw = cfg.pop("_gateway")
     rest = cfg.pop("rest", {})       # REST 프록시 백엔드(site -> base+inject) — MCP 백엔드 아님
     portal = cfg.pop("portal", {})   # 포털 JWKS/폐기목록/aud allowlist (PAT 검증용)
+    heax = cfg.pop("heax_registry", {})  # heax-hub MCP 앱 자동탐지(없으면 비활성) — {servers_url, base, token, poll_s}
     backends = {k: v for k, v in cfg.items() if isinstance(v, dict) and "url" in v}
-    return gw, backends, rest, portal
+    return gw, backends, rest, portal, heax
 
 
-GW, BACKENDS, REST, PORTAL = _load_config()
+GW, BACKENDS, REST, PORTAL, HEAX = _load_config()
 GW_TOKEN = GW["token"]
 HOST = GW.get("host", "127.0.0.1")
 PORT = int(GW.get("port", 9110))
@@ -156,13 +158,64 @@ async def _aggregate():
     log.info("AGGREGATED %d exposed tools (unique names: %d)", len(exposed_tools), len(set(route)))
 
 
+HEAX_PREFIX = "heax-"  # 자동탐지된 heax-hub MCP 앱 백엔드 키 프리픽스
+
+
+async def _discover_heax() -> dict[str, dict]:
+    """heax registry(servers_url) 폴링 → {backend_key: spec(url, headers)}.
+
+    heax_registry 미설정이거나 폴링 실패 시 {} 를 돌려 기존 백엔드에 영향 없음.
+    반환 URL = base(게이트웨이 config 의 heax Caddy 오리진) + 각 앱의 상대경로(path).
+    heax 서비스 PAT 를 Authorization 으로 주입해 forward_auth(/authz) 게이트를 통과한다.
+    """
+    servers_url = HEAX.get("servers_url")
+    if not servers_url:
+        return {}
+    base = (HEAX.get("base") or "").rstrip("/")
+    token = HEAX.get("token")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        async with httpx.AsyncClient(timeout=10) as cli:
+            resp = await cli.get(servers_url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:  # noqa: BLE001 — 다음 주기에 재시도
+        log.warning("heax registry 폴링 실패(%s): %r", servers_url, exc)
+        return {}
+    out: dict[str, dict] = {}
+    for s in data.get("servers", []):
+        sid, path = s.get("id"), s.get("path")
+        if not sid or not path:
+            continue
+        out[f"{HEAX_PREFIX}{sid}"] = {"url": f"{base}{path}", "headers": headers}
+    return out
+
+
 async def _revive_loop(tg):
-    """죽은 백엔드 재활: 주기적으로 세션 없는 백엔드를 재연결하고, 살아나면 도구를 재집계한다.
-    이게 없으면 부팅 시점에 다운이었던 백엔드의 도구는 게이트웨이 재시작 전까지 영구 누락된다.
-    (전 백엔드 정상 부팅 시엔 재집계가 일어나지 않아 노출 도구 이름도 안정적으로 유지된다.)"""
+    """죽은 백엔드 재활 + heax MCP 앱 자동탐지: 주기적으로 세션 없는 백엔드를 재연결하고,
+    heax registry 를 재폴링해 신규 MCP 앱은 합류시키고 사라진 앱은 제거한 뒤, 변화가 있으면
+    도구를 재집계한다. 이게 없으면 부팅 시점에 다운이었던 백엔드/그 뒤 추가된 heax MCP 는
+    게이트웨이 재시작 전까지 누락된다."""
     while True:
         await anyio.sleep(REVIVE_INTERVAL_S)
         revived = False
+        # heax registry 재폴링 — 신규 MCP 앱 합류 / 레지스트리에서 사라진 앱 제거
+        if HEAX.get("servers_url"):
+            discovered = await _discover_heax()
+            for key, spec in discovered.items():
+                if key in backends:
+                    continue
+                b = _Backend(key, spec["url"], spec.get("headers"))
+                backends[key] = b
+                await tg.start(b.run)
+                await b._ready.wait()
+                if b.session is not None:
+                    log.info("heax MCP %s 합류 (%s)", key, spec["url"])
+                    revived = True
+            for key in [k for k in list(backends) if k.startswith(HEAX_PREFIX) and k not in discovered]:
+                backends.pop(key)._stop.set()
+                log.info("heax MCP %s 제거 (레지스트리에서 사라짐)", key)
+                revived = True
         for key, b in backends.items():
             if b.session is not None:
                 continue
@@ -187,6 +240,11 @@ async def _backends_lifespan():
     async with anyio.create_task_group() as tg:
         _task_group_holder["tg"] = tg
         for key, spec in BACKENDS.items():
+            b = _Backend(key, spec["url"], spec.get("headers"))
+            backends[key] = b
+            await tg.start(b.run)
+        # heax-hub MCP 앱 자동탐지 → heax-<id> 백엔드로 합류 (heax_registry 있을 때만)
+        for key, spec in (await _discover_heax()).items():
             b = _Backend(key, spec["url"], spec.get("headers"))
             backends[key] = b
             await tg.start(b.run)

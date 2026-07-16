@@ -57,5 +57,10 @@
       "ai-data-hub",
       "signalforge"
     ]
+  },
+  "heax_registry": {
+    "servers_url": "http://127.0.0.1:4040/api/v1/mcp/servers",
+    "base": "http://127.0.0.1:4180",
+    "token": "heax_pat_REPLACE_WITH_HEAX_SERVICE_PAT"
   }
 }

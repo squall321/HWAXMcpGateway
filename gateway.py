@@ -15,6 +15,7 @@ import mcp.types as types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("hwax-mcp-gateway")
@@ -259,6 +260,10 @@ async def _backends_lifespan():
 
 
 fm = FastMCP("hwax-mcp-gateway")
+# nginx 리버스프록시(/mcp-gw/) 뒤 + 개인 Claude(다양한 도메인 Host)로 접근되므로 MCP SDK 의
+# DNS-rebinding Host 검증을 끈다 — 안 끄면 프록시가 넘긴 Host(localhost·도메인)를 거부해 421.
+# 인가는 Bearer GW_TOKEN/포털 PAT 로 별도 수행하므로 Host 화이트리스트는 불필요.
+fm.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 _low = fm._mcp_server
 
 

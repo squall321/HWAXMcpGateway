@@ -110,6 +110,8 @@ if e.get("SF_MCP_TOKEN"):
 if e.get("MXWP_MCP"):
     cfg["mx-white-paper"] = {"url": "http://127.0.0.1:8765/mcp", "transport": "streamable_http",
         "headers": {"Authorization": f"Bearer {e['MXWP_MCP']}"}}
+# AIDH MCP 는 api_server 에 내장(:8001/mcp, auth_required=false → 무인증) — 항상 포함.
+cfg["ai-data-hub"] = {"url": "http://127.0.0.1:8001/mcp", "transport": "streamable_http"}
 rest = {"ai-data-hub": {"base": "http://127.0.0.1:8001"}}
 if e.get("MXWP_REST"):
     rest["mx-white-paper"] = {"base": "http://127.0.0.1:8800",

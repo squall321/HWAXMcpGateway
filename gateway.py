@@ -188,7 +188,8 @@ async def _discover_heax() -> dict[str, dict]:
         sid, path = s.get("id"), s.get("path")
         if not sid or not path:
             continue
-        out[f"{HEAX_PREFIX}{sid}"] = {"url": f"{base}{path}", "headers": headers}
+        out[f"{HEAX_PREFIX}{sid}"] = {"url": f"{base}{path}", "headers": headers,
+                                      "allowed_groups": list(s.get("allowed_groups") or [])}
     return out
 
 
@@ -208,6 +209,7 @@ async def _revive_loop(tg):
                     continue
                 b = _Backend(key, spec["url"], spec.get("headers"))
                 backends[key] = b
+                POLICY[key] = spec.get("allowed_groups") or []   # heax 앱의 그룹 필터 반영
                 await tg.start(b.run)
                 await b._ready.wait()
                 if b.session is not None:
@@ -215,6 +217,7 @@ async def _revive_loop(tg):
                     revived = True
             for key in [k for k in list(backends) if k.startswith(HEAX_PREFIX) and k not in discovered]:
                 backends.pop(key)._stop.set()
+                POLICY.pop(key, None)
                 log.info("heax MCP %s 제거 (레지스트리에서 사라짐)", key)
                 revived = True
         for key, b in backends.items():
@@ -248,6 +251,7 @@ async def _backends_lifespan():
         for key, spec in (await _discover_heax()).items():
             b = _Backend(key, spec["url"], spec.get("headers"))
             backends[key] = b
+            POLICY[key] = spec.get("allowed_groups") or []   # heax 앱의 그룹 필터 반영
             await tg.start(b.run)
         await _aggregate()
         tg.start_soon(_revive_loop, tg)

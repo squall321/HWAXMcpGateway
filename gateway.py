@@ -5,7 +5,7 @@ import os
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anyio
@@ -46,6 +46,10 @@ PORT = int(GW.get("port", 9110))
 # /mcp 를 GW_TOKEN(내부 에이전트) 외에 포털 PAT(개인 Claude 등)로도 열 때 요구하는 audience.
 MCP_AUDIENCE = PORTAL.get("mcp_audience", "mcp-gateway")
 AUDIT_PATH = os.environ.get("GATEWAY_AUDIT", str(Path(__file__).with_name("audit.jsonl")))
+# 백엔드 도구 호출 타임아웃(초) — 행 걸린 백엔드가 챗 SSE 를 무기한 붙잡지 않게.
+CALL_TIMEOUT_S = int(os.environ.get("GATEWAY_CALL_TIMEOUT", "120"))
+# 죽은 백엔드 재활 주기(초) — 부팅 때 없던 백엔드가 나중에 떠도 재시작 없이 합류.
+REVIVE_INTERVAL_S = int(os.environ.get("GATEWAY_REVIVE_INTERVAL", "60"))
 
 # 그룹 기반 도구 인가: Agent Server가 사용자 groups를 X-HWAX-Groups(콤마구분)로 실어 보낸다.
 # 백엔드별 allowed_groups가 비었거나 없으면 전체 공개, 있으면 caller groups와 교집합이 있어야 노출/호출.
@@ -152,6 +156,31 @@ async def _aggregate():
     log.info("AGGREGATED %d exposed tools (unique names: %d)", len(exposed_tools), len(set(route)))
 
 
+async def _revive_loop(tg):
+    """죽은 백엔드 재활: 주기적으로 세션 없는 백엔드를 재연결하고, 살아나면 도구를 재집계한다.
+    이게 없으면 부팅 시점에 다운이었던 백엔드의 도구는 게이트웨이 재시작 전까지 영구 누락된다.
+    (전 백엔드 정상 부팅 시엔 재집계가 일어나지 않아 노출 도구 이름도 안정적으로 유지된다.)"""
+    while True:
+        await anyio.sleep(REVIVE_INTERVAL_S)
+        revived = False
+        for key, b in backends.items():
+            if b.session is not None:
+                continue
+            try:
+                await b.reconnect(tg)
+                await b._ready.wait()
+                if b.session is not None:
+                    log.info("backend %s revived — re-aggregating tools", key)
+                    revived = True
+            except Exception as exc:  # noqa: BLE001 — 다음 주기에 재시도
+                log.debug("revive %s failed: %r", key, exc)
+        if revived:
+            try:
+                await _aggregate()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("re-aggregate after revive failed: %r", exc)
+
+
 @asynccontextmanager
 async def _backends_lifespan():
     """백엔드 영속 세션 + 도구 집계. streamable_http_app 의 세션매니저 lifespan 과 함께 돈다."""
@@ -162,6 +191,7 @@ async def _backends_lifespan():
             backends[key] = b
             await tg.start(b.run)
         await _aggregate()
+        tg.start_soon(_revive_loop, tg)
         try:
             yield
         finally:
@@ -224,24 +254,31 @@ async def _call_tool(name: str, arguments: dict):
             isError=True,
         )
     b = backends[backend_key]
+    # 행 걸린 백엔드가 챗 SSE 체인 전체를 무기한 블록하지 않게 호출당 타임아웃을 건다.
+    call_timeout = timedelta(seconds=CALL_TIMEOUT_S)
     try:
         if b.session is None:
             raise RuntimeError("backend session down")
-        res = await b.session.call_tool(original, arguments)
+        res = await b.session.call_tool(original, arguments, read_timeout_seconds=call_timeout)
         _audit(name, backend_key, not getattr(res, "isError", False), None,
                round((time.monotonic() - t0) * 1000))
         return res
     except Exception as e:  # noqa: BLE001
         log.warning("call %s on %s failed (%r), reconnecting once", name, backend_key, e)
-        tg = _task_group_holder.get("tg")
-        if tg is not None:
-            await b.reconnect(tg)
-            await b._ready.wait()
-            if b.session is not None:
-                res = await b.session.call_tool(original, arguments)
-                _audit(name, backend_key, not getattr(res, "isError", False), "reconnected",
-                       round((time.monotonic() - t0) * 1000))
-                return res
+        try:
+            tg = _task_group_holder.get("tg")
+            if tg is not None:
+                await b.reconnect(tg)
+                await b._ready.wait()
+                if b.session is not None:
+                    res = await b.session.call_tool(original, arguments,
+                                                    read_timeout_seconds=call_timeout)
+                    _audit(name, backend_key, not getattr(res, "isError", False), "reconnected",
+                           round((time.monotonic() - t0) * 1000))
+                    return res
+        except Exception as e2:  # noqa: BLE001 — 재시도 실패도 정돈된 isError 로 (프로토콜 에러 방지)
+            log.warning("retry of %s on %s failed too (%r)", name, backend_key, e2)
+            e = e2
         _audit(name, backend_key, False, repr(e), round((time.monotonic() - t0) * 1000))
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=f"backend {backend_key} unavailable: {e!r}")],

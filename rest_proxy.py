@@ -22,6 +22,46 @@ _HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
         "trailers", "transfer-encoding", "upgrade", "host", "content-length", "authorization"}
 
 
+class PortalPatVerifier:
+    """포털 PAT 검증(JWKS RS256, scope=api, aud, 폐기목록 60s 캐시). /mcp 게이트와 REST 프록시가 공유.
+    verify(token, audience) → 성공 시 claims dict, 실패 시 None(모든 오류를 None 으로 흡수)."""
+
+    def __init__(self, portal_conf: dict):
+        jwks_url = portal_conf.get("jwks_url")
+        self.jwks = PyJWKClient(jwks_url, cache_keys=True) if jwks_url else None
+        self._revoked_url = portal_conf.get("revoked_url")
+        self._revoked: set[str] = set()
+        self._revoked_at = 0.0
+        self._client = httpx.AsyncClient(timeout=10.0)
+
+    async def _revoked_set(self) -> set[str]:
+        now = time.monotonic()
+        if not self._revoked_url or (self._revoked_at and now - self._revoked_at < 60):
+            return self._revoked
+        try:
+            r = await self._client.get(self._revoked_url, timeout=5)
+            self._revoked = set(r.json().get("revoked", []))
+            self._revoked_at = now
+        except Exception:  # noqa: BLE001 — keep last-known set on transient error
+            pass
+        return self._revoked
+
+    async def verify(self, token: str, audience: str) -> dict | None:
+        if not self.jwks or not token:
+            return None
+        try:
+            key = self.jwks.get_signing_key_from_jwt(token).key
+            claims = jwt.decode(token, key, algorithms=["RS256"], audience=audience,
+                                options={"require": ["exp", "aud", "sub", "jti"], "leeway": 30})
+            if claims.get("scope") != "api":
+                return None
+            if claims["jti"] in await self._revoked_set():
+                return None
+            return claims
+        except Exception:  # noqa: BLE001 — any failure = not a valid PAT
+            return None
+
+
 class RestProxy:
     def __init__(self, rest_conf: dict, portal_conf: dict, audit):
         self.rest = rest_conf or {}

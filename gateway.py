@@ -43,6 +43,8 @@ GW, BACKENDS, REST, PORTAL = _load_config()
 GW_TOKEN = GW["token"]
 HOST = GW.get("host", "127.0.0.1")
 PORT = int(GW.get("port", 9110))
+# /mcp 를 GW_TOKEN(내부 에이전트) 외에 포털 PAT(개인 Claude 등)로도 열 때 요구하는 audience.
+MCP_AUDIENCE = PORTAL.get("mcp_audience", "mcp-gateway")
 AUDIT_PATH = os.environ.get("GATEWAY_AUDIT", str(Path(__file__).with_name("audit.jsonl")))
 
 # 그룹 기반 도구 인가: Agent Server가 사용자 groups를 X-HWAX-Groups(콤마구분)로 실어 보낸다.
@@ -247,8 +249,9 @@ async def _call_tool(name: str, arguments: dict):
         )
 
 
-def _bearer_gate(app):
-    """순수 ASGI 미들웨어: Authorization: Bearer <GW_TOKEN> 검사 (streamable-http 응답버퍼링 회피)."""
+def _bearer_gate(app, pat_verifier=None):
+    """순수 ASGI 미들웨어: /mcp 인가. Bearer <GW_TOKEN>(내부 에이전트) 또는 포털 PAT(개인 Claude 등).
+    PAT 로 들어오면 PAT 의 groups 를 x-hwax-groups 로 강제 주입해 그룹별 도구 필터가 적용된다."""
     expected = f"Bearer {GW_TOKEN}"
 
     async def middleware(scope, receive, send):
@@ -273,18 +276,31 @@ def _bearer_gate(app):
             return
         headers = dict(scope.get("headers") or [])
         auth = headers.get(b"authorization", b"").decode("latin-1")
-        if auth != expected:
-            await send({
-                "type": "http.response.start",
-                "status": 401,
-                "headers": [(b"content-type", b"application/json")],
-            })
-            await send({
-                "type": "http.response.body",
-                "body": b'{"error":"unauthorized"}',
-            })
+        if auth == expected:
+            # 내부 에이전트 서버: GW_TOKEN. groups 는 에이전트가 x-hwax-groups 로 실어 보냄(신뢰).
+            await app(scope, receive, send)
             return
-        await app(scope, receive, send)
+        # GW_TOKEN 이 아니면 포털 PAT(개인 Claude 등) 로 검증 시도 → 성공 시 PAT 의 groups 로 도구 필터.
+        token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+        claims = await pat_verifier.verify(token, MCP_AUDIENCE) if (token and pat_verifier) else None
+        if claims is not None:
+            groups = ",".join(str(g) for g in (claims.get("groups") or []))
+            # 클라이언트가 위조로 넣었을 x-hwax-groups 는 버리고, 검증된 PAT 의 groups 로 강제한다.
+            fresh = [(k, v) for (k, v) in (scope.get("headers") or [])
+                     if k.lower() != GROUPS_HEADER.encode()]
+            fresh.append((GROUPS_HEADER.encode(), groups.encode("latin-1")))
+            await app({**scope, "headers": fresh}, receive, send)
+            return
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b'{"error":"unauthorized"}',
+        })
+        return
 
     return middleware
 
@@ -307,7 +323,13 @@ def main():
                 yield
 
     star.router.lifespan_context = _combined
-    app = _bearer_gate(star)
+    # 포털 PAT 로 /mcp 를 여는 검증기(개인 Claude 등). portal.jwks_url 이 있을 때만 활성.
+    pat_verifier = None
+    if PORTAL.get("jwks_url"):
+        from rest_proxy import PortalPatVerifier
+        pat_verifier = PortalPatVerifier(PORTAL)
+        log.info("MCP PAT auth enabled (audience=%s)", MCP_AUDIENCE)
+    app = _bearer_gate(star, pat_verifier)
     log.info("starting hwax-mcp-gateway on %s:%d (path /mcp), %d backends", HOST, PORT, len(BACKENDS))
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 

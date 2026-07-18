@@ -3,3 +3,4 @@ gateway_config.json
 __pycache__/
 *.pyc
 audit.jsonl
+provision.env

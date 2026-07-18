@@ -25,8 +25,15 @@ if [ -f "$CFG" ] && [ "$FORCE" = 0 ]; then
 fi
 [ -f "$CFG" ] && cp -f "$CFG" "$CFG.bak" && echo "기존 config 백업: $CFG.bak"
 
-echo "▶ 1) GW_TOKEN 생성"
-GW_TOKEN="$(openssl rand -hex 32)"
+echo "▶ 1) GW_TOKEN 준비"
+# --force 재생성 시 기존 토큰을 보존한다 — 회전하면 에이전트/PAT 소비자와의 정합이 깨질 수 있고,
+# 백엔드 추가가 목적인 재프로비저닝에 토큰 회전은 불필요하다. 명시 회전은 ROTATE_GW_TOKEN=1.
+GW_TOKEN=""
+if [ "${ROTATE_GW_TOKEN:-0}" != "1" ] && [ -f "$CFG.bak" ]; then
+  GW_TOKEN="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["_gateway"]["token"])' "$CFG.bak" 2>/dev/null || true)"
+  [ -n "$GW_TOKEN" ] && echo "  ✓ 기존 GW_TOKEN 보존 (${GW_TOKEN:0:8}…)"
+fi
+[ -n "$GW_TOKEN" ] || { GW_TOKEN="$(openssl rand -hex 32)"; echo "  ✓ 신규 생성"; }
 
 echo "▶ 2) SignalForge .env 에서 토큰 읽기"
 SF_ENV="$PARENT/SignalForge/.env"
@@ -146,5 +153,6 @@ else:
     print(f"  ⚠ {e['AGENT_DIR']} 없음 — mcp_servers.json 생략(에이전트 클론 후 --force 재실행)")
 PYEOF
 chmod 600 "$CFG" 2>/dev/null
+chmod 600 "$AGENT_DIR/mcp_servers.json" 2>/dev/null   # GW_TOKEN 평문 — config와 동일하게 보호
 
 echo "▶ 완료 — 게이트웨이 기동: (포털) ./infra/scripts/services.sh up mcp-gateway agent-server"

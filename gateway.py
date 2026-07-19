@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -282,8 +283,101 @@ def _backend_allowed(backend_key: str, groups: list[str]) -> bool:
     return (not allowed) or bool(set(groups) & set(allowed))
 
 
+# ── 게이트웨이 로컬 도구: save_conversation ─────────────────────────────────
+# Claude(MCP) 심의의 대화 전개를 포털 서버 대화 저장소에 남긴다(웹 챗에서 이어보기).
+# 신원 귀속: 호출자의 Authorization(포털 PAT)을 그대로 포털 REST 에 포워딩 → 포털이
+# 자체 검증해 owner_sub = PAT sub. 게이트웨이는 신원 매핑을 하지 않는다(위조 불가).
+# GW_TOKEN 경로(내부 에이전트)는 포털이 401 → CONV_UNAVAILABLE 반환(비치명적 폴백).
+SAVE_CONV_TOOL = types.Tool(
+    name="save_conversation",
+    description=(
+        "심의/대화 로그를 포털 서버 대화 저장소에 저장한다(웹 챗에서 이어보기·GLM 이어가기용). "
+        "messages: [{role: user|assistant|system|persona, content, persona?, round?}] 순서대로. "
+        "성공 시 conversation_id 반환, 포털 미가용/인증 불가면 CONV_UNAVAILABLE."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "대화 제목(심의 주제 등)"},
+            "kind": {"type": "string", "enum": ["chat", "deliberation"], "default": "deliberation"},
+            "source": {"type": "string", "enum": ["web", "mcp"], "default": "mcp"},
+            "messages": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role": {"type": "string", "enum": ["user", "assistant", "system", "persona"]},
+                        "content": {"type": "string"},
+                        "persona": {"type": "string"},
+                        "round": {"type": "integer"},
+                    },
+                    "required": ["role", "content"],
+                },
+            },
+        },
+        "required": ["title", "messages"],
+    },
+)
+
+
+def _portal_api_base() -> str | None:
+    """포털 REST base — portal.api_base 우선, 없으면 jwks_url 의 origin 에서 유도."""
+    base = PORTAL.get("api_base")
+    if base:
+        return str(base).rstrip("/")
+    jwks = PORTAL.get("jwks_url") or ""
+    m = re.match(r"^(https?://[^/]+)", jwks)
+    return m.group(1) if m else None
+
+
+async def _save_conversation(arguments: dict) -> types.CallToolResult:
+    """로컬 도구 실행: 호출자 PAT 를 포워딩해 포털 /agent/conversations 에 일괄 생성."""
+    t0 = time.monotonic()
+
+    def _fail(reason: str) -> types.CallToolResult:
+        _audit("save_conversation", "portal", False, reason,
+               round((time.monotonic() - t0) * 1000))
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=f"CONV_UNAVAILABLE: {reason}")],
+            isError=True,
+        )
+
+    base = _portal_api_base()
+    if not base:
+        return _fail("portal api base not configured")
+    try:
+        req = _low.request_context.request
+        auth = req.headers.get("authorization") if req is not None else None
+    except LookupError:
+        auth = None
+    if not auth:
+        return _fail("no caller authorization to forward")
+    body = {
+        "title": str(arguments.get("title") or "심의")[:200],
+        "kind": arguments.get("kind") or "deliberation",
+        "source": arguments.get("source") or "mcp",
+        "messages": arguments.get("messages") or [],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as cli:
+            r = await cli.post(f"{base}/agent/conversations", json=body,
+                               headers={"Authorization": auth})
+        if r.status_code != 200:
+            return _fail(f"portal {r.status_code}")
+        cid = r.json().get("id")
+        _audit("save_conversation", "portal", True, None,
+               round((time.monotonic() - t0) * 1000))
+        return types.CallToolResult(
+            content=[types.TextContent(type="text",
+                     text=json.dumps({"ok": True, "conversation_id": cid}))],
+        )
+    except Exception as e:  # noqa: BLE001 — 포털 미가용은 비치명적(폴백 계약)
+        return _fail(repr(e))
+
+
 def _visible_tools(groups: list[str]) -> list[types.Tool]:
-    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)]
+    # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
+    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL]
 
 
 def _request_groups() -> list[str]:
@@ -306,6 +400,8 @@ async def _list_tools():
 @_low.call_tool(validate_input=False)
 async def _call_tool(name: str, arguments: dict):
     t0 = time.monotonic()
+    if name == SAVE_CONV_TOOL.name:  # 게이트웨이 로컬 도구(백엔드 라우팅 없음)
+        return await _save_conversation(arguments or {})
     if name not in route:
         _audit(name, None, False, "unknown tool", 0)
         return types.CallToolResult(

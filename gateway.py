@@ -352,11 +352,27 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
         auth = None
     if not auth:
         return _fail("no caller authorization to forward")
+    # 포털 검증 상한(persona 120·content 20000·messages 200)에 맞춰 사전 정규화 — 항목 하나가
+    # 길면 포털이 배치 전체를 422 로 거부해 심의 대화가 통째로 유실된다(전기박리 심의 사고).
+    def _msg(m: dict) -> dict:
+        role = m.get("role")
+        out = {"role": role if role in ("user", "assistant", "system", "persona") else "assistant",
+               "content": str(m.get("content") or "")[:20000]}
+        if m.get("persona") is not None:
+            out["persona"] = str(m["persona"])[:120]
+        if m.get("round") is not None:
+            try:
+                out["round"] = int(m["round"])
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    raw_msgs = arguments.get("messages") or []
     body = {
         "title": str(arguments.get("title") or "심의")[:200],
         "kind": arguments.get("kind") or "deliberation",
         "source": arguments.get("source") or "mcp",
-        "messages": arguments.get("messages") or [],
+        "messages": [_msg(m) for m in raw_msgs if isinstance(m, dict)][:200],
     }
     try:
         async with httpx.AsyncClient(timeout=15.0) as cli:

@@ -77,6 +77,36 @@ except Exception as exc:  # traceback 대신 원인 한 줄 (프로비저닝 출
 print(tok)
 PYEOF
 }
+# heax-hub MCP 토큰 자동 발급 — heax-hub 백엔드(호스트 venv)에서 pat_service 로 admin PAT 를 민팅.
+# admin 유저여야 /api/v1/mcp/servers 가 전체 앱을 보인다(visible_app_ids=None). mxwp 자동 발급과 동형.
+mint_heax() {  # $1=토큰이름 → stdout 마지막 줄이 평문 토큰. 실패 시 stderr.
+  local hdir="$PARENT/HEAXHub/backend"
+  [ -x "$hdir/.venv/bin/python" ] || { echo "heax-hub venv 없음: $hdir/.venv" >&2; return 1; }
+  ( cd "$hdir" && .venv/bin/python - "$1" <<'PYEOF' ) | tail -1
+import sys
+sys.path.insert(0, ".")
+from app.db.session import SessionLocal
+from app.db.models.user import User, UserRole
+from app.db.models.personal_access_token import PersonalAccessToken
+from app.services import pat_service
+name = sys.argv[1]
+db = SessionLocal()
+try:
+    user = (db.query(User).filter(User.role == UserRole.ADMIN).order_by(User.created_at.asc()).first()
+            or db.query(User).order_by(User.created_at.asc()).first())
+    assert user, "users 테이블이 비어 있음"
+    # 재실행 누적 방지 — 같은 이름 기존 토큰 삭제 후 신규 발급(평문 회수 불가라 매번 신규 토큰)
+    db.query(PersonalAccessToken).filter(
+        PersonalAccessToken.user_id == user.id,
+        PersonalAccessToken.name == name).delete()
+    db.commit()
+    _row, tok = pat_service.issue(db, user=user, name=name)
+    print(tok)
+finally:
+    db.close()
+PYEOF
+}
+
 MXWP_MCP=""; MXWP_REST=""
 if apptainer instance list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx mxwp_api; then
   # 앱 코드 경로 자동 탐지 (배포마다 다를 수 있음: apps/api, dist/… 등)
@@ -98,6 +128,24 @@ if apptainer instance list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx mxwp_ap
   fi
 else
   echo "  ⚠ mxwp_api 인스턴스 없음 — mx-white-paper 백엔드 생략됨(뜬 뒤 --force 재실행)"
+fi
+
+# heax_registry 자동 활성화 — HEAX_MCP_TOKEN 미설정 시 heax-hub 에서 admin PAT 를 자동 발급한다.
+# (env 로 명시돼 있으면 그대로 존중.) 이걸로 update-all 만으로 heax 도구가 전량 챗까지 간다.
+if [ -z "${HEAX_MCP_TOKEN:-}" ]; then
+  if [ -x "$PARENT/HEAXHub/backend/.venv/bin/python" ]; then
+    echo "▶ heax MCP 토큰 자동 발급(hwax-gateway-mcp)"
+    HEAX_MCP_TOKEN="$(mint_heax hwax-gateway-mcp 2>/tmp/heaxmint.$$.err || true)"
+    case "${HEAX_MCP_TOKEN:-}" in
+      heax_*) echo "  ✓ heax MCP 토큰 (${HEAX_MCP_TOKEN:0:14}…) → heax_registry 활성" ;;
+      *) echo "  ⚠ heax 토큰 자동 발급 실패 — heax_registry 생략(수동: provision.env 에 HEAX_MCP_TOKEN)"
+         [ -s /tmp/heaxmint.$$.err ] && sed 's/^/    /' /tmp/heaxmint.$$.err >&2
+         HEAX_MCP_TOKEN="" ;;
+    esac
+    rm -f /tmp/heaxmint.$$.err
+  else
+    echo "  · heax-hub 백엔드 venv 미발견 — heax_registry 생략(heax 앱 자동탐지 비활성)"
+  fi
 fi
 
 echo "▶ 4) config 파일 작성"

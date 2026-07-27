@@ -85,11 +85,16 @@ mint_heax() {  # $1=토큰이름 → stdout 마지막 줄이 평문 토큰. 실�
   ( cd "$hdir" && .venv/bin/python - "$1" <<'PYEOF' ) | tail -1
 import sys
 sys.path.insert(0, ".")
-from app.db.session import SessionLocal
+from app.db.base import Base
+from app.db.session import SessionLocal, engine
 from app.db.models.user import User, UserRole
 from app.db.models.personal_access_token import PersonalAccessToken
 from app.services import pat_service
 name = sys.argv[1]
+# PAT 테이블은 alembic 마이그레이션에 없는 신규 테이블이라, cae00 처럼 alembic 로만 스키마를
+# 만드는 배포엔 존재하지 않아 DELETE/INSERT 가 UndefinedTable 로 죽었다. 발급 전 멱등 create_all
+# 로 이 테이블만 보장한다(기존 테이블은 불변 — 테스트가 쓰는 것과 동일한 패턴).
+Base.metadata.create_all(engine, tables=[PersonalAccessToken.__table__])
 db = SessionLocal()
 try:
     user = (db.query(User).filter(User.role == UserRole.ADMIN).order_by(User.created_at.asc()).first()

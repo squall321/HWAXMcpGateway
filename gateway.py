@@ -391,9 +391,82 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
         return _fail(repr(e))
 
 
+# ── 게이트웨이 로컬 도구: list_tool_apps ────────────────────────────────────
+# 167개 도구가 평평하게 보이면 "무엇을 할 수 있는지" 파악이 불가능하다. 도구를 소유 앱(도메인)
+# 단위로 묶어 보여주고, 각 앱의 접근 가능 여부(그룹 인가 + 백엔드 생존)까지 함께 알려준다.
+LIST_APPS_TOOL = types.Tool(
+    name="list_tool_apps",
+    description=(
+        "이 게이트웨이에 연결된 MCP 앱(도메인) 목록과 각 앱의 도구를 계층적으로 반환한다. "
+        "'무슨 앱/도구가 있냐', '어떤 기능이 되냐' 같은 질문에 전체 도구를 나열하는 대신 이걸 호출하라. "
+        "각 앱마다 accessible(내 권한으로 사용 가능한지)·reachable(백엔드 생존)·tool_count·tools 를 준다. "
+        "app 인자를 주면 그 앱의 도구만 상세(이름+설명)로 반환한다."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "app": {"type": "string", "description": "특정 앱 키(예: heax-thermal_shock_mcp). 생략 시 전체 앱 요약."},
+            "include_tools": {"type": "boolean", "description": "전체 목록에도 도구 이름을 포함(기본 true)."},
+        },
+    },
+)
+
+
+async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
+    groups = _request_groups()
+    want_app = str((arguments or {}).get("app") or "").strip()
+    include = (arguments or {}).get("include_tools")
+    include = True if include is None else bool(include)
+
+    by_app: dict[str, list[types.Tool]] = {}
+    for t in exposed_tools:
+        by_app.setdefault(route[t.name][0], []).append(t)
+    by_app.setdefault("_gateway", []).extend([SAVE_CONV_TOOL, LIST_APPS_TOOL])
+    # 연결이 끊긴 백엔드는 도구가 집계되지 않아 목록에서 통째로 사라진다 — 접근성 점검이
+    # 목적이므로 '앱은 있는데 지금 불통'을 보이게 빈 항목으로 채운다.
+    for _k in backends:
+        by_app.setdefault(_k, [])
+
+    apps = []
+    for key in sorted(by_app, key=lambda k: -len(by_app[k])):
+        tools = by_app[key]
+        local = key == "_gateway"
+        # 접근성: 그룹 인가(로컬 도구는 전 그룹) + 백엔드 세션 생존.
+        accessible = True if local else _backend_allowed(key, groups)
+        reachable = True if local else (key in backends and backends[key].session is not None)
+        if want_app and key != want_app:
+            continue
+        entry = {
+            "app": key,
+            "tool_count": len(tools),
+            "accessible": accessible,
+            "reachable": reachable,
+            "status": "ok" if (accessible and reachable) else
+                      ("no_access" if not accessible else "backend_down"),
+        }
+        if want_app:
+            entry["tools"] = [{"name": t.name, "description": (t.description or "")[:300]} for t in tools]
+        elif include:
+            entry["tools"] = sorted(t.name for t in tools)
+        apps.append(entry)
+
+    payload = {
+        "apps": apps,
+        "app_count": len(apps),
+        "total_tools": sum(a["tool_count"] for a in apps),
+        "note": "accessible=내 권한으로 호출 가능, reachable=백엔드 연결 정상. "
+                "특정 앱의 도구 설명은 list_tool_apps(app='<키>') 로 조회.",
+    }
+    if want_app and not apps:
+        payload["error"] = f"unknown app: {want_app}"
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
+    )
+
+
 def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
-    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL]
+    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL, LIST_APPS_TOOL]
 
 
 def _request_groups() -> list[str]:
@@ -418,6 +491,8 @@ async def _call_tool(name: str, arguments: dict):
     t0 = time.monotonic()
     if name == SAVE_CONV_TOOL.name:  # 게이트웨이 로컬 도구(백엔드 라우팅 없음)
         return await _save_conversation(arguments or {})
+    if name == LIST_APPS_TOOL.name:
+        return await _list_tool_apps(arguments or {})
     if name not in route:
         _audit(name, None, False, "unknown tool", 0)
         return types.CallToolResult(
@@ -494,6 +569,7 @@ def _bearer_gate(app, pat_verifier=None):
             # '_gateway' 로 귀속시킨다(앱이 늘어도 분류 누락 0 을 유지).
             for _t in list(exposed_tools) + [SAVE_CONV_TOOL]:
                 _map.setdefault(_t.name, "_gateway")
+            _map.setdefault(LIST_APPS_TOOL.name, "_gateway")
             body = json.dumps({
                 "map": _map,
                 "backends": sorted(set(_map.values())),

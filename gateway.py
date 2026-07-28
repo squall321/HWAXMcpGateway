@@ -489,9 +489,14 @@ def _bearer_gate(app, pat_verifier=None):
         if scope.get("path") == "/tools-map":
             # 무인증: 도구 → 백엔드(소유 MCP 앱) 매핑. 도구가 166개로 평평하게 쏟아지면 고르기
             # 어려워, 클라이언트가 '어느 MCP 앱의 기능인지'로 계층화할 수 있게 노출한다.
+            _map = {name: bk for name, (bk, _orig) in route.items()}
+            # 게이트웨이 로컬 도구(save_conversation 등)는 route 에 없다 — 미분류로 남지 않게
+            # '_gateway' 로 귀속시킨다(앱이 늘어도 분류 누락 0 을 유지).
+            for _t in list(exposed_tools) + [SAVE_CONV_TOOL]:
+                _map.setdefault(_t.name, "_gateway")
             body = json.dumps({
-                "map": {name: bk for name, (bk, _orig) in route.items()},
-                "backends": sorted({bk for bk, _ in route.values()}),
+                "map": _map,
+                "backends": sorted(set(_map.values())),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

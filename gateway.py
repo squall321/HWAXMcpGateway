@@ -486,6 +486,17 @@ def _bearer_gate(app, pat_verifier=None):
                         "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": body})
             return
+        if scope.get("path") == "/tools-map":
+            # 무인증: 도구 → 백엔드(소유 MCP 앱) 매핑. 도구가 166개로 평평하게 쏟아지면 고르기
+            # 어려워, 클라이언트가 '어느 MCP 앱의 기능인지'로 계층화할 수 있게 노출한다.
+            body = json.dumps({
+                "map": {name: bk for name, (bk, _orig) in route.items()},
+                "backends": sorted({bk for bk, _ in route.values()}),
+            }).encode()
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": body})
+            return
         if scope.get("path", "").startswith("/api/"):
             # REST 프록시: GW_TOKEN이 아니라 라우트 핸들러가 포털 PAT(JWKS)로 자체 인증.
             await app(scope, receive, send)

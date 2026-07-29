@@ -57,6 +57,8 @@ REVIVE_INTERVAL_S = int(os.environ.get("GATEWAY_REVIVE_INTERVAL", "60"))
 
 # 그룹 기반 도구 인가: Agent Server가 사용자 groups를 X-HWAX-Groups(콤마구분)로 실어 보낸다.
 # 백엔드별 allowed_groups가 비었거나 없으면 전체 공개, 있으면 caller groups와 교집합이 있어야 노출/호출.
+from urllib.parse import quote, unquote  # 비ASCII 그룹명 헤더 인/디코드
+
 GROUPS_HEADER = "x-hwax-groups"
 POLICY: dict[str, list[str]] = {k: list(v.get("allowed_groups", [])) for k, v in BACKENDS.items()}
 
@@ -273,8 +275,24 @@ _low = fm._mcp_server
 
 
 def _parse_groups(raw: str | None) -> list[str]:
-    """콤마 구분 헤더 → 그룹 리스트(공백·빈값 제거)."""
-    return [g.strip() for g in (raw or "").split(",") if g.strip()]
+    """콤마 구분 헤더 → 그룹 리스트(공백·빈값 제거).
+
+    HTTP 헤더는 latin-1 만 담으므로 '연구소' 같은 비ASCII 그룹명은 클라이언트가 퍼센트
+    인코딩해 보낸다(에이전트 서버 _with_groups). 여기서 되돌린다 — 순수 ASCII 값은
+    unquote 해도 그대로라 기존 클라이언트와 하위호환된다.
+    """
+    out = []
+    for g in (raw or "").split(","):
+        g = g.strip()
+        if not g:
+            continue
+        if "%" in g:
+            try:
+                g = unquote(g)
+            except Exception:  # noqa: BLE001 — 잘못된 인코딩이면 원문 유지
+                pass
+        out.append(g)
+    return out
 
 
 def _backend_allowed(backend_key: str, groups: list[str]) -> bool:
@@ -596,7 +614,8 @@ def _bearer_gate(app, pat_verifier=None):
             # 클라이언트가 위조로 넣었을 x-hwax-groups 는 버리고, 검증된 PAT 의 groups 로 강제한다.
             fresh = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() != GROUPS_HEADER.encode()]
-            fresh.append((GROUPS_HEADER.encode(), groups.encode("latin-1")))
+            # PAT 의 groups 에도 한글이 올 수 있다 — 같은 규칙으로 인코딩해 실어야 헤더가 안 깨진다.
+            fresh.append((GROUPS_HEADER.encode(), quote(groups, safe=",").encode("latin-1")))
             await app({**scope, "headers": fresh}, receive, send)
             return
         await send({

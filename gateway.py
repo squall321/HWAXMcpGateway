@@ -165,10 +165,14 @@ async def _aggregate():
 HEAX_PREFIX = "heax-"  # 자동탐지된 heax-hub MCP 앱 백엔드 키 프리픽스
 
 
-async def _discover_heax() -> dict[str, dict]:
+async def _discover_heax() -> dict[str, dict] | None:
     """heax registry(servers_url) 폴링 → {backend_key: spec(url, headers)}.
 
-    heax_registry 미설정이거나 폴링 실패 시 {} 를 돌려 기존 백엔드에 영향 없음.
+    ⚠ 반환값 계약: **폴링 실패는 None, '등록된 앱이 없음'은 {}** 로 구분한다. 예전에는 둘 다
+    {} 였고 revive 루프가 "discovered 에 없으면 제거"를 그대로 적용해, HEAX Hub 가 재시작하는
+    60초 동안 heax MCP 앱 40개가 통째로 게이트웨이에서 사라졌다(운영에서 하루 3회, 166→126).
+    사용자에겐 "열충격 도구 있어?" → "그런 도구 없습니다"로 보인다. 일시적 불통이 카탈로그를
+    지우면 안 된다.
     반환 URL = base(게이트웨이 config 의 heax Caddy 오리진) + 각 앱의 상대경로(path).
     heax 서비스 PAT 를 Authorization 으로 주입해 forward_auth(/authz) 게이트를 통과한다.
     """
@@ -184,8 +188,8 @@ async def _discover_heax() -> dict[str, dict]:
             resp.raise_for_status()
             data = resp.json()
     except Exception as exc:  # noqa: BLE001 — 다음 주기에 재시도
-        log.warning("heax registry 폴링 실패(%s): %r", servers_url, exc)
-        return {}
+        log.warning("heax registry 폴링 실패(%s): %r — 기존 heax 앱 유지", servers_url, exc)
+        return None
     out: dict[str, dict] = {}
     for s in data.get("servers", []):
         sid, path = s.get("id"), s.get("path")
@@ -194,6 +198,10 @@ async def _discover_heax() -> dict[str, dict]:
         out[f"{HEAX_PREFIX}{sid}"] = {"url": f"{base}{path}", "headers": headers,
                                       "allowed_groups": list(s.get("allowed_groups") or [])}
     return out
+
+
+# heax registry 연속 폴링 실패 횟수 — 일시적 불통과 '정말 사라짐'을 구분하기 위한 상태.
+_HEAX_FAILS = {"n": 0}
 
 
 async def _revive_loop(tg):
@@ -207,6 +215,17 @@ async def _revive_loop(tg):
         # heax registry 재폴링 — 신규 MCP 앱 합류 / 레지스트리에서 사라진 앱 제거
         if HEAX.get("servers_url"):
             discovered = await _discover_heax()
+            if discovered is None:
+                # 폴링 실패 — 마지막 정상 상태를 그대로 유지한다(제거 금지).
+                _HEAX_FAILS["n"] += 1
+                log.warning("heax registry 연속 실패 %d회 — 기존 앱 %d개 유지",
+                            _HEAX_FAILS["n"],
+                            sum(1 for k in backends if k.startswith(HEAX_PREFIX)))
+                discovered = {}
+                _allow_removal = False
+            else:
+                _HEAX_FAILS["n"] = 0
+                _allow_removal = True
             for key, spec in discovered.items():
                 if key in backends:
                     continue
@@ -218,7 +237,9 @@ async def _revive_loop(tg):
                 if b.session is not None:
                     log.info("heax MCP %s 합류 (%s)", key, spec["url"])
                     revived = True
-            for key in [k for k in list(backends) if k.startswith(HEAX_PREFIX) and k not in discovered]:
+            for key in ([k for k in list(backends)
+                         if k.startswith(HEAX_PREFIX) and k not in discovered]
+                        if _allow_removal else []):
                 backends.pop(key)._stop.set()
                 POLICY.pop(key, None)
                 log.info("heax MCP %s 제거 (레지스트리에서 사라짐)", key)

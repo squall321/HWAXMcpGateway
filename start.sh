@@ -39,10 +39,30 @@ if command -v ss >/dev/null 2>&1 && ss -tlnH "sport = :$PORT" 2>/dev/null | grep
     exit 0
   fi
   OWNER="$(ss -tlnpH "sport = :$PORT" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
-  echo "✗ :$PORT 를 다른 프로세스가 점유 중입니다(헬스 응답 없음)." >&2
-  [ -n "$OWNER" ] && echo "   pid=$OWNER  cmd: $(tr '\0' ' ' < "/proc/$OWNER/cmdline" 2>/dev/null | cut -c1-120)" >&2
-  echo "   임시 실행이라면 다른 포트로:  GATEWAY_PORT=9111 GATEWAY_CONFIG=<임시cfg> ./start.sh" >&2
-  exit 1
+  OWNER_CMD="$(tr '\0' ' ' < "/proc/${OWNER:-0}/cmdline" 2>/dev/null || true)"
+  case "$OWNER_CMD" in
+    *gateway.py*)
+      # 우리 게이트웨이가 포트를 물고 있는데 헬스가 죽었다 = 먹통. 여기서 거부하면
+      # update-all 5단계의 자동 복구(services.sh up)가 막혀 되살릴 방법이 없어진다.
+      # 그래서 정리하고 새로 띄운다 — 이게 치유 경로다.
+      echo "· :$PORT 의 게이트웨이가 응답 불능 — 정리 후 재기동 (pid=$OWNER)"
+      kill "$OWNER" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q . || break
+        sleep 0.5
+      done
+      if ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q .; then
+        kill -9 "$OWNER" 2>/dev/null || true
+        sleep 1
+      fi
+      ;;
+    *)
+      echo "✗ :$PORT 를 다른 프로세스가 점유 중입니다(헬스 응답 없음)." >&2
+      [ -n "$OWNER" ] && echo "   pid=$OWNER  cmd: $(printf '%s' "$OWNER_CMD" | cut -c1-120)" >&2
+      echo "   임시 실행이라면 다른 포트로:  GATEWAY_PORT=9111 GATEWAY_CONFIG=<임시cfg> ./start.sh" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 if [ "$BG" = "1" ]; then

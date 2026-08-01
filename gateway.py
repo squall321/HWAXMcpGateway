@@ -46,7 +46,9 @@ def _load_config():
 GW, BACKENDS, REST, PORTAL, HEAX = _load_config()
 GW_TOKEN = GW["token"]
 HOST = GW.get("host", "127.0.0.1")
-PORT = int(GW.get("port", 9110))
+# GATEWAY_PORT 로 config 를 덮어쓸 수 있다 — 임시/재현 실행이 운영 포트(9110)를 뺏지 않도록
+# "임시 실행은 다른 포트" 규약을 코드로 지원한다(start.sh 의 포트 가드와 짝).
+PORT = int(os.environ.get("GATEWAY_PORT") or GW.get("port", 9110))
 # /mcp 를 GW_TOKEN(내부 에이전트) 외에 포털 PAT(개인 Claude 등)로도 열 때 요구하는 audience.
 MCP_AUDIENCE = PORTAL.get("mcp_audience", "mcp-gateway")
 AUDIT_PATH = os.environ.get("GATEWAY_AUDIT", str(Path(__file__).with_name("audit.jsonl")))
@@ -54,6 +56,10 @@ AUDIT_PATH = os.environ.get("GATEWAY_AUDIT", str(Path(__file__).with_name("audit
 CALL_TIMEOUT_S = int(os.environ.get("GATEWAY_CALL_TIMEOUT", "120"))
 # 죽은 백엔드 재활 주기(초) — 부팅 때 없던 백엔드가 나중에 떠도 재시작 없이 합류.
 REVIVE_INTERVAL_S = int(os.environ.get("GATEWAY_REVIVE_INTERVAL", "60"))
+# 연결 상태 백엔드의 list_tools 확인 타임아웃 — 행 걸린 백엔드가 revive 루프를 막지 않게.
+LIVENESS_TIMEOUT_S = float(os.environ.get("GATEWAY_LIVENESS_TIMEOUT", "10"))
+# 호출 경로에서 재연결이 일어났음을 revive 루프에 알리는 플래그(카탈로그 재집계 예약).
+_REAGG: dict[str, bool] = {}
 
 # 그룹 기반 도구 인가: Agent Server가 사용자 groups를 X-HWAX-Groups(콤마구분)로 실어 보낸다.
 # 백엔드별 allowed_groups가 비었거나 없으면 전체 공개, 있으면 caller groups와 교집합이 있어야 노출/호출.
@@ -244,6 +250,28 @@ async def _revive_loop(tg):
                 POLICY.pop(key, None)
                 log.info("heax MCP %s 제거 (레지스트리에서 사라짐)", key)
                 revived = True
+        # ── 연결된 백엔드의 도구 목록 재확인(G3) ──────────────────────────────
+        # 앱 인스턴스가 교체돼도(SIF 재빌드·재기동) run() 은 _stop 대기로 park 중이라 예외가
+        # 나지 않아 session 객체가 살아 있는 것처럼 남는다. 그러면 아래 재연결 루프가
+        # 건너뛰고 카탈로그는 옛 도구로 굳는다 — 새 도구가 게이트웨이 재기동 전까지 안 보였다.
+        # 주기적으로 list_tools 를 다시 받아 (a) 죽은 세션을 감지해 재연결 대상으로 돌리고
+        # (b) 도구 구성이 바뀌었으면 재집계한다. 백엔드당 60초에 1회라 비용은 무시할 수준.
+        for key, b in list(backends.items()):
+            if b.session is None:
+                continue
+            try:
+                with anyio.fail_after(LIVENESS_TIMEOUT_S):
+                    res = await b.session.list_tools()
+                now = {t.name for t in res.tools}
+                prev = {orig for (bk, orig) in route.values() if bk == key}
+                if now != prev:
+                    log.info("backend %s 도구 구성 변경 (%d→%d) — 재집계",
+                             key, len(prev), len(now))
+                    revived = True
+            except Exception as exc:  # noqa: BLE001 — 죽은 세션 → 아래 재연결 루프가 처리
+                log.warning("backend %s liveness 실패 (%r) — 재연결 예약", key, exc)
+                b.session = None
+
         for key, b in backends.items():
             if b.session is not None:
                 continue
@@ -255,6 +283,9 @@ async def _revive_loop(tg):
                     revived = True
             except Exception as exc:  # noqa: BLE001 — 다음 주기에 재시도
                 log.debug("revive %s failed: %r", key, exc)
+        # 호출 경로(_call_tool)에서 재연결이 일어났으면 그쪽은 카탈로그를 못 고치므로 여기서 갱신.
+        if _REAGG.pop("pending", False):
+            revived = True
         if revived:
             try:
                 await _aggregate()
@@ -564,6 +595,9 @@ async def _call_tool(name: str, arguments: dict):
                 await b.reconnect(tg)
                 await b._ready.wait()
                 if b.session is not None:
+                    # 재연결했으면 그 백엔드의 도구 구성이 바뀌었을 수 있다(앱 교체). 호출 지연을
+                    # 늘리지 않도록 여기서 재집계하지 않고 revive 루프에 예약만 건다(G3).
+                    _REAGG["pending"] = True
                     res = await b.session.call_tool(original, arguments,
                                                     read_timeout_seconds=call_timeout)
                     _audit(name, backend_key, not getattr(res, "isError", False), "reconnected",

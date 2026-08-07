@@ -201,8 +201,13 @@ async def _discover_heax() -> dict[str, dict] | None:
         sid, path = s.get("id"), s.get("path")
         if not sid or not path:
             continue
+        # registry 가 주는 표시 정보(name·description)를 버리지 않는다 — 앱 단위 선택 UI 는
+        # 라벨이 곧 사용자가 보는 전부라, 버리면 클라이언트가 앱 키에서 이름을 추측하게 되고
+        # 실제로 틀린 이름이 노출된다(heax-kooremapper_mcp → 'Kooremapper' vs 등록명 'DynaForge MCP').
         out[f"{HEAX_PREFIX}{sid}"] = {"url": f"{base}{path}", "headers": headers,
-                                      "allowed_groups": list(s.get("allowed_groups") or [])}
+                                      "allowed_groups": list(s.get("allowed_groups") or []),
+                                      "label": (s.get("name") or "").strip()[:80],
+                                      "description": (s.get("description") or "").strip()[:300]}
     return out
 
 
@@ -233,6 +238,10 @@ async def _revive_loop(tg):
                 _HEAX_FAILS["n"] = 0
                 _allow_removal = True
             for key, spec in discovered.items():
+                # 표시 정보는 백엔드 합류 여부와 무관하게 항상 갱신한다 — 이미 붙어 있는 앱도
+                # registry 에서 이름이 바뀔 수 있고, 라벨은 세션 생존과 별개다.
+                DISCOVERED_META[key] = {"label": spec.get("label") or "",
+                                        "description": spec.get("description") or ""}
                 if key in backends:
                     continue
                 b = _Backend(key, spec["url"], spec.get("headers"))
@@ -304,6 +313,8 @@ async def _backends_lifespan():
             await tg.start(b.run)
         # heax-hub MCP 앱 자동탐지 → heax-<id> 백엔드로 합류 (heax_registry 있을 때만)
         for key, spec in (await _discover_heax()).items():
+            DISCOVERED_META[key] = {"label": spec.get("label") or "",
+                                    "description": spec.get("description") or ""}
             b = _Backend(key, spec["url"], spec.get("headers"))
             backends[key] = b
             POLICY[key] = spec.get("allowed_groups") or []   # heax 앱의 그룹 필터 반영
@@ -464,6 +475,47 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
 # ── 게이트웨이 로컬 도구: list_tool_apps ────────────────────────────────────
 # 167개 도구가 평평하게 보이면 "무엇을 할 수 있는지" 파악이 불가능하다. 도구를 소유 앱(도메인)
 # 단위로 묶어 보여주고, 각 앱의 접근 가능 여부(그룹 인가 + 백엔드 생존)까지 함께 알려준다.
+# 앱 표시 정보 — 앱 단위 선택 UI 는 라벨·설명이 곧 사용자가 보는 전부다.
+# heax 앱은 registry 가 name·description 을 주므로 자동이고, 정적 백엔드는 출처가 아예 없어
+# (config 에 url/headers 뿐, MCP initialize 의 serverInfo 도 'mxwp-rag' 수준) 여기 손으로 둔다.
+# 신규 앱이 붙어도 이름은 registry 를 따라가므로 이 표는 정적 5개만 유지하면 된다.
+# registry 발굴로 채워지는 표시 정보 — heax 앱은 여기, 정적 백엔드는 아래 APP_META.
+# backends 는 _Backend 객체라 라벨을 담지 못하고 BACKENDS 는 정적 config 사본이라 heax 앱이 없다.
+DISCOVERED_META: dict[str, dict] = {}
+
+APP_META: dict[str, dict] = {
+    "reportarchive": {"label": "리포트 아카이브",
+                      "description": "보고서 작성·검색·온톨로지 — 템플릿으로 보고서를 만들고 과거 보고 이력과 객체 그래프를 조회한다."},
+    "signalforge": {"label": "SignalForge VOC",
+                    "description": "글로벌 커뮤니티 VOC 인텔리전스 — 제품·이슈별 불만을 수집·분류하고 급상승 이슈를 알린다."},
+    "mx-white-paper": {"label": "MX 백서",
+                       "description": "사내 업무 백서 검색 — 축적된 업무 지식·노하우 문서를 의미 검색으로 찾는다."},
+    "ai-data-hub": {"label": "AI 데이터 허브",
+                    "description": "사내 데이터 계층화·온톨로지·API 프록시 — 흩어진 사내 데이터와 시스템 API 를 한 곳에서 조회한다."},
+    "smart-twin-cluster": {"label": "시뮬레이션 클러스터",
+                           "description": "Slurm 해석 잡 조회 — 실행 중·완료 해석 잡과 결과 파일 상태를 읽는다(읽기 전용)."},
+    "_gateway": {"label": "게이트웨이 공통",
+                 "description": "앱·도구 카탈로그와 대화 저장 등 게이트웨이 자체 기능."},
+}
+
+
+def _app_meta(key: str) -> dict:
+    """앱 표시 정보 — registry(heax) > 큐레이션 표(정적) > 키에서 유도 순."""
+    spec = DISCOVERED_META.get(key) or BACKENDS.get(key) or {}
+    label = (spec.get("label") or "").strip()
+    desc = (spec.get("description") or "").strip()
+    curated = APP_META.get(key, {})
+    if not label:
+        label = curated.get("label") or ""
+    if not desc:
+        desc = curated.get("description") or ""
+    if not label:
+        # 마지막 폴백 — heax- 접두사와 _mcp 접미사를 떼고 사람이 읽을 형태로.
+        base = key.removeprefix(HEAX_PREFIX).removesuffix("_mcp").removesuffix("-mcp")
+        label = " ".join(w.capitalize() for w in base.replace("_", " ").replace("-", " ").split()) or key
+    return {"label": label, "description": desc}
+
+
 LIST_APPS_TOOL = types.Tool(
     name="list_tool_apps",
     description=(
@@ -506,8 +558,11 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         reachable = True if local else (key in backends and backends[key].session is not None)
         if want_app and key != want_app:
             continue
+        meta = _app_meta(key)
         entry = {
             "app": key,
+            "label": meta["label"],
+            "description": meta["description"],
             "tool_count": len(tools),
             "accessible": accessible,
             "reachable": reachable,
@@ -643,10 +698,26 @@ def _bearer_gate(app, pat_verifier=None):
             for _t in list(exposed_tools) + [SAVE_CONV_TOOL]:
                 _map.setdefault(_t.name, "_gateway")
             _map.setdefault(LIST_APPS_TOOL.name, "_gateway")
+            # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
+            # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서
+            # 통째로 사라진다. backends 를 먼저 채워 '앱은 있는데 지금 불통'을 보이게 한다.
+            _counts: dict[str, int] = {k: 0 for k in backends}
+            for _bk in _map.values():
+                _counts[_bk] = _counts.get(_bk, 0) + 1
+            _apps = []
+            for _k in sorted(_counts, key=lambda k: -_counts[k]):
+                _m = _app_meta(_k)
+                _apps.append({
+                    "app": _k, "label": _m["label"], "description": _m["description"],
+                    "tool_count": _counts[_k],
+                    "reachable": _k == "_gateway" or (
+                        _k in backends and backends[_k].session is not None),
+                })
             body = json.dumps({
                 "map": _map,
                 "backends": sorted(set(_map.values())),
-            }).encode()
+                "apps": _apps,
+            }, ensure_ascii=False).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": body})

@@ -192,6 +192,22 @@ if e.get("HEAX_MCP_TOKEN"):
         "servers_url": e.get("HEAX_MCP_SERVERS_URL") or "http://127.0.0.1:4040/api/v1/mcp/servers",
         "base": e.get("HEAX_MCP_BASE") or "http://127.0.0.1:4180",
         "token": e["HEAX_MCP_TOKEN"]}
+# 프로비저너가 만드는 키는 아래가 전부다. 그 밖의 백엔드는 손으로 붙인 것이므로 보존한다.
+# 예전엔 cfg 를 빈 dict 에서 시작해 파일을 통째로 덮어썼다 — 그래서 --force 한 번에
+# smart-twin-cluster(slurm 도구 19개)가 조용히 사라진다. update-all 의 기대 목록에도
+# 없어서 사라진 사실조차 안 잡힌다(실측). 관리 키는 여기서 보존하지 않는다 —
+# 이번 실행이 안 만든 관리 키(예: RAT_TOKEN 없어 빠진 reportarchive)는 의도된 제거다.
+MANAGED = {"_gateway", "reportarchive", "signalforge", "mx-white-paper",
+           "ai-data-hub", "rest", "portal", "heax_registry"}
+try:
+    with open(e["CFG"]) as f:
+        prev = json.load(f)
+except Exception:
+    prev = {}
+for k, v in prev.items():
+    if k not in MANAGED and k not in cfg:
+        cfg[k] = v
+        print(f"  · 보존: {k} (프로비저너가 만들지 않는 백엔드 — 덮어쓰지 않는다)")
 with open(e["CFG"], "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False); f.write("\n")
 print(f"  ✓ {e['CFG']}")

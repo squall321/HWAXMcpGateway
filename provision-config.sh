@@ -264,8 +264,15 @@ cfg["portal"] = {"jwks_url": "http://127.0.0.1:8723/.well-known/jwks.json",
 # mcp-remote 는 그 URL 로 가는 stdio 브리지일 뿐이라, HTTP 를 직접 말하는 이 게이트웨이에는 불필요하다.
 # 토큰이 URL 쿼리에 들어가므로 레포에 박지 않는다 — provision.env 의 ODB_HUB_TOKEN 을 쓴다(RAT_TOKEN 과 동형).
 if e.get("ODB_HUB_TOKEN"):
+    # 호스트는 보존하되 토큰은 항상 env 의 현재 값을 쓴다.
+    # URL 통째로 보존하면 .bak 에 박힌 옛 토큰이 되살아나 새 토큰을 덮어쓴다 —
+    # 호스트는 '설정'이고 토큰은 '시크릿'이라 수명이 다르다.
+    _odb_prev = _prev("odb-hub")            # 예: http://10.9.9.9:8000/mcp?token=old
+    _odb_base = (e.get("ODB_HUB_BASE")
+                 or (_odb_prev.split("/mcp")[0] if _odb_prev else None)
+                 or "http://10.252.38.121:8000")
     cfg["odb-hub"] = {
-        "url": f'{e.get("ODB_HUB_BASE") or "http://10.252.38.121:8000"}/mcp?token={e["ODB_HUB_TOKEN"]}',
+        "url": f'{_odb_base}/mcp?token={e["ODB_HUB_TOKEN"]}',
         "transport": "streamable_http"}
 
 # heax-hub MCP 앱 자동탐지(옵션) — heax registry 를 폴링해 mcp:{expose} 앱을 heax-<id> 백엔드로 흡수.

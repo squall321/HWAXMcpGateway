@@ -8,6 +8,8 @@
 #      (앱의 _gen_token/hash_password 를 그대로 import — 포맷/해시가 앱과 항상 일치)
 #   4) gateway_config.json 작성(chmod 600) + HWAXAgentServer/mcp_servers.json 작성
 #   5) ReportArchive 백엔드: RAT_TOKEN 환경변수가 있으면 포함, 없으면 생략(그 백엔드만 빠짐)
+#      워크스페이스 슬러그는 RA_WORKSPACE_SLUG > 기존 config 값 > "dev" 순으로 정한다
+#      (예전엔 "dev" 하드코딩이라 --force 마다 운영 박스 값을 덮어썼다).
 #   6) ODB 자동화 허브: ODB_HUB_TOKEN 이 있으면 odb-hub 백엔드 포함(cae00 에서만 도달하는 사내 서버).
 #      주의 — 게이트웨이는 "url" 키가 있는 항목만 백엔드로 읽는다(gateway.py:42). mcp-remote 의
 #      {"command":"npx","args":[...]} 형식을 넣으면 에러 없이 조용히 무시되므로 url 형식으로 쓴다.
@@ -171,13 +173,29 @@ GW_TOKEN="$GW_TOKEN" SF_MCP_TOKEN="$SF_MCP_TOKEN" SF_API_KEY="$SF_API_KEY" \
 MXWP_MCP="$MXWP_MCP" MXWP_REST="$MXWP_REST" RAT_TOKEN="${RAT_TOKEN:-}" \
 HEAX_MCP_TOKEN="${HEAX_MCP_TOKEN:-}" HEAX_MCP_SERVERS_URL="${HEAX_MCP_SERVERS_URL:-}" HEAX_MCP_BASE="${HEAX_MCP_BASE:-}" \
 ODB_HUB_TOKEN="${ODB_HUB_TOKEN:-}" ODB_HUB_BASE="${ODB_HUB_BASE:-}" \
+RA_WORKSPACE_SLUG="${RA_WORKSPACE_SLUG:-}" \
 CFG="$CFG" AGENT_DIR="$AGENT_DIR" python3 - <<'PYEOF'
 import json, os
 e = os.environ
+
+
+def _prev_ra_slug():
+    """직전 config 의 reportarchive 슬러그. --force 재생성이 값을 잃지 않게 한다."""
+    try:
+        with open(e["CFG"] + ".bak") as f:
+            return ((json.load(f).get("reportarchive") or {}).get("headers") or {}).get("X-Workspace-Slug")
+    except Exception:
+        return None
+
 cfg = {"_gateway": {"host": "127.0.0.1", "port": 9110, "token": e["GW_TOKEN"]}}
 if e.get("RAT_TOKEN"):
     cfg["reportarchive"] = {"url": "http://127.0.0.1:3002/mcp", "transport": "streamable_http",
-        "headers": {"Authorization": f"Bearer {e['RAT_TOKEN']}", "X-Workspace-Slug": "dev"}}
+        "headers": {"Authorization": f"Bearer {e['RAT_TOKEN']}",
+                    # 슬러그가 "dev" 로 하드코딩돼 있었다. 박스마다 다를 수 있는 값인데
+                    # --force 가 돌 때마다 무조건 dev 로 덮어쓴다 — 운영 박스가 다른 워크스페이스를
+                    # 쓰고 있었다면 조용히 엉뚱한 곳을 가리키게 된다(경고도 없다).
+                    # 기존 config 값 > env > "dev" 순으로 존중한다.
+                    "X-Workspace-Slug": e.get("RA_WORKSPACE_SLUG") or _prev_ra_slug() or "dev"}}
 # SF MCP 는 SF_MCP_TOKEN 미설정 시 무인증 모드로 돌므로 헤더 없이도 포함한다.
 cfg["signalforge"] = {"url": "http://127.0.0.1:8013/mcp", "transport": "streamable_http"}
 if e.get("SF_MCP_TOKEN"):

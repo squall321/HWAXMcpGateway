@@ -29,9 +29,13 @@ echo "▶ 1) GW_TOKEN 준비"
 # --force 재생성 시 기존 토큰을 보존한다 — 회전하면 에이전트/PAT 소비자와의 정합이 깨질 수 있고,
 # 백엔드 추가가 목적인 재프로비저닝에 토큰 회전은 불필요하다. 명시 회전은 ROTATE_GW_TOKEN=1.
 GW_TOKEN=""
-if [ "${ROTATE_GW_TOKEN:-0}" != "1" ] && [ -f "$CFG.bak" ]; then
+# 조건에 FORCE 가 빠져 있었다 — .bak 은 지워지지 않고 남으므로, config 만 지우고 재실행하면
+# '신규 프로비저닝'인데도 예전 .bak 에서 토큰을 끌어와 회전이 안 된다(출력은 '✓ 보존'이라 경고도 없다).
+# 이번 실행이 26행에서 방금 백업을 뜬 경우(=FORCE 이고 config 가 있었던 경우)에만 보존한다.
+if [ "$FORCE" = 1 ] && [ "${ROTATE_GW_TOKEN:-0}" != "1" ] && [ -f "$CFG.bak" ]; then
   GW_TOKEN="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["_gateway"]["token"])' "$CFG.bak" 2>/dev/null || true)"
-  [ -n "$GW_TOKEN" ] && echo "  ✓ 기존 GW_TOKEN 보존 (${GW_TOKEN:0:8}…)"
+  # 토큰 앞자리를 찍지 않는다 — 이 출력은 update-all 로그에 그대로 남는다.
+  [ -n "$GW_TOKEN" ] && echo "  ✓ 기존 GW_TOKEN 보존"
 fi
 [ -n "$GW_TOKEN" ] || { GW_TOKEN="$(openssl rand -hex 32)"; echo "  ✓ 신규 생성"; }
 
@@ -221,6 +225,12 @@ if os.path.isdir(e["AGENT_DIR"]):
 else:
     print(f"  ⚠ {e['AGENT_DIR']} 없음 — mcp_servers.json 생략(에이전트 클론 후 --force 재실행)")
 PYEOF
+# 히어독의 성공 여부를 아무도 안 봤다 — config 작성이 통째로 실패해도 아래 chmod 를 지나
+# '▶ 완료' 를 찍고 exit 0 으로 끝났다. 호출부(update-all §5)도 종료코드를 안 보므로
+# 재프로비저닝 실패가 어디에도 안 남는다. set -e 는 켤 수 없다 — 이 파일엔 '실패가 정상'인
+# grep/case 분기가 여럿이라 그것들까지 죽는다. 그래서 여기만 명시적으로 검사한다.
+rc=$?
+[ "$rc" = 0 ] || { echo "✗ config 작성 실패(python rc=$rc) — 기존 config 를 그대로 둔다" >&2; exit 1; }
 chmod 600 "$CFG" 2>/dev/null
 chmod 600 "$AGENT_DIR/mcp_servers.json" 2>/dev/null   # GW_TOKEN 평문 — config와 동일하게 보호
 

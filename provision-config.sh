@@ -10,6 +10,13 @@
 #   5) ReportArchive 백엔드: RAT_TOKEN 환경변수가 있으면 포함, 없으면 생략(그 백엔드만 빠짐)
 #      워크스페이스 슬러그는 RA_WORKSPACE_SLUG > 기존 config 값 > "dev" 순으로 정한다
 #      (예전엔 "dev" 하드코딩이라 --force 마다 운영 박스 값을 덮어썼다).
+#
+# 백엔드 주소는 전부 오버라이드 가능하다 — 서비스가 다른 서버로 빠질 수 있기 때문이다.
+# 우선순위는 env > 기존 config(.bak) > 같은 박스 localhost 기본값이다. env 를 안 쓰더라도
+# 손으로 바꿔 둔 주소는 --force 재생성에서 보존된다.
+#   RA_MCP_URL   SF_MCP_URL   MXWP_MCP_URL   AIDH_MCP_URL      (MCP 엔드포인트)
+#   SF_REST_BASE MXWP_REST_BASE AIDH_REST_BASE                 (REST 베이스)
+#   HEAX_MCP_SERVERS_URL / HEAX_MCP_BASE                       (heax registry — 기존부터 있던 손잡이)
 #   6) ODB 자동화 허브: ODB_HUB_TOKEN 이 있으면 odb-hub 백엔드 포함(cae00 에서만 도달하는 사내 서버).
 #      주의 — 게이트웨이는 "url" 키가 있는 항목만 백엔드로 읽는다(gateway.py:42). mcp-remote 의
 #      {"command":"npx","args":[...]} 형식을 넣으면 에러 없이 조용히 무시되므로 url 형식으로 쓴다.
@@ -174,9 +181,31 @@ MXWP_MCP="$MXWP_MCP" MXWP_REST="$MXWP_REST" RAT_TOKEN="${RAT_TOKEN:-}" \
 HEAX_MCP_TOKEN="${HEAX_MCP_TOKEN:-}" HEAX_MCP_SERVERS_URL="${HEAX_MCP_SERVERS_URL:-}" HEAX_MCP_BASE="${HEAX_MCP_BASE:-}" \
 ODB_HUB_TOKEN="${ODB_HUB_TOKEN:-}" ODB_HUB_BASE="${ODB_HUB_BASE:-}" \
 RA_WORKSPACE_SLUG="${RA_WORKSPACE_SLUG:-}" \
+RA_MCP_URL="${RA_MCP_URL:-}" SF_MCP_URL="${SF_MCP_URL:-}" MXWP_MCP_URL="${MXWP_MCP_URL:-}" \
+AIDH_MCP_URL="${AIDH_MCP_URL:-}" AIDH_REST_BASE="${AIDH_REST_BASE:-}" \
+MXWP_REST_BASE="${MXWP_REST_BASE:-}" SF_REST_BASE="${SF_REST_BASE:-}" \
 CFG="$CFG" AGENT_DIR="$AGENT_DIR" python3 - <<'PYEOF'
 import json, os
 e = os.environ
+
+
+def _prev(key, field="url"):
+    """직전 config(.bak)의 값 — --force 재생성이 손으로 바꾼 주소를 잃지 않게 한다."""
+    try:
+        with open(e["CFG"] + ".bak") as f:
+            return (json.load(f).get(key) or {}).get(field)
+    except Exception:
+        return None
+
+
+def _url(env_key, key, default, field="url"):
+    """백엔드 주소: env > 기존 config > 기본값(같은 박스 localhost).
+
+    서비스가 다른 서버로 빠질 수 있으므로 전부 오버라이드 가능해야 한다 —
+    예전엔 127.0.0.1 이 리터럴로 박혀 있어 원격 배치를 표현할 방법이 없었다.
+    heax_registry 만 이 손잡이를 갖고 있었는데, 나머지도 같은 이유로 필요하다.
+    """
+    return e.get(env_key) or _prev(key, field) or default
 
 
 def _prev_ra_slug():
@@ -189,7 +218,8 @@ def _prev_ra_slug():
 
 cfg = {"_gateway": {"host": "127.0.0.1", "port": 9110, "token": e["GW_TOKEN"]}}
 if e.get("RAT_TOKEN"):
-    cfg["reportarchive"] = {"url": "http://127.0.0.1:3002/mcp", "transport": "streamable_http",
+    cfg["reportarchive"] = {"url": _url("RA_MCP_URL", "reportarchive", "http://127.0.0.1:3002/mcp"),
+        "transport": "streamable_http",
         "headers": {"Authorization": f"Bearer {e['RAT_TOKEN']}",
                     # 슬러그가 "dev" 로 하드코딩돼 있었다. 박스마다 다를 수 있는 값인데
                     # --force 가 돌 때마다 무조건 dev 로 덮어쓴다 — 운영 박스가 다른 워크스페이스를
@@ -197,20 +227,32 @@ if e.get("RAT_TOKEN"):
                     # 기존 config 값 > env > "dev" 순으로 존중한다.
                     "X-Workspace-Slug": e.get("RA_WORKSPACE_SLUG") or _prev_ra_slug() or "dev"}}
 # SF MCP 는 SF_MCP_TOKEN 미설정 시 무인증 모드로 돌므로 헤더 없이도 포함한다.
-cfg["signalforge"] = {"url": "http://127.0.0.1:8013/mcp", "transport": "streamable_http"}
+cfg["signalforge"] = {"url": _url("SF_MCP_URL", "signalforge", "http://127.0.0.1:8013/mcp"),
+                      "transport": "streamable_http"}
 if e.get("SF_MCP_TOKEN"):
     cfg["signalforge"]["headers"] = {"Authorization": f"Bearer {e['SF_MCP_TOKEN']}"}
 if e.get("MXWP_MCP"):
-    cfg["mx-white-paper"] = {"url": "http://127.0.0.1:8765/mcp", "transport": "streamable_http",
+    cfg["mx-white-paper"] = {"url": _url("MXWP_MCP_URL", "mx-white-paper", "http://127.0.0.1:8765/mcp"),
+        "transport": "streamable_http",
         "headers": {"Authorization": f"Bearer {e['MXWP_MCP']}"}}
 # AIDH MCP 는 api_server 에 내장(:8001/mcp, auth_required=false → 무인증) — 항상 포함.
-cfg["ai-data-hub"] = {"url": "http://127.0.0.1:8001/mcp/", "transport": "streamable_http"}
-rest = {"ai-data-hub": {"base": "http://127.0.0.1:8001"}}
+cfg["ai-data-hub"] = {"url": _url("AIDH_MCP_URL", "ai-data-hub", "http://127.0.0.1:8001/mcp/"),
+                      "transport": "streamable_http"}
+def _rest_base(env_key, key, default):
+    try:
+        with open(e["CFG"] + ".bak") as f:
+            prev = ((json.load(f).get("rest") or {}).get(key) or {}).get("base")
+    except Exception:
+        prev = None
+    return e.get(env_key) or prev or default
+
+
+rest = {"ai-data-hub": {"base": _rest_base("AIDH_REST_BASE", "ai-data-hub", "http://127.0.0.1:8001")}}
 if e.get("MXWP_REST"):
-    rest["mx-white-paper"] = {"base": "http://127.0.0.1:8800",
+    rest["mx-white-paper"] = {"base": _rest_base("MXWP_REST_BASE", "mx-white-paper", "http://127.0.0.1:8800"),
         "inject": {"header": "Authorization", "value": f"Bearer {e['MXWP_REST']}"}}
 if e.get("SF_API_KEY"):
-    rest["signalforge"] = {"base": "http://127.0.0.1:17370",
+    rest["signalforge"] = {"base": _rest_base("SF_REST_BASE", "signalforge", "http://127.0.0.1:17370"),
         "inject": {"header": "X-API-Key", "value": e["SF_API_KEY"]}}
 cfg["rest"] = rest
 cfg["portal"] = {"jwks_url": "http://127.0.0.1:8723/.well-known/jwks.json",

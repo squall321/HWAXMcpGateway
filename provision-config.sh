@@ -231,6 +231,26 @@ PYEOF
 # grep/case 분기가 여럿이라 그것들까지 죽는다. 그래서 여기만 명시적으로 검사한다.
 rc=$?
 [ "$rc" = 0 ] || { echo "✗ config 작성 실패(python rc=$rc) — 기존 config 를 그대로 둔다" >&2; exit 1; }
+# 있던 백엔드가 조용히 사라지는 것을 막는다. 관리 키는 토큰 env 가 없으면 만들어지지 않는데,
+# 그게 '의도된 제거'인지 '이 박스에 provision.env 가 없을 뿐'인지 스크립트는 구분하지 못한다.
+# 실제로 dev 에서 --force 한 번에 reportarchive(도구 24개)가 사라졌다. 최소한 말은 해야 한다.
+if [ -f "$CFG.bak" ]; then
+  CFG="$CFG" python3 - <<'PYCHK'
+import json, os
+cfg = os.environ["CFG"]
+try:
+    a = json.load(open(cfg)); b = json.load(open(cfg + ".bak"))
+except Exception:
+    raise SystemExit(0)
+skip = {"rest", "portal"}
+gone = sorted(k for k in b if k not in skip and k not in a)
+if gone:
+    print("  ⚠ 이전 config 에 있었으나 이번에 빠진 백엔드: " + ", ".join(gone))
+    print("     해당 토큰 env 가 이 박스에 없으면 그 백엔드는 생성되지 않는다(예: RAT_TOKEN → reportarchive).")
+    print("     의도한 제거가 아니라면 provision.env 를 채우고 --force 를 다시 돌리거나,")
+    print(f"     {os.path.basename(cfg)}.bak 에서 해당 키만 복원하라.")
+PYCHK
+fi
 chmod 600 "$CFG" 2>/dev/null
 chmod 600 "$AGENT_DIR/mcp_servers.json" 2>/dev/null   # GW_TOKEN 평문 — config와 동일하게 보호
 

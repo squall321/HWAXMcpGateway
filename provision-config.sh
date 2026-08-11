@@ -8,6 +8,9 @@
 #      (앱의 _gen_token/hash_password 를 그대로 import — 포맷/해시가 앱과 항상 일치)
 #   4) gateway_config.json 작성(chmod 600) + HWAXAgentServer/mcp_servers.json 작성
 #   5) ReportArchive 백엔드: RAT_TOKEN 환경변수가 있으면 포함, 없으면 생략(그 백엔드만 빠짐)
+#   6) ODB 자동화 허브: ODB_HUB_TOKEN 이 있으면 odb-hub 백엔드 포함(cae00 에서만 도달하는 사내 서버).
+#      주의 — 게이트웨이는 "url" 키가 있는 항목만 백엔드로 읽는다(gateway.py:42). mcp-remote 의
+#      {"command":"npx","args":[...]} 형식을 넣으면 에러 없이 조용히 무시되므로 url 형식으로 쓴다.
 #
 # 사용:  bash provision-config.sh            # 이미 config 있으면 건드리지 않음
 #        bash provision-config.sh --force    # 재생성(기존은 .bak 백업)
@@ -157,10 +160,17 @@ if [ -z "${HEAX_MCP_TOKEN:-}" ]; then
   fi
 fi
 
+if [ -z "${ODB_HUB_TOKEN:-}" ]; then
+  echo "  · ODB_HUB_TOKEN 미설정 — odb-hub 백엔드 생략(provision.env 에 ODB_HUB_TOKEN=... 한 줄이면 편입)"
+else
+  echo "  ✓ odb-hub 토큰 확인 — ${ODB_HUB_BASE:-http://10.252.38.121:8000}/mcp 로 등록"
+fi
+
 echo "▶ 4) config 파일 작성"
 GW_TOKEN="$GW_TOKEN" SF_MCP_TOKEN="$SF_MCP_TOKEN" SF_API_KEY="$SF_API_KEY" \
 MXWP_MCP="$MXWP_MCP" MXWP_REST="$MXWP_REST" RAT_TOKEN="${RAT_TOKEN:-}" \
 HEAX_MCP_TOKEN="${HEAX_MCP_TOKEN:-}" HEAX_MCP_SERVERS_URL="${HEAX_MCP_SERVERS_URL:-}" HEAX_MCP_BASE="${HEAX_MCP_BASE:-}" \
+ODB_HUB_TOKEN="${ODB_HUB_TOKEN:-}" ODB_HUB_BASE="${ODB_HUB_BASE:-}" \
 CFG="$CFG" AGENT_DIR="$AGENT_DIR" python3 - <<'PYEOF'
 import json, os
 e = os.environ
@@ -188,6 +198,16 @@ cfg["rest"] = rest
 cfg["portal"] = {"jwks_url": "http://127.0.0.1:8723/.well-known/jwks.json",
                  "revoked_url": "http://127.0.0.1:8723/auth/pat/revoked.json",
                  "audience_ok": ["mx-white-paper", "ai-data-hub", "signalforge"]}
+# ODB 자동화 허브 — cae00 에서만 도달하는 사내 MCP 서버. dev 에서는 닿지 않는다(실측: 포트 차단).
+# 반드시 url 형식이어야 한다 — 게이트웨이는 `"url" in v` 인 항목만 백엔드로 읽는다(gateway.py:42).
+# mcp-remote 의 {"command":"npx","args":[...]} 형식을 그대로 넣으면 에러 없이 조용히 무시된다.
+# mcp-remote 는 그 URL 로 가는 stdio 브리지일 뿐이라, HTTP 를 직접 말하는 이 게이트웨이에는 불필요하다.
+# 토큰이 URL 쿼리에 들어가므로 레포에 박지 않는다 — provision.env 의 ODB_HUB_TOKEN 을 쓴다(RAT_TOKEN 과 동형).
+if e.get("ODB_HUB_TOKEN"):
+    cfg["odb-hub"] = {
+        "url": f'{e.get("ODB_HUB_BASE") or "http://10.252.38.121:8000"}/mcp?token={e["ODB_HUB_TOKEN"]}',
+        "transport": "streamable_http"}
+
 # heax-hub MCP 앱 자동탐지(옵션) — heax registry 를 폴링해 mcp:{expose} 앱을 heax-<id> 백엔드로 흡수.
 #   token: HEAX_MCP_TOKEN env(heax 'MCP 토큰' 메뉴/PAT). 없으면 heax_registry 생략(그 기능만 빠짐).
 #   servers_url/base: dev 기본 localhost. prod 은 HEAX_MCP_SERVERS_URL/HEAX_MCP_BASE(도메인)로 오버라이드.
@@ -202,7 +222,7 @@ if e.get("HEAX_MCP_TOKEN"):
 # 없어서 사라진 사실조차 안 잡힌다(실측). 관리 키는 여기서 보존하지 않는다 —
 # 이번 실행이 안 만든 관리 키(예: RAT_TOKEN 없어 빠진 reportarchive)는 의도된 제거다.
 MANAGED = {"_gateway", "reportarchive", "signalforge", "mx-white-paper",
-           "ai-data-hub", "rest", "portal", "heax_registry"}
+           "ai-data-hub", "rest", "portal", "heax_registry", "odb-hub"}
 try:
     with open(e["CFG"]) as f:
         prev = json.load(f)

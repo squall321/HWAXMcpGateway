@@ -34,8 +34,27 @@ fi
 
 # ── 포트 선점 확인 ────────────────────────────────────────────────────────────
 if command -v ss >/dev/null 2>&1 && ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q .; then
-  if curl -sf -m 3 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-    echo "✓ 게이트웨이가 이미 :$PORT 에서 정상 동작 중 — 기동 생략(중복 방지)"
+  # 상태코드만 보면 안 된다 — /health 의 "status" 는 리터럴 "ok" 라 백엔드가 전멸하고
+  # 도구가 0개여도 200 이 나온다(gateway.py:702). 그래서 '도구 0개짜리 좀비'가 정상으로
+  # 판정돼 기동이 생략되고, 화면엔 초록 ✓ 만 찍혀 사람이 문제를 못 봤다.
+  # 그렇다고 재기동 트리거로 바꾸면 안 된다 — tools=0 은 부팅 직후·백엔드 바운스 중의
+  # 정상 과도 상태이고 _revive_loop(60s)가 고친다. 강제 재기동을 걸면 둘이 싸운다.
+  # 기동 생략은 유지하되, 본문을 읽어 실제 상태를 함께 찍는다.
+  GW_H="$(curl -sf -m 3 "http://127.0.0.1:$PORT/health" 2>/dev/null)" || GW_H=""
+  if [ -n "$GW_H" ]; then
+    GW_SUM="$(printf '%s' "$GW_H" | "$PY" -c 'import json,sys
+try:
+    h = json.load(sys.stdin)
+    b = h.get("backends") or {}
+    down = sorted(k for k, v in b.items() if not v)
+    t = h.get("tools", 0)
+    msg = f"도구 {t}개 / 백엔드 {len(b)}개"
+    if down: msg += " / DOWN: " + ", ".join(down)
+    if t == 0: msg += "  ← 도구 0개다. 부팅 직후면 60초 내 revive 로 채워진다."
+    print(msg)
+except Exception:
+    print("본문 해석 실패")' 2>/dev/null || echo "본문 해석 실패")"
+    echo "✓ 게이트웨이가 이미 :$PORT 에서 응답 중 — 기동 생략(중복 방지)  [$GW_SUM]"
     exit 0
   fi
   OWNER="$(ss -tlnpH "sport = :$PORT" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"

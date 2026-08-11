@@ -285,9 +285,18 @@ async def _revive_loop(tg):
             if b.session is not None:
                 continue
             try:
-                await b.reconnect(tg)
-                await b._ready.wait()
-                if b.session is not None:
+                # LIVENESS_TIMEOUT_S 는 위 list_tools 한 곳에만 걸려 있었고 재연결 경로엔
+                # 아무 데드라인이 없었다. 여기서 멈추면 '예외'가 아니라 '행'이라 except 도
+                # 안 걸리고, MCP 클라이언트 기본 read timeout(300s)이 만료될 때까지 revive
+                # 루프 전체가 얼어붙는다 — 그동안 로그도 완전 무음이다.
+                # anyio 는 start() 대기가 취소되면 방금 띄운 자식 태스크도 함께 취소한다.
+                with anyio.move_on_after(LIVENESS_TIMEOUT_S) as _sc:
+                    await b.reconnect(tg)
+                    await b._ready.wait()
+                if _sc.cancel_called:
+                    log.warning("backend %s 재연결 타임아웃(%.0fs) — 다음 주기에 재시도",
+                                key, LIVENESS_TIMEOUT_S)
+                elif b.session is not None:
                     log.info("backend %s revived — re-aggregating tools", key)
                     revived = True
             except Exception as exc:  # noqa: BLE001 — 다음 주기에 재시도
@@ -312,7 +321,17 @@ async def _backends_lifespan():
             backends[key] = b
             await tg.start(b.run)
         # heax-hub MCP 앱 자동탐지 → heax-<id> 백엔드로 합류 (heax_registry 있을 때만)
-        for key, spec in (await _discover_heax()).items():
+        # _discover_heax 는 '폴링 실패=None, 앱 없음={}' 계약이다(docstring). revive 루프는
+        # `if discovered is None:` 으로 지키는데 부팅 경로만 곧바로 .items() 를 불렀다 —
+        # 게이트웨이가 뜨는 순간 heax-hub(:4040)가 마침 불통이면 AttributeError 로 lifespan 이
+        # 죽어 게이트웨이 자체가 못 뜬다. 선택 기능 하나가 전체 기동을 막으면 안 된다.
+        # 폴링이 실패하면 heax 앱 없이 뜨고, 60초 뒤 _revive_loop 가 알아서 합류시킨다.
+        _boot_heax = await _discover_heax()
+        if _boot_heax is None:
+            log.warning("부팅 시 heax registry 폴링 실패 — heax 앱 없이 기동한다"
+                        "(%ds 후 revive 루프가 합류시킨다)", REVIVE_INTERVAL_S)
+            _boot_heax = {}
+        for key, spec in _boot_heax.items():
             DISCOVERED_META[key] = {"label": spec.get("label") or "",
                                     "description": spec.get("description") or ""}
             b = _Backend(key, spec["url"], spec.get("headers"))

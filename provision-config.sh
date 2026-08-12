@@ -127,6 +127,38 @@ finally:
     db.close()
 PYEOF
 }
+# DynaForge(kooremapper) MCP 전용 kr_ PAT 발급 — heax 서비스 PAT 로는 이 앱이 안 열린다.
+# 이 앱은 매니페스트가 portal_auth 를 일부러 빼고(launch.mode=proxy) Authorization 을 자기
+# REST(:8700)로 넘겨 재검증한다. 그래서 heax_ 토큰을 주면 shared/auth.py 가 "토큰이 유효하지
+# 않거나 만료되었습니다"로 전량 거절한다 — 도구 22개가 목록에만 뜨고 호출은 0% 성공이었다.
+# 발급은 KooRemapper 의 게이트웨이 SSO(/api/v1/auth/sso)를 그대로 쓴다. 신뢰 근거는 공유
+# 시크릿이고, 사용자당 직전 SSO PAT 를 회수하므로 재실행해도 토큰이 쌓이지 않는다.
+mint_koorm() {  # → stdout 마지막 줄이 kr_ 평문 토큰. 실패 시 stderr.
+  local envf="$PARENT/KooRemapper/platform/.env" base="${KOORM_BASE:-http://127.0.0.1:8700}"
+  [ -f "$envf" ] || { echo "KooRemapper platform/.env 없음: $envf" >&2; return 1; }
+  local sec; sec="$(awk -F= '/^KOORM_HEAX_GATEWAY_SECRET=/{sub(/^[^=]*=/,"");print;exit}' "$envf")"
+  [ -n "$sec" ] || { echo "KOORM_HEAX_GATEWAY_SECRET 미설정 — SSO 엔드포인트가 닫혀 있다" >&2; return 1; }
+  local body
+  body="$(curl -sS -m 15 -X POST "$base/api/v1/auth/sso" \
+      -H "X-Heax-Gateway-Secret: $sec" \
+      -H "X-Heax-User-Email: ${KOORM_SVC_EMAIL:-hwax-gateway@heax.local}" \
+      -H "X-Heax-User-Name: HWAX MCP Gateway (service)" 2>&1)" || {
+    echo "SSO 호출 실패: $body" >&2; return 1; }
+  printf '%s' "$body" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print("SSO 응답이 JSON 이 아님", file=sys.stderr); raise SystemExit(1)
+def find(o):
+    if isinstance(o,dict):
+        for k,v in o.items():
+            if k in ("access_token","token") and isinstance(v,str): return v
+            r=find(v)
+            if r: return r
+    return None
+t=find(d)
+if not t: print(f"토큰 없음: {json.dumps(d,ensure_ascii=False)[:200]}", file=sys.stderr); raise SystemExit(1)
+print(t)'
+}
 
 MXWP_MCP=""; MXWP_REST=""
 if apptainer instance list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx mxwp_api; then
@@ -169,6 +201,23 @@ if [ -z "${HEAX_MCP_TOKEN:-}" ]; then
   fi
 fi
 
+# DynaForge MCP 는 자체 kr_ PAT 를 요구한다 — heax_registry 가 켜져 있을 때만 의미가 있다.
+if [ -n "${HEAX_MCP_TOKEN:-}" ] && [ -z "${KOORM_MCP_TOKEN:-}" ]; then
+  if [ -d "$PARENT/KooRemapper/platform" ]; then
+    echo "▶ DynaForge MCP 토큰 자동 발급(kr_ PAT)"
+    KOORM_MCP_TOKEN="$(mint_koorm 2>/tmp/koormint.$$.err || true)"
+    case "${KOORM_MCP_TOKEN:-}" in
+      kr_*) echo "  ✓ kr_ PAT 발급 → heax_registry.app_tokens.kooremapper_mcp" ;;
+      *) echo "  ⚠ kr_ PAT 발급 실패 — DynaForge MCP 도구는 호출 시 인증 실패한다(목록에는 뜬다)"
+         [ -s /tmp/koormint.$$.err ] && sed 's/^/    /' /tmp/koormint.$$.err >&2
+         KOORM_MCP_TOKEN="" ;;
+    esac
+    rm -f /tmp/koormint.$$.err
+  else
+    echo "  · KooRemapper 레포 미발견 — DynaForge MCP 토큰 생략"
+  fi
+fi
+
 if [ -z "${ODB_HUB_TOKEN:-}" ]; then
   echo "  · ODB_HUB_TOKEN 미설정 — odb-hub 백엔드 생략(provision.env 에 ODB_HUB_TOKEN=... 한 줄이면 편입)"
 else
@@ -179,6 +228,7 @@ echo "▶ 4) config 파일 작성"
 GW_TOKEN="$GW_TOKEN" SF_MCP_TOKEN="$SF_MCP_TOKEN" SF_API_KEY="$SF_API_KEY" \
 MXWP_MCP="$MXWP_MCP" MXWP_REST="$MXWP_REST" RAT_TOKEN="${RAT_TOKEN:-}" \
 HEAX_MCP_TOKEN="${HEAX_MCP_TOKEN:-}" HEAX_MCP_SERVERS_URL="${HEAX_MCP_SERVERS_URL:-}" HEAX_MCP_BASE="${HEAX_MCP_BASE:-}" \
+KOORM_MCP_TOKEN="${KOORM_MCP_TOKEN:-}" \
 ODB_HUB_TOKEN="${ODB_HUB_TOKEN:-}" ODB_HUB_BASE="${ODB_HUB_BASE:-}" \
 RA_WORKSPACE_SLUG="${RA_WORKSPACE_SLUG:-}" \
 RA_MCP_URL="${RA_MCP_URL:-}" SF_MCP_URL="${SF_MCP_URL:-}" MXWP_MCP_URL="${MXWP_MCP_URL:-}" \
@@ -278,11 +328,19 @@ if e.get("ODB_HUB_TOKEN"):
 # heax-hub MCP 앱 자동탐지(옵션) — heax registry 를 폴링해 mcp:{expose} 앱을 heax-<id> 백엔드로 흡수.
 #   token: HEAX_MCP_TOKEN env(heax 'MCP 토큰' 메뉴/PAT). 없으면 heax_registry 생략(그 기능만 빠짐).
 #   servers_url/base: dev 기본 localhost. prod 은 HEAX_MCP_SERVERS_URL/HEAX_MCP_BASE(도메인)로 오버라이드.
+#   app_tokens: 자체 인증을 쓰는 앱의 토큰 예외표. heax 서비스 PAT 를 자기 백엔드로 넘겨
+#     재검증하는 앱(kooremapper_mcp)은 종류가 안 맞아 호출이 전량 실패하므로 여기서 갈아끼운다.
+#     발급이 실패한 실행에서 기존 토큰까지 날리면 멀쩡하던 앱이 죽으므로 이전 값을 보존한다.
 if e.get("HEAX_MCP_TOKEN"):
+    app_tokens = dict(_prev("heax_registry", "app_tokens") or {})
+    if e.get("KOORM_MCP_TOKEN"):
+        app_tokens["kooremapper_mcp"] = e["KOORM_MCP_TOKEN"]
     cfg["heax_registry"] = {
         "servers_url": e.get("HEAX_MCP_SERVERS_URL") or "http://127.0.0.1:4040/api/v1/mcp/servers",
         "base": e.get("HEAX_MCP_BASE") or "http://127.0.0.1:4180",
         "token": e["HEAX_MCP_TOKEN"]}
+    if app_tokens:
+        cfg["heax_registry"]["app_tokens"] = app_tokens
 # 프로비저너가 만드는 키는 아래가 전부다. 그 밖의 백엔드는 손으로 붙인 것이므로 보존한다.
 # 예전엔 cfg 를 빈 dict 에서 시작해 파일을 통째로 덮어썼다 — 그래서 --force 한 번에
 # smart-twin-cluster(slurm 도구 19개)가 조용히 사라진다. update-all 의 기대 목록에도

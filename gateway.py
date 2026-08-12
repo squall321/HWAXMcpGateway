@@ -188,6 +188,12 @@ async def _discover_heax() -> dict[str, dict] | None:
     base = (HEAX.get("base") or "").rstrip("/")
     token = HEAX.get("token")
     headers = {"Authorization": f"Bearer {token}"} if token else {}
+    # 자체 인증을 쓰는 앱의 토큰 예외표 {app_id: token}. heax 서비스 PAT 는 Caddy 의
+    # forward_auth 를 통과시키는 용도라, 앱이 Authorization 을 자기 백엔드로 넘겨 다시
+    # 검증하면 종류가 안 맞아 전량 실패한다. kooremapper_mcp 가 그랬다 — 도구 22개가
+    # 목록에는 뜨는데 호출은 100% "토큰이 유효하지 않거나 만료되었습니다"였고,
+    # 노출된 2026-08-01 이후 감사로그 성공 0건이었다(발견 2026-08-12).
+    app_tokens = HEAX.get("app_tokens") or {}
     try:
         async with httpx.AsyncClient(timeout=10) as cli:
             resp = await cli.get(servers_url, headers=headers)
@@ -204,7 +210,10 @@ async def _discover_heax() -> dict[str, dict] | None:
         # registry 가 주는 표시 정보(name·description)를 버리지 않는다 — 앱 단위 선택 UI 는
         # 라벨이 곧 사용자가 보는 전부라, 버리면 클라이언트가 앱 키에서 이름을 추측하게 되고
         # 실제로 틀린 이름이 노출된다(heax-kooremapper_mcp → 'Kooremapper' vs 등록명 'DynaForge MCP').
-        out[f"{HEAX_PREFIX}{sid}"] = {"url": f"{base}{path}", "headers": headers,
+        hdrs = headers
+        if app_tokens.get(sid):
+            hdrs = {**headers, "Authorization": f"Bearer {app_tokens[sid]}"}
+        out[f"{HEAX_PREFIX}{sid}"] = {"url": f"{base}{path}", "headers": hdrs,
                                       "allowed_groups": list(s.get("allowed_groups") or []),
                                       "label": (s.get("name") or "").strip()[:80],
                                       "description": (s.get("description") or "").strip()[:300]}

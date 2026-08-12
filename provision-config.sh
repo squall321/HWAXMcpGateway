@@ -35,7 +35,16 @@ if [ -f "$CFG" ] && [ "$FORCE" = 0 ]; then
   echo "이미 존재: $CFG — 재생성하려면 --force"
   exit 0
 fi
-[ -f "$CFG" ] && cp -f "$CFG" "$CFG.bak" && echo "기존 config 백업: $CFG.bak"
+# .bak 은 매 실행 덮어쓴다 — 그래서 한 번 잘못 만들어진 config 로 재실행하면 '멀쩡했던 백업'이
+# 그 자리에서 사라진다. cae00 에서 reportarchive·odb-hub 가 빠진 config 가 만들어진 직후가
+# 정확히 그 상태였다(2026-08-12). 세대 백업을 함께 남겨 되돌릴 수 있게 한다(최근 5개 보관).
+if [ -f "$CFG" ]; then
+  cp -f "$CFG" "$CFG.bak"
+  cp -f "$CFG" "$CFG.bak.$(date +%Y%m%d-%H%M%S)"
+  chmod 600 "$CFG.bak" "$CFG".bak.* 2>/dev/null || true
+  ls -1t "$CFG".bak.20* 2>/dev/null | tail -n +6 | xargs -r rm -f
+  echo "기존 config 백업: $CFG.bak (+ 세대본)"
+fi
 
 echo "▶ 1) GW_TOKEN 준비"
 # --force 재생성 시 기존 토큰을 보존한다 — 회전하면 에이전트/PAT 소비자와의 정합이 깨질 수 있고,
@@ -219,7 +228,8 @@ if [ -n "${HEAX_MCP_TOKEN:-}" ] && [ -z "${KOORM_MCP_TOKEN:-}" ]; then
 fi
 
 if [ -z "${ODB_HUB_TOKEN:-}" ]; then
-  echo "  · ODB_HUB_TOKEN 미설정 — odb-hub 백엔드 생략(provision.env 에 ODB_HUB_TOKEN=... 한 줄이면 편입)"
+  # 여기서 '생략'을 단정하면 안 된다 — 직전 config 에 토큰이 있으면 아래 _carry 가 이어받는다.
+  echo "  · ODB_HUB_TOKEN 미설정 — 직전 config 에 있으면 그 값을 이어받고, 없으면 이 백엔드만 빠진다"
 else
   echo "  ✓ odb-hub 토큰 확인 — ${ODB_HUB_BASE:-http://10.252.38.121:8000}/mcp 로 등록"
 fi
@@ -235,7 +245,7 @@ RA_MCP_URL="${RA_MCP_URL:-}" SF_MCP_URL="${SF_MCP_URL:-}" MXWP_MCP_URL="${MXWP_M
 AIDH_MCP_URL="${AIDH_MCP_URL:-}" AIDH_REST_BASE="${AIDH_REST_BASE:-}" \
 MXWP_REST_BASE="${MXWP_REST_BASE:-}" SF_REST_BASE="${SF_REST_BASE:-}" \
 CFG="$CFG" AGENT_DIR="$AGENT_DIR" python3 - <<'PYEOF'
-import json, os
+import json, os, re
 e = os.environ
 
 
@@ -266,11 +276,33 @@ def _prev_ra_slug():
     except Exception:
         return None
 
+# env 가 이 박스에 없다고 '돌고 있던 백엔드'를 지우면 안 된다. 직전 config(.bak, 이번 실행이
+# 26행에서 라이브를 그대로 복사해 둔 것)에 토큰이 있으면 그걸 이어받는다.
+# cae00 에서 실제로 이것 때문에 reportarchive(24개)+odb-hub 가 한 번에 사라졌다(2026-08-12).
+# 경고는 config 를 이미 쓴 뒤에 나오므로 사후약방문이었다. 지우려면 config 를 직접 편집하면 된다.
+def _carry(env_key, getter, label):
+    v = e.get(env_key)
+    if v:
+        return v
+    v = getter()
+    if v:
+        print(f"  · {label}: env 없음 → 직전 config 값을 이어받는다(사라지지 않게)")
+    return v
+
+_RAT = _carry("RAT_TOKEN",
+              lambda: ((_prev("reportarchive", "headers") or {}).get("Authorization") or "")
+                      .replace("Bearer ", "").strip() or None,
+              "RAT_TOKEN")
+_ODB = _carry("ODB_HUB_TOKEN",
+              lambda: (re.search(r'[?&]token=([^&]+)', _prev("odb-hub") or "") or [None, None])[1]
+                      if re.search(r'[?&]token=([^&]+)', _prev("odb-hub") or "") else None,
+              "ODB_HUB_TOKEN")
+
 cfg = {"_gateway": {"host": "127.0.0.1", "port": 9110, "token": e["GW_TOKEN"]}}
-if e.get("RAT_TOKEN"):
+if _RAT:
     cfg["reportarchive"] = {"url": _url("RA_MCP_URL", "reportarchive", "http://127.0.0.1:3002/mcp"),
         "transport": "streamable_http",
-        "headers": {"Authorization": f"Bearer {e['RAT_TOKEN']}",
+        "headers": {"Authorization": f"Bearer {_RAT}",
                     # 슬러그가 "dev" 로 하드코딩돼 있었다. 박스마다 다를 수 있는 값인데
                     # --force 가 돌 때마다 무조건 dev 로 덮어쓴다 — 운영 박스가 다른 워크스페이스를
                     # 쓰고 있었다면 조용히 엉뚱한 곳을 가리키게 된다(경고도 없다).
@@ -313,7 +345,7 @@ cfg["portal"] = {"jwks_url": "http://127.0.0.1:8723/.well-known/jwks.json",
 # mcp-remote 의 {"command":"npx","args":[...]} 형식을 그대로 넣으면 에러 없이 조용히 무시된다.
 # mcp-remote 는 그 URL 로 가는 stdio 브리지일 뿐이라, HTTP 를 직접 말하는 이 게이트웨이에는 불필요하다.
 # 토큰이 URL 쿼리에 들어가므로 레포에 박지 않는다 — provision.env 의 ODB_HUB_TOKEN 을 쓴다(RAT_TOKEN 과 동형).
-if e.get("ODB_HUB_TOKEN"):
+if _ODB:
     # 호스트는 보존하되 토큰은 항상 env 의 현재 값을 쓴다.
     # URL 통째로 보존하면 .bak 에 박힌 옛 토큰이 되살아나 새 토큰을 덮어쓴다 —
     # 호스트는 '설정'이고 토큰은 '시크릿'이라 수명이 다르다.
@@ -322,7 +354,7 @@ if e.get("ODB_HUB_TOKEN"):
                  or (_odb_prev.split("/mcp")[0] if _odb_prev else None)
                  or "http://10.252.38.121:8000")
     cfg["odb-hub"] = {
-        "url": f'{_odb_base}/mcp?token={e["ODB_HUB_TOKEN"]}',
+        "url": f'{_odb_base}/mcp?token={_ODB}',
         "transport": "streamable_http"}
 
 # heax-hub MCP 앱 자동탐지(옵션) — heax registry 를 폴링해 mcp:{expose} 앱을 heax-<id> 백엔드로 흡수.
@@ -345,7 +377,8 @@ if e.get("HEAX_MCP_TOKEN"):
 # 예전엔 cfg 를 빈 dict 에서 시작해 파일을 통째로 덮어썼다 — 그래서 --force 한 번에
 # smart-twin-cluster(slurm 도구 19개)가 조용히 사라진다. update-all 의 기대 목록에도
 # 없어서 사라진 사실조차 안 잡힌다(실측). 관리 키는 여기서 보존하지 않는다 —
-# 이번 실행이 안 만든 관리 키(예: RAT_TOKEN 없어 빠진 reportarchive)는 의도된 제거다.
+# 관리 키 중 토큰이 필요한 것(reportarchive·odb-hub)은 env 가 없어도 직전 config 에서
+# 이어받으므로(_carry) 여기까지 와서 사라지는 일은 없다.
 MANAGED = {"_gateway", "reportarchive", "signalforge", "mx-white-paper",
            "ai-data-hub", "rest", "portal", "heax_registry", "odb-hub"}
 try:

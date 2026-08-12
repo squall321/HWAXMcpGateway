@@ -7,3 +7,4 @@ provision.env
 gateway.log
 gateway.pid
 gateway_config.json.bak
+gateway_config.json.bak.*

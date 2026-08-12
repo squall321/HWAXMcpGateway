@@ -12,12 +12,26 @@
 # localhost 기본값은 일부러 안 넣는다 — 프로비저너가 같은 값을 만들어내므로 관리 지점만 늘어난다.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
-[ -f gateway_config.json.bak ] || { echo "✗ gateway_config.json.bak 없음 — --force 를 한 번 돌린 뒤에 쓴다" >&2; exit 1; }
+[ -f gateway_config.json ] || [ -f gateway_config.json.bak ] \
+  || { echo "✗ gateway_config.json / .bak 둘 다 없음 — --force 를 한 번 돌린 뒤에 쓴다" >&2; exit 1; }
 
 OUT="$(python3 - <<'PY'
 import json, os, re, sys
-BAK, ENV = "gateway_config.json.bak", "provision.env"
-d = json.load(open(BAK))
+ENV = "provision.env"
+# 정본은 '지금 돌고 있는' gateway_config.json 이다. .bak 은 직전 프로비저닝 시점이라
+# 그 뒤에 손으로 붙인 백엔드가 없다. cae00 에서 실제로 이것 때문에 사고가 났다 —
+# .bak 이 오래돼 reportarchive·odb-hub 가 없었고, 이 스크립트가 "추가할 것 없음" 이라고
+# 답한 뒤 --force 가 두 백엔드(도구 24개+)를 그대로 떨궜다(2026-08-12).
+# live 를 먼저 읽고 .bak 으로 빈 곳만 메운다.
+d = {}
+for path in ("gateway_config.json.bak", "gateway_config.json"):   # 뒤가 이긴다
+    try:
+        with open(path) as f:
+            for k, v in json.load(f).items():
+                if v:
+                    d[k] = v
+    except Exception:
+        pass
 have = set()
 if os.path.exists(ENV):
     have = {m.group(1) for l in open(ENV) if (m := re.match(r'\s*([A-Za-z_][A-Za-z0-9_]*)=', l))}
@@ -35,6 +49,13 @@ for ek, k in (("RA_MCP_URL","reportarchive"),("SF_MCP_URL","signalforge"),
 for ek, k in (("AIDH_REST_BASE","ai-data-hub"),("MXWP_REST_BASE","mx-white-paper"),("SF_REST_BASE","signalforge")):
     v = ((d.get("rest") or {}).get(k) or {}).get("base")
     if remote(v): out.append((ek, v))
+# odb-hub 는 토큰이 URL 쿼리에 들어간다 — 여기서 안 뽑으면 --force 마다 이 백엔드가 사라진다.
+odb = (d.get("odb-hub") or {}).get("url") or ""
+if odb:
+    m = re.search(r'[?&]token=([^&]+)', odb)
+    if m: out.append(("ODB_HUB_TOKEN", m.group(1)))
+    b = re.match(r'(https?://[^/]+)', odb)
+    if b: out.append(("ODB_HUB_BASE", b.group(1)))
 for k, v in out:
     if k not in have: print(f"{k}={v}")
     else: print(f"# 이미 있음(건너뜀): {k}", file=sys.stderr)

@@ -169,6 +169,26 @@ if not t: print(f"토큰 없음: {json.dumps(d,ensure_ascii=False)[:200]}", file
 print(t)'
 }
 
+prev_koorm_token() {  # 직전 config 에 저장된 kr_ PAT (없으면 빈 문자열)
+  [ -f "$CFG" ] || return 0
+  python3 - "$CFG" <<'PY' 2>/dev/null || true
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+print(((d.get("heax_registry") or {}).get("app_tokens") or {}).get("kooremapper_mcp",""))
+PY
+}
+
+koorm_token_alive() {  # kr_ PAT 가 아직 유효한가 — 읽기 전용 엔드포인트로 확인
+  local tok="$1" base="${KOORM_BASE:-http://127.0.0.1:8700}" code
+  [ -n "$tok" ] || return 1
+  code="$(curl -s -o /dev/null -m 8 -w '%{http_code}' \
+      -H "Authorization: Bearer $tok" "$base/api/v1/operations" 2>/dev/null)" || return 1
+  [ "$code" = "200" ]
+}
+
 MXWP_MCP=""; MXWP_REST=""
 if apptainer instance list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx mxwp_api; then
   # 앱 코드 경로 자동 탐지 (배포마다 다를 수 있음: apps/api, dist/… 등)
@@ -211,17 +231,34 @@ if [ -z "${HEAX_MCP_TOKEN:-}" ]; then
 fi
 
 # DynaForge MCP 는 자체 kr_ PAT 를 요구한다 — heax_registry 가 켜져 있을 때만 의미가 있다.
-if [ -n "${HEAX_MCP_TOKEN:-}" ] && [ -z "${KOORM_MCP_TOKEN:-}" ]; then
+#
+# ⚠ 예전 조건은 `[ -z "$KOORM_MCP_TOKEN" ]` 이었다 — 즉 '값이 있으면 통과'다. 그런데 아래
+#   app_tokens 는 직전 config 의 값을 이어받으므로, 한 번 취소·만료된 kr_ PAT 가 박히면
+#   --force 를 몇 번 돌려도 그 죽은 토큰이 계속 옮겨간다. 증상이 고약한 게, 도구 목록은
+#   heax_registry 로 뜨고 **호출만 전량 401** 이라 "붙었는데 안 된다"로 보인다.
+#   (실측: dev 의 저장 토큰이 401 "토큰이 유효하지 않거나 취소·만료되었습니다",
+#    같은 순간 새로 발급한 토큰은 200. cae00 도 같은 이유였다.)
+#   → 이어받기 전에 살아 있는지 묻고, 죽었으면 다시 발급한다.
+if [ -n "${HEAX_MCP_TOKEN:-}" ]; then
   if [ -d "$PARENT/KooRemapper/platform" ]; then
-    echo "▶ DynaForge MCP 토큰 자동 발급(kr_ PAT)"
-    KOORM_MCP_TOKEN="$(mint_koorm 2>/tmp/koormint.$$.err || true)"
-    case "${KOORM_MCP_TOKEN:-}" in
-      kr_*) echo "  ✓ kr_ PAT 발급 → heax_registry.app_tokens.kooremapper_mcp" ;;
-      *) echo "  ⚠ kr_ PAT 발급 실패 — DynaForge MCP 도구는 호출 시 인증 실패한다(목록에는 뜬다)"
-         [ -s /tmp/koormint.$$.err ] && sed 's/^/    /' /tmp/koormint.$$.err >&2
-         KOORM_MCP_TOKEN="" ;;
-    esac
-    rm -f /tmp/koormint.$$.err
+    [ -n "${KOORM_MCP_TOKEN:-}" ] || KOORM_MCP_TOKEN="$(prev_koorm_token)"
+    if koorm_token_alive "${KOORM_MCP_TOKEN:-}"; then
+      echo "  ✓ 기존 kr_ PAT 유효 — 재발급 생략"
+    else
+      [ -n "${KOORM_MCP_TOKEN:-}" ] && echo "  · 기존 kr_ PAT 가 만료·취소됨(또는 검증 불가) — 재발급한다"
+      echo "▶ DynaForge MCP 토큰 자동 발급(kr_ PAT)"
+      _koorm_new="$(mint_koorm 2>/tmp/koormint.$$.err || true)"
+      case "${_koorm_new:-}" in
+        kr_*) KOORM_MCP_TOKEN="$_koorm_new"
+              echo "  ✓ kr_ PAT 발급 → heax_registry.app_tokens.kooremapper_mcp" ;;
+        # 발급 실패 시 기존 값을 지우지는 않는다(멀쩡한 토큰을 날리는 사고 방지).
+        # 다만 그 토큰은 방금 검증에 실패했으므로 호출은 계속 401 이다 — 그 사실을 말해 둔다.
+        *) echo "  ⚠ kr_ PAT 발급 실패 — DynaForge MCP 도구는 호출 시 인증 실패한다(목록에는 뜬다)"
+           [ -s /tmp/koormint.$$.err ] && sed 's/^/    /' /tmp/koormint.$$.err >&2 ;;
+      esac
+      unset _koorm_new
+      rm -f /tmp/koormint.$$.err
+    fi
   else
     echo "  · KooRemapper 레포 미발견 — DynaForge MCP 토큰 생략"
   fi

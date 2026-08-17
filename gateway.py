@@ -68,6 +68,20 @@ from urllib.parse import quote, unquote  # 비ASCII 그룹명 헤더 인/디코�
 GROUPS_HEADER = "x-hwax-groups"
 POLICY: dict[str, list[str]] = {k: list(v.get("allowed_groups", [])) for k, v in BACKENDS.items()}
 
+# 호출자 신원(이메일). groups 가 '무엇을 볼 수 있는 부류인가'라면 이쪽은 '누구인가'다.
+# 백엔드가 사용자별 데이터를 스코프할 때 필요하다 — 게이트웨이는 백엔드마다 서비스 계정
+# 자격증명 하나로 접속하므로, 이 헤더가 없으면 백엔드 눈에는 모든 호출이 '게이트웨이'다.
+# 실제로 DynaForge 가 그랬다: 세션 12·K파일 25건이 있는데 심의는 0건을 봤다(2026-08-17).
+# groups 와 같은 규칙으로 퍼센트 인코딩한다(헤더는 latin-1 만 담는다).
+USER_HEADER = "x-hwax-user"
+# 백엔드별 사용자 위임 설정 — {app_id: {sso_url, secret, client, base?}}.
+# 값이 있는 백엔드만 사용자별 자격증명으로 호출한다(나머지는 종전대로 서비스 계정).
+PER_USER_SSO: dict[str, dict] = {k: v for k, v in (HEAX.get("per_user_sso") or {}).items()
+                                 if isinstance(v, dict) and v.get("sso_url") and v.get("secret")}
+# 사용자 PAT 캐시 수명(초). PAT 자체는 장수명이라 만료 때문이 아니라 '권한 회수 반영'을 위한 값이다.
+# 짧게 잡으면 재발급이 잦아 백엔드에 폐기 토큰 행이 쌓인다(발급이 직전 것을 회수하는 구조).
+USER_PAT_TTL_S = int(os.environ.get("GATEWAY_USER_PAT_TTL", "43200"))
+
 
 def _audit(tool, backend, ok, err, ms, caller=None):
     """호출 1건을 JSONL 감사 로그에 append (감사 실패가 호출을 막지 않게). caller=REST PAT 주체."""
@@ -633,6 +647,87 @@ def _request_groups() -> list[str]:
     return _parse_groups(raw)
 
 
+def _request_user() -> str:
+    """현재 요청 헤더(X-HWAX-User)의 호출자 이메일. 없으면 ''(=위임 없음)."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return ""
+    raw = req.headers.get(USER_HEADER) if req is not None else None
+    if not raw:
+        return ""
+    try:
+        return unquote(raw).strip().lower()
+    except Exception:  # noqa: BLE001 — 헤더가 깨져도 호출을 막지 않는다(위임 없음으로 강등)
+        return ""
+
+
+# ── 사용자별 백엔드 자격증명 ────────────────────────────────────────────────
+# {(app_id, email): (token, 만료 monotonic)}. 발급이 '같은 이름의 직전 토큰'을 회수하므로
+# 같은 사용자에 대한 동시 발급은 서로를 무효화한다 — 사용자 단위 락으로 직렬화한다.
+_USER_PATS: dict[tuple[str, str], tuple[str, float]] = {}
+_USER_PAT_LOCKS: dict[tuple[str, str], anyio.Lock] = {}
+
+
+async def _mint_user_pat(conf: dict, email: str) -> str:
+    """백엔드의 게이트웨이 SSO 로 이 사용자의 PAT 를 발급받는다. 실패 시 예외."""
+    async with httpx.AsyncClient(timeout=15) as cli:
+        resp = await cli.post(conf["sso_url"], headers={
+            "X-Heax-Gateway-Secret": conf["secret"],
+            "X-Heax-User-Email": email,
+            # 클라이언트를 구분해야 이 발급이 사용자의 웹 세션 토큰을 회수하지 않는다.
+            "X-Heax-Client": conf.get("client") or "deliberation",
+        })
+    if resp.status_code != 200:
+        raise RuntimeError(f"SSO {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+
+    def _find(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in ("access_token", "token") and isinstance(v, str):
+                    return v
+                got = _find(v)
+                if got:
+                    return got
+        return None
+
+    tok = _find(data)
+    if not tok:
+        raise RuntimeError(f"SSO 응답에 토큰 없음: {json.dumps(data, ensure_ascii=False)[:200]}")
+    return tok
+
+
+async def _user_pat(app_id: str, email: str, *, force: bool = False) -> str:
+    """캐시된 사용자 PAT (없거나 force 면 발급). 사용자 단위로 직렬화한다."""
+    key = (app_id, email)
+    lock = _USER_PAT_LOCKS.setdefault(key, anyio.Lock())
+    async with lock:
+        hit = _USER_PATS.get(key)
+        if hit and not force and hit[1] > time.monotonic():
+            return hit[0]
+        tok = await _mint_user_pat(PER_USER_SSO[app_id], email)
+        _USER_PATS[key] = (tok, time.monotonic() + USER_PAT_TTL_S)
+        log.info("user PAT minted for %s on %s", email, app_id)
+        return tok
+
+
+async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: str, timeout_s: float):
+    """이 호출만을 위한 단발 세션으로 백엔드를 부른다.
+
+    영속 세션은 열 때의 헤더(서비스 계정)를 그대로 물고 있어 호출별 자격증명 교체가 안 된다.
+    사용자별 스코프가 필요한 백엔드는 그래서 세션을 매번 새로 연다 — 핸드셰이크 비용이
+    붙지만 대상이 로컬 앱이고, 대안은 '남의 데이터가 보이거나 아무것도 안 보이는' 둘 뿐이다.
+    """
+    hdrs = {**(b.headers or {}), "Authorization": f"Bearer {token}"}
+    with anyio.fail_after(timeout_s):
+        async with streamablehttp_client(b.url, headers=hdrs) as (read, write, _sid):
+            async with ClientSession(read, write) as sess:
+                await sess.initialize()
+                return await sess.call_tool(original, arguments,
+                                            read_timeout_seconds=timedelta(seconds=timeout_s))
+
+
 @_low.list_tools()
 async def _list_tools():
     # 도구 목록을 caller groups로 필터(보이지 않는 도구는 LLM이 알 수도 없음).
@@ -663,11 +758,48 @@ async def _call_tool(name: str, arguments: dict):
     b = backends[backend_key]
     # 행 걸린 백엔드가 챗 SSE 체인 전체를 무기한 블록하지 않게 호출당 타임아웃을 건다.
     call_timeout = timedelta(seconds=CALL_TIMEOUT_S)
+
+    # 사용자 위임 — 이 백엔드가 사용자별 스코프를 쓰고 호출자 신원이 있으면, 서비스 계정이 아니라
+    # 그 사용자의 자격증명으로 부른다. 신원이 없으면 종전대로 서비스 계정(감사에 사유를 남긴다).
+    app_id = backend_key[len(HEAX_PREFIX):] if backend_key.startswith(HEAX_PREFIX) else ""
+    note = None   # 서비스 계정으로 강등된 사유 — 아래 정상 경로의 감사기록에 실린다.
+    if app_id in PER_USER_SSO:
+        email = _request_user()
+        if not email:
+            log.warning("per-user backend %s called without %s — 서비스 계정 시야로 응답한다",
+                        backend_key, USER_HEADER)
+            # 여기서 따로 감사하지 않는다 — 호출은 아래에서 실제로 일어나므로, 미리 남기면
+            # 한 호출에 기록이 두 줄(가짜 성공 + 진짜)이 되어 감사로그가 호출 수를 부풀린다.
+            note = "no-identity"
+        else:
+            for attempt in (0, 1):   # 폐기된 캐시 토큰은 1회 재발급 후 재시도
+                try:
+                    tok = await _user_pat(app_id, email, force=bool(attempt))
+                    res = await _call_as_user(b, original, arguments, tok, CALL_TIMEOUT_S)
+                except Exception as exc:  # noqa: BLE001
+                    if attempt == 0:
+                        log.warning("per-user call %s failed (%r) — 토큰 재발급 후 1회 재시도",
+                                    name, exc)
+                        continue
+                    _audit(name, backend_key, False, f"per-user: {exc!r}",
+                           round((time.monotonic() - t0) * 1000))
+                    # 서비스 계정으로 조용히 강등하지 않는다 — 그러면 '내 모델 0건'이라는
+                    # 사실과 다른 답이 나가고, 실패가 정상 응답과 구분되지 않는다.
+                    return types.CallToolResult(
+                        content=[types.TextContent(type="text", text=(
+                            f"{backend_key}: {email} 자격증명으로 호출하지 못했습니다 ({exc!r}). "
+                            "이 앱은 사용자별 데이터라 서비스 계정 결과로 대체하지 않습니다."))],
+                        isError=True,
+                    )
+                _audit(name, backend_key, not getattr(res, "isError", False),
+                       f"as:{email}", round((time.monotonic() - t0) * 1000))
+                return res
+
     try:
         if b.session is None:
             raise RuntimeError("backend session down")
         res = await b.session.call_tool(original, arguments, read_timeout_seconds=call_timeout)
-        _audit(name, backend_key, not getattr(res, "isError", False), None,
+        _audit(name, backend_key, not getattr(res, "isError", False), note,
                round((time.monotonic() - t0) * 1000))
         return res
     except Exception as e:  # noqa: BLE001
@@ -683,7 +815,8 @@ async def _call_tool(name: str, arguments: dict):
                     _REAGG["pending"] = True
                     res = await b.session.call_tool(original, arguments,
                                                     read_timeout_seconds=call_timeout)
-                    _audit(name, backend_key, not getattr(res, "isError", False), "reconnected",
+                    _audit(name, backend_key, not getattr(res, "isError", False),
+                           "reconnected" + (f"+{note}" if note else ""),
                            round((time.monotonic() - t0) * 1000))
                     return res
         except Exception as e2:  # noqa: BLE001 — 재시도 실패도 정돈된 isError 로 (프로토콜 에러 방지)
@@ -766,10 +899,16 @@ def _bearer_gate(app, pat_verifier=None):
         if claims is not None:
             groups = ",".join(str(g) for g in (claims.get("groups") or []))
             # 클라이언트가 위조로 넣었을 x-hwax-groups 는 버리고, 검증된 PAT 의 groups 로 강제한다.
+            # 신원 헤더도 groups 와 똑같이 다룬다 — 클라이언트가 실어 보낸 값은 버리고 검증된
+            # PAT 의 것만 싣는다. PAT 에 이메일이 없으면 아무것도 싣지 않는다(위조로 남의 시야를
+            # 얻는 경로가 생기면 안 되므로, 신원 없음 쪽으로 닫는다).
             fresh = [(k, v) for (k, v) in (scope.get("headers") or [])
-                     if k.lower() != GROUPS_HEADER.encode()]
+                     if k.lower() not in (GROUPS_HEADER.encode(), USER_HEADER.encode())]
             # PAT 의 groups 에도 한글이 올 수 있다 — 같은 규칙으로 인코딩해 실어야 헤더가 안 깨진다.
             fresh.append((GROUPS_HEADER.encode(), quote(groups, safe=",").encode("latin-1")))
+            _email = str(claims.get("email") or "").strip().lower()
+            if _email:
+                fresh.append((USER_HEADER.encode(), quote(_email, safe="@.").encode("latin-1")))
             await app({**scope, "headers": fresh}, receive, send)
             return
         await send({

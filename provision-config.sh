@@ -259,6 +259,18 @@ if [ -n "${HEAX_MCP_TOKEN:-}" ]; then
       unset _koorm_new
       rm -f /tmp/koormint.$$.err
     fi
+    # 사용자 위임 — 게이트웨이가 호출자별 kr_ PAT 를 직접 발급할 수 있게 SSO 좌표를 넘긴다.
+    # 서비스 계정 하나로만 부르면 DynaForge 눈에는 모든 호출이 '게이트웨이'라, 사용자 소유
+    # 세션이 하나도 안 보인다(세션 12건이 있는데 심의는 0건을 봤다). 시크릿은 kr_ PAT 를
+    # 발급할 때 쓰는 그 값이고, config 는 이미 평문 PAT 를 담는 파일이라 노출 등급이 같다.
+    KOORM_SSO_SECRET="$(awk -F= '/^KOORM_HEAX_GATEWAY_SECRET=/{sub(/^[^=]*=/,"");print;exit}' \
+        "$PARENT/KooRemapper/platform/.env" 2>/dev/null || true)"
+    KOORM_SSO_URL="${KOORM_BASE:-http://127.0.0.1:8700}/api/v1/auth/sso"
+    if [ -n "$KOORM_SSO_SECRET" ]; then
+      echo "  ✓ DynaForge 사용자 위임 활성 — 심의·챗이 호출자 본인 시야로 조회한다"
+    else
+      echo "  ⚠ KOORM_HEAX_GATEWAY_SECRET 미발견 — 사용자 위임 없이 서비스 계정 시야로만 조회한다"
+    fi
   else
     echo "  · KooRemapper 레포 미발견 — DynaForge MCP 토큰 생략"
   fi
@@ -276,6 +288,7 @@ GW_TOKEN="$GW_TOKEN" SF_MCP_TOKEN="$SF_MCP_TOKEN" SF_API_KEY="$SF_API_KEY" \
 MXWP_MCP="$MXWP_MCP" MXWP_REST="$MXWP_REST" RAT_TOKEN="${RAT_TOKEN:-}" \
 HEAX_MCP_TOKEN="${HEAX_MCP_TOKEN:-}" HEAX_MCP_SERVERS_URL="${HEAX_MCP_SERVERS_URL:-}" HEAX_MCP_BASE="${HEAX_MCP_BASE:-}" \
 KOORM_MCP_TOKEN="${KOORM_MCP_TOKEN:-}" \
+KOORM_SSO_SECRET="${KOORM_SSO_SECRET:-}" KOORM_SSO_URL="${KOORM_SSO_URL:-}" \
 ODB_HUB_TOKEN="${ODB_HUB_TOKEN:-}" ODB_HUB_BASE="${ODB_HUB_BASE:-}" \
 RA_WORKSPACE_SLUG="${RA_WORKSPACE_SLUG:-}" \
 RA_MCP_URL="${RA_MCP_URL:-}" SF_MCP_URL="${SF_MCP_URL:-}" MXWP_MCP_URL="${MXWP_MCP_URL:-}" \
@@ -410,6 +423,16 @@ if e.get("HEAX_MCP_TOKEN"):
         "token": e["HEAX_MCP_TOKEN"]}
     if app_tokens:
         cfg["heax_registry"]["app_tokens"] = app_tokens
+    # per_user_sso: 호출자별 자격증명을 게이트웨이가 직접 발급할 앱. 이번 실행이 시크릿을
+    # 못 읽었다고 기존 설정을 지우면(레포 미체크아웃 등) 멀쩡하던 위임이 조용히 꺼진다.
+    per_user = dict(_prev("heax_registry", "per_user_sso") or {})
+    if e.get("KOORM_SSO_SECRET"):
+        per_user["kooremapper_mcp"] = {
+            "sso_url": e.get("KOORM_SSO_URL") or "http://127.0.0.1:8700/api/v1/auth/sso",
+            "secret": e["KOORM_SSO_SECRET"],
+            "client": "deliberation"}
+    if per_user:
+        cfg["heax_registry"]["per_user_sso"] = per_user
 # 프로비저너가 만드는 키는 아래가 전부다. 그 밖의 백엔드는 손으로 붙인 것이므로 보존한다.
 # 예전엔 cfg 를 빈 dict 에서 시작해 파일을 통째로 덮어썼다 — 그래서 --force 한 번에
 # smart-twin-cluster(slurm 도구 19개)가 조용히 사라진다. update-all 의 기대 목록에도

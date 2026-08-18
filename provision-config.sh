@@ -18,6 +18,9 @@
 #   SF_REST_BASE MXWP_REST_BASE AIDH_REST_BASE                 (REST 베이스)
 #   HEAX_MCP_SERVERS_URL / HEAX_MCP_BASE                       (heax registry — 기존부터 있던 손잡이)
 #   6) ODB 자동화 허브: ODB_HUB_TOKEN 이 있으면 odb-hub 백엔드 포함(cae00 에서만 도달하는 사내 서버).
+#   7) AI Ready Portal(ARP): ARP_BASE 가 있으면 arp 백엔드 포함(역시 cae00 전용 사내 서버).
+#      토큰이 없는 서버라 '주소가 설정돼 있다'가 곧 '이 박스에서 쓴다'는 신호다 — dev 에서는
+#      값을 두지 않아 가짜 DOWN 이 뜨지 않는다(ODB_HUB_TOKEN 이 하는 역할과 같다).
 #      주의 — 게이트웨이는 "url" 키가 있는 항목만 백엔드로 읽는다(gateway.py:42). mcp-remote 의
 #      {"command":"npx","args":[...]} 형식을 넣으면 에러 없이 조용히 무시되므로 url 형식으로 쓴다.
 #
@@ -284,6 +287,12 @@ if [ -n "${HEAX_MCP_TOKEN:-}" ]; then
   fi
 fi
 
+if [ -n "${ARP_BASE:-}" ]; then
+  echo "  ✓ ARP(AI Ready Portal) — ${ARP_BASE}/mcp 로 등록"
+else
+  echo "  · ARP_BASE 미설정 — 직전 config 에 있으면 그 값을 이어받고, 없으면 이 백엔드만 빠진다"
+fi
+
 if [ -z "${ODB_HUB_TOKEN:-}" ]; then
   # 여기서 '생략'을 단정하면 안 된다 — 직전 config 에 토큰이 있으면 아래 _carry 가 이어받는다.
   echo "  · ODB_HUB_TOKEN 미설정 — 직전 config 에 있으면 그 값을 이어받고, 없으면 이 백엔드만 빠진다"
@@ -298,6 +307,7 @@ HEAX_MCP_TOKEN="${HEAX_MCP_TOKEN:-}" HEAX_MCP_SERVERS_URL="${HEAX_MCP_SERVERS_UR
 KOORM_MCP_TOKEN="${KOORM_MCP_TOKEN:-}" \
 KOORM_SSO_SECRET="${KOORM_SSO_SECRET:-}" KOORM_SSO_URL="${KOORM_SSO_URL:-}" \
 ODB_HUB_TOKEN="${ODB_HUB_TOKEN:-}" ODB_HUB_BASE="${ODB_HUB_BASE:-}" \
+ARP_BASE="${ARP_BASE:-}" \
 RA_WORKSPACE_SLUG="${RA_WORKSPACE_SLUG:-}" \
 RA_MCP_URL="${RA_MCP_URL:-}" SF_MCP_URL="${SF_MCP_URL:-}" MXWP_MCP_URL="${MXWP_MCP_URL:-}" \
 AIDH_MCP_URL="${AIDH_MCP_URL:-}" AIDH_REST_BASE="${AIDH_REST_BASE:-}" \
@@ -415,6 +425,16 @@ if _ODB:
         "url": f'{_odb_base}/mcp?token={_ODB}',
         "transport": "streamable_http"}
 
+# AI Ready Portal(ARP) — cae00 에서만 도달하는 사내 포탈. 토큰 없이 열려 있어 URL 만 있으면 된다.
+# ⚠ 클라이언트가 주는 mcp-remote 형식({"command":"npx","args":[...]})을 그대로 넣으면
+# 게이트웨이는 "url" 키가 없는 항목을 백엔드로 읽지 않아 에러 없이 조용히 무시한다(odb-hub 와 같은 함정).
+# mcp-remote 는 HTTP MCP 로 가는 stdio 브리지일 뿐이라, HTTP 를 직접 말하는 여기엔 불필요하다.
+# env 가 없으면 직전 config 의 주소를 이어받는다 — 한 번 붙여 두면 --force 재생성에서 안 사라진다.
+_ARP_PREV = _prev("arp")                      # 예: http://10.252.38.97:3001/mcp
+_ARP_BASE = e.get("ARP_BASE") or (_ARP_PREV.split("/mcp")[0] if _ARP_PREV else None)
+if _ARP_BASE:
+    cfg["arp"] = {"url": f'{_ARP_BASE.rstrip("/")}/mcp', "transport": "streamable_http"}
+
 # heax-hub MCP 앱 자동탐지(옵션) — heax registry 를 폴링해 mcp:{expose} 앱을 heax-<id> 백엔드로 흡수.
 #   token: HEAX_MCP_TOKEN env(heax 'MCP 토큰' 메뉴/PAT). 없으면 heax_registry 생략(그 기능만 빠짐).
 #   servers_url/base: dev 기본 localhost. prod 은 HEAX_MCP_SERVERS_URL/HEAX_MCP_BASE(도메인)로 오버라이드.
@@ -448,7 +468,7 @@ if e.get("HEAX_MCP_TOKEN"):
 # 관리 키 중 토큰이 필요한 것(reportarchive·odb-hub)은 env 가 없어도 직전 config 에서
 # 이어받으므로(_carry) 여기까지 와서 사라지는 일은 없다.
 MANAGED = {"_gateway", "reportarchive", "signalforge", "mx-white-paper",
-           "ai-data-hub", "rest", "portal", "heax_registry", "odb-hub"}
+           "ai-data-hub", "rest", "portal", "heax_registry", "odb-hub", "arp"}
 try:
     with open(e["CFG"]) as f:
         prev = json.load(f)

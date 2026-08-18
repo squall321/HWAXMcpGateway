@@ -242,14 +242,15 @@ fi
 if [ -n "${HEAX_MCP_TOKEN:-}" ]; then
   if [ -d "$PARENT/KooRemapper/platform" ]; then
     [ -n "${KOORM_MCP_TOKEN:-}" ] || KOORM_MCP_TOKEN="$(prev_koorm_token)"
+    _koorm_up=0   # DynaForge 가 실제로 응답했는가 — 아래 위임 메시지가 이 값을 봐야 한다.
     if koorm_token_alive "${KOORM_MCP_TOKEN:-}"; then
-      echo "  ✓ 기존 kr_ PAT 유효 — 재발급 생략"
+      echo "  ✓ 기존 kr_ PAT 유효 — 재발급 생략"; _koorm_up=1
     else
       [ -n "${KOORM_MCP_TOKEN:-}" ] && echo "  · 기존 kr_ PAT 가 만료·취소됨(또는 검증 불가) — 재발급한다"
       echo "▶ DynaForge MCP 토큰 자동 발급(kr_ PAT)"
       _koorm_new="$(mint_koorm 2>/tmp/koormint.$$.err || true)"
       case "${_koorm_new:-}" in
-        kr_*) KOORM_MCP_TOKEN="$_koorm_new"
+        kr_*) KOORM_MCP_TOKEN="$_koorm_new"; _koorm_up=1
               echo "  ✓ kr_ PAT 발급 → heax_registry.app_tokens.kooremapper_mcp" ;;
         # 발급 실패 시 기존 값을 지우지는 않는다(멀쩡한 토큰을 날리는 사고 방지).
         # 다만 그 토큰은 방금 검증에 실패했으므로 호출은 계속 401 이다 — 그 사실을 말해 둔다.
@@ -266,10 +267,17 @@ if [ -n "${HEAX_MCP_TOKEN:-}" ]; then
     KOORM_SSO_SECRET="$(awk -F= '/^KOORM_HEAX_GATEWAY_SECRET=/{sub(/^[^=]*=/,"");print;exit}' \
         "$PARENT/KooRemapper/platform/.env" 2>/dev/null || true)"
     KOORM_SSO_URL="${KOORM_BASE:-http://127.0.0.1:8700}/api/v1/auth/sso"
-    if [ -n "$KOORM_SSO_SECRET" ]; then
+    # ⚠ 시크릿이 있다는 것과 위임이 동작한다는 것은 다르다. 예전엔 .env 를 읽었다는
+    # 이유만으로 초록을 찍었고, DynaForge 가 통째로 죽어 kr_ PAT 발급이 방금 실패한
+    # 직후에도 "✓ 위임 활성" 이 나갔다(cae00 2026-08-18). 실패 바로 밑의 초록은
+    # 사람을 잘못된 결론으로 데려간다 — 앱 응답 여부까지 보고 말한다.
+    if [ -z "$KOORM_SSO_SECRET" ]; then
+      echo "  ⚠ KOORM_HEAX_GATEWAY_SECRET 미발견 — 사용자 위임 없이 서비스 계정 시야로만 조회한다"
+    elif [ "${_koorm_up:-0}" = "1" ]; then
       echo "  ✓ DynaForge 사용자 위임 활성 — 심의·챗이 호출자 본인 시야로 조회한다"
     else
-      echo "  ⚠ KOORM_HEAX_GATEWAY_SECRET 미발견 — 사용자 위임 없이 서비스 계정 시야로만 조회한다"
+      echo "  ⚠ DynaForge 사용자 위임: 설정은 기록했지만 지금은 확인 못 했다(앱이 응답하지 않음)."
+      echo "    앱이 뜨면 그때부터 동작한다. 지금은 위임도 서비스 계정도 아니라 호출 자체가 안 된다."
     fi
   else
     echo "  · KooRemapper 레포 미발견 — DynaForge MCP 토큰 생략"

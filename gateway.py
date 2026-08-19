@@ -514,6 +514,77 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
         return _fail(repr(e))
 
 
+# ── 게이트웨이 로컬 도구: search_conversations ──────────────────────────────
+# "예전에 이거 얘기했었는데" 를 찾아 준다. 키워드가 아니라 의미로 찾는다 — 사용자가 기억하는
+# 것은 표현이 아니라 내용이기 때문이다. 신원 귀속은 save_conversation 과 같다: 호출자 PAT 를
+# 포털에 그대로 넘겨 포털이 owner_sub 를 판정한다. 게이트웨이는 "누구인지"를 말하지 않는다
+# — 여기서 신원을 만들어 내면 남의 대화를 읽는 경로가 생긴다.
+SEARCH_CONV_TOOL = types.Tool(
+    name="search_conversations",
+    description=(
+        "내 지난 대화(심의·웹 챗)를 의미로 검색한다. 키워드가 아니라 뜻으로 찾으므로 "
+        "'그때 배터리 스웰링 논의에서 뭘 결정했더라' 같은 질문에 쓴다. 호출자 본인의 대화만 "
+        "검색된다. 결과에는 대화 제목·발화자·본문 조각·유사도가 들어 있고, 전문이 필요하면 "
+        "conversation_id 로 포털에서 이어보면 된다. 포털 미가용/인증 불가면 CONV_UNAVAILABLE."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "찾고 싶은 내용(문장으로 쓸수록 좋다)"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 8},
+        },
+        "required": ["query"],
+    },
+)
+
+
+async def _search_conversations(arguments: dict) -> types.CallToolResult:
+    """로컬 도구 실행: 호출자 PAT 를 포워딩해 포털 /agent/conversations/search 를 부른다."""
+    t0 = time.monotonic()
+
+    def _fail(reason: str) -> types.CallToolResult:
+        _audit("search_conversations", "portal", False, reason,
+               round((time.monotonic() - t0) * 1000))
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=f"CONV_UNAVAILABLE: {reason}")],
+            isError=True,
+        )
+
+    base = _portal_api_base()
+    if not base:
+        return _fail("portal api base not configured")
+    try:
+        req = _low.request_context.request
+        auth = req.headers.get("authorization") if req is not None else None
+    except LookupError:
+        auth = None
+    if not auth:
+        return _fail("no caller authorization to forward")
+    q = str(arguments.get("query") or "").strip()
+    if len(q) < 2:
+        return _fail("query 가 너무 짧습니다")
+    try:
+        limit = max(1, min(30, int(arguments.get("limit") or 8)))
+    except (TypeError, ValueError):
+        limit = 8
+    try:
+        # 임베딩 + 색인이 걸릴 수 있어 save 보다 넉넉히 준다(첫 검색은 전량 색인).
+        async with httpx.AsyncClient(timeout=120.0) as cli:
+            r = await cli.post(f"{base}/agent/conversations/search",
+                               json={"query": q, "limit": limit},
+                               headers={"Authorization": auth})
+        if r.status_code != 200:
+            return _fail(f"portal {r.status_code}")
+        _audit("search_conversations", "portal", True, None,
+               round((time.monotonic() - t0) * 1000))
+        return types.CallToolResult(
+            content=[types.TextContent(type="text",
+                     text=json.dumps(r.json(), ensure_ascii=False))],
+        )
+    except Exception as e:  # noqa: BLE001 — 포털 미가용은 비치명적(폴백 계약)
+        return _fail(repr(e))
+
+
 # ── 게이트웨이 로컬 도구: list_tool_apps ────────────────────────────────────
 # 167개 도구가 평평하게 보이면 "무엇을 할 수 있는지" 파악이 불가능하다. 도구를 소유 앱(도메인)
 # 단위로 묶어 보여주고, 각 앱의 접근 가능 여부(그룹 인가 + 백엔드 생존)까지 함께 알려준다.
@@ -585,7 +656,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     by_app: dict[str, list[types.Tool]] = {}
     for t in exposed_tools:
         by_app.setdefault(route[t.name][0], []).append(t)
-    by_app.setdefault("_gateway", []).extend([SAVE_CONV_TOOL, LIST_APPS_TOOL])
+    by_app.setdefault("_gateway", []).extend([SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL])
     # 연결이 끊긴 백엔드는 도구가 집계되지 않아 목록에서 통째로 사라진다 — 접근성 점검이
     # 목적이므로 '앱은 있는데 지금 불통'을 보이게 빈 항목으로 채운다.
     for _k in backends:
@@ -633,7 +704,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
 
 def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
-    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL, LIST_APPS_TOOL]
+    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL]
 
 
 def _request_groups() -> list[str]:
@@ -739,6 +810,8 @@ async def _call_tool(name: str, arguments: dict):
     t0 = time.monotonic()
     if name == SAVE_CONV_TOOL.name:  # 게이트웨이 로컬 도구(백엔드 라우팅 없음)
         return await _save_conversation(arguments or {})
+    if name == SEARCH_CONV_TOOL.name:
+        return await _search_conversations(arguments or {})
     if name == LIST_APPS_TOOL.name:
         return await _list_tool_apps(arguments or {})
     if name not in route:
@@ -856,7 +929,7 @@ def _bearer_gate(app, pat_verifier=None):
             _map = {name: bk for name, (bk, _orig) in route.items()}
             # 게이트웨이 로컬 도구(save_conversation 등)는 route 에 없다 — 미분류로 남지 않게
             # '_gateway' 로 귀속시킨다(앱이 늘어도 분류 누락 0 을 유지).
-            for _t in list(exposed_tools) + [SAVE_CONV_TOOL]:
+            for _t in list(exposed_tools) + [SAVE_CONV_TOOL, SEARCH_CONV_TOOL]:
                 _map.setdefault(_t.name, "_gateway")
             _map.setdefault(LIST_APPS_TOOL.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가

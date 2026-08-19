@@ -8,6 +8,7 @@ not in the published revoked-jti denylist), then forwards `/api/<site>/<path>` t
 site's REST base injecting the site's OWN service credential. Sub-sites are never changed.
 """
 
+import logging
 import time
 
 import httpx
@@ -21,6 +22,9 @@ from starlette.routing import Route
 _HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
         "trailers", "transfer-encoding", "upgrade", "host", "content-length", "authorization"}
 
+
+
+log = logging.getLogger("hwax-mcp-gateway")
 
 class PortalPatVerifier:
     """포털 PAT 검증(JWKS RS256, scope=api, aud, 폐기목록 60s 캐시). /mcp 게이트와 REST 프록시가 공유.
@@ -40,10 +44,20 @@ class PortalPatVerifier:
             return self._revoked
         try:
             r = await self._client.get(self._revoked_url, timeout=5)
-            self._revoked = set(r.json().get("revoked", []))
+            r.raise_for_status()
+            body = r.json()
+            # ⚠ 'revoked' 키가 없으면 빈 목록으로 받아들이면 안 된다. 포털 재기동 중
+            # 앞단이 200 으로 {"detail": …} 같은 것을 돌려주면 폐기가 통째로 꺼지고,
+            # _revoked_at 도장까지 찍혀 60초 동안 재조회조차 안 한다. 토큰이 무기한으로
+            # 발급될 수 있는 지금 이것이 마지막 방어선이라 조용히 비우면 안 된다.
+            if not isinstance(body, dict) or "revoked" not in body:
+                raise ValueError(f"revoked 목록 형식이 아니다: {str(body)[:120]}")
+            self._revoked = set(body["revoked"])
             self._revoked_at = now
-        except Exception:  # noqa: BLE001 — keep last-known set on transient error
-            pass
+        except Exception as exc:  # noqa: BLE001 — 직전 목록 유지(fail-closed 는 더 위험)
+            # 조용히 넘기지 않는다. 이 목록은 무기한 토큰의 유일한 차단 수단이라,
+            # 갱신 실패가 이어지면 폐기가 반영 안 된 채 계속 도는 것이므로 보여야 한다.
+            log.warning("폐기목록 갱신 실패 — 직전 목록(%d건) 유지: %r", len(self._revoked), exc)
         return self._revoked
 
     async def verify(self, token: str, audience: str) -> dict | None:
@@ -81,10 +95,20 @@ class RestProxy:
             return self._revoked
         try:
             r = await self._client.get(self._revoked_url, timeout=5)
-            self._revoked = set(r.json().get("revoked", []))
+            r.raise_for_status()
+            body = r.json()
+            # ⚠ 'revoked' 키가 없으면 빈 목록으로 받아들이면 안 된다. 포털 재기동 중
+            # 앞단이 200 으로 {"detail": …} 같은 것을 돌려주면 폐기가 통째로 꺼지고,
+            # _revoked_at 도장까지 찍혀 60초 동안 재조회조차 안 한다. 토큰이 무기한으로
+            # 발급될 수 있는 지금 이것이 마지막 방어선이라 조용히 비우면 안 된다.
+            if not isinstance(body, dict) or "revoked" not in body:
+                raise ValueError(f"revoked 목록 형식이 아니다: {str(body)[:120]}")
+            self._revoked = set(body["revoked"])
             self._revoked_at = now
-        except Exception:  # noqa: BLE001 — keep last-known set on transient fetch error
-            pass
+        except Exception as exc:  # noqa: BLE001 — 직전 목록 유지(fail-closed 는 더 위험)
+            # 조용히 넘기지 않는다. 이 목록은 무기한 토큰의 유일한 차단 수단이라,
+            # 갱신 실패가 이어지면 폐기가 반영 안 된 채 계속 도는 것이므로 보여야 한다.
+            log.warning("폐기목록 갱신 실패 — 직전 목록(%d건) 유지: %r", len(self._revoked), exc)
         return self._revoked
 
     def _verify(self, token: str, site: str) -> dict:

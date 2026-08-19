@@ -491,10 +491,15 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
         return out
 
     raw_msgs = arguments.get("messages") or []
+    # kind/source 도 정규화한다. 포털 스키마가 Literal 이라 값 하나가 어긋나면 422 로
+    # 배치 전체가 거부돼 심의 전문이 통째로 유실된다 — 길이 상한만 맞춰 두고 여기를
+    # 비워 두면 같은 사고가 다른 필드로 재현될 뿐이다.
+    _kind = str(arguments.get("kind") or "deliberation")
+    _source = str(arguments.get("source") or "mcp")
     body = {
         "title": str(arguments.get("title") or "심의")[:200],
-        "kind": arguments.get("kind") or "deliberation",
-        "source": arguments.get("source") or "mcp",
+        "kind": _kind if _kind in ("chat", "deliberation") else "deliberation",
+        "source": _source if _source in ("web", "mcp") else "mcp",
         "messages": [_msg(m) for m in raw_msgs if isinstance(m, dict)][:200],
     }
     try:

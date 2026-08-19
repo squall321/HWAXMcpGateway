@@ -140,6 +140,25 @@ class RestProxy:
             self.audit(f"{request.method} /{path}", site, False, f"pat: {e!r}", 0)
             return JSONResponse({"error": "invalid PAT", "detail": str(e)}, status_code=401)
 
+        # ⚠ 서비스 자격증명을 주입하는 사이트는 기본적으로 읽기만 허용한다.
+        # 아래 inject 는 "그 사이트의 마스터 키" 다. PAT 검증은 서명·aud·scope=="api"·폐기목록
+        # 까지고 groups 도 PAT 의 scopes 도 경로도 보지 않으므로, 포털에 로그인한 최저 권한
+        # 사용자가 aud 만 맞는 PAT(ttl_days=0 이면 100년)를 스스로 찍어 공개 오리진
+        # /mcp-gw/api/<site>/... 로 그 마스터 키 권한을 그대로 쓸 수 있었다. 아무도 실수하지
+        # 않아도 그렇게 된다 — 허용 audience 목록이 사용자·그룹과 무관한 전역 설정이기 때문이다.
+        # 쓰기를 열려면 사이트 설정에 methods 를 명시하게 한다(감사로그 기준 이 프록시는
+        # 아직 호출 0건이라, 닫아도 깨지는 사용처가 없다).
+        # inject 가 없는 사이트는 권한 상승이 없으므로 종전대로 둔다.
+        allowed = conf.get("methods") or (["GET", "HEAD"] if conf.get("inject") else None)
+        if allowed is not None and request.method.upper() not in {m.upper() for m in allowed}:
+            self.audit(f"{request.method} /{path}", site, False, "method not allowed", 0,
+                       caller=claims.get("sub"))
+            return JSONResponse(
+                {"error": "method not allowed for this site",
+                 "detail": f"{site} 는 {'/'.join(allowed)} 만 허용한다. 쓰기가 필요하면 "
+                           f"게이트웨이 설정의 rest.{site}.methods 에 명시하라."},
+                status_code=405)
+
         url = conf["base"].rstrip("/") + "/" + path.lstrip("/")
         headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP}
         inj = conf.get("inject")                           # optional (a site may allow anonymous)

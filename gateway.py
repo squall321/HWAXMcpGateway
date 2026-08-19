@@ -109,6 +109,9 @@ class _Backend:
         self._ready = anyio.Event()
         self._stop = anyio.Event()
         self._failed: Exception | None = None
+        # 재연결 직렬화 + 세대 번호. 아래 reconnect 주석 참고.
+        self._recon_lock = anyio.Lock()
+        self._gen = 0
 
     async def run(self, task_status=anyio.TASK_STATUS_IGNORED):
         """streamablehttp_client + ClientSession을 열고 stop 이벤트까지 park."""
@@ -129,14 +132,30 @@ class _Backend:
                 task_status.started()
             log.warning("backend %s session ended: %r", self.key, e)
 
-    async def reconnect(self, tg):
-        """call 시 세션이 죽었으면 새 태스크로 1회 재연결."""
-        self._stop.set()
-        self.session = None
-        self._ready = anyio.Event()
-        self._stop = anyio.Event()
-        self._failed = None
-        await tg.start(self.run)
+    async def reconnect(self, tg, seen_gen: int | None = None):
+        """call 시 세션이 죽었으면 새 태스크로 1회 재연결.
+
+        ⚠ 락이 없으면 안 된다. 이 함수는 앞 5줄이 동기라 거기서는 안 끼어들지만
+        `await tg.start(self.run)` 에서 양보한다. 그 창에 들어온 두 번째 호출이 _stop/_ready
+        를 또 갈아 끼워, 백엔드 하나에 영속 세션이 여러 개 살아남고 self.session 은 핸드셰이크를
+        마지막에 끝낸 쪽으로 비결정적으로 정해진다(재현: 동시 3건 → 세션 3개 생존).
+
+        seen_gen 은 "내가 죽었다고 본 그 세션" 의 세대다. 호출 실패는 한 백엔드에 대해 동시에
+        여러 건이 겪는다 — 세대를 안 보면 첫 호출이 새로 만든 멀쩡한 세션을 두 번째 호출이
+        곧바로 다시 부수고, 그 사이 다른 모든 동시 호출이 read timeout 까지 조용히 매달린다.
+        이미 누가 갈아 끼웠으면 그냥 그 세션을 쓴다. (liveness 로 부르는 _revive_loop 는
+        세대를 넘기지 않는다 — 거기서는 무조건 갈아 끼우는 것이 의도다.)
+        """
+        async with self._recon_lock:
+            if seen_gen is not None and seen_gen != self._gen:
+                return                       # 다른 호출이 이미 새 세션을 세웠다
+            self._stop.set()
+            self.session = None
+            self._ready = anyio.Event()
+            self._stop = anyio.Event()
+            self._failed = None
+            self._gen += 1
+            await tg.start(self.run)
 
 
 # 백엔드 핸들 + 노출 도구/라우트 (lifespan에서 채움)
@@ -873,6 +892,10 @@ async def _call_tool(name: str, arguments: dict):
                        f"as:{email}", round((time.monotonic() - t0) * 1000))
                 return res
 
+    # 이 호출이 쓰는 세션의 세대. 실패했을 때 "내가 죽었다고 본 그 세션" 을 가리키므로,
+    # 그 사이 다른 호출이 이미 갈아 끼웠다면 새 세션을 또 부수지 않는다. try 밖에서 잡는다 —
+    # 안에서 잡으면 session is None 분기에서 미정의가 된다.
+    _gen = b._gen
     try:
         if b.session is None:
             raise RuntimeError("backend session down")
@@ -885,7 +908,7 @@ async def _call_tool(name: str, arguments: dict):
         try:
             tg = _task_group_holder.get("tg")
             if tg is not None:
-                await b.reconnect(tg)
+                await b.reconnect(tg, _gen)
                 await b._ready.wait()
                 if b.session is not None:
                     # 재연결했으면 그 백엔드의 도구 구성이 바뀌었을 수 있다(앱 교체). 호출 지연을

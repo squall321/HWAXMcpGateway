@@ -104,6 +104,10 @@ _CACHEABLE = ("list_", "get_", "search_", "find_", "query_", "describe_", "hybri
               "coverage_", "top_", "agent_search", "recommend_agents", "instrument_summary",
               "section_contact_usage", "report_", "inspect_", "project_tree", "part_",
               "compare_", "ashby_", "measurement_gaps", "how_to_measure")
+# ⚠ 접두사가 여는 것 중 **쓰기**가 섞여 있다 — report_ingest·report_fragmentize 는 report_ 에
+#   걸리지만 원장에 쓴다. 쓰기가 캐시되면 TTL 안 재호출이 백엔드에 도달하지 않고 무음 드롭되고,
+#   flush 경로(캐시 비대상=쓰기 가정)도 안 탄다(감사 비판자 1-B 실증). 이름 명시로 막는다.
+_CACHE_DENY = ("report_ingest", "report_fragmentize", "get_agent_session")
 # {(backend, tool, args, identity): (result, expiry)} — 삽입 순서 = LRU 근사(오래된 것부터 버린다)
 _RESP_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 _CACHE_STAT = {"hit": 0, "miss": 0, "flush": 0}
@@ -132,7 +136,7 @@ def _cache_key(backend_key: str, tool: str, arguments) -> tuple | None:
     ⚠ 키에 **호출자 신원**을 넣는다. PER_USER_SSO 백엔드는 사용자별 시야로 답하므로,
       신원을 빼면 A 가 부른 결과를 B 가 받는다 — 권한 우회다.
     """
-    if CACHE_TTL_S <= 0 or not tool.startswith(_CACHEABLE):
+    if CACHE_TTL_S <= 0 or tool in _CACHE_DENY or not tool.startswith(_CACHEABLE):
         return None
     try:
         args = json.dumps(arguments or {}, sort_keys=True, ensure_ascii=False)

@@ -631,7 +631,10 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
         "title": str(arguments.get("title") or "심의")[:200],
         "kind": _kind if _kind in ("chat", "deliberation") else "deliberation",
         "source": _source if _source in ("web", "mcp") else "mcp",
-        "messages": [_msg(m) for m in raw_msgs if isinstance(m, dict)][:200],
+        # ⚠ 머리 200 을 남기면 잘리는 쪽이 꼬리 = 결정문 분할(워크플로 msgs 는 결정문이 맨 뒤다).
+        #   첫 항목(user 질문) + 꼬리 199 를 지킨다 — 발언 일부를 버려도 결정문은 산다(감사 C48).
+        "messages": (lambda ms: ms if len(ms) <= 200 else [ms[0]] + ms[-199:])(
+            [_msg(m) for m in raw_msgs if isinstance(m, dict)]),
     }
     try:
         async with httpx.AsyncClient(timeout=15.0) as cli:

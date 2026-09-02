@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -81,6 +81,83 @@ PER_USER_SSO: dict[str, dict] = {k: v for k, v in (HEAX.get("per_user_sso") or {
 # 사용자 PAT 캐시 수명(초). PAT 자체는 장수명이라 만료 때문이 아니라 '권한 회수 반영'을 위한 값이다.
 # 짧게 잡으면 재발급이 잦아 백엔드에 폐기 토큰 행이 쌓인다(발급이 직전 것을 회수하는 구조).
 USER_PAT_TTL_S = int(os.environ.get("GATEWAY_USER_PAT_TTL", "43200"))
+
+# ── 읽기 전용 응답 캐시 ───────────────────────────────────────────────────────
+# 심의는 좌석 수만큼 **같은 조회를 반복한다.** 실측(2026-09-02 솔더볼 심의): hwax 도구
+# 728회 중 124회(17%)가 (도구,인자) 완전 동일이었고 `get_model_info {}` 하나가 29회,
+# 같은 좌석의 `get_context_bundle` 이 6회였다. 좌석마다 같은 것을 묻는 건 정상 동작이라
+# 프롬프트로 막을 일이 아니라 캐시할 일이다.
+#
+# 왜 게이트웨이인가 — 에이전트끼리 공유되려면 **모든 호출이 지나는 유일한 지점**이어야 한다.
+# 워크플로는 자식 에이전트의 도구 호출을 가로챌 수 없고, 심의 엔진(deliberation.py)은
+# agent-server 경로만 덮는다. MCP 워크플로 경로는 그쪽을 안 지난다.
+#
+# 부수 효과 하나 더 — 권한 auto-mode 가 호출마다 안전성을 판정하는데 그 판정 모델이
+# rate-limit 에 걸려 같은 실측에서 호출의 33%가 거부됐다. 중복을 없애면 판정 부하도 준다.
+CACHE_TTL_S = float(os.environ.get("GATEWAY_CACHE_TTL", "300"))
+CACHE_MAX = int(os.environ.get("GATEWAY_CACHE_MAX", "512"))
+# 캐시해도 되는 도구 — 접두사 화이트리스트로만 연다(deny-by-default). 심의 엔진의
+# _FREE_ALLOW 와 같은 자세다. 여기 없으면 캐시하지 않고, 쓰기로 보이면 아래에서 무효화한다.
+_CACHEABLE = ("list_", "get_", "search_", "find_", "query_", "describe_", "hybrid_",
+              "semantic_", "fts_", "material_", "property_", "database_", "catalog_",
+              "coverage_", "top_", "agent_search", "recommend_agents", "instrument_summary",
+              "section_contact_usage", "report_", "inspect_", "project_tree", "part_",
+              "compare_", "ashby_", "measurement_gaps", "how_to_measure")
+# {(backend, tool, args, identity): (result, expiry)} — 삽입 순서 = LRU 근사(오래된 것부터 버린다)
+_RESP_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_CACHE_STAT = {"hit": 0, "miss": 0, "flush": 0}
+
+
+def _cache_key(backend_key: str, tool: str, arguments) -> tuple | None:
+    """캐시 키. 캐시 불가면 None.
+
+    ⚠ 키에 **호출자 신원**을 넣는다. PER_USER_SSO 백엔드는 사용자별 시야로 답하므로,
+      신원을 빼면 A 가 부른 결과를 B 가 받는다 — 권한 우회다.
+    """
+    if CACHE_TTL_S <= 0 or not tool.startswith(_CACHEABLE):
+        return None
+    try:
+        args = json.dumps(arguments or {}, sort_keys=True, ensure_ascii=False)
+    except Exception:  # noqa: BLE001 — 직렬화 안 되는 인자는 캐시하지 않는다
+        return None
+    return (backend_key, tool, args, _request_user(), tuple(sorted(_request_groups())))
+
+
+def _cache_get(key):
+    if key is None:
+        return None
+    hit = _RESP_CACHE.get(key)
+    if hit is None:
+        return None
+    res, exp = hit
+    if time.monotonic() >= exp:
+        _RESP_CACHE.pop(key, None)
+        return None
+    _RESP_CACHE.move_to_end(key)
+    _CACHE_STAT["hit"] += 1
+    return res
+
+
+def _cache_put(key, res):
+    """성공 결과만 담는다 — 오류를 캐시하면 일시적 실패가 TTL 동안 굳는다."""
+    if key is None or getattr(res, "isError", False):
+        return res
+    _RESP_CACHE[key] = (res, time.monotonic() + CACHE_TTL_S)
+    _RESP_CACHE.move_to_end(key)
+    while len(_RESP_CACHE) > CACHE_MAX:
+        _RESP_CACHE.popitem(last=False)
+    _CACHE_STAT["miss"] += 1
+    return res
+
+
+def _cache_flush_backend(backend_key: str):
+    """그 백엔드의 캐시를 버린다. 쓰기 호출 직후에 부른다 — 안 그러면 방금 만든 것이
+    TTL 동안 목록에 안 보인다(create_project 뒤 list_projects 가 옛 목록을 준다)."""
+    doomed = [k for k in _RESP_CACHE if k[0] == backend_key]
+    for k in doomed:
+        _RESP_CACHE.pop(k, None)
+    if doomed:
+        _CACHE_STAT["flush"] += len(doomed)
 
 
 def _audit(tool, backend, ok, err, ms, caller=None):
@@ -864,6 +941,18 @@ async def _call_tool(name: str, arguments: dict):
             isError=True,
         )
     b = backends[backend_key]
+    # ── 읽기 전용 캐시 ── 인가(위)를 통과한 뒤에 본다. 순서가 반대면 권한 없는 호출자가
+    #    캐시된 남의 결과를 받는다. 키에도 신원이 들어간다(_cache_key 주석 참조).
+    ckey = _cache_key(backend_key, original, arguments)
+    if ckey is not None:
+        _hit = _cache_get(ckey)
+        if _hit is not None:
+            _audit(name, backend_key, True, "cache-hit", 0)
+            return _hit
+    else:
+        # 캐시 대상이 아니다 = 쓰기이거나 알 수 없는 도구. 그 백엔드의 캐시를 버린다 —
+        # 방금 만든 것이 TTL 동안 목록에 안 보이는 read-after-write 를 막는다.
+        _cache_flush_backend(backend_key)
     # 행 걸린 백엔드가 챗 SSE 체인 전체를 무기한 블록하지 않게 호출당 타임아웃을 건다.
     call_timeout = timedelta(seconds=CALL_TIMEOUT_S)
 
@@ -901,7 +990,7 @@ async def _call_tool(name: str, arguments: dict):
                     )
                 _audit(name, backend_key, not getattr(res, "isError", False),
                        f"as:{email}", round((time.monotonic() - t0) * 1000))
-                return res
+                return _cache_put(ckey, res)
 
     # 이 호출이 쓰는 세션의 세대. 실패했을 때 "내가 죽었다고 본 그 세션" 을 가리키므로,
     # 그 사이 다른 호출이 이미 갈아 끼웠다면 새 세션을 또 부수지 않는다. try 밖에서 잡는다 —
@@ -913,7 +1002,7 @@ async def _call_tool(name: str, arguments: dict):
         res = await b.session.call_tool(original, arguments, read_timeout_seconds=call_timeout)
         _audit(name, backend_key, not getattr(res, "isError", False), note,
                round((time.monotonic() - t0) * 1000))
-        return res
+        return _cache_put(ckey, res)
     except Exception as e:  # noqa: BLE001
         log.warning("call %s on %s failed (%r), reconnecting once", name, backend_key, e)
         try:
@@ -930,7 +1019,7 @@ async def _call_tool(name: str, arguments: dict):
                     _audit(name, backend_key, not getattr(res, "isError", False),
                            "reconnected" + (f"+{note}" if note else ""),
                            round((time.monotonic() - t0) * 1000))
-                    return res
+                    return _cache_put(ckey, res)
         except Exception as e2:  # noqa: BLE001 — 재시도 실패도 정돈된 isError 로 (프로토콜 에러 방지)
             log.warning("retry of %s on %s failed too (%r)", name, backend_key, e2)
             e = e2
@@ -956,6 +1045,8 @@ def _bearer_gate(app, pat_verifier=None):
                 "status": "ok",
                 "tools": len(exposed_tools),
                 "backends": {k: (b.session is not None) for k, b in backends.items()},
+                # 캐시 효과를 밖에서 볼 수 있게 — 안 보이면 켜졌는지도 모른다.
+                "cache": {**_CACHE_STAT, "size": len(_RESP_CACHE), "ttl_s": CACHE_TTL_S},
                 "policy": POLICY,
             }).encode()
             await send({"type": "http.response.start", "status": 200,

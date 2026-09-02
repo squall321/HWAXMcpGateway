@@ -1,4 +1,5 @@
 # 3개 백엔드 MCP를 집계해 단일 streamable-http 엔드포인트로 재노출하는 게이트웨이
+import hashlib
 import json
 import logging
 import os
@@ -106,6 +107,23 @@ _CACHEABLE = ("list_", "get_", "search_", "find_", "query_", "describe_", "hybri
 # {(backend, tool, args, identity): (result, expiry)} — 삽입 순서 = LRU 근사(오래된 것부터 버린다)
 _RESP_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 _CACHE_STAT = {"hit": 0, "miss": 0, "flush": 0}
+
+
+# 백엔드별 도구 지문 — {이름: 설명·스키마 해시}. 이름 집합만 보면 설명·스키마 변경을 못 잡는다.
+_FP: dict[str, dict] = {}
+
+
+def _tools_fp(tools) -> dict:
+    """도구 목록의 지문. 이름 → (설명 + 입력스키마) 해시."""
+    out = {}
+    for t in tools:
+        try:
+            sch = json.dumps(getattr(t, "inputSchema", None) or {}, sort_keys=True, default=str)
+        except Exception:  # noqa: BLE001
+            sch = ""
+        raw = (getattr(t, "description", "") or "") + "\x00" + sch
+        out[t.name] = hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
+    return out
 
 
 def _cache_key(backend_key: str, tool: str, arguments) -> tuple | None:
@@ -390,12 +408,18 @@ async def _revive_once(tg) -> bool:
         try:
             with anyio.fail_after(LIVENESS_TIMEOUT_S):
                 res = await b.session.list_tools()
-            now = {t.name for t in res.tools}
-            prev = {orig for (bk, orig) in route.values() if bk == key}
-            if now != prev:
-                log.info("backend %s 도구 구성 변경 (%d→%d) — 재집계",
-                         key, len(prev), len(now))
-                revived = True
+            # ⚠ **이름만 비교하면 안 된다.** 설명·입력 스키마가 바뀌어도 이름은 그대로라
+            #   재집계가 안 걸리고, 카탈로그가 옛 설명으로 굳는다 — 게이트웨이를 재기동해야만
+            #   반영됐다(실측 2026-09-02: 도구 설명 2건을 고치고 앱을 재기동했는데
+            #   /refresh 가 changed:false 를 냈다). 지문으로 비교한다.
+            now = _tools_fp(res.tools)
+            prev = _FP.get(key)
+            if prev != now:
+                _FP[key] = now
+                if prev is not None:
+                    log.info("backend %s 도구 구성·메타 변경 (%d→%d) — 재집계",
+                             key, len(prev), len(now))
+                    revived = True
         except Exception as exc:  # noqa: BLE001 — 죽은 세션 → 아래 재연결 루프가 처리
             log.warning("backend %s liveness 실패 (%r) — 재연결 예약", key, exc)
             b.session = None

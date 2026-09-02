@@ -257,100 +257,111 @@ async def _discover_heax() -> dict[str, dict] | None:
 _HEAX_FAILS = {"n": 0}
 
 
+async def _revive_once(tg) -> bool:
+    """재활 1회 — 죽은 백엔드 재연결 + heax 앱 재탐지 + 도구 구성 변경 감지 후 재집계.
+
+    주기 루프(_revive_loop)와 수동 트리거(POST /refresh)가 **같은 코드**를 쓴다. 수동
+    트리거가 필요한 이유는 배포 자동화 때문이다 — 외부 MCP 를 재배포한 직후 update-all 이
+    카탈로그를 검증하는데, 주기가 60초라 그때까지 옛 도구 목록으로 판정하게 된다.
+    변화가 있었으면 True."""
+    revived = False
+    # heax registry 재폴링 — 신규 MCP 앱 합류 / 레지스트리에서 사라진 앱 제거
+    if HEAX.get("servers_url"):
+        discovered = await _discover_heax()
+        if discovered is None:
+            # 폴링 실패 — 마지막 정상 상태를 그대로 유지한다(제거 금지).
+            _HEAX_FAILS["n"] += 1
+            log.warning("heax registry 연속 실패 %d회 — 기존 앱 %d개 유지",
+                        _HEAX_FAILS["n"],
+                        sum(1 for k in backends if k.startswith(HEAX_PREFIX)))
+            discovered = {}
+            _allow_removal = False
+        else:
+            _HEAX_FAILS["n"] = 0
+            _allow_removal = True
+        for key, spec in discovered.items():
+            # 표시 정보는 백엔드 합류 여부와 무관하게 항상 갱신한다 — 이미 붙어 있는 앱도
+            # registry 에서 이름이 바뀔 수 있고, 라벨은 세션 생존과 별개다.
+            DISCOVERED_META[key] = {"label": spec.get("label") or "",
+                                    "description": spec.get("description") or ""}
+            if key in backends:
+                continue
+            b = _Backend(key, spec["url"], spec.get("headers"))
+            backends[key] = b
+            POLICY[key] = spec.get("allowed_groups") or []   # heax 앱의 그룹 필터 반영
+            await tg.start(b.run)
+            await b._ready.wait()
+            if b.session is not None:
+                log.info("heax MCP %s 합류 (%s)", key, spec["url"])
+                revived = True
+        for key in ([k for k in list(backends)
+                     if k.startswith(HEAX_PREFIX) and k not in discovered]
+                    if _allow_removal else []):
+            backends.pop(key)._stop.set()
+            POLICY.pop(key, None)
+            log.info("heax MCP %s 제거 (레지스트리에서 사라짐)", key)
+            revived = True
+    # ── 연결된 백엔드의 도구 목록 재확인(G3) ──────────────────────────────
+    # 앱 인스턴스가 교체돼도(SIF 재빌드·재기동) run() 은 _stop 대기로 park 중이라 예외가
+    # 나지 않아 session 객체가 살아 있는 것처럼 남는다. 그러면 아래 재연결 루프가
+    # 건너뛰고 카탈로그는 옛 도구로 굳는다 — 새 도구가 게이트웨이 재기동 전까지 안 보였다.
+    # 주기적으로 list_tools 를 다시 받아 (a) 죽은 세션을 감지해 재연결 대상으로 돌리고
+    # (b) 도구 구성이 바뀌었으면 재집계한다. 백엔드당 60초에 1회라 비용은 무시할 수준.
+    for key, b in list(backends.items()):
+        if b.session is None:
+            continue
+        try:
+            with anyio.fail_after(LIVENESS_TIMEOUT_S):
+                res = await b.session.list_tools()
+            now = {t.name for t in res.tools}
+            prev = {orig for (bk, orig) in route.values() if bk == key}
+            if now != prev:
+                log.info("backend %s 도구 구성 변경 (%d→%d) — 재집계",
+                         key, len(prev), len(now))
+                revived = True
+        except Exception as exc:  # noqa: BLE001 — 죽은 세션 → 아래 재연결 루프가 처리
+            log.warning("backend %s liveness 실패 (%r) — 재연결 예약", key, exc)
+            b.session = None
+
+    for key, b in backends.items():
+        if b.session is not None:
+            continue
+        try:
+            # LIVENESS_TIMEOUT_S 는 위 list_tools 한 곳에만 걸려 있었고 재연결 경로엔
+            # 아무 데드라인이 없었다. 여기서 멈추면 '예외'가 아니라 '행'이라 except 도
+            # 안 걸리고, MCP 클라이언트 기본 read timeout(300s)이 만료될 때까지 revive
+            # 루프 전체가 얼어붙는다 — 그동안 로그도 완전 무음이다.
+            # anyio 는 start() 대기가 취소되면 방금 띄운 자식 태스크도 함께 취소한다.
+            with anyio.move_on_after(LIVENESS_TIMEOUT_S) as _sc:
+                await b.reconnect(tg)
+                await b._ready.wait()
+            if _sc.cancel_called:
+                log.warning("backend %s 재연결 타임아웃(%.0fs) — 다음 주기에 재시도",
+                            key, LIVENESS_TIMEOUT_S)
+            elif b.session is not None:
+                log.info("backend %s revived — re-aggregating tools", key)
+                revived = True
+        except Exception as exc:  # noqa: BLE001 — 다음 주기에 재시도
+            log.debug("revive %s failed: %r", key, exc)
+    # 호출 경로(_call_tool)에서 재연결이 일어났으면 그쪽은 카탈로그를 못 고치므로 여기서 갱신.
+    if _REAGG.pop("pending", False):
+        revived = True
+    if revived:
+        try:
+            await _aggregate()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("re-aggregate after revive failed: %r", exc)
+    return revived
+
+
 async def _revive_loop(tg):
-    """죽은 백엔드 재활 + heax MCP 앱 자동탐지: 주기적으로 세션 없는 백엔드를 재연결하고,
-    heax registry 를 재폴링해 신규 MCP 앱은 합류시키고 사라진 앱은 제거한 뒤, 변화가 있으면
-    도구를 재집계한다. 이게 없으면 부팅 시점에 다운이었던 백엔드/그 뒤 추가된 heax MCP 는
-    게이트웨이 재시작 전까지 누락된다."""
+    """_revive_once 를 REVIVE_INTERVAL_S 마다 돌린다."""
     while True:
         await anyio.sleep(REVIVE_INTERVAL_S)
-        revived = False
-        # heax registry 재폴링 — 신규 MCP 앱 합류 / 레지스트리에서 사라진 앱 제거
-        if HEAX.get("servers_url"):
-            discovered = await _discover_heax()
-            if discovered is None:
-                # 폴링 실패 — 마지막 정상 상태를 그대로 유지한다(제거 금지).
-                _HEAX_FAILS["n"] += 1
-                log.warning("heax registry 연속 실패 %d회 — 기존 앱 %d개 유지",
-                            _HEAX_FAILS["n"],
-                            sum(1 for k in backends if k.startswith(HEAX_PREFIX)))
-                discovered = {}
-                _allow_removal = False
-            else:
-                _HEAX_FAILS["n"] = 0
-                _allow_removal = True
-            for key, spec in discovered.items():
-                # 표시 정보는 백엔드 합류 여부와 무관하게 항상 갱신한다 — 이미 붙어 있는 앱도
-                # registry 에서 이름이 바뀔 수 있고, 라벨은 세션 생존과 별개다.
-                DISCOVERED_META[key] = {"label": spec.get("label") or "",
-                                        "description": spec.get("description") or ""}
-                if key in backends:
-                    continue
-                b = _Backend(key, spec["url"], spec.get("headers"))
-                backends[key] = b
-                POLICY[key] = spec.get("allowed_groups") or []   # heax 앱의 그룹 필터 반영
-                await tg.start(b.run)
-                await b._ready.wait()
-                if b.session is not None:
-                    log.info("heax MCP %s 합류 (%s)", key, spec["url"])
-                    revived = True
-            for key in ([k for k in list(backends)
-                         if k.startswith(HEAX_PREFIX) and k not in discovered]
-                        if _allow_removal else []):
-                backends.pop(key)._stop.set()
-                POLICY.pop(key, None)
-                log.info("heax MCP %s 제거 (레지스트리에서 사라짐)", key)
-                revived = True
-        # ── 연결된 백엔드의 도구 목록 재확인(G3) ──────────────────────────────
-        # 앱 인스턴스가 교체돼도(SIF 재빌드·재기동) run() 은 _stop 대기로 park 중이라 예외가
-        # 나지 않아 session 객체가 살아 있는 것처럼 남는다. 그러면 아래 재연결 루프가
-        # 건너뛰고 카탈로그는 옛 도구로 굳는다 — 새 도구가 게이트웨이 재기동 전까지 안 보였다.
-        # 주기적으로 list_tools 를 다시 받아 (a) 죽은 세션을 감지해 재연결 대상으로 돌리고
-        # (b) 도구 구성이 바뀌었으면 재집계한다. 백엔드당 60초에 1회라 비용은 무시할 수준.
-        for key, b in list(backends.items()):
-            if b.session is None:
-                continue
-            try:
-                with anyio.fail_after(LIVENESS_TIMEOUT_S):
-                    res = await b.session.list_tools()
-                now = {t.name for t in res.tools}
-                prev = {orig for (bk, orig) in route.values() if bk == key}
-                if now != prev:
-                    log.info("backend %s 도구 구성 변경 (%d→%d) — 재집계",
-                             key, len(prev), len(now))
-                    revived = True
-            except Exception as exc:  # noqa: BLE001 — 죽은 세션 → 아래 재연결 루프가 처리
-                log.warning("backend %s liveness 실패 (%r) — 재연결 예약", key, exc)
-                b.session = None
-
-        for key, b in backends.items():
-            if b.session is not None:
-                continue
-            try:
-                # LIVENESS_TIMEOUT_S 는 위 list_tools 한 곳에만 걸려 있었고 재연결 경로엔
-                # 아무 데드라인이 없었다. 여기서 멈추면 '예외'가 아니라 '행'이라 except 도
-                # 안 걸리고, MCP 클라이언트 기본 read timeout(300s)이 만료될 때까지 revive
-                # 루프 전체가 얼어붙는다 — 그동안 로그도 완전 무음이다.
-                # anyio 는 start() 대기가 취소되면 방금 띄운 자식 태스크도 함께 취소한다.
-                with anyio.move_on_after(LIVENESS_TIMEOUT_S) as _sc:
-                    await b.reconnect(tg)
-                    await b._ready.wait()
-                if _sc.cancel_called:
-                    log.warning("backend %s 재연결 타임아웃(%.0fs) — 다음 주기에 재시도",
-                                key, LIVENESS_TIMEOUT_S)
-                elif b.session is not None:
-                    log.info("backend %s revived — re-aggregating tools", key)
-                    revived = True
-            except Exception as exc:  # noqa: BLE001 — 다음 주기에 재시도
-                log.debug("revive %s failed: %r", key, exc)
-        # 호출 경로(_call_tool)에서 재연결이 일어났으면 그쪽은 카탈로그를 못 고치므로 여기서 갱신.
-        if _REAGG.pop("pending", False):
-            revived = True
-        if revived:
-            try:
-                await _aggregate()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("re-aggregate after revive failed: %r", exc)
+        try:
+            await _revive_once(tg)
+        except Exception as exc:  # noqa: BLE001 — 한 주기 실패가 루프를 죽이면 안 된다
+            log.warning("revive 주기 실패: %r", exc)
 
 
 @asynccontextmanager
@@ -983,6 +994,37 @@ def _bearer_gate(app, pat_verifier=None):
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": body})
+            return
+        if scope.get("path") == "/refresh" and scope.get("method") == "POST":
+            # 외부 MCP 의 기능 변경을 **즉시** 반영시키는 트리거. 주기 루프가 60초마다 같은
+            # 일을 하지만, 배포 직후 검증(update-all)이 그때까지 옛 목록으로 판정하게 된다.
+            # 백엔드에 I/O 를 일으키므로 GW_TOKEN 을 요구한다(무인증 /health·/tools-map 과 다름).
+            if dict(scope.get("headers") or {}).get(b"authorization", b"").decode("latin-1") != expected:
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": b'{"error":"unauthorized"}'})
+                return
+            _tg = _task_group_holder.get("tg")
+            if _tg is None:
+                await send({"type": "http.response.start", "status": 503,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": b'{"error":"not ready"}'})
+                return
+            _before = len(exposed_tools)
+            try:
+                _changed = await _revive_once(_tg)
+                _body = json.dumps({"ok": True, "changed": bool(_changed),
+                                    "tools_before": _before, "tools": len(exposed_tools),
+                                    "backends": {k: (b.session is not None)
+                                                 for k, b in backends.items()}}).encode()
+                _status = 200
+            except Exception as exc:  # noqa: BLE001 — 트리거 실패가 게이트웨이를 죽이면 안 된다
+                log.warning("/refresh 실패: %r", exc)
+                _body = json.dumps({"ok": False, "error": str(exc)[:200]}).encode()
+                _status = 500
+            await send({"type": "http.response.start", "status": _status,
+                        "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": _body})
             return
         if scope.get("path", "").startswith("/api/"):
             # REST 프록시: GW_TOKEN이 아니라 라우트 핸들러가 포털 PAT(JWKS)로 자체 인증.

@@ -832,6 +832,30 @@ LIST_APPS_TOOL = types.Tool(
 )
 
 
+INVOKE_TOOL = types.Tool(
+    name="invoke_tool",
+    description=(
+        "게이트웨이의 아무 도구나 **이름으로 즉시 호출**한다 — search_tools 로 찾은 도구가 "
+        "현재 목록에 바인딩돼 있지 않아도 이걸로 바로 쓸 수 있다(웹 챗의 '찾은 즉시 호출' 경로). "
+        "arguments 는 그 도구의 스키마를 따라야 한다 — search_tools 결과의 args 를 참고하고, "
+        "모르면 추측하지 말고 search_tools/list_tool_apps 로 먼저 확인하라. "
+        "안전장치: 파괴·제어성 도구(delete_/remove_/cancel_/purge_/…_control/…_set_state)는 "
+        "여기로 못 부른다 — 그런 작업은 직접 바인딩된 도구로만 한다."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "호출할 도구 이름(search_tools 결과의 tool)"},
+            "arguments": {"type": "object", "description": "그 도구에 넘길 인자 객체"},
+        },
+        "required": ["name"],
+    },
+)
+# 범용 실행기로는 못 부르는 것 — 한 번의 환각이 곧 파괴가 되는 도구들. 직접 바인딩 전용.
+_INVOKE_DENY_PREFIX = ("delete_", "remove_", "cancel_", "purge_", "destroy_")
+_INVOKE_DENY_SUFFIX = ("_control", "_set_state")
+
+
 SEARCH_TOOLS_TOOL = types.Tool(
     name="search_tools",
     description=(
@@ -895,14 +919,27 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
         if score > 0:
             # 커버리지 승수 — 질의어를 더 많이 맞힌 도구가 개별 단어 빈도보다 앞선다.
             rows.append((score * (1 + covered / max(1, len(terms))),
-                         t.name, app, (t.description or "").strip()[:220]))
+                         t.name, app, (t.description or "").strip()[:220], t))
     rows.sort(key=lambda r: (-r[0], r[1]))
+
+    def _args_summary(t) -> dict:
+        """invoke_tool 로 바로 부를 수 있게 인자 요약을 붙인다 — 이게 없으면 모델이
+        스키마를 추측해 넣는다(범용 실행기의 최대 실패 모드)."""
+        sch = getattr(t, "inputSchema", None) or {}
+        props = sch.get("properties") or {}
+        return {
+            "required": sch.get("required") or [],
+            "properties": {k: str((v or {}).get("type") or "any")
+                           for k, v in list(props.items())[:12]},
+        }
     payload = {
         "query": q,
-        "matches": [{"tool": n, "app": a, "description": d} for _, n, a, d in rows[:limit]],
+        "matches": [{"tool": n, "app": a, "description": d, "args": _args_summary(t)}
+                    for _, n, a, d, t in rows[:limit]],
         "match_count": len(rows),
-        "note": "여기 나온 도구는 이름으로 바로 호출 가능하다. 원하는 게 없으면 "
-                "질문을 바꿔 다시 검색하거나 list_tool_apps(app='<키>') 로 앱 상세를 보라.",
+        "note": "여기 나온 도구는 현재 목록에 없어도 invoke_tool(name, arguments) 로 즉시 "
+                "호출할 수 있다(args 의 required 를 채워라). 원하는 게 없으면 질문을 바꿔 "
+                "다시 검색하거나 list_tool_apps(app='<키>') 로 앱 상세를 보라.",
     }
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
@@ -918,7 +955,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     by_app: dict[str, list[types.Tool]] = {}
     for t in exposed_tools:
         by_app.setdefault(route[t.name][0], []).append(t)
-    by_app.setdefault("_gateway", []).extend([SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL])
+    by_app.setdefault("_gateway", []).extend([SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL])
     # 연결이 끊긴 백엔드는 도구가 집계되지 않아 목록에서 통째로 사라진다 — 접근성 점검이
     # 목적이므로 '앱은 있는데 지금 불통'을 보이게 빈 항목으로 채운다.
     for _k in backends:
@@ -966,7 +1003,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
 
 def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
-    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL]
+    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL]
 
 
 def _request_groups() -> list[str]:
@@ -1080,6 +1117,25 @@ async def _list_tools():
 @_low.call_tool(validate_input=False)
 async def _call_tool(name: str, arguments: dict):
     t0 = time.monotonic()
+    # 범용 실행기 — 이름·인자를 안쪽 도구로 바꿔 끼우고 **아래 정상 경로를 그대로 탄다**
+    # (인가·캐시·사용자 위임·감사 전부 기존 로직 적용). 재귀·파괴 도구만 여기서 차단.
+    if name == INVOKE_TOOL.name:
+        inner = str((arguments or {}).get("name") or "").strip()
+        inner_args = (arguments or {}).get("arguments") or {}
+        if not inner or inner == INVOKE_TOOL.name:
+            return types.CallToolResult(content=[types.TextContent(
+                type="text", text="invoke_tool: name 에 호출할 도구 이름을 주세요.")], isError=True)
+        if inner.startswith(_INVOKE_DENY_PREFIX) or inner.endswith(_INVOKE_DENY_SUFFIX):
+            _audit(name, None, False, f"invoke-denied:{inner}", 0)
+            return types.CallToolResult(content=[types.TextContent(
+                type="text", text=(f"invoke_tool: '{inner}' 은 파괴·제어성 도구라 범용 실행기로 "
+                                   "부를 수 없습니다. 직접 바인딩된 도구로만 호출하세요."))],
+                isError=True)
+        if not isinstance(inner_args, dict):
+            return types.CallToolResult(content=[types.TextContent(
+                type="text", text="invoke_tool: arguments 는 객체여야 합니다.")], isError=True)
+        log.info("invoke_tool → %s", inner)
+        name, arguments = inner, inner_args
     if name == SAVE_CONV_TOOL.name:  # 게이트웨이 로컬 도구(백엔드 라우팅 없음)
         return await _save_conversation(arguments or {})
     if name == SEARCH_CONV_TOOL.name:

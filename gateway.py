@@ -832,6 +832,83 @@ LIST_APPS_TOOL = types.Tool(
 )
 
 
+SEARCH_TOOLS_TOOL = types.Tool(
+    name="search_tools",
+    description=(
+        "하고 싶은 일을 한 문장으로 주면 맞는 도구를 이름·설명에서 찾아 추천한다(전 앱 대상). "
+        "맞는 도구가 안 보이거나 앱이 많아 고르기 어려울 때 **먼저** 이걸 호출하라 — "
+        "기본 노출에서 숨겨진 도구도 여기서는 전부 찾아진다. 결과의 도구는 이름으로 바로 호출 "
+        "가능하다. 결과가 비면 list_tool_apps 로 앱 목록을 훑어라."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "하고 싶은 일(한국어/영어, 예: '과거 보고서 요약', 'mesh quality check')"},
+            "limit": {"type": "integer", "description": "최대 결과 수(기본 8)"},
+        },
+        "required": ["query"],
+    },
+)
+
+
+async def _search_tools(arguments: dict) -> types.CallToolResult:
+    """도구 검색 안내대 — 351개 평면 노출의 선택 비용을 줄이는 입구(실측: 상위 40개가
+    호출의 79%, 30%는 한 번도 안 불림 — 롱테일은 검색으로 찾게 한다). 임베딩 없이
+    부분문자열 매칭(한국어는 조사 탓에 토큰 경계가 흐려 substring 이 더 잘 맞는다)."""
+    q = str((arguments or {}).get("query") or "").strip().lower()
+    limit = max(1, min(20, int((arguments or {}).get("limit") or 8)))
+    if len(q) < 2:
+        return types.CallToolResult(content=[types.TextContent(
+            type="text", text='{"error": "query 를 2자 이상 주세요"}')], isError=True)
+    terms = [w for w in re.split(r"[\s,;·/()\[\]{}\"']+", q) if len(w) >= 2]
+    # 도구 이름이 전부 영어라 한국어 질의가 이름을 못 맞힌다 — 도메인 동의어로 넓힌다.
+    # (조사가 붙어도 substring 이라 '보고서를'→'보고서' 매칭은 된다.)
+    _SYN = {
+        "보고서": ("report",), "리포트": ("report",), "요약": ("digest", "summary"),
+        "검색": ("search",), "조회": ("get", "list", "search"), "목록": ("list",),
+        "물성": ("material", "property"), "재료": ("material",), "곡선": ("curve",),
+        "잡": ("job",), "작업": ("job",), "상태": ("status", "health"),
+        "슬럼": ("slurm",), "슬럼잡": ("slurm",), "클러스터": ("cluster",),
+        "메쉬": ("mesh",), "메시": ("mesh",), "형상": ("geometry", "shape"),
+        "시험": ("test",), "측정": ("measure",), "업로드": ("upload",),
+        "그래프": ("plot", "chart"), "차트": ("chart", "plot"), "그림": ("plot", "render"),
+        "템플릿": ("template",), "초안": ("draft",), "전문가": ("agent", "expert"),
+        "부품": ("part",), "적층": ("laminate",), "대화": ("conversation",),
+    }
+    expand = {w: (w,) + tuple(s for k, ss in _SYN.items() if k in w for s in ss) for w in terms}
+    groups = _request_groups()
+    rows = []
+    for t in _visible_tools(groups):
+        name = t.name.lower()
+        desc = (t.description or "").lower()
+        app = route.get(t.name, ("_gateway",))[0]
+        meta = _app_meta(app) if app != "_gateway" else {"label": "gateway", "description": ""}
+        hay_app = (str(meta.get("label") or "") + " " + str(meta.get("description") or "")).lower()
+        score, covered = 0, 0
+        for w, variants in expand.items():
+            name_hit = any(v in name for v in variants)
+            desc_freq = max(min(desc.count(v), 3) for v in variants)
+            app_hit = any(v in hay_app for v in variants)
+            if name_hit or desc_freq or app_hit:
+                covered += 1
+                score += 4 * name_hit + desc_freq + app_hit
+        if score > 0:
+            # 커버리지 승수 — 질의어를 더 많이 맞힌 도구가 개별 단어 빈도보다 앞선다.
+            rows.append((score * (1 + covered / max(1, len(terms))),
+                         t.name, app, (t.description or "").strip()[:220]))
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    payload = {
+        "query": q,
+        "matches": [{"tool": n, "app": a, "description": d} for _, n, a, d in rows[:limit]],
+        "match_count": len(rows),
+        "note": "여기 나온 도구는 이름으로 바로 호출 가능하다. 원하는 게 없으면 "
+                "질문을 바꿔 다시 검색하거나 list_tool_apps(app='<키>') 로 앱 상세를 보라.",
+    }
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
+    )
+
+
 async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     groups = _request_groups()
     want_app = str((arguments or {}).get("app") or "").strip()
@@ -841,7 +918,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     by_app: dict[str, list[types.Tool]] = {}
     for t in exposed_tools:
         by_app.setdefault(route[t.name][0], []).append(t)
-    by_app.setdefault("_gateway", []).extend([SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL])
+    by_app.setdefault("_gateway", []).extend([SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL])
     # 연결이 끊긴 백엔드는 도구가 집계되지 않아 목록에서 통째로 사라진다 — 접근성 점검이
     # 목적이므로 '앱은 있는데 지금 불통'을 보이게 빈 항목으로 채운다.
     for _k in backends:
@@ -889,7 +966,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
 
 def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
-    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL]
+    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL]
 
 
 def _request_groups() -> list[str]:
@@ -1009,6 +1086,8 @@ async def _call_tool(name: str, arguments: dict):
         return await _search_conversations(arguments or {})
     if name == LIST_APPS_TOOL.name:
         return await _list_tool_apps(arguments or {})
+    if name == SEARCH_TOOLS_TOOL.name:
+        return await _search_tools(arguments or {})
     if name not in route:
         _audit(name, None, False, "unknown tool", 0)
         return types.CallToolResult(

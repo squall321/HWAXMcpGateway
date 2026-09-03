@@ -83,6 +83,46 @@ PER_USER_SSO: dict[str, dict] = {k: v for k, v in (HEAX.get("per_user_sso") or {
 # 짧게 잡으면 재발급이 잦아 백엔드에 폐기 토큰 행이 쌓인다(발급이 직전 것을 회수하는 구조).
 USER_PAT_TTL_S = int(os.environ.get("GATEWAY_USER_PAT_TTL", "43200"))
 
+# ── 포털 등록 연결 토큰으로 위임하는 백엔드(사용자 발안 2026-09-03) ──────────────
+# 사용자가 해당 서비스(RA)에서 직접 발급받은 PAT 를 포털 API 토큰 페이지에 등록하면,
+# 게이트웨이가 호출 시 포털 /internal/connections 에서 그 토큰을 읽어 그 사람 명의로
+# 부른다. 미등록 사용자는 종전대로 서비스 계정(폴백 유지 — 등록은 점진 전환).
+# {backend_key: 포털 service 이름}. 인증은 GW_TOKEN 공유 시크릿(포털 쪽 동일 값 필요).
+PORTAL_CONN_BACKENDS: dict[str, str] = {"reportarchive": "reportarchive"}
+PORTAL_CONN_TTL_S = int(os.environ.get("GATEWAY_CONN_TTL", "300"))
+# {(service,email): (conn|None, 만료 monotonic)} — None 은 '등록 없음' 부정 캐시.
+_CONN_CACHE: dict[tuple[str, str], tuple[dict | None, float]] = {}
+
+
+async def _portal_connection(service: str, email: str) -> dict | None:
+    """포털에 등록된 사용자 연결 토큰 {token, workspace} — 없거나 실패면 None(서비스 계정 폴백)."""
+    key = (service, email)
+    hit = _CONN_CACHE.get(key)
+    if hit and hit[1] > time.monotonic():
+        return hit[0]
+    base = (PORTAL.get("api_base") or "").rstrip("/")
+    conn: dict | None = None
+    if base:
+        try:
+            async with httpx.AsyncClient(timeout=8) as cli:
+                resp = await cli.get(f"{base}/internal/connections/{service}",
+                                     params={"email": email},
+                                     headers={"Authorization": f"Bearer {GW_TOKEN}"})
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict) and data.get("token"):
+                    conn = {"token": data["token"], "workspace": data.get("workspace") or ""}
+            elif resp.status_code not in (404,):
+                log.warning("portal connection lookup %s/%s → HTTP %s", service, email,
+                            resp.status_code)
+        except Exception as exc:  # noqa: BLE001 — 조회 실패는 서비스 계정 폴백(가용성 우선)
+            log.warning("portal connection lookup failed (%r) — 서비스 계정 폴백", exc)
+            # 실패는 짧게만 캐시해 포털 복구가 빨리 반영되게 한다.
+            _CONN_CACHE[key] = (None, time.monotonic() + 30)
+            return None
+    _CONN_CACHE[key] = (conn, time.monotonic() + PORTAL_CONN_TTL_S)
+    return conn
+
 # ── 읽기 전용 응답 캐시 ───────────────────────────────────────────────────────
 # 심의는 좌석 수만큼 **같은 조회를 반복한다.** 실측(2026-09-02 솔더볼 심의): hwax 도구
 # 728회 중 124회(17%)가 (도구,인자) 완전 동일이었고 `get_model_info {}` 하나가 29회,
@@ -926,14 +966,17 @@ async def _user_pat(app_id: str, email: str, *, force: bool = False) -> str:
         return tok
 
 
-async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: str, timeout_s: float):
+async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: str, timeout_s: float,
+                        extra_headers: dict | None = None):
     """이 호출만을 위한 단발 세션으로 백엔드를 부른다.
 
     영속 세션은 열 때의 헤더(서비스 계정)를 그대로 물고 있어 호출별 자격증명 교체가 안 된다.
     사용자별 스코프가 필요한 백엔드는 그래서 세션을 매번 새로 연다 — 핸드셰이크 비용이
     붙지만 대상이 로컬 앱이고, 대안은 '남의 데이터가 보이거나 아무것도 안 보이는' 둘 뿐이다.
+    extra_headers 는 Authorization 외 헤더 교체용(예: RA 의 X-Workspace-Slug 를 그 사용자
+    부서로) — 서비스 계정 헤더 위에 덮어쓴다.
     """
-    hdrs = {**(b.headers or {}), "Authorization": f"Bearer {token}"}
+    hdrs = {**(b.headers or {}), "Authorization": f"Bearer {token}", **(extra_headers or {})}
     with anyio.fail_after(timeout_s):
         async with streamablehttp_client(b.url, headers=hdrs) as (read, write, _sid):
             async with ClientSession(read, write) as sess:
@@ -1021,6 +1064,35 @@ async def _call_tool(name: str, arguments: dict):
                     )
                 _audit(name, backend_key, not getattr(res, "isError", False),
                        f"as:{email}", round((time.monotonic() - t0) * 1000))
+                return _cache_put(ckey, res)
+    elif backend_key in PORTAL_CONN_BACKENDS:
+        # 포털 등록 연결 토큰 위임(RA 등) — 등록한 사용자만 본인 명의, 나머지는 서비스 계정.
+        email = _request_user()
+        if not email:
+            note = "no-identity"
+        else:
+            conn = await _portal_connection(PORTAL_CONN_BACKENDS[backend_key], email)
+            if conn is None:
+                note = "no-connection"   # 미등록 — 종전 서비스 계정 경로로 폴백
+            else:
+                extra = {"X-Workspace-Slug": conn["workspace"]} if conn.get("workspace") else None
+                try:
+                    res = await _call_as_user(b, original, arguments, conn["token"],
+                                              CALL_TIMEOUT_S, extra_headers=extra)
+                except Exception as exc:  # noqa: BLE001
+                    _audit(name, backend_key, False, f"conn-user: {exc!r}",
+                           round((time.monotonic() - t0) * 1000))
+                    # 서비스 계정으로 조용히 강등하지 않는다 — 강등하면 보고서가 다시
+                    # 서비스 계정 명의로 쌓여 오귀속이 재발한다. 재등록을 안내한다.
+                    return types.CallToolResult(
+                        content=[types.TextContent(type="text", text=(
+                            f"{backend_key}: {email} 의 등록 토큰으로 호출하지 못했습니다 "
+                            f"({exc!r}). 포털 API 토큰 페이지에서 Report Archive 토큰을 "
+                            "다시 등록하세요(만료·폐기 가능성)."))],
+                        isError=True,
+                    )
+                _audit(name, backend_key, not getattr(res, "isError", False),
+                       f"as-conn:{email}", round((time.monotonic() - t0) * 1000))
                 return _cache_put(ckey, res)
 
     # 이 호출이 쓰는 세션의 세대. 실패했을 때 "내가 죽었다고 본 그 세션" 을 가리키므로,

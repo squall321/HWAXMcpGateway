@@ -120,7 +120,9 @@ async def _portal_connection(service: str, email: str) -> dict | None:
             # 실패는 짧게만 캐시해 포털 복구가 빨리 반영되게 한다.
             _CONN_CACHE[key] = (None, time.monotonic() + 30)
             return None
-    _CONN_CACHE[key] = (conn, time.monotonic() + PORTAL_CONN_TTL_S)
+    # '등록 없음'(404)도 30초만 — 방금 등록한 사용자가 5분을 기다리게 하지 않는다.
+    ttl = PORTAL_CONN_TTL_S if conn else 30
+    _CONN_CACHE[key] = (conn, time.monotonic() + ttl)
     return conn
 
 # ── 읽기 전용 응답 캐시 ───────────────────────────────────────────────────────
@@ -974,9 +976,16 @@ async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: st
     사용자별 스코프가 필요한 백엔드는 그래서 세션을 매번 새로 연다 — 핸드셰이크 비용이
     붙지만 대상이 로컬 앱이고, 대안은 '남의 데이터가 보이거나 아무것도 안 보이는' 둘 뿐이다.
     extra_headers 는 Authorization 외 헤더 교체용(예: RA 의 X-Workspace-Slug 를 그 사용자
-    부서로) — 서비스 계정 헤더 위에 덮어쓴다.
+    부서로) — 같은 이름의 서비스 계정 헤더를 대소문자 무관하게 밀어내고, 값이 None 이면
+    **삭제**한다(사용자 부서가 비었을 때 서비스 부서가 새어 들어가 "부서를 찾을 수
+    없습니다: dev" 가 나던 누수를 막는다 — cae00 실사고 2026-09-03).
     """
-    hdrs = {**(b.headers or {}), "Authorization": f"Bearer {token}", **(extra_headers or {})}
+    base = dict(b.headers or {})
+    if extra_headers:
+        drop = {k.lower() for k in extra_headers}
+        base = {k: v for k, v in base.items() if k.lower() not in drop}
+    hdrs = {**base, "Authorization": f"Bearer {token}",
+            **{k: v for k, v in (extra_headers or {}).items() if v is not None}}
     with anyio.fail_after(timeout_s):
         async with streamablehttp_client(b.url, headers=hdrs) as (read, write, _sid):
             async with ClientSession(read, write) as sess:
@@ -1075,7 +1084,9 @@ async def _call_tool(name: str, arguments: dict):
             if conn is None:
                 note = "no-connection"   # 미등록 — 종전 서비스 계정 경로로 폴백
             else:
-                extra = {"X-Workspace-Slug": conn["workspace"]} if conn.get("workspace") else None
+                # 사용자 부서가 비어 있으면 헤더를 **지운다**(None) — 서비스 계정의
+                # X-Workspace-Slug 가 남으면 그 부서 명의 오류가 사용자에게 뒤집어씌워진다.
+                extra = {"X-Workspace-Slug": conn.get("workspace") or None}
                 try:
                     res = await _call_as_user(b, original, arguments, conn["token"],
                                               CALL_TIMEOUT_S, extra_headers=extra)

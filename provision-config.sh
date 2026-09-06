@@ -388,6 +388,10 @@ if e.get("MXWP_MCP"):
 # AIDH MCP 는 api_server 에 내장(:8001/mcp, auth_required=false → 무인증) — 항상 포함.
 cfg["ai-data-hub"] = {"url": _url("AIDH_MCP_URL", "ai-data-hub", "http://127.0.0.1:8001/mcp/"),
                       "transport": "streamable_http"}
+# SmartTwinMCP(:5013) — 해석 잡 제출·후처리·수집. smart-twin-cluster(:5012, 대시보드 slurm 조회)와
+# 별개 서버다. 이게 없으면 잡을 던질 수는 있어도 후처리·결과 수집 도구가 통째로 안 보인다.
+cfg["smart-twin-mcp"] = {"url": _url("SMARTTWIN_MCP_URL", "smart-twin-mcp", "http://127.0.0.1:5013/mcp"),
+                         "transport": "streamable_http"}
 # 심의 MCP 는 HWAXAgentServer 에 내장(:9009/mcp, 루프백 무인증) — 항상 포함.
 # 이게 없으면 MCP 클라이언트에서 심의를 시작할 방법이 아예 없다(도구 목록에 진입점 0개).
 cfg["hwax-deliberation"] = {"url": _url("DELIB_MCP_URL", "hwax-deliberation", "http://127.0.0.1:9009/mcp/"),
@@ -472,7 +476,8 @@ if e.get("HEAX_MCP_TOKEN"):
 # 관리 키 중 토큰이 필요한 것(reportarchive·odb-hub)은 env 가 없어도 직전 config 에서
 # 이어받으므로(_carry) 여기까지 와서 사라지는 일은 없다.
 MANAGED = {"_gateway", "reportarchive", "signalforge", "mx-white-paper",
-           "ai-data-hub", "hwax-deliberation", "rest", "portal", "heax_registry", "odb-hub", "arp"}
+           "ai-data-hub", "hwax-deliberation", "smart-twin-mcp",
+           "rest", "portal", "heax_registry", "odb-hub", "arp"}
 try:
     with open(e["CFG"]) as f:
         prev = json.load(f)

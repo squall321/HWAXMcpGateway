@@ -795,9 +795,14 @@ APP_META: dict[str, dict] = {
     # 이 라벨은 챗 에이전트가 보는 도구 설명 앞에 그대로 붙고 search_tools 매칭 대상이기도 하다.
     # '심의' 를 찾는 요청이 여기로 오게 하려면 라벨에 그 낱말이 있어야 한다 — 없던 시절엔
     # 이름에 '심의' 가 든 유일한 앱(발표자료 생성기)으로 수렴해 슬라이드를 만들었다(실사고).
+    # ⚠ 이 description 은 앱의 전 도구에 검색 가산점(app_hit)을 준다 — 사용자가 쓰는 업무 낱말을
+    # 여기 다 넣어야 그 낱말로 찾을 때 심의가 후보에 오른다. 낱말이 빠지면 '원인 규명'·'리스크'로
+    # 검색해도 심의가 순위권 밖으로 밀린다(실측).
     "hwax-deliberation": {"label": "HWAX 전문가 심의",
                           "description": "전문가 심의 엔진 — 여러 도메인 좌석이 라운드를 돌며 도구 근거 위에서 수렴해 "
-                                         "의사결정문을 만든다. 범용 심의·시뮬레이션 심의(메커니즘→해석 설계)·시험 계획 심의. "
+                                         "결정 문서를 만든다. 원인 규명·불량 원인 분석·안 선택·트레이드오프 결정·"
+                                         "신뢰 판정·리스크 심사·위험 도출·해석 설계·시뮬레이션 심의·시험 계획·"
+                                         "시험 설계·구축 계획·메커니즘 규명. 포털 웹 심의와 같은 엔진이며 "
                                          "심의는 길어서 시작·조회·회수 3단이다."},
     "_gateway": {"label": "게이트웨이 공통",
                  "description": "앱·도구 카탈로그와 대화 저장 등 게이트웨이 자체 기능."},
@@ -905,6 +910,15 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
         "그래프": ("plot", "chart"), "차트": ("chart", "plot"), "그림": ("plot", "render"),
         "템플릿": ("template",), "초안": ("draft",), "전문가": ("agent", "expert"),
         "부품": ("part",), "적층": ("laminate",), "대화": ("conversation",),
+        # 심의 계열 — 도구 이름이 deliberate_* 라 한국어 업무 낱말이 이름을 못 맞힌다.
+        # 앱 설명만으로는 app_hit 가산점뿐이라 다른 앱에 밀린다(실측: '안 선택' 이 물성·VOC 에 밀림).
+        # 이름까지 맞히게 이어 준다 — 한 글자 토큰('안')은 위에서 이미 버려지므로 두 글자 이상만.
+        "심의": ("deliberate",), "토의": ("deliberate",), "심사": ("deliberate", "risk"),
+        "규명": ("deliberate",), "원인": ("deliberate",), "불량": ("deliberate",),
+        "선택": ("deliberate",), "대안": ("deliberate",), "판정": ("deliberate",),
+        "신뢰": ("deliberate",), "리스크": ("deliberate", "risk"), "위험": ("deliberate", "risk"),
+        "도출": ("deliberate",), "설계": ("deliberate",), "계획": ("deliberate", "plan"),
+        "전문가심의": ("deliberate",), "회의": ("deliberate", "meeting"),
     }
     expand = {w: (w,) + tuple(s for k, ss in _SYN.items() if k in w for s in ss) for w in terms}
     groups = _request_groups()
@@ -1318,6 +1332,10 @@ def _bearer_gate(app, pat_verifier=None):
             for _t in list(exposed_tools) + [SAVE_CONV_TOOL, SEARCH_CONV_TOOL]:
                 _map.setdefault(_t.name, "_gateway")
             _map.setdefault(LIST_APPS_TOOL.name, "_gateway")
+            # search_tools·invoke_tool 도 게이트웨이 로컬이다 — 빠뜨리면 /tools-map 의 _gateway
+            # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
+            for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL):
+                _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서
             # 통째로 사라진다. backends 를 먼저 채워 '앱은 있는데 지금 불통'을 보이게 한다.

@@ -1066,13 +1066,18 @@ _USER_PAT_LOCKS: dict[tuple[str, str], anyio.Lock] = {}
 
 async def _mint_user_pat(conf: dict, email: str) -> str:
     """백엔드의 게이트웨이 SSO 로 이 사용자의 PAT 를 발급받는다. 실패 시 예외."""
+    headers = {
+        "X-Heax-Gateway-Secret": conf["secret"],
+        "X-Heax-User-Email": email,
+        # 클라이언트를 구분해야 이 발급이 사용자의 웹 세션 토큰을 회수하지 않는다.
+        "X-Heax-Client": conf.get("client") or "deliberation",
+    }
+    # heax-hub 앱(SIF)은 재배포마다 포트가 바뀐다 — 직접 포트를 박으면 다음 배포에 조용히 끊긴다.
+    # 그래서 sso_url 을 Caddy 경로로 두고, 그 라우트의 forward_auth 를 서비스 토큰으로 통과한다.
+    if conf.get("auth") == "heax" and HEAX.get("token"):
+        headers["Authorization"] = f"Bearer {HEAX['token']}"
     async with httpx.AsyncClient(timeout=15) as cli:
-        resp = await cli.post(conf["sso_url"], headers={
-            "X-Heax-Gateway-Secret": conf["secret"],
-            "X-Heax-User-Email": email,
-            # 클라이언트를 구분해야 이 발급이 사용자의 웹 세션 토큰을 회수하지 않는다.
-            "X-Heax-Client": conf.get("client") or "deliberation",
-        })
+        resp = await cli.post(conf["sso_url"], headers=headers)
     if resp.status_code != 200:
         raise RuntimeError(f"SSO {resp.status_code}: {resp.text[:200]}")
     data = resp.json()
@@ -1108,7 +1113,7 @@ async def _user_pat(app_id: str, email: str, *, force: bool = False) -> str:
 
 
 async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: str, timeout_s: float,
-                        extra_headers: dict | None = None):
+                        extra_headers: dict | None = None, token_header: str | None = None):
     """이 호출만을 위한 단발 세션으로 백엔드를 부른다.
 
     영속 세션은 열 때의 헤더(서비스 계정)를 그대로 물고 있어 호출별 자격증명 교체가 안 된다.
@@ -1118,12 +1123,16 @@ async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: st
     부서로) — 같은 이름의 서비스 계정 헤더를 대소문자 무관하게 밀어내고, 값이 None 이면
     **삭제**한다(사용자 부서가 비었을 때 서비스 부서가 새어 들어가 "부서를 찾을 수
     없습니다: dev" 가 나던 누수를 막는다 — cae00 실사고 2026-09-03).
+    token_header 는 사용자 자격을 Authorization 이 아닌 그 헤더로 싣는 백엔드용이다 —
+    Caddy forward_auth 뒤에 있는 heax 앱은 Authorization 을 heax 가 아는 토큰으로 지켜야
+    문을 통과하므로, 앱 전용 자격은 따로 실어야 한다(안 그러면 Caddy 가 401 로 끊는다).
     """
     base = dict(b.headers or {})
     if extra_headers:
         drop = {k.lower() for k in extra_headers}
         base = {k: v for k, v in base.items() if k.lower() not in drop}
-    hdrs = {**base, "Authorization": f"Bearer {token}",
+    auth = {token_header: token} if token_header else {"Authorization": f"Bearer {token}"}
+    hdrs = {**base, **auth,
             **{k: v for k, v in (extra_headers or {}).items() if v is not None}}
     with anyio.fail_after(timeout_s):
         async with streamablehttp_client(b.url, headers=hdrs) as (read, write, _sid):
@@ -1215,7 +1224,9 @@ async def _call_tool(name: str, arguments: dict):
             for attempt in (0, 1):   # 폐기된 캐시 토큰은 1회 재발급 후 재시도
                 try:
                     tok = await _user_pat(app_id, email, force=bool(attempt))
-                    res = await _call_as_user(b, original, arguments, tok, CALL_TIMEOUT_S)
+                    res = await _call_as_user(
+                        b, original, arguments, tok, CALL_TIMEOUT_S,
+                        token_header=PER_USER_SSO[app_id].get("token_header"))
                 except Exception as exc:  # noqa: BLE001
                     if attempt == 0:
                         log.warning("per-user call %s failed (%r) — 토큰 재발급 후 1회 재시도",

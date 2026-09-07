@@ -287,6 +287,25 @@ if [ -n "${HEAX_MCP_TOKEN:-}" ]; then
   fi
 fi
 
+# ── HWAXRisk 사용자 위임 — 리스크 심사 앱도 사용자별 시야로 답한다 ────────────
+# 이 앱은 과제를 소유자·멤버·조직공개로 나눠 보여주므로, 서비스 계정 하나로 부르면 과제가
+# 0건이다(2026-09-07 실측). 시크릿은 앱 데이터 디렉터리의 secrets.env 에 있다. 주소는
+# 앱 포트가 아니라 Caddy 경로로 잡는다 — SIF 재배포마다 포트가 바뀌기 때문이다(9293→9295 실측).
+# 그 라우트는 forward_auth 가 걸려 있어 게이트웨이가 heax 서비스 토큰을 함께 보낸다(auth=heax).
+HR_SECRETS="$PARENT/HEAXHub/var/app_data/hwax_risk/secrets.env"
+HR_SSO_SECRET="$(awk -F= '/^HWAXRISK_HEAX_GATEWAY_SECRET=/{sub(/^[^=]*=/,"");print;exit}' \
+    "$HR_SECRETS" 2>/dev/null || true)"
+if [ -n "$HR_SSO_SECRET" ]; then
+  HWAXRISK_SSO_SECRET="$HR_SSO_SECRET"
+  echo "  ✓ HWAXRisk 사용자 위임 활성 — 심의·챗이 호출자 본인 과제를 본다"
+elif [ -d "$PARENT/HEAXHub/var/app_data/hwax_risk" ]; then
+  echo "  ⚠ $HR_SECRETS 에 HWAXRISK_HEAX_GATEWAY_SECRET 없음 — 리스크 앱은 조직공개 과제만 보인다"
+  echo "    발급) python3 -c 'import secrets;print(secrets.token_urlsafe(32))' 값을 그 파일에 넣고 chmod 600."
+else
+  echo "  · HEAXHub 에 hwax_risk 앱 데이터 없음 — 리스크 앱 사용자 위임 생략"
+fi
+unset HR_SECRETS HR_SSO_SECRET
+
 if [ -n "${ARP_BASE:-}" ]; then
   echo "  ✓ ARP(AI Ready Portal) — ${ARP_BASE}/mcp 로 등록"
 else
@@ -312,6 +331,7 @@ RA_WORKSPACE_SLUG="${RA_WORKSPACE_SLUG:-}" \
 RA_MCP_URL="${RA_MCP_URL:-}" SF_MCP_URL="${SF_MCP_URL:-}" MXWP_MCP_URL="${MXWP_MCP_URL:-}" \
 AIDH_MCP_URL="${AIDH_MCP_URL:-}" AIDH_REST_BASE="${AIDH_REST_BASE:-}" \
 MXWP_REST_BASE="${MXWP_REST_BASE:-}" SF_REST_BASE="${SF_REST_BASE:-}" \
+HWAXRISK_SSO_URL="${HWAXRISK_SSO_URL:-}" HWAXRISK_SSO_SECRET="${HWAXRISK_SSO_SECRET:-}" \
 CFG="$CFG" AGENT_DIR="$AGENT_DIR" python3 - <<'PYEOF'
 import json, os, re
 e = os.environ
@@ -467,6 +487,17 @@ if e.get("HEAX_MCP_TOKEN"):
             "sso_url": e.get("KOORM_SSO_URL") or "http://127.0.0.1:8700/api/v1/auth/sso",
             "secret": e["KOORM_SSO_SECRET"],
             "client": "deliberation"}
+    if e.get("HWAXRISK_SSO_SECRET"):
+        per_user["hwax_risk"] = {
+            "sso_url": e.get("HWAXRISK_SSO_URL") or (
+                (e.get("HEAX_MCP_BASE") or "http://127.0.0.1:4180").rstrip("/")
+                + "/apps/hwax_risk/api/auth/sso"),
+            "secret": e["HWAXRISK_SSO_SECRET"],
+            "client": "deliberation",
+            # 발급 요청은 서비스 토큰으로 Caddy 를 통과하고(auth), 실제 호출에서는 사용자 자격을
+            # Authorization 이 아니라 이 헤더로 싣는다(token_header) — 둘 다 forward_auth 때문이다.
+            "auth": "heax",
+            "token_header": "X-Heax-Sso-Assertion"}
     if per_user:
         cfg["heax_registry"]["per_user_sso"] = per_user
 # 프로비저너가 만드는 키는 아래가 전부다. 그 밖의 백엔드는 손으로 붙인 것이므로 보존한다.

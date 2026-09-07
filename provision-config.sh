@@ -292,19 +292,28 @@ fi
 # 0건이다(2026-09-07 실측). 시크릿은 앱 데이터 디렉터리의 secrets.env 에 있다. 주소는
 # 앱 포트가 아니라 Caddy 경로로 잡는다 — SIF 재배포마다 포트가 바뀌기 때문이다(9293→9295 실측).
 # 그 라우트는 forward_auth 가 걸려 있어 게이트웨이가 heax 서비스 토큰을 함께 보낸다(auth=heax).
-HR_SECRETS="$PARENT/HEAXHub/var/app_data/hwax_risk/secrets.env"
-HR_SSO_SECRET="$(awk -F= '/^HWAXRISK_HEAX_GATEWAY_SECRET=/{sub(/^[^=]*=/,"");print;exit}' \
-    "$HR_SECRETS" 2>/dev/null || true)"
+HR_DATA="$PARENT/HEAXHub/var/app_data/hwax_risk"
+HR_SECRETS="$HR_DATA/secrets.env"
+hr_secret() { awk -F= '/^HWAXRISK_HEAX_GATEWAY_SECRET=/{sub(/^[^=]*=/,"");print;exit}' "$HR_SECRETS" 2>/dev/null; }
+HR_SSO_SECRET="$(hr_secret || true)"
+if [ -z "$HR_SSO_SECRET" ] && [ -d "$HR_DATA" ]; then
+  # 없으면 여기서 만든다 — 게이트웨이와 앱만 나눠 갖는 로컬 값이고, 앱은 요청마다 secrets.env 를
+  # 다시 읽으므로 재기동도 필요 없다. 다른 시크릿이 이미 있을 수 있으니 덮지 말고 덧붙인다.
+  ( umask 177; printf 'HWAXRISK_HEAX_GATEWAY_SECRET=%s\n' \
+      "$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')" >> "$HR_SECRETS" )
+  chmod 600 "$HR_SECRETS" 2>/dev/null || true
+  HR_SSO_SECRET="$(hr_secret || true)"
+  [ -n "$HR_SSO_SECRET" ] && echo "  ✓ HWAXRisk 게이트웨이 시크릿 신규 발급 → $HR_SECRETS"
+fi
 if [ -n "$HR_SSO_SECRET" ]; then
   HWAXRISK_SSO_SECRET="$HR_SSO_SECRET"
   echo "  ✓ HWAXRisk 사용자 위임 활성 — 심의·챗이 호출자 본인 과제를 본다"
-elif [ -d "$PARENT/HEAXHub/var/app_data/hwax_risk" ]; then
-  echo "  ⚠ $HR_SECRETS 에 HWAXRISK_HEAX_GATEWAY_SECRET 없음 — 리스크 앱은 조직공개 과제만 보인다"
-  echo "    발급) python3 -c 'import secrets;print(secrets.token_urlsafe(32))' 값을 그 파일에 넣고 chmod 600."
+elif [ -d "$HR_DATA" ]; then
+  echo "  ⚠ $HR_SECRETS 에 시크릿을 쓰지 못했다 — 리스크 앱은 조직공개 과제만 보인다(권한 확인)"
 else
   echo "  · HEAXHub 에 hwax_risk 앱 데이터 없음 — 리스크 앱 사용자 위임 생략"
 fi
-unset HR_SECRETS HR_SSO_SECRET
+unset HR_DATA HR_SECRETS HR_SSO_SECRET
 
 if [ -n "${ARP_BASE:-}" ]; then
   echo "  ✓ ARP(AI Ready Portal) — ${ARP_BASE}/mcp 로 등록"

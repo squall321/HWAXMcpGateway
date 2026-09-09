@@ -303,6 +303,17 @@ class _Backend:
 backends: dict[str, _Backend] = {}
 exposed_tools: list[types.Tool] = []
 route: dict[str, tuple[str, str]] = {}  # exposed_name -> (backend_key, original_name)
+# 호출 전용 별칭 — `<백엔드키>_<도구이름>` 은 **언제나** 부를 수 있다.
+# ⚠ 없으면 도구의 노출 이름이 **제3자 앱의 가동 여부로 뒤집힌다** — 아래 _aggregate 는
+# 접두어를 "지금 붙어 있는 백엔드들 사이에서 이름이 겹칠 때만" 붙이므로, 다른 앱이
+# 재배포로 잠깐 빠지면 그 창에서 이름이 bare 로 돌아가고 클라이언트가 외운 반대쪽은
+# 항상 `unknown tool` 이 된다(실측: StepForge 의 cancel_job·system_capabilities·
+# system_status·whoami 4개가 DynaForge 하나에 물려 있었고, bare 로 노출된 나머지
+# 수백 개도 같은 조건이다).
+# ⚠ **목록에는 안 올린다** — tools/list·`/tools-map`·드리프트 검사는 `route` 만 본다.
+# 별칭을 노출하면 게이트웨이 전체가 한꺼번에 개명되는 것과 같아진다.
+# ⚠ **`route` 를 먼저 본다** — 기존 이름의 뜻은 하나도 바뀌지 않는다.
+alias_route: dict[str, tuple[str, str]] = {}
 _task_group_holder: dict[str, object] = {}
 
 
@@ -322,7 +333,10 @@ async def _aggregate():
     name_counts = Counter(t.name for _, t in collected)
     exposed_tools.clear()
     route.clear()
+    alias_route.clear()
     for key, t in collected:
+        # 충돌 여부와 **무관하게** 별칭을 등록한다(호출 전용).
+        alias_route[f"{key.replace('-', '')}_{t.name}"] = (key, t.name)
         if name_counts[t.name] > 1:
             prefix = key.replace("-", "")  # mx-white-paper -> mxwhitepaper
             exposed_name = f"{prefix}_{t.name}"
@@ -339,7 +353,8 @@ async def _aggregate():
             )
         )
         route[exposed_name] = (key, t.name)
-    log.info("AGGREGATED %d exposed tools (unique names: %d)", len(exposed_tools), len(set(route)))
+    log.info("AGGREGATED %d exposed tools (unique names: %d, call-only aliases: %d)",
+             len(exposed_tools), len(set(route)), len(alias_route))
 
 
 HEAX_PREFIX = "heax-"  # 자동탐지된 heax-hub MCP 앱 백엔드 키 프리픽스
@@ -1178,13 +1193,15 @@ async def _call_tool(name: str, arguments: dict):
         return await _list_tool_apps(arguments or {})
     if name == SEARCH_TOOLS_TOOL.name:
         return await _search_tools(arguments or {})
-    if name not in route:
+    # `route` 를 **먼저** 본다 — bare 이름의 뜻은 그대로다. 없을 때만 호출 전용 별칭.
+    resolved = route.get(name) or alias_route.get(name)
+    if resolved is None:
         _audit(name, None, False, "unknown tool", 0)
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=f"unknown tool: {name}")],
             isError=True,
         )
-    backend_key, original = route[name]
+    backend_key, original = resolved
     # tools/list에서 숨겼더라도 직접 호출을 시도할 수 있으니 호출 시점에도 인가 재확인(enforcement).
     if not _backend_allowed(backend_key, _request_groups()):
         _audit(name, backend_key, False, "forbidden", 0)

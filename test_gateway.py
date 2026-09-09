@@ -123,3 +123,75 @@ def test_aliases_do_not_change_the_visible_catalogue(monkeypatch):
     assert listed == set(gw.route), "노출 목록과 route 가 1:1 이다"
     assert len(gw.alias_route) == 4, "별칭은 백엔드×도구 전부"
     assert not (listed & (set(gw.alias_route) - set(gw.route))), "별칭이 목록에 새지 않는다"
+
+
+# ── invoke_tool 의 파괴 도구 차단이 별칭으로 뚫리지 않는가 ────────────────────
+class _CallSess:
+    """받은 호출을 기록한다 — **반환값이 아니라 피호출자 기록**으로 판정한다."""
+    def __init__(self, tools):
+        self._t = tools
+        self.calls: list[str] = []
+
+    async def list_tools(self): return _Res(self._t)
+
+    async def call_tool(self, original, args, read_timeout_seconds=None):
+        self.calls.append(original)
+        return types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
+
+
+class _CallB:
+    def __init__(self, tools):
+        import asyncio
+        self.url, self.headers = "http://stub/mcp", {}
+        self.session = _CallSess([_tool(n) for n in tools])
+        self._failed, self._gen = None, 0
+        self._ready = asyncio.Event(); self._ready.set()
+
+
+def test_invoke_tool_deny_survives_the_call_only_alias(monkeypatch):
+    """**파괴 도구 차단은 호출자가 준 이름이 아니라 해석된 원본으로 한다.**
+
+    호출 전용 별칭 `<백엔드키>_<도구>` 는 `delete_`·`cancel_` 로 **시작할 수가 없다**.
+    차단을 caller 문자열로만 보면 별칭이 그대로 우회로가 된다 — 실측으로 라이브 462개
+    중 파괴 도구 9개가 별칭 도입만으로 invoke_tool 로 부를 수 있게 됐었다(충돌 접두어로
+    노출된 2개는 그 전부터 뚫려 있었다).
+    ⚠ 기존 테스트 6개도, 별칭 회귀 3개도 `_call_tool` 을 **한 번도 안 불렀다** —
+    이 리포가 반복해 밟은 "이 경로를 덮는 테스트 0개" 다.
+    """
+    import asyncio
+
+    b = _CallB(["delete_project", "cancel_job", "list_parts"])
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": b})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    asyncio.run(gw._aggregate())
+
+    def invoke(name):
+        return asyncio.run(gw._call_tool("invoke_tool", {"name": name, "arguments": {}}))
+
+    assert invoke("delete_project").isError, "bare 는 원래 막힌다"
+    assert invoke("heaxstep_forge_delete_project").isError, "별칭으로도 막혀야 한다"
+    assert invoke("heaxstep_forge_cancel_job").isError, "별칭으로도 막혀야 한다"
+    # ⚠ 요점 — 백엔드까지 **한 번도 안 갔어야** 한다(반환값만 보면 못 잡는다)
+    assert b.session.calls == [], f"파괴 도구가 백엔드까지 갔다: {b.session.calls}"
+    # 파괴 계열이 아니면 별칭으로도 그대로 된다 — **과차단 금지**
+    assert not invoke("heaxstep_forge_list_parts").isError
+    assert b.session.calls == ["list_parts"]
+
+
+def test_an_alias_collision_is_not_silent(monkeypatch, caplog):
+    """별칭이 겹치면 **조용히 마지막 승자를 고르지 않는다.**
+
+    `key.replace('-','')` 는 `heax-step`+`forge_x` 와 `heax-step_forge`+`x` 를 같은
+    별칭으로 뭉갠다. PER_USER_SSO 백엔드면 남의 앱 자격증명이 발급된다. 라이브에는
+    지금 충돌이 0건이라 동작은 안 바꾸고 보이게만 한다.
+    """
+    import logging
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        _aggregate_with(monkeypatch, {"heax-step_forge": ["cancel_job"],
+                                      "heax-step": ["forge_cancel_job"]})
+    assert any("alias collision" in r.message for r in caplog.records), \
+        f"충돌을 조용히 넘겼다 — {[r.message for r in caplog.records]}"

@@ -336,7 +336,14 @@ async def _aggregate():
     alias_route.clear()
     for key, t in collected:
         # 충돌 여부와 **무관하게** 별칭을 등록한다(호출 전용).
-        alias_route[f"{key.replace('-', '')}_{t.name}"] = (key, t.name)
+        _alias = f"{key.replace('-', '')}_{t.name}"
+        if _alias in alias_route:
+            # ⚠ 하이픈을 지우므로 `heax-step`+`forge_x` 와 `heax-step_forge`+`x` 가 같은
+            # 별칭이 된다. 조용히 마지막 승자를 고르면 PER_USER_SSO 백엔드에서 **남의 앱
+            # 자격증명**이 발급된다(실측). 라이브 462개에서 지금 충돌은 0건이라 동작은
+            # 안 바꾸고 **보이게만** 한다 — 흔적이 alias 개수 차이뿐이면 아무도 못 본다.
+            log.warning("alias collision %s: %s ← %s", _alias, alias_route[_alias], (key, t.name))
+        alias_route[_alias] = (key, t.name)
         if name_counts[t.name] > 1:
             prefix = key.replace("-", "")  # mx-white-paper -> mxwhitepaper
             exposed_name = f"{prefix}_{t.name}"
@@ -1174,7 +1181,18 @@ async def _call_tool(name: str, arguments: dict):
         if not inner or inner == INVOKE_TOOL.name:
             return types.CallToolResult(content=[types.TextContent(
                 type="text", text="invoke_tool: name 에 호출할 도구 이름을 주세요.")], isError=True)
-        if inner.startswith(_INVOKE_DENY_PREFIX) or inner.endswith(_INVOKE_DENY_SUFFIX):
+        # ⚠ 차단은 **해석된 원본 도구 이름**으로 한다 — 호출자가 준 문자열로만 보면 같은
+        # 도구의 다른 이름이 그대로 우회로가 된다. 호출 전용 별칭 `<백엔드키>_<도구>` 도,
+        # 충돌 때 붙는 접두어 노출 이름도 `delete_`·`cancel_` 로 **시작할 수가 없다**
+        # (접미어 `_control`·`_set_state` 만 보존돼 관문이 반쯤만 들었다).
+        # 실측 — 별칭 도입으로 파괴 도구 9개가 이 관문을 그냥 지나가게 됐었고, 충돌
+        # 접두어로 노출된 2개는 그 전부터 뚫려 있었다. `inner` 검사도 남긴다: 해석이
+        # 안 되는 이름(오타·미접속 백엔드)이 파괴 꼴이면 `unknown tool` 보다 이 쪽이 낫다.
+        _resolved = route.get(inner) or alias_route.get(inner)
+        _orig = _resolved[1] if _resolved else inner
+        if (_orig.startswith(_INVOKE_DENY_PREFIX) or _orig.endswith(_INVOKE_DENY_SUFFIX)
+                or inner.startswith(_INVOKE_DENY_PREFIX)
+                or inner.endswith(_INVOKE_DENY_SUFFIX)):
             _audit(name, None, False, f"invoke-denied:{inner}", 0)
             return types.CallToolResult(content=[types.TextContent(
                 type="text", text=(f"invoke_tool: '{inner}' 은 파괴·제어성 도구라 범용 실행기로 "

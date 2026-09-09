@@ -105,14 +105,26 @@ def test_bare_names_keep_their_meaning(monkeypatch):
 
     극단적으로, 어떤 백엔드가 남의 별칭과 같은 이름의 도구를 내더라도 bare 가 이긴다.
     """
-    _aggregate_with(monkeypatch, {
-        "heax-step_forge": ["cancel_job"],
-        "other": ["heaxstep_forge_cancel_job"],       # 남의 별칭과 같은 이름
-    })
-    assert gw.route["heaxstep_forge_cancel_job"] == ("other", "heaxstep_forge_cancel_job")
-    resolved = gw.route.get("heaxstep_forge_cancel_job") or gw.alias_route.get(
-        "heaxstep_forge_cancel_job")
-    assert resolved[0] == "other", "route 가 먼저다 — 기존 이름의 뜻이 안 바뀐다"
+    import asyncio
+
+    # ⚠ **해석 순서를 테스트 안에 다시 쓰면 안 된다** — 처음 쓴 판이 그랬고, gateway.py 의
+    # 순서를 뒤집어도 6개가 전부 통과했다(관문이 장식이었다). `_call_tool` 을 실제로 불러
+    # **어느 백엔드가 받았는지**로 판정한다.
+    mine = _CallB(["list_parts"])
+    other = _CallB(["heaxstep_forge_list_parts"])       # 남의 별칭과 같은 이름
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": mine, "other": other})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    asyncio.run(gw._aggregate())
+
+    assert gw.route["heaxstep_forge_list_parts"] == ("other", "heaxstep_forge_list_parts")
+    asyncio.run(gw._call_tool("heaxstep_forge_list_parts", {}))
+    assert other.session.calls == ["heaxstep_forge_list_parts"], \
+        "route 가 먼저다 — 기존 이름의 뜻이 안 바뀐다"
+    assert mine.session.calls == [], f"별칭이 기존 이름을 가로챘다: {mine.session.calls}"
 
 
 def test_aliases_do_not_change_the_visible_catalogue(monkeypatch):

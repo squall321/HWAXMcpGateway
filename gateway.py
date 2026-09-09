@@ -64,7 +64,7 @@ _REAGG: dict[str, bool] = {}
 
 # 그룹 기반 도구 인가: Agent Server가 사용자 groups를 X-HWAX-Groups(콤마구분)로 실어 보낸다.
 # 백엔드별 allowed_groups가 비었거나 없으면 전체 공개, 있으면 caller groups와 교집합이 있어야 노출/호출.
-from urllib.parse import quote, unquote  # 비ASCII 그룹명 헤더 인/디코드
+from urllib.parse import parse_qs, quote, unquote  # 비ASCII 그룹명 헤더 인/디코드 + 쿼리 파싱
 
 GROUPS_HEADER = "x-hwax-groups"
 POLICY: dict[str, list[str]] = {k: list(v.get("allowed_groups", [])) for k, v in BACKENDS.items()}
@@ -1374,6 +1374,31 @@ def _bearer_gate(app, pat_verifier=None):
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": body})
+            return
+        if scope.get("path") == "/conn-invalidate" and scope.get("method") == "POST":
+            # 포털이 사용자 연결(토큰·워크스페이스)을 바꾸면 이걸 부른다. 안 부르면 바뀐 값이
+            # PORTAL_CONN_TTL_S(기본 300초) 동안 안 먹어서, 방금 조직을 바꾼 사용자의 보고서가
+            # 옛 워크스페이스로 조용히 간다 — 설정이 안 듣는 것처럼 보이는 그 실패다.
+            # GW_TOKEN 을 요구한다(포털이 /internal/connections 를 읽을 때 쓰는 값과 같다).
+            if dict(scope.get("headers") or {}).get(b"authorization", b"").decode("latin-1") != expected:
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": b'{"error":"unauthorized"}'})
+                return
+            _q = parse_qs((scope.get("query_string") or b"").decode("utf-8"))
+            _email = (_q.get("email") or [""])[0].strip().lower()
+            if _email:
+                _gone = [k for k in _CONN_CACHE if k[1] == _email]
+                for k in _gone:
+                    _CONN_CACHE.pop(k, None)
+            else:
+                _gone = list(_CONN_CACHE)
+                _CONN_CACHE.clear()
+            log.info("connection cache invalidated: %s (%d entries)", _email or "(전체)", len(_gone))
+            _body = json.dumps({"ok": True, "dropped": len(_gone)}).encode()
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": _body})
             return
         if scope.get("path") == "/refresh" and scope.get("method") == "POST":
             # 외부 MCP 의 기능 변경을 **즉시** 반영시키는 트리거. 주기 루프가 60초마다 같은

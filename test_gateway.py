@@ -207,3 +207,59 @@ def test_an_alias_collision_is_not_silent(monkeypatch, caplog):
                                       "heax-step": ["forge_cancel_job"]})
     assert any("alias collision" in r.message for r in caplog.records), \
         f"충돌을 조용히 넘겼다 — {[r.message for r in caplog.records]}"
+
+
+# ── save_conversation 이 meta 를 포털까지 옮기는지 ──────────────────────────────
+# ⚠ 종전 _msg() 는 role/content/persona/round 만 옮겨 meta 를 조용히 버렸다. MCP 심의가 반박
+#   구조를 만들어도 포털 관계도·이어하기 조항 승계에 닿지 않았다 — 이 테스트가 그 게이트를 지킨다.
+def _drive_save(monkeypatch, messages):
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+        def json(self): return {"id": "c-1"}
+
+    class _Cli:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None):
+            sent["body"] = json
+            return _Resp()
+
+    monkeypatch.setattr(gw, "_portal_api_base", lambda: "http://portal")
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    monkeypatch.setattr(gw, "_audit", lambda *a, **k: None)
+    monkeypatch.setattr(gw, "_low", NS(request_context=NS(request=NS(headers={"authorization": "Bearer t"}))))
+    asyncio.run(gw._save_conversation({"title": "심의", "messages": messages}))
+    return sent["body"]["messages"]
+
+
+def test_save_conversation_meta_를_옮긴다(monkeypatch):
+    rb = [{"target": "sim-solder-fatigue", "quote": "사이클 800회에서 크랙이 관통한다", "counter": "가속시험 한정",
+           "basis": "JESD22-A104"}]
+    out = _drive_save(monkeypatch, [
+        {"role": "persona", "persona": "a", "round": 2, "content": "x", "meta": {"rebut": rb}},
+        {"role": "persona", "persona": "b", "round": 3, "content": "y", "meta": {"non_negotiable": "양산 금형 변경 불가"}},
+    ])
+    assert out[0]["meta"]["rebut"][0]["target"] == "sim-solder-fatigue"
+    assert out[1]["meta"]["non_negotiable"] == "양산 금형 변경 불가"
+
+
+def test_save_conversation_meta_는_알려진_칸만_잘라서(monkeypatch):
+    big = [{"target": "t" * 500, "quote": "q" * 500, "counter": "c" * 500, "basis": "b" * 500, "junk": 1}] * 9
+    out = _drive_save(monkeypatch, [
+        {"role": "persona", "persona": "a", "content": "x", "meta": {"rebut": big, "evil": "x" * 99999}},
+        {"role": "persona", "persona": "b", "content": "y", "meta": "문자열은 meta 가 아니다"},
+        {"role": "persona", "persona": "c", "content": "z"},
+    ])
+    m = out[0]["meta"]
+    assert set(m) == {"rebut"}                               # 모르는 칸은 옮기지 않는다
+    assert len(m["rebut"]) == 4                              # 웹 경로와 같은 상한
+    r = m["rebut"][0]
+    assert (len(r["target"]), len(r["quote"]), len(r["counter"]), len(r["basis"])) == (60, 80, 160, 60)
+    assert "junk" not in r
+    assert "meta" not in out[1] and "meta" not in out[2]    # dict 아니면·없으면 칸 자체를 안 만든다

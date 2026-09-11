@@ -614,7 +614,8 @@ SAVE_CONV_TOOL = types.Tool(
     name="save_conversation",
     description=(
         "심의/대화 로그를 포털 서버 대화 저장소에 저장한다(웹 챗에서 이어보기·GLM 이어가기용). "
-        "messages: [{role: user|assistant|system|persona, content, persona?, round?}] 순서대로. "
+        "messages: [{role: user|assistant|system|persona, content, persona?, round?, meta?}] 순서대로. "
+        "meta 는 심의 발언의 {rebut:[{target,quote,counter,basis}], non_negotiable} — 웹 관계도·이어하기가 쓴다. "
         "성공 시 conversation_id 반환, 포털 미가용/인증 불가면 CONV_UNAVAILABLE."
     ),
     inputSchema={
@@ -632,6 +633,8 @@ SAVE_CONV_TOOL = types.Tool(
                         "content": {"type": "string"},
                         "persona": {"type": "string"},
                         "round": {"type": "integer"},
+                        "meta": {"type": "object",
+                                 "description": "심의 발언 구조 — {rebut:[{target,quote,counter,basis}], non_negotiable}"},
                     },
                     "required": ["role", "content"],
                 },
@@ -687,6 +690,23 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
                 out["round"] = int(m["round"])
             except (TypeError, ValueError):
                 pass
+        # meta — ⚠ 종전엔 여기서 role/content/persona/round 만 옮겨 meta 를 **조용히** 버렸다.
+        # 그래서 MCP 심의는 반박 구조를 만들어도 포털 관계도·이어하기 조항 승계에 닿지 않았다.
+        # 알려진 두 칸만, 웹 경로(포털 routes.py 발언 저장)와 같은 자르기로 옮긴다 — 임의 dict 를
+        # 통째로 넘기면 크기 폭주로 배치 전체가 거부될 수 있다(위 사전 정규화와 같은 이유).
+        meta = m.get("meta")
+        if isinstance(meta, dict):
+            mo: dict = {}
+            if meta.get("non_negotiable"):
+                mo["non_negotiable"] = str(meta["non_negotiable"])[:1200]
+            if isinstance(meta.get("rebut"), list):
+                rb = [{"target": str(r.get("target") or "")[:60], "quote": str(r.get("quote") or "")[:80],
+                       "counter": str(r.get("counter") or "")[:160], "basis": str(r.get("basis") or "")[:60]}
+                      for r in meta["rebut"][:4] if isinstance(r, dict)]
+                if rb:
+                    mo["rebut"] = rb
+            if mo:
+                out["meta"] = mo
         return out
 
     raw_msgs = arguments.get("messages") or []

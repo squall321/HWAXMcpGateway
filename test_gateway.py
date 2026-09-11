@@ -1,4 +1,6 @@
 # 게이트웨이 그룹 인가 순수 로직 단위 테스트 (네트워크·백엔드 불필요).
+import json
+
 import mcp.types as types
 
 import gateway as gw
@@ -263,3 +265,92 @@ def test_save_conversation_meta_는_알려진_칸만_잘라서(monkeypatch):
     assert (len(r["target"]), len(r["quote"]), len(r["counter"]), len(r["basis"])) == (60, 80, 160, 60)
     assert "junk" not in r
     assert "meta" not in out[1] and "meta" not in out[2]    # dict 아니면·없으면 칸 자체를 안 만든다
+
+
+# ── 도구 영역 분류(tool_areas.json) ──────────────────────────────────────────────
+# 손으로 고치는 파일이라 **조용한** 실패가 위험하다 — JSON 중복 키는 파이썬이 뒤엣것으로 말없이
+# 덮고, 정의 안 된 영역을 가리키면 UI 에 라벨 없는 칸이 생긴다. 그 둘을 여기서 막는다.
+def _load_areas_strict():
+    import json as _j
+    from pathlib import Path as _P
+
+    def _no_dupes(pairs):
+        keys = [k for k, _ in pairs]
+        dup = {k for k in keys if keys.count(k) > 1}
+        assert not dup, f"tool_areas.json 중복 키(뒤엣것이 조용히 이긴다): {sorted(dup)}"
+        return dict(pairs)
+
+    return _j.loads((_P(gw.__file__).parent / "tool_areas.json").read_text(encoding="utf-8"),
+                    object_pairs_hook=_no_dupes)
+
+
+def test_tool_areas_파일이_온전하다():
+    import re as _re
+    tx = _load_areas_strict()
+    keys = [a["key"] for a in tx["areas"]]
+    assert len(keys) == len(set(keys)), "영역 키 중복"
+    assert all(a.get("label") for a in tx["areas"]), "라벨 없는 영역 — UI 에 빈 칸이 뜬다"
+    refs = list(tx["apps"].values()) + list(tx["tools"].values()) + [a for _, a in tx["patterns"]]
+    assert set(refs) <= set(keys), f"정의 안 된 영역을 가리킨다: {sorted(set(refs) - set(keys))}"
+    for p, _ in tx["patterns"]:
+        _re.compile(p)
+
+
+def test_정적_백엔드는_앱_기본값이_있다():
+    # 정적 백엔드(APP_META)가 기본값 없이 붙으면 그 앱 도구 전부가 미분류로 떨어진다.
+    tx = _load_areas_strict()
+    missing = [k for k in gw.APP_META if k not in tx["apps"]]
+    assert not missing, f"영역 기본값 없는 정적 앱: {missing}"
+
+
+def test_영역_판정_순서는_도구_패턴_앱(monkeypatch, tmp_path):
+    f = tmp_path / "tool_areas.json"
+    f.write_text(json.dumps({
+        "areas": [{"key": k, "label": k} for k in ("cad", "mesh", "system")],
+        "apps": {"heax-step_forge": "cad"},
+        "patterns": [["_whoami$", "system"]],
+        "tools": {"mesh_report": "mesh", "odd_whoami": "cad"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(gw, "_AREAS_PATH", f)
+    monkeypatch.setattr(gw, "_AREAS_CACHE", {"mtime": None, "data": {}})
+    assert gw._area_of("find_parts", "heax-step_forge") == "cad"          # 앱 기본값
+    assert gw._area_of("mesh_report", "heax-step_forge") == "mesh"        # 도구 지정이 앱을 이긴다
+    assert gw._area_of("heaxstep_forge_whoami", "heax-step_forge") == "system"  # 패턴이 앱을 이긴다
+    assert gw._area_of("odd_whoami", "heax-step_forge") == "cad"          # 도구 지정이 패턴도 이긴다
+    assert gw._area_of("x", "unknown-app") == ""                          # 미분류는 빈 문자열
+
+
+def test_깨진_분류표는_게이트웨이를_죽이지_않는다(monkeypatch, tmp_path):
+    f = tmp_path / "tool_areas.json"
+    f.write_text("{ 깨진 json", encoding="utf-8")
+    monkeypatch.setattr(gw, "_AREAS_PATH", f)
+    monkeypatch.setattr(gw, "_AREAS_CACHE", {"mtime": None, "data": {}})
+    assert gw._area_of("find_parts", "heax-step_forge") == ""   # 분류 없이 — 전부 미분류로 드러난다
+    assert gw._area_meta() == []
+
+
+def test_list_tool_apps_영역보기(monkeypatch, tmp_path):
+    import asyncio
+    f = tmp_path / "tool_areas.json"
+    f.write_text(json.dumps({
+        "areas": [{"key": "cad", "label": "CAD"}, {"key": "mesh", "label": "메시"}],
+        "apps": {"heax-step_forge": "cad"}, "patterns": [], "tools": {"mesh_report": "mesh"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(gw, "_AREAS_PATH", f)
+    monkeypatch.setattr(gw, "_AREAS_CACHE", {"mtime": None, "data": {}})
+
+    class _S:
+        session = object()
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": _S(), "secret": _S()})
+    monkeypatch.setattr(gw, "exposed_tools", [_tool("find_parts"), _tool("mesh_report"), _tool("s_tool")])
+    monkeypatch.setattr(gw, "route", {"find_parts": ("heax-step_forge", "find_parts"),
+                                      "mesh_report": ("heax-step_forge", "mesh_report"),
+                                      "s_tool": ("secret", "s_tool")})
+    monkeypatch.setattr(gw, "POLICY", {"secret": ["admin"]})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    res = asyncio.run(gw._list_tool_apps({"by": "area"}))
+    body = json.loads(res.content[0].text)
+    by = {a["area"]: a for a in body["areas"]}
+    assert by["cad"]["tools"] == ["find_parts"] and by["mesh"]["tools"] == ["mesh_report"]
+    assert "s_tool" not in json.dumps(body), "권한 없는 앱의 도구가 영역 보기에 새어 나왔다"
+    assert body["hidden_no_access_or_down"] == 1

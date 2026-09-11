@@ -872,19 +872,70 @@ def _app_meta(key: str) -> dict:
     return {"label": label, "description": desc}
 
 
+# ── 도구 영역 분류 — tool_areas.json(추적 파일) ─────────────────────────────────
+# 앱은 '누가 만들었나'이고 영역은 '무슨 일을 하나'다. 둘이 어긋난다 — StepForge 81개에 CAD 조작·
+# 메시·재료가 섞여 있고, '해석 결과'는 앱 셋에 흩어져 있다. 사용자는 영역으로 찾는다.
+# ⚠ gateway_config.json 에 두지 않는다(gitignore·--force 재생성에 날아감). 이 파일은 git 으로 간다.
+_AREAS_PATH = Path(__file__).resolve().parent / "tool_areas.json"
+_AREAS_CACHE: dict = {"mtime": None, "data": {}}
+
+
+def _tool_areas() -> dict:
+    """영역 분류표 — mtime 캐시라 파일을 고치면 재기동 없이 반영된다.
+
+    읽기 실패는 게이트웨이를 죽이지 않는다(분류 없이 동작). 대신 **경고를 남기고** /tools-map 의
+    unclassified 가 전량으로 차서 UI 에 '미분류 N' 으로 드러난다 — 조용히 틀린 분류를 내지 않는다."""
+    try:
+        mt = _AREAS_PATH.stat().st_mtime
+    except OSError:
+        return {}
+    if _AREAS_CACHE["mtime"] != mt:
+        try:
+            raw = json.loads(_AREAS_PATH.read_text(encoding="utf-8"))
+            raw["_patterns"] = [(re.compile(p), a) for p, a in (raw.get("patterns") or [])]
+            _AREAS_CACHE.update({"mtime": mt, "data": raw})
+        except (OSError, ValueError, re.error) as exc:
+            log.warning("tool_areas.json 을 못 읽었다 — 영역 분류 없이 간다: %r", exc)
+            _AREAS_CACHE.update({"mtime": mt, "data": {}})
+    return _AREAS_CACHE["data"]
+
+
+def _area_of(name: str, app: str) -> str:
+    """도구 → 영역 키. 도구 지정 > 이름 패턴(첫 일치) > 앱 기본값. 없으면 ''(미분류)."""
+    tx = _tool_areas()
+    a = (tx.get("tools") or {}).get(name)
+    if a:
+        return a
+    for rx, a in tx.get("_patterns") or []:
+        if rx.search(name):
+            return a
+    return (tx.get("apps") or {}).get(app, "")
+
+
+def _area_meta() -> list[dict]:
+    return [{"area": a["key"], "label": a.get("label") or a["key"], "description": a.get("description") or ""}
+            for a in (_tool_areas().get("areas") or []) if a.get("key")]
+
+
 LIST_APPS_TOOL = types.Tool(
     name="list_tool_apps",
     description=(
         "이 게이트웨이에 연결된 MCP 앱(도메인) 목록과 각 앱의 도구를 계층적으로 반환한다. "
         "'무슨 앱/도구가 있냐', '어떤 기능이 되냐' 같은 질문에 전체 도구를 나열하는 대신 이걸 호출하라. "
         "각 앱마다 accessible(내 권한으로 사용 가능한지)·reachable(백엔드 생존)·tool_count·tools 를 준다. "
-        "app 인자를 주면 그 앱의 도구만 상세(이름+설명)로 반환한다."
+        "app 인자를 주면 그 앱의 도구만 상세(이름+설명)로 반환한다. "
+        "by='area' 면 앱 대신 **하는 일(영역)** 로 묶는다 — CAD·형상 제어, 메시·해석 모델 구성, 시뮬레이션 실행·잡, "
+        "해석 계산·예측, 해석 결과 분석, 물성·재료, VOC·시장 신호, 사내 지식 검색, 웹·논문 조사, 보고서·문서·발표, "
+        "전문가·심의·리스크, 데이터 등록·온톨로지, 시스템·공통. '시뮬레이션 관련 도구 뭐 있어' 같은 질문엔 이걸 쓴다."
     ),
     inputSchema={
         "type": "object",
         "properties": {
             "app": {"type": "string", "description": "특정 앱 키(예: heax-thermal_shock_mcp). 생략 시 전체 앱 요약."},
             "include_tools": {"type": "boolean", "description": "전체 목록에도 도구 이름을 포함(기본 true)."},
+            "by": {"type": "string", "enum": ["app", "area"],
+                   "description": "묶는 기준 — app(소유 앱, 기본) 또는 area(하는 일)."},
+            "area": {"type": "string", "description": "by='area' 에서 특정 영역 키만(예: sim, cad, voc). 도구 설명까지 준다."},
         },
     },
 )
@@ -1028,6 +1079,9 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     for _k in backends:
         by_app.setdefault(_k, [])
 
+    if str((arguments or {}).get("by") or "").strip() == "area":
+        return _list_by_area(by_app, groups, str((arguments or {}).get("area") or "").strip())
+
     apps = []
     for key in sorted(by_app, key=lambda k: -len(by_app[k])):
         tools = by_app[key]
@@ -1066,6 +1120,41 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
     )
+
+
+def _list_by_area(by_app: dict, groups: list[str], want_area: str) -> types.CallToolResult:
+    """list_tool_apps(by='area') — 앱이 아니라 하는 일로 묶는다. 내 권한으로 못 쓰는 앱의 도구는
+    뺀다(영역 보기는 '무엇을 할 수 있나'가 목적이라, 못 쓰는 걸 늘어놓으면 오답이 된다)."""
+    meta = {m["area"]: m for m in _area_meta()}
+    buckets: dict[str, list] = {k: [] for k in meta}
+    hidden = 0
+    for app, tools in by_app.items():
+        local = app == "_gateway"
+        if not local and not (_backend_allowed(app, groups) and app in backends
+                              and backends[app].session is not None):
+            hidden += len(tools)
+            continue
+        for t in tools:
+            buckets.setdefault(_area_of(t.name, app), []).append((t, app))
+    areas = []
+    for key, items in buckets.items():
+        if want_area and key != want_area:
+            continue
+        m = meta.get(key) or {"label": "미분류", "description": "tool_areas.json 에 없는 도구 — 영역을 지정해야 한다."}
+        entry = {"area": key or "", "label": m["label"], "description": m["description"], "tool_count": len(items)}
+        if want_area:
+            entry["tools"] = [{"name": t.name, "app": a, "description": (t.description or "")[:300]} for t, a in items]
+        else:
+            entry["tools"] = sorted(t.name for t, _ in items)
+        if items or want_area:
+            areas.append(entry)
+    payload = {"areas": areas, "area_count": len(areas), "total_tools": sum(a["tool_count"] for a in areas),
+               "hidden_no_access_or_down": hidden,
+               "note": "영역 = 하는 일. 특정 영역의 도구 설명은 list_tool_apps(by='area', area='<키>')."}
+    if want_area and not areas:
+        payload["error"] = f"unknown area: {want_area} — 가능한 키: {', '.join(meta)}"
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
 
 
 def _visible_tools(groups: list[str]) -> list[types.Tool]:
@@ -1421,10 +1510,17 @@ def _bearer_gate(app, pat_verifier=None):
                     "reachable": _k == "_gateway" or (
                         _k in backends and backends[_k].session is not None),
                 })
+            # 영역 — 하는 일로 묶은 두 번째 축(tool_areas.json). 미분류는 숨기지 않고 따로 준다:
+            # 새 앱이 붙어 분류표에 한 줄이 빠지면 그 도구들이 UI 에서 '미분류 N' 으로 보여야 한다.
+            _areas = {n: _area_of(n, bk) for n, bk in _map.items()}
+            _acnt = Counter(a for a in _areas.values() if a)
             body = json.dumps({
                 "map": _map,
                 "backends": sorted(set(_map.values())),
                 "apps": _apps,
+                "areas": _areas,
+                "area_meta": [{**m, "tool_count": _acnt.get(m["area"], 0)} for m in _area_meta()],
+                "unclassified": sorted(n for n, a in _areas.items() if not a),
             }, ensure_ascii=False).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

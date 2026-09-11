@@ -1,0 +1,102 @@
+{
+  "_doc": [
+    "도구 영역 분류 정본 — 도구를 '소유 앱'이 아니라 '무슨 일을 하는가'로 묶는다(심의·챗 도구 선택 UI, list_tool_apps).",
+    "앱과 영역은 실제로 어긋난다: StepForge 하나에 CAD 조작·메시·재료가, 리포트 아카이브에 보고서·해석결과·온톨로지가 섞여 있다.",
+    "판정 순서: tools(도구 이름 지정) > patterns(앱을 가로지르는 이름 규칙, 위에서부터 첫 일치) > apps(앱 기본값). 셋 다 없으면 미분류.",
+    "미분류는 /tools-map 의 unclassified 로 드러나고 UI 가 '미분류 N'으로 보인다 — 새 앱이 붙으면 apps 에 기본값 한 줄을 넣는다.",
+    "⚠ gateway_config.json 에 두지 않는다 — gitignore 이고 provision-config.sh --force 재생성에 날아간다. 이 파일은 git 으로 cae00 에 간다.",
+    "파일을 고치면 게이트웨이 재기동 없이 반영된다(mtime 캐시). 키는 바꾸지 말 것 — 프론트가 영역 키로 선택 상태를 기억한다."
+  ],
+  "areas": [
+    {"key": "cad", "label": "CAD·형상 제어", "description": "STEP 어셈블리를 직접 다룬다 — 반입·파트 찾기·이름·배치·치수·단면·질량·형상 점검·STEP 되쓰기."},
+    {"key": "mesh", "label": "메시·해석 모델 구성", "description": "형상을 해석 덱으로 — 메시·접촉·인터페이스·K파일 오퍼레이션·덱 검사."},
+    {"key": "sim", "label": "시뮬레이션 실행·잡", "description": "해석을 실제로 돌린다 — 낙하 시뮬레이션 제출, 잡 상태·중지·재실행, 클러스터 조회."},
+    {"key": "calc", "label": "해석 계산·예측", "description": "잡 없이 바로 답하는 해석 — 적층판 해석식, 열충격·휨 대리모델 예측."},
+    {"key": "result", "label": "해석 결과 분석", "description": "끝난 해석을 읽는다 — 낙하·충격 리포트 분석, 최악 케이스, 에너지 흐름, 해석 런 요약·피크·비교."},
+    {"key": "material", "label": "물성·재료", "description": "재료 물성 조회·등록·비교·곡선·MAT 카드, 측정 계획, 균질화 물성."},
+    {"key": "voc", "label": "VOC·시장 신호", "description": "글로벌 커뮤니티 불만·감성·급상승 이슈·결함 프로필 — SignalForge."},
+    {"key": "knowledge", "label": "사내 지식 검색", "description": "지식 카드·백서·과거 보고서·온톨로지·지난 대화에서 근거를 찾는다."},
+    {"key": "research", "label": "웹·논문 조사", "description": "사외 웹·학술 검색, 페이지 인용, 논문을 지식 카드로 반입."},
+    {"key": "report", "label": "보고서·문서·발표", "description": "보고서 작성·게시·템플릿, 백서 문서 편집, 발표 영상·PPTX 제작."},
+    {"key": "expert", "label": "전문가·심의·리스크", "description": "전문가 페르소나 관리·추천, 다중 전문가 심의, 설계 리스크 심사."},
+    {"key": "data", "label": "데이터 등록·온톨로지", "description": "레코드·문서형 등록, 파일 변환, 표 통계, 온톨로지 객체·연결·경보."},
+    {"key": "system", "label": "시스템·공통", "description": "계정·상태·능력 조회, 도구 검색·호출, 대화 저장."}
+  ],
+  "apps": {
+    "heax-step_forge": "cad",
+    "heax-kooremapper_mcp": "mesh",
+    "smart-twin-mcp": "sim",
+    "smart-twin-cluster": "sim",
+    "heax-laminate_analyzer_mcp": "calc",
+    "heax-thermal_shock_mcp": "calc",
+    "heax-materialtwin_web": "material",
+    "signalforge": "voc",
+    "ai-data-hub": "knowledge",
+    "mx-white-paper": "knowledge",
+    "heax-web_research_mcp": "research",
+    "heax-paper_ingest": "research",
+    "reportarchive": "report",
+    "heax-web_design_agents": "report",
+    "hwax-deliberation": "expert",
+    "heax-hwax_risk": "expert",
+    "_gateway": "system"
+  },
+  "patterns": [
+    ["_whoami$", "system"],
+    ["_system_status$", "system"],
+    ["_system_capabilities$", "system"],
+    ["^echo(_args)?$", "system"],
+    ["^get_server_info$", "system"]
+  ],
+  "tools": {
+    "mesh_forecast": "mesh", "mesh_report": "mesh", "mesh_size_advice": "mesh", "remesh_parts": "mesh",
+    "part_mesh_map": "mesh", "contact_preview": "mesh", "check_deck": "mesh", "set_interface": "mesh",
+    "confirm_interfaces": "mesh", "list_interfaces": "mesh", "interface_graph": "mesh", "interface_summary": "mesh",
+    "get_part_rules": "mesh", "set_part_rules": "mesh", "run_job": "mesh", "list_jobs": "mesh", "job_log": "mesh",
+    "job_params_guide": "mesh", "heaxstep_forge_job_status": "mesh", "heaxstep_forge_cancel_job": "mesh",
+    "download_artifact": "mesh", "list_artifacts": "mesh",
+
+    "material_lookup": "material", "material_sources": "material", "register_materials": "material",
+    "register_materials_csv": "material", "resolve_materials": "material", "list_local_materials": "material",
+    "heaxstep_forge_register_material": "material",
+
+    "attach_report_scenario": "result", "compare_reports": "result", "delete_report": "result",
+    "find_reports": "result", "heaxkooremapper_mcp_list_reports": "result", "ingest_report": "result",
+    "publish_report_to_datahub": "result", "report_angle_stats": "result", "report_case": "result",
+    "report_corpus": "result", "report_directional": "result", "report_energy_flow": "result",
+    "report_facets": "result", "report_findings": "result", "report_geometry": "result",
+    "report_part_energy": "result", "report_part_risk": "result", "report_part_series": "result",
+    "report_query": "result", "report_scatter": "result", "report_summary": "result",
+    "report_upload_instructions": "result", "report_worst_cases": "result", "update_report_meta": "result",
+    "job_postprocess": "result",
+
+    "derive_lamina_from_constituents": "material", "homogenize_layer": "material",
+    "homogenize_patterned_layer": "material",
+
+    "bind_records_to_agent": "expert", "create_agent": "expert", "draft_agent": "expert", "patch_agent": "expert",
+    "describe_agent_schema": "expert", "list_agent_domains": "expert", "list_agents": "expert",
+    "recommend_agents": "expert", "get_agent_session": "expert",
+    "convert_file": "data", "create_doc_type": "data", "list_doc_types": "data", "import_record": "data",
+    "describe_record_schema": "data", "describe_data_capability": "data", "data_aggregate": "data",
+    "pcb_warpage_surrogate": "calc", "stress_strain_plot": "material", "fetch_rerank_model": "system",
+
+    "create_document": "report", "delete_block": "report", "export_document": "report", "import_file": "report",
+    "insert_block": "report", "insert_image_block": "report", "move_block": "report", "update_block": "report",
+    "upload_image": "report", "upload_image_base64": "report", "upload_image_from_url": "report",
+    "validate_block": "report", "mxwhitepaper_extract_pptx_images": "report",
+
+    "search_reports": "knowledge", "reportarchive_list_reports": "knowledge", "get_report": "knowledge",
+    "get_report_outline": "knowledge", "get_reports_digest": "knowledge", "list_related_reports": "knowledge",
+    "list_report_links": "knowledge", "aggregate_reports": "knowledge", "ask_ontology": "knowledge",
+    "search_objects": "knowledge", "get_object": "knowledge", "get_subgraph": "knowledge",
+    "list_object_types": "knowledge", "describe_metadata": "knowledge", "run_saved_search": "knowledge",
+    "list_saved_searches": "knowledge",
+    "get_analysis_peaks": "result", "get_analysis_series": "result", "get_analysis_summary": "result",
+    "list_analysis_parts": "result", "list_analysis_runs": "result", "compare_analysis_runs": "result",
+    "map_analysis_part": "result",
+    "add_object_alias": "data", "create_object": "data", "update_object": "data", "link_objects": "data",
+    "list_alert_rules": "data", "list_alert_firing": "data",
+
+    "search_conversations": "knowledge"
+  }
+}

@@ -562,6 +562,11 @@ async def _backends_lifespan():
             await tg.start(b.run)
         await _aggregate()
         tg.start_soon(_revive_loop, tg)
+        # 포털 권한 정책 — 디스크 캐시로 먼저 막고(포털이 늦게 떠도 권한이 풀린 채 돌지 않게),
+        # 포털에서 받아 갱신한 뒤 주기적으로 다시 받는다.
+        _load_access_cache()
+        await _refresh_access_policy()
+        tg.start_soon(_access_policy_loop)
         try:
             yield
         finally:
@@ -600,9 +605,113 @@ def _parse_groups(raw: str | None) -> list[str]:
 
 
 def _backend_allowed(backend_key: str, groups: list[str]) -> bool:
-    """백엔드 공개 여부: allowed_groups 비었으면 전체 공개, 아니면 caller groups와 교집합 필요."""
+    """백엔드 공개 여부: allowed_groups 비었으면 전체 공개, 아니면 caller groups와 교집합 필요.
+
+    포털 권한 정책(_ACCESS_POLICY)이 이 백엔드에 필요 권한을 걸었으면 그것도 통과해야 한다(둘 다).
+    POLICY 에 덮어쓰지 않는 이유 — heax registry 재탐지가 POLICY[key] 를 빈 값으로 되돌려 권한이
+    소리 없이 풀린다."""
+    gs = set(groups)
     allowed = POLICY.get(backend_key, [])
-    return (not allowed) or bool(set(groups) & set(allowed))
+    if allowed and not (gs & set(allowed)):
+        return False
+    need = _ACCESS_POLICY.get(backend_key)
+    # 내부 서비스(GW_TOKEN 으로 그룹 헤더 없이 부름)는 사람이 아니다 — 사람 권한 정책을 받지 않는다.
+    return (not need) or SERVICE_GROUP in gs or bool(gs & set(need))
+
+
+# ── 포털 권한 정책(HWAXPortal docs/access-control) ─────────────────────────────
+# 백엔드별 필요 권한(feat:·plat:)의 정본은 포털 access.yaml 하나다. 여기서 받아 _backend_allowed 가
+# 함께 본다. gateway_config.json 의 allowed_groups 는 provision 이 다시 쓰며 날아가서 쓰지 않는다.
+# 받은 값은 디스크에 캐시한다 — 포털이 잠깐 죽어도 직전 정책으로 돈다(부팅 때 포털이 없으면 캐시로).
+ACCESS_POLICY_TTL_S = int(os.environ.get("GATEWAY_ACCESS_POLICY_TTL", "60"))
+ACCESS_ENT_TTL_S = int(os.environ.get("GATEWAY_ACCESS_ENT_TTL", "60"))
+_ACCESS_CACHE_FILE = Path(__file__).resolve().parent / ".access_policy_cache.json"
+# GW_TOKEN 으로 그룹 헤더 **없이** 오는 호출 = 사용자 대리가 아닌 내부 서비스 자신. 미들웨어가 이
+# 표시 그룹을 붙인다. 에이전트서버는 사용자 호출에 늘 그룹 헤더를 싣는다(빈 값이라도 싣는다).
+SERVICE_GROUP = "gateway:service"
+_ACCESS_POLICY: dict[str, list[str]] = {}
+# {(email, 로그인 그룹): (권한 키 | None, 만료)} — PAT 호출자의 **지금** 권한.
+_ENT_CACHE: dict[tuple[str, str], tuple[list[str] | None, float]] = {}
+_ENT_LAST: dict[tuple[str, str], list[str]] = {}     # 포털이 죽었을 때 쓸 직전 값(만료 없음)
+
+
+def _is_synthetic(group: str) -> bool:
+    return group.startswith("feat:") or group.startswith("plat:")
+
+
+def _load_access_cache() -> None:
+    try:
+        data = json.loads(_ACCESS_CACHE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            _ACCESS_POLICY.clear()
+            _ACCESS_POLICY.update({str(k): [str(x) for x in v] for k, v in data.items() if isinstance(v, list)})
+            log.info("권한 정책 캐시 적재 — 백엔드 %d개", len(_ACCESS_POLICY))
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001 — 깨진 캐시는 무시(포털에서 다시 받는다)
+        log.warning("권한 정책 캐시를 못 읽었다: %r", exc)
+
+
+async def _refresh_access_policy() -> bool:
+    """포털에서 백엔드별 필요 권한을 받아 바꾼다. 실패하면 지금 값을 그대로 둔다(False)."""
+    base = _portal_api_base()
+    if not base:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=8) as cli:
+            resp = await cli.get(f"{base.rstrip('/')}/internal/access/policy",
+                                 headers={"Authorization": f"Bearer {GW_TOKEN}"})
+        if resp.status_code == 404:
+            return False                      # 권한 기능 이전 포털 — 종전대로(정책 없음)
+        resp.raise_for_status()
+        backends = (resp.json() or {}).get("backends") or {}
+        new = {str(k): [str(x) for x in v] for k, v in backends.items() if isinstance(v, list)}
+    except Exception as exc:  # noqa: BLE001 — 직전 정책 유지(가용성) + 경고
+        log.warning("포털 권한 정책 조회 실패 — 직전 정책 유지(백엔드 %d개): %r", len(_ACCESS_POLICY), exc)
+        return False
+    if new != _ACCESS_POLICY:
+        _ACCESS_POLICY.clear()
+        _ACCESS_POLICY.update(new)
+        log.info("권한 정책 갱신 — 백엔드 %d개", len(new))
+        try:
+            _ACCESS_CACHE_FILE.write_text(json.dumps(new, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        except OSError as exc:
+            log.warning("권한 정책 캐시를 못 썼다: %r", exc)
+    return True
+
+
+async def _access_policy_loop() -> None:
+    while True:
+        await anyio.sleep(ACCESS_POLICY_TTL_S)
+        await _refresh_access_policy()
+
+
+async def _portal_entitlements(email: str, base_groups: list[str]) -> list[str] | None:
+    """이 사람의 지금 권한 키 — PAT 에 박힌 발급 때 값 대신 쓴다. 포털이 모르면(권한 기능 이전)
+    None. 조회가 실패하면 직전에 받은 값, 그것도 없으면 None(호출부가 PAT 값으로 돈다)."""
+    key = (email, ",".join(sorted(base_groups)))
+    hit = _ENT_CACHE.get(key)
+    if hit and hit[1] > time.monotonic():
+        return hit[0]
+    base = _portal_api_base()
+    if not base or not email:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8) as cli:
+            resp = await cli.get(f"{base.rstrip('/')}/internal/access/entitlements",
+                                 params={"email": email, "groups": ",".join(base_groups)},
+                                 headers={"Authorization": f"Bearer {GW_TOKEN}"})
+        if resp.status_code == 404:
+            _ENT_CACHE[key] = (None, time.monotonic() + 300)
+            return None
+        resp.raise_for_status()
+        keys = [str(k) for k in (resp.json() or {}).get("keys") or []]
+    except Exception as exc:  # noqa: BLE001 — 직전 값으로(가용성), 없으면 None
+        log.warning("포털 권한 조회 실패(%s) — 직전 값으로: %r", email, exc)
+        return _ENT_LAST.get(key)
+    _ENT_CACHE[key] = (keys, time.monotonic() + ACCESS_ENT_TTL_S)
+    _ENT_LAST[key] = keys
+    return keys
 
 
 # ── 게이트웨이 로컬 도구: save_conversation ─────────────────────────────────
@@ -1477,6 +1586,8 @@ def _bearer_gate(app, pat_verifier=None):
                 # 캐시 효과를 밖에서 볼 수 있게 — 안 보이면 켜졌는지도 모른다.
                 "cache": {**_CACHE_STAT, "size": len(_RESP_CACHE), "ttl_s": CACHE_TTL_S},
                 "policy": POLICY,
+                # 포털 권한 정책(백엔드 → 필요 권한) — 비었으면 포털 정책 없이 도는 중이다.
+                "access_policy": _ACCESS_POLICY,
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
@@ -1590,13 +1701,25 @@ def _bearer_gate(app, pat_verifier=None):
         auth = headers.get(b"authorization", b"").decode("latin-1")
         if auth == expected:
             # 내부 에이전트 서버: GW_TOKEN. groups 는 에이전트가 x-hwax-groups 로 실어 보냄(신뢰).
+            # 그룹 헤더가 아예 없으면 사용자를 대리하지 않는 내부 서비스 호출이다 — 표시 그룹을 붙여
+            # 사람 권한 정책(포털)에서 뺀다. 권한 정책 이전과 같은 시야를 지킨다.
+            if GROUPS_HEADER.encode() not in headers:
+                scope = {**scope, "headers": [*(scope.get("headers") or []),
+                                              (GROUPS_HEADER.encode(), SERVICE_GROUP.encode())]}
             await app(scope, receive, send)
             return
         # GW_TOKEN 이 아니면 포털 PAT(개인 Claude 등) 로 검증 시도 → 성공 시 PAT 의 groups 로 도구 필터.
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         claims = await pat_verifier.verify(token, MCP_AUDIENCE) if (token and pat_verifier) else None
         if claims is not None:
-            groups = ",".join(str(g) for g in (claims.get("groups") or []))
+            # 권한(feat:·plat:)은 PAT 에 박힌 발급 때 값이 아니라 포털의 **지금** 값으로 바꾼다 —
+            # 거둔 권한이 PAT 수명(최대 100년) 동안 남지 않게. 포털이 모르면(None) PAT 값 그대로.
+            _pat_groups = [str(g) for g in (claims.get("groups") or []) if str(g) != SERVICE_GROUP]
+            _base = [g for g in _pat_groups if not _is_synthetic(g)]
+            _now_keys = await _portal_entitlements(str(claims.get("email") or "").strip().lower(), _base)
+            if _now_keys is not None:
+                _pat_groups = _base + _now_keys
+            groups = ",".join(_pat_groups)
             # 클라이언트가 위조로 넣었을 x-hwax-groups 는 버리고, 검증된 PAT 의 groups 로 강제한다.
             # 신원 헤더도 groups 와 똑같이 다룬다 — 클라이언트가 실어 보낸 값은 버리고 검증된
             # PAT 의 것만 싣는다. PAT 에 이메일이 없으면 아무것도 싣지 않는다(위조로 남의 시야를

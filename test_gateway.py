@@ -354,3 +354,76 @@ def test_list_tool_apps_영역보기(monkeypatch, tmp_path):
     assert by["cad"]["tools"] == ["find_parts"] and by["mesh"]["tools"] == ["mesh_report"]
     assert "s_tool" not in json.dumps(body), "권한 없는 앱의 도구가 영역 보기에 새어 나왔다"
     assert body["hidden_no_access_or_down"] == 1
+
+
+# ── 포털 권한 정책(HWAXPortal docs/access-control) ────────────────────────────
+import asyncio  # noqa: E402
+
+import httpx  # noqa: E402
+
+
+def _mock_http(monkeypatch, handler):
+    real = httpx.AsyncClient
+    monkeypatch.setattr(gw.httpx, "AsyncClient",
+                        lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(gw, "_portal_api_base", lambda: "http://portal")
+
+
+def test_포털_권한_정책은_allowed_groups_와_함께_본다(monkeypatch):
+    monkeypatch.setattr(gw, "POLICY", {"sf": [], "sec": ["admin"]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {"sf": ["plat:stepforge"], "sec": ["plat:risk"]})
+    assert gw._backend_allowed("sf", ["feat:chat"]) is False
+    assert gw._backend_allowed("sf", ["plat:stepforge"]) is True
+    assert gw._backend_allowed("sec", ["plat:risk"]) is False, "둘 다 통과해야 한다"
+    assert gw._backend_allowed("sec", ["admin", "plat:risk"]) is True
+    assert gw._backend_allowed("free", []) is True, "정책이 없는 백엔드는 종전대로 공개"
+
+
+def test_권한_정책은_포털에서_받아_디스크에_남기고_포털이_죽으면_직전_값으로(monkeypatch, tmp_path):
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_CACHE_FILE", tmp_path / "ap.json")
+    _mock_http(monkeypatch, lambda req: httpx.Response(200, json={"backends": {"sf": ["plat:stepforge"]}}))
+    assert asyncio.run(gw._refresh_access_policy()) is True
+    assert gw._ACCESS_POLICY == {"sf": ["plat:stepforge"]}
+    assert json.loads((tmp_path / "ap.json").read_text(encoding="utf-8")) == {"sf": ["plat:stepforge"]}
+
+    def boom(req):
+        raise httpx.ConnectError("portal down")
+    _mock_http(monkeypatch, boom)
+    assert asyncio.run(gw._refresh_access_policy()) is False
+    assert gw._ACCESS_POLICY == {"sf": ["plat:stepforge"]}, "실패하면 직전 정책을 지킨다(풀지 않는다)"
+    gw._ACCESS_POLICY.clear()
+    gw._load_access_cache()
+    assert gw._ACCESS_POLICY == {"sf": ["plat:stepforge"]}, "재기동 때 포털이 없어도 캐시로 막는다"
+
+
+def test_PAT_호출자는_포털의_지금_권한을_쓴다(monkeypatch):
+    monkeypatch.setattr(gw, "_ENT_CACHE", {})
+    monkeypatch.setattr(gw, "_ENT_LAST", {})
+    calls = []
+
+    def ok(req):
+        calls.append(dict(req.url.params))
+        return httpx.Response(200, json={"keys": ["feat:chat"]})
+    _mock_http(monkeypatch, ok)
+    assert asyncio.run(gw._portal_entitlements("u@corp.com", ["mes-user"])) == ["feat:chat"]
+    assert asyncio.run(gw._portal_entitlements("u@corp.com", ["mes-user"])) == ["feat:chat"]
+    assert len(calls) == 1 and calls[0] == {"email": "u@corp.com", "groups": "mes-user"}, "캐시"
+
+    gw._ENT_CACHE.clear()
+    def boom(req):
+        raise httpx.ConnectError("portal down")
+    _mock_http(monkeypatch, boom)
+    assert asyncio.run(gw._portal_entitlements("u@corp.com", ["mes-user"])) == ["feat:chat"], \
+        "포털이 죽으면 직전 값"
+    _mock_http(monkeypatch, lambda req: httpx.Response(404))
+    assert asyncio.run(gw._portal_entitlements("new@corp.com", [])) is None, \
+        "권한 기능 이전 포털 — PAT 값 그대로 쓰게 None"
+    assert gw._is_synthetic("plat:stepforge") and not gw._is_synthetic("portal-admin")
+
+
+def test_그룹_헤더_없는_내부_서비스는_사람_권한_정책을_받지_않는다(monkeypatch):
+    monkeypatch.setattr(gw, "POLICY", {"sf": [], "sec": ["admin"]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {"sf": ["plat:stepforge"], "sec": ["plat:risk"]})
+    assert gw._backend_allowed("sf", [gw.SERVICE_GROUP]) is True
+    assert gw._backend_allowed("sec", [gw.SERVICE_GROUP]) is False, "설정 allowed_groups 는 그대로 본다"

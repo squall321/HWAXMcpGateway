@@ -484,3 +484,13 @@ def test_조직도_도구가_라벨없이도_돈다(monkeypatch):
     # 검색은 이름·키 모두에서 찾는다.
     hit = json.loads(asyncio.run(gw._browse_experts({"q": "laminate"})).content[0].text)
     assert [e["key"] for e in hit["experts"]] == ["he-calc-laminate"]
+
+
+def test_서버_지침이_비어_있지_않다():
+    """MCP initialize 응답의 instructions 는 **클라이언트(클로드)가 읽는** 유일한 사용 지침이다.
+    비워 두면 도구 수백 개를 주고 '알아서 하라' 는 셈이라, 이 허브에서 실제로 났던 실패
+    (도구를 안 부르고 수치를 지어내기·refused 를 자료 없음으로 읽기)가 그대로 재현된다."""
+    assert gw._INSTRUCTIONS.strip(), "서버 지침이 비었다"
+    for must in ("search_tools", "invoke_tool", "refused", "desc_match", "browse_experts"):
+        assert must in gw._INSTRUCTIONS, f"지침에 {must} 안내가 빠졌다"
+    assert gw.fm.instructions == gw._INSTRUCTIONS, "FastMCP 에 실려야 클라이언트로 간다"

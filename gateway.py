@@ -594,9 +594,11 @@ _INSTRUCTIONS = """HWAX 엔지니어링 허브 — 사내 설계·해석·품질
    대신 응답의 `desc_match`(어휘 포함률)·`matched_sections`(소유 근거 수)·`low_confidence` 를 보라.
 5. 사람에게 물을 일을 도구로 때우지 마라. 등록·발행·삭제·잡 제출처럼 되돌리기 어려운 도구는
    무엇을 어디에 쓸지 사용자에게 확인한 뒤 부른다.
-6. 전문가가 필요하면 `browse_experts` 로 조직도를 보여 주고 사람이 고르게 한 뒤,
+6. 수치를 사용자에게 보내기 전에 `verify_answer(초안)` 로 대조하라 — 이번 세션에 실제로 조회한
+   도구 출력에 없는 값을 코드가 집어 준다(기억으로 채운 값을 거기서 잡는다).
+7. 전문가가 필요하면 `browse_experts` 로 조직도를 보여 주고 사람이 고르게 한 뒤,
    `use_experts(keys=[...])` 로 역할·도구를 받아 그 전문가로서 답하라(첫 명이 주 전문가).
-7. 도구가 실패하면 인자만 바꿔 반복하지 마라. 응답이 '인자 문제가 아니다' 라고 말하면
+8. 도구가 실패하면 인자만 바꿔 반복하지 마라. 응답이 '인자 문제가 아니다' 라고 말하면
    연결·시간초과이므로 다른 방법을 찾거나 사용자에게 알려라.
 """
 
@@ -1208,7 +1210,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     for t in exposed_tools:
         by_app.setdefault(route[t.name][0], []).append(t)
     by_app.setdefault("_gateway", []).extend([SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
-                                              BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL])
+                                              BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL])
     # 연결이 끊긴 백엔드는 도구가 집계되지 않아 목록에서 통째로 사라진다 — 접근성 점검이
     # 목적이므로 '앱은 있는데 지금 불통'을 보이게 빈 항목으로 채운다.
     for _k in backends:
@@ -1509,10 +1511,108 @@ async def _use_experts(arguments: dict) -> types.CallToolResult:
         type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
 
 
+
+# ── 답변 수치 대조 (클로드용) ──────────────────────────────────────────────────
+# 웹 챗에는 **코드가 만드는** 근거 블록이 있어 답의 수치를 도구 출력과 대조한다. MCP 에는 그게
+# 없어 지침(부탁)뿐이었다 — 지침은 보장이 아니다. 호출자별로 최근 도구 출력을 들고 있다가
+# verify_answer(초안) 로 대조해 준다. 판정 기준은 에이전트서버 evidence.py 와 같다:
+# 소수점이 있거나 100 이상인 수치만 보고, 부분문자열로 대조한다(경고 남발이 기능을 죽인다).
+# ⚠ 뒤 경계에 `(?!\w)` 를 쓰면 한글 단위가 붙은 수치를 놓친다 — 파이썬 \w 는 유니코드라
+# 한글도 단어 글자다("408명"은 검사조차 안 되고 "1250.5원"은 "1250" 으로 잘린다, 실측).
+# 에이전트서버 evidence.py 와 같은 패턴을 쓴다 — 두 화면의 경고 기준이 달라지면 안 된다.
+_NUM_TOK_RE = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?![\d.])")
+# 호출자별 최근 도구 출력 — {키: (마감시각, [(도구, 출력조각), …])}. 메모리 상한을 건다.
+_EVID: "OrderedDict[str, tuple]" = OrderedDict()
+EVID_TTL_S = int(os.environ.get("EVID_TTL_S", "1800"))
+EVID_MAX_CALLERS = int(os.environ.get("EVID_MAX_CALLERS", "64"))
+EVID_MAX_CALLS = int(os.environ.get("EVID_MAX_CALLS", "20"))
+EVID_MAX_CHARS = int(os.environ.get("EVID_MAX_CHARS", "200000"))
+
+
+def _evid_key() -> str:
+    return _request_user() or ",".join(sorted(_request_groups())) or "_anon"
+
+
+def _evid_keep(tool: str, res):
+    """도구 결과를 증거 칸에 쌓고 **그대로 돌려준다**(호출부 한 줄만 감싸면 되게)."""
+    _evid_record(tool, res)
+    return res
+
+
+def _evid_record(tool: str, res) -> None:
+    """도구 출력 원문을 호출자 칸에 쌓는다. 실패는 무시한다 — 검증 보조가 호출을 막으면 안 된다."""
+    try:
+        txt = "".join(getattr(c, "text", "") or "" for c in (getattr(res, "content", None) or []))
+        if not txt:
+            return
+        key = _evid_key()
+        now = time.monotonic()
+        _, calls = _EVID.get(key, (0.0, []))
+        calls.append((tool, txt[:EVID_MAX_CHARS // 4]))
+        del calls[:-EVID_MAX_CALLS]
+        while sum(len(t) for _, t in calls) > EVID_MAX_CHARS and len(calls) > 1:
+            calls.pop(0)
+        _EVID[key] = (now + EVID_TTL_S, calls)
+        _EVID.move_to_end(key)
+        while len(_EVID) > EVID_MAX_CALLERS:
+            _EVID.popitem(last=False)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("evidence record skipped: %r", exc)
+
+
+VERIFY_TOOL = types.Tool(
+    name="verify_answer",
+    description=(
+        "답변 초안의 수치가 **이번 세션에 실제로 조회한 도구 출력**에 있는지 코드로 대조한다. "
+        "사용자에게 수치를 보내기 전에 부르면, 근거 없는 값(기억으로 채운 값)을 집어 준다. "
+        "소수점이 있거나 100 이상인 수치만 본다(작은 정수는 순번·개수라 오탐이 더 나쁘다)."),
+    inputSchema={
+        "type": "object",
+        "properties": {"text": {"type": "string", "description": "사용자에게 보낼 답변 초안."}},
+        "required": ["text"],
+    },
+)
+
+
+async def _verify_answer(arguments: dict) -> types.CallToolResult:
+    text = str((arguments or {}).get("text") or "")
+    exp, calls = _EVID.get(_evid_key(), (0.0, []))
+    if exp and exp < time.monotonic():
+        calls = []
+    src = " ".join(t for _, t in calls).replace(",", "")
+    seen, bad, checked = set(), [], 0
+    for m in _NUM_TOK_RE.finditer(text):
+        raw = m.group(0)
+        norm = raw.replace(",", "")
+        try:
+            val = float(norm)
+        except ValueError:
+            continue
+        if "." not in norm and val < 100:
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        checked += 1
+        if norm not in src:
+            bad.append(raw)
+    payload = {
+        "checked": checked, "unsourced": bad[:12],
+        "tool_calls": [t for t, _ in calls],
+        "note": ("조회 기록이 없다 — 도구를 먼저 부르고 그 결과로 답하라."
+                 if not calls else
+                 ("모든 수치가 조회 결과에 있다." if not bad else
+                  "위 수치는 이번 세션 조회 결과에서 찾지 못했다. 도구로 다시 확인하거나, "
+                  "계산·추론한 값이면 그렇게 밝혀라 — 조회한 값처럼 말하지 마라.")),
+    }
+    return types.CallToolResult(content=[types.TextContent(
+        type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
+
+
 def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
-            BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL]
+            BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL]
 
 
 def _request_groups() -> list[str]:
@@ -1677,6 +1777,8 @@ async def _call_tool(name: str, arguments: dict):
         return await _browse_experts(arguments or {})
     if name == USE_EXPERTS_TOOL.name:
         return await _use_experts(arguments or {})
+    if name == VERIFY_TOOL.name:
+        return await _verify_answer(arguments or {})
     # `route` 를 **먼저** 본다 — bare 이름의 뜻은 그대로다. 없을 때만 호출 전용 별칭.
     resolved = route.get(name) or alias_route.get(name)
     if resolved is None:
@@ -1745,7 +1847,7 @@ async def _call_tool(name: str, arguments: dict):
                     )
                 _audit(name, backend_key, not getattr(res, "isError", False),
                        f"as:{email}", round((time.monotonic() - t0) * 1000))
-                return _cache_put(ckey, res)
+                return _cache_put(ckey, _evid_keep(name, res))
     elif backend_key in PORTAL_CONN_BACKENDS:
         # 포털 등록 연결 토큰 위임(RA 등) — 등록한 사용자만 본인 명의, 나머지는 서비스 계정.
         email = _request_user()
@@ -1776,7 +1878,7 @@ async def _call_tool(name: str, arguments: dict):
                     )
                 _audit(name, backend_key, not getattr(res, "isError", False),
                        f"as-conn:{email}", round((time.monotonic() - t0) * 1000))
-                return _cache_put(ckey, res)
+                return _cache_put(ckey, _evid_keep(name, res))
 
     # 이 호출이 쓰는 세션의 세대. 실패했을 때 "내가 죽었다고 본 그 세션" 을 가리키므로,
     # 그 사이 다른 호출이 이미 갈아 끼웠다면 새 세션을 또 부수지 않는다. try 밖에서 잡는다 —
@@ -1788,7 +1890,7 @@ async def _call_tool(name: str, arguments: dict):
         res = await b.session.call_tool(original, arguments, read_timeout_seconds=call_timeout)
         _audit(name, backend_key, not getattr(res, "isError", False), note,
                round((time.monotonic() - t0) * 1000))
-        return _cache_put(ckey, res)
+        return _cache_put(ckey, _evid_keep(name, res))
     except Exception as e:  # noqa: BLE001
         log.warning("call %s on %s failed (%r), reconnecting once", name, backend_key, e)
         try:
@@ -1805,7 +1907,7 @@ async def _call_tool(name: str, arguments: dict):
                     _audit(name, backend_key, not getattr(res, "isError", False),
                            "reconnected" + (f"+{note}" if note else ""),
                            round((time.monotonic() - t0) * 1000))
-                    return _cache_put(ckey, res)
+                    return _cache_put(ckey, _evid_keep(name, res))
         except Exception as e2:  # noqa: BLE001 — 재시도 실패도 정돈된 isError 로 (프로토콜 에러 방지)
             log.warning("retry of %s on %s failed too (%r)", name, backend_key, e2)
             e = e2
@@ -1852,7 +1954,8 @@ def _bearer_gate(app, pat_verifier=None):
             _map.setdefault(LIST_APPS_TOOL.name, "_gateway")
             # search_tools·invoke_tool 도 게이트웨이 로컬이다 — 빠뜨리면 /tools-map 의 _gateway
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
-            for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL):
+            for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
+                        VERIFY_TOOL):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서

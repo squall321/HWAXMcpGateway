@@ -35,7 +35,7 @@ def test_visible_tools(monkeypatch):
     # 그것들은 백엔드 인가와 무관하므로 백엔드에서 온 것만 골라 본다(이 테스트의 관심사다).
     local = {t.name for t in (gw.SAVE_CONV_TOOL, gw.SEARCH_CONV_TOOL, gw.LIST_APPS_TOOL,
                               gw.SEARCH_TOOLS_TOOL, gw.INVOKE_TOOL,
-                              gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL)}
+                              gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -494,3 +494,43 @@ def test_서버_지침이_비어_있지_않다():
     for must in ("search_tools", "invoke_tool", "refused", "desc_match", "browse_experts"):
         assert must in gw._INSTRUCTIONS, f"지침에 {must} 안내가 빠졌다"
     assert gw.fm.instructions == gw._INSTRUCTIONS, "FastMCP 에 실려야 클라이언트로 간다"
+
+
+def test_답변_수치를_조회기록과_대조한다(monkeypatch):
+    """MCP 에는 웹의 근거 블록 같은 **코드 검증**이 없어 지침(부탁)뿐이었다. 조회 기록에 없는
+    수치를 집어 주면 클로드가 보내기 전에 스스로 잡을 수 있다."""
+    import asyncio
+
+    monkeypatch.setattr(gw, "_EVID", gw.OrderedDict())
+    monkeypatch.setattr(gw, "_request_user", lambda: "a@b.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+
+    # 조회 기록이 없으면 '먼저 도구를 부르라' 고 말한다 — 조용히 통과시키지 않는다.
+    r0 = json.loads(asyncio.run(gw._verify_answer({"text": "응력 48039.32 MPa"})).content[0].text)
+    assert r0["unsourced"] == ["48039.32"] and "도구를 먼저" in r0["note"]
+
+    res = gw.types.CallToolResult(content=[gw.types.TextContent(
+        type="text", text='{"stress": 48039.32, "count": 12}')])
+    gw._evid_keep("compute_x", res)
+
+    body = json.loads(asyncio.run(gw._verify_answer(
+        {"text": "응력은 48039.32 MPa 이고 안전율은 1250.5 다. 항목 12개."})).content[0].text)
+    assert body["unsourced"] == ["1250.5"], "조회에 없는 값만 집어야 한다"
+    assert body["checked"] == 2, "작은 정수(12)는 오탐이 더 나쁘므로 보지 않는다"
+    assert body["tool_calls"] == ["compute_x"]
+
+
+def test_한글_단위_수치도_대조한다(monkeypatch):
+    """에이전트서버와 같은 결함이 여기에도 있었다 — `(?!\\w)` 는 한글을 단어로 봐서 '408명'을
+    통째로 건너뛴다. 두 화면의 판정 기준은 같아야 한다."""
+    import asyncio
+
+    monkeypatch.setattr(gw, "_EVID", gw.OrderedDict())
+    monkeypatch.setattr(gw, "_request_user", lambda: "a@b.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    gw._evid_keep("t", gw.types.CallToolResult(content=[gw.types.TextContent(
+        type="text", text='{"n": 408}')]))
+    body = json.loads(asyncio.run(gw._verify_answer(
+        {"text": "전문가 408명, 비용 1250.5원"})).content[0].text)
+    assert body["unsourced"] == ["1250.5"], "한글 단위가 붙어도 대조해야 한다"
+    assert body["checked"] == 2

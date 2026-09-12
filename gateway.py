@@ -1192,6 +1192,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         return _list_by_area(by_app, groups, str((arguments or {}).get("area") or "").strip())
 
     apps = []
+    denied = 0
     for key in sorted(by_app, key=lambda k: -len(by_app[k])):
         tools = by_app[key]
         local = key == "_gateway"
@@ -1199,6 +1200,12 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         accessible = True if local else _backend_allowed(key, groups)
         reachable = True if local else (key in backends and backends[key].session is not None)
         if want_app and key != want_app:
+            continue
+        # 권한 없는 앱은 **목록에서 뺀다** — 예전엔 accessible:false 딱지만 붙여 도구 이름까지
+        # 보여 줬고, 모델은 못 부를 도구를 계획에 넣었다(호출은 막히니 실패로만 끝난다).
+        # 이름으로 콕 집어 물어도 도구는 안 준다 — 권한 없음만 알린다(되물음을 끊는다).
+        if not accessible:
+            denied += 1
             continue
         meta = _app_meta(key)
         entry = {
@@ -1221,11 +1228,14 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         "apps": apps,
         "app_count": len(apps),
         "total_tools": sum(a["tool_count"] for a in apps),
-        "note": "accessible=내 권한으로 호출 가능, reachable=백엔드 연결 정상. "
+        "hidden_no_access": denied,
+        "note": "여기 있는 앱은 모두 내 권한으로 호출 가능하다(reachable=백엔드 연결 정상). "
+                "권한 없는 앱은 목록에 없다 — 필요하면 포털 '내 권한'에서 요청하라. "
                 "특정 앱의 도구 설명은 list_tool_apps(app='<키>') 로 조회.",
     }
     if want_app and not apps:
-        payload["error"] = f"unknown app: {want_app}"
+        payload["error"] = (f"no_access: {want_app} — 이 계정에는 권한이 없는 앱이다"
+                            if denied else f"unknown app: {want_app}")
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
     )

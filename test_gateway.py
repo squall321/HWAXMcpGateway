@@ -427,3 +427,33 @@ def test_그룹_헤더_없는_내부_서비스는_사람_권한_정책을_받지
     monkeypatch.setattr(gw, "_ACCESS_POLICY", {"sf": ["plat:stepforge"], "sec": ["plat:risk"]})
     assert gw._backend_allowed("sf", [gw.SERVICE_GROUP]) is True
     assert gw._backend_allowed("sec", [gw.SERVICE_GROUP]) is False, "설정 allowed_groups 는 그대로 본다"
+
+def test_list_tool_apps_는_권한없는_앱을_아예_안_보여준다(monkeypatch):
+    """앱 목록도 영역 보기와 같은 규칙 — 못 쓰는 앱은 이름도 도구도 내보내지 않는다.
+    예전엔 accessible:false 로 딱지만 붙여 도구 이름을 다 실었고, 모델이 그걸 계획에 넣었다."""
+    class _S:
+        session = object()
+    monkeypatch.setattr(gw, "backends", {"open_app": _S(), "secret": _S()})
+    monkeypatch.setattr(gw, "exposed_tools", [_tool("find_parts"), _tool("s_tool")])
+    monkeypatch.setattr(gw, "route", {"find_parts": ("open_app", "find_parts"),
+                                      "s_tool": ("secret", "s_tool")})
+    monkeypatch.setattr(gw, "POLICY", {"secret": ["admin"]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+
+    body = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    keys = {a["app"] for a in body["apps"]}
+    assert "open_app" in keys and "secret" not in keys
+    assert "s_tool" not in json.dumps(body), "권한 없는 앱의 도구 이름이 새어 나왔다"
+    assert body["hidden_no_access"] == 1
+
+    # 이름으로 콕 집어 물어도 도구는 안 준다 — 권한 없음만 알린다.
+    one = json.loads(asyncio.run(gw._list_tool_apps({"app": "secret"})).content[0].text)
+    assert one["apps"] == [] and one["error"].startswith("no_access")
+    assert "s_tool" not in json.dumps(one)
+
+    # 권한이 있으면 종전대로 보인다.
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["admin"])
+    body2 = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    assert {a["app"] for a in body2["apps"]} >= {"open_app", "secret"}
+    assert body2["hidden_no_access"] == 0

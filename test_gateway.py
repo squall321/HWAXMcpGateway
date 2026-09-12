@@ -34,7 +34,8 @@ def test_visible_tools(monkeypatch):
     # ⚠ `_visible_tools` 는 게이트웨이 **로컬 도구**(save_conversation 등)를 늘 덧붙인다 —
     # 그것들은 백엔드 인가와 무관하므로 백엔드에서 온 것만 골라 본다(이 테스트의 관심사다).
     local = {t.name for t in (gw.SAVE_CONV_TOOL, gw.SEARCH_CONV_TOOL, gw.LIST_APPS_TOOL,
-                              gw.SEARCH_TOOLS_TOOL, gw.INVOKE_TOOL)}
+                              gw.SEARCH_TOOLS_TOOL, gw.INVOKE_TOOL,
+                              gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -457,3 +458,29 @@ def test_list_tool_apps_는_권한없는_앱을_아예_안_보여준다(monkeypa
     body2 = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
     assert {a["app"] for a in body2["apps"]} >= {"open_app", "secret"}
     assert body2["hidden_no_access"] == 0
+
+
+def test_조직도_도구가_라벨없이도_돈다(monkeypatch):
+    """라벨 표(포털 orgTaxonomy.json)를 못 받아도 목록 자체는 돌아야 한다 — 라벨이 없다고
+    조직도를 통째로 죽이면 클로드 쪽에서 '전문가가 없다'로 보인다(코드로라도 보여 준다)."""
+    import asyncio
+
+    async def fake_call(name, args):
+        assert name == "list_agents"
+        rows = [{"agent_type": "cam-aa-process", "name": "카메라 조립"},
+                {"agent_type": "he-calc-laminate", "name": "Laminate 운영자"}]
+        return gw.types.CallToolResult(content=[gw.types.TextContent(
+            type="text", text=json.dumps({"result": rows}, ensure_ascii=False))])
+
+    monkeypatch.setattr(gw, "_call_tool", fake_call)
+    monkeypatch.setattr(gw, "_ORG_TAX", {})
+    monkeypatch.setattr(gw, "_portal_api_base", lambda: "")   # 라벨 표 없음
+    body = json.loads(asyncio.run(gw._browse_experts({})).content[0].text)
+    assert body["total"] == 2
+    assert "라벨 표를 못 받아" in body["note"]
+    doms = {d["domain"] for sec in body["chart"] for d in sec["domains"]}
+    assert doms == {"cam", "he"}
+
+    # 검색은 이름·키 모두에서 찾는다.
+    hit = json.loads(asyncio.run(gw._browse_experts({"q": "laminate"})).content[0].text)
+    assert [e["key"] for e in hit["experts"]] == ["he-calc-laminate"]

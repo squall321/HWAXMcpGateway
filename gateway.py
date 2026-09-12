@@ -1182,7 +1182,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     by_app: dict[str, list[types.Tool]] = {}
     for t in exposed_tools:
         by_app.setdefault(route[t.name][0], []).append(t)
-    by_app.setdefault("_gateway", []).extend([SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL])
+    by_app.setdefault("_gateway", []).extend([SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
+                                              BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL])
     # 연결이 끊긴 백엔드는 도구가 집계되지 않아 목록에서 통째로 사라진다 — 접근성 점검이
     # 목적이므로 '앱은 있는데 지금 불통'을 보이게 빈 항목으로 채운다.
     for _k in backends:
@@ -1276,9 +1277,217 @@ def _list_by_area(by_app: dict, groups: list[str], want_area: str) -> types.Call
         content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
 
 
+
+# ── 전문가 조직도 (클로드에서도 사람을 고르게 한다) ────────────────────────────────
+# MCP 에는 UI 표면이 없다 — 패널을 띄울 수 없으므로 **도구 두 개**로 같은 일을 한다.
+#   browse_experts : 조직도(루트→분류→분야→사람)와 검색 결과를 계층으로 돌려준다 → 클로드가 목록으로 보여 준다
+#   use_experts    : 고른 사람의 역할 문서·운영 앱·입구 도구를 돌려준다 → 클로드가 그 전문가가 된다
+# 라벨 정본은 포털의 orgTaxonomy.json 하나다(여기서 옮겨 적지 않는다 — 두 조직도가 갈린다).
+_ORG_TAX: dict = {}
+_ORG_TAX_AT = 0.0
+ORG_TAX_TTL_S = int(os.environ.get("ORG_TAX_TTL_S", "600"))
+
+
+async def _org_taxonomy() -> dict:
+    """포털에서 조직도 라벨 표를 받아 캐시한다. 못 받으면 빈 표 — 그때는 도메인 코드가 그대로
+    보이지만 목록 자체는 돌아간다(라벨이 없다고 조직도를 통째로 죽이지 않는다)."""
+    global _ORG_TAX_AT
+    if _ORG_TAX and time.monotonic() - _ORG_TAX_AT < ORG_TAX_TTL_S:
+        return _ORG_TAX
+    base = _portal_api_base()
+    if not base:
+        return _ORG_TAX
+    try:
+        async with httpx.AsyncClient(timeout=8) as cli:
+            r = await cli.get(f"{base.rstrip('/')}/internal/org-taxonomy",
+                              headers={"Authorization": f"Bearer {GW_TOKEN}"})
+        r.raise_for_status()
+        data = r.json() or {}
+        if isinstance(data, dict) and data.get("domain_label"):
+            _ORG_TAX.clear()
+            _ORG_TAX.update(data)
+            _ORG_TAX_AT = time.monotonic()
+    except Exception as exc:  # noqa: BLE001 — 라벨은 있으면 좋은 것이지 필수가 아니다
+        log.warning("조직도 라벨 표 조회 실패 — 코드로 보여 준다: %r", exc)
+    return _ORG_TAX
+
+
+BROWSE_EXPERTS_TOOL = types.Tool(
+    name="browse_experts",
+    description=(
+        "전문가 조직도를 훑는다 — 인자 없이 부르면 루트→분류→분야(인원수)를, domain 을 주면 "
+        "그 분야의 사람들을, q 를 주면 이름·키·설명으로 찾은 사람들을 돌려준다. "
+        "사용자가 '누구한테 물어볼까'를 정할 때 이 목록을 보여 주고 고르게 하라. "
+        "고른 뒤에는 use_experts(keys=[...]) 로 그 전문가의 역할과 도구를 받는다."),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "q": {"type": "string", "description": "검색어(이름·키워드). 비우면 분야 목록."},
+            "domain": {"type": "string", "description": "분야 코드(cam·mech·he…) — 그 분야 사람들만."},
+            "limit": {"type": "integer", "description": "최대 인원(기본 40)."},
+        },
+    },
+)
+
+USE_EXPERTS_TOOL = types.Tool(
+    name="use_experts",
+    description=(
+        "고른 전문가로 답하기 위한 재료를 돌려준다 — 역할 문서(사전 지식·작업 순서·함정), "
+        "HE팀 운영자면 그 앱과 입구 도구. **첫 명이 주 전문가**(목소리)이고 나머지는 보조로, "
+        "도구와 판단 기준만 빌려준다(최대 5명). 받은 역할대로 답하되 관점이 갈리면 숨기지 말고 "
+        "'이견:' 한 줄로 밝혀라. 보조의 사내 지식이 필요하면 agent_search(<키>, 질의) 를 쓴다."),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "keys": {"type": "array", "items": {"type": "string"},
+                     "description": "전문가 키 목록(browse_experts 결과의 key). 첫 명이 주 전문가."},
+        },
+        "required": ["keys"],
+    },
+)
+
+
+def _tax_domain_label(code: str) -> str:
+    return (_ORG_TAX.get("domain_label") or {}).get(code) or code
+
+
+async def _agents_json(args: dict) -> list[dict]:
+    """AIDataHub 의 list_agents 를 **정상 경로**로 부른다 — 인가·캐시·감사가 그대로 적용된다
+    (권한 없는 사람은 여기서 막힌다). 결과는 JSON 배열이어야 하고, 아니면 빈 목록이다."""
+    res = await _call_tool("list_agents", args)
+    if getattr(res, "isError", False):
+        return []
+    out: list[dict] = []
+    for c in (getattr(res, "content", None) or []):
+        txt = getattr(c, "text", "") or ""
+        try:
+            data = json.loads(txt)
+        except Exception:  # noqa: BLE001 — 텍스트로 온 응답은 접지 않는다
+            continue
+        # ⚠ 목록 도구는 **블록 하나에 한 명씩** 실어 보낸다(796명이면 content 796개다).
+        # 배열만 기대하면 0명으로 읽고, 화면에는 '전문가가 없다'로 보인다(실측).
+        if isinstance(data, dict) and (data.get("agent_type") or data.get("id")):
+            out.append(data)
+            continue
+        rows = data.get("result") if isinstance(data, dict) else data
+        if isinstance(rows, dict):
+            rows = rows.get("agents") or rows.get("data") or []
+        if isinstance(rows, list):
+            out.extend(r for r in rows if isinstance(r, dict))
+    return out
+
+
+async def _browse_experts(arguments: dict) -> types.CallToolResult:
+    tax = await _org_taxonomy()
+    q = str((arguments or {}).get("q") or "").strip()
+    domain = str((arguments or {}).get("domain") or "").strip()
+    limit = max(1, min(200, int((arguments or {}).get("limit") or 40)))
+
+    rows = await _agents_json({"compact": True, **({"domain": domain} if domain else {})})
+    people = []
+    for r in rows:
+        key = str(r.get("agent_type") or r.get("id") or "").strip()
+        if key:
+            people.append({"key": key, "name": str(r.get("name") or key),
+                           "domain": key.split("-")[0] or "기타"})
+    if q:
+        ql = q.lower()
+        hit = [p for p in people if ql in p["name"].lower() or ql in p["key"].lower()]
+        payload = {"query": q, "found": len(hit),
+                   "experts": [{**p, "domain_label": _tax_domain_label(p["domain"])} for p in hit[:limit]],
+                   "note": "이름·키 일치만 본다. 주제로 찾으려면 recommend_agents(q) 를 쓰고, "
+                           "고른 뒤에는 use_experts(keys=[...]) 로 역할과 도구를 받아라."}
+        return types.CallToolResult(content=[types.TextContent(
+            type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
+
+    if domain:
+        payload = {"domain": domain, "domain_label": _tax_domain_label(domain),
+                   "count": len(people), "experts": people[:limit],
+                   "note": "use_experts(keys=[...]) 로 고른 사람의 역할·도구를 받아라(첫 명이 주 전문가)."}
+        return types.CallToolResult(content=[types.TextContent(
+            type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
+
+    # 분야 목록 — 라벨 표의 분류(루트→분류→분야)로 접는다. 표를 못 받았으면 코드로 보여 준다.
+    counts: dict[str, int] = {}
+    for p in people:
+        counts[p["domain"]] = counts.get(p["domain"], 0) + 1
+    cats = tax.get("categories") or []
+    roots = {r["id"]: r["label"] for r in (tax.get("roots") or [])}
+    app_doms = set(tax.get("app_analyst_domains") or [])
+    seen: set[str] = set()
+    tree = []
+    for c in cats:
+        doms = list(c.get("domains") or [])
+        if c.get("id") == "apps":
+            doms = [d for d in counts if d in app_doms]
+        elif c.get("id") == "sw":
+            doms = [d for d in counts if d == "sw"]
+        entries = [{"domain": d, "label": _tax_domain_label(d), "count": counts.get(d, 0)}
+                   for d in doms if counts.get(d)]
+        seen.update(e["domain"] for e in entries)
+        if entries:
+            tree.append({"root": roots.get(c.get("root"), c.get("root")), "category": c.get("label"),
+                         "count": sum(e["count"] for e in entries), "domains": entries})
+    rest = [{"domain": d, "label": _tax_domain_label(d), "count": n}
+            for d, n in sorted(counts.items(), key=lambda x: -x[1]) if d not in seen]
+    if rest:
+        tree.append({"root": "미분류", "category": "미분류", "count": sum(e["count"] for e in rest),
+                     "domains": rest})
+    payload = {"total": len(people), "chart": tree,
+               "note": ("분야를 고르면 browse_experts(domain='<코드>'), 이름으로 찾으려면 q, "
+                        "주제로 찾으려면 recommend_agents(q). 고른 뒤 use_experts(keys=[...])."
+                        + ("" if tax else " ⚠ 라벨 표를 못 받아 코드로 보여 준다."))}
+    return types.CallToolResult(content=[types.TextContent(
+        type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
+
+
+async def _use_experts(arguments: dict) -> types.CallToolResult:
+    """고른 전문가의 역할·운영 앱·입구 도구. 포털 챗의 pinned_agents 와 같은 규칙이다 —
+    첫 명이 주 전문가(목소리)이고 나머지는 도구와 판단 기준만 빌려준다."""
+    keys = [str(k).strip()[:120] for k in ((arguments or {}).get("keys") or []) if str(k).strip()]
+    keys = list(dict.fromkeys(keys))[:5]
+    if not keys:
+        return types.CallToolResult(content=[types.TextContent(
+            type="text", text="use_experts: keys 에 전문가 키를 하나 이상 주세요(browse_experts 참조).")],
+            isError=True)
+    out = []
+    for i, k in enumerate(keys):
+        res = await _call_tool("get_agent_session", {"agent_type": k})
+        role, apps, key_tools, kind = "", [], [], "domain"
+        for c in (getattr(res, "content", None) or []):
+            try:
+                d = json.loads(getattr(c, "text", "") or "")
+            except Exception:  # noqa: BLE001
+                continue
+            d = d.get("result", d) if isinstance(d, dict) else d
+            if isinstance(d, list) and d:
+                d = d[0]
+            if not isinstance(d, dict):
+                continue
+            d = d.get("data", d)
+            role = str(d.get("system_prompt") or d.get("description") or "")[:8000]
+            rc = d.get("response_config") if isinstance(d.get("response_config"), dict) else {}
+            if rc.get("persona_kind") == "mcp_operator":
+                kind = "operator"
+                apps = [str(a) for a in (rc.get("mcp_apps") or [])][:3]
+                key_tools = [str(t) for t in (rc.get("key_tools") or [])][:12]
+        out.append({"key": k, "role": "lead" if i == 0 else "helper", "kind": kind,
+                    "role_doc": role, "apps": apps, "entry_tools": key_tools})
+    payload = {
+        "lead": keys[0], "helpers": keys[1:], "experts": out,
+        "how": ("첫 명의 목소리로 한 사람처럼 답하라. 보조는 이름으로 따로 말하지 말고 그들의 "
+                "판단 기준과 도구를 녹여라. 운영자의 앱 도구는 search_tools 로 찾아 invoke_tool 로 "
+                "부르고, 사내 지식은 agent_search(<키>, 질의) 로 조회한다. 관점이 갈리면 숨기지 "
+                "말고 '이견:' 한 줄로 밝혀라."),
+    }
+    return types.CallToolResult(content=[types.TextContent(
+        type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
+
+
 def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
-    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL]
+    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
+            BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL]
 
 
 def _request_groups() -> list[str]:
@@ -1439,6 +1648,10 @@ async def _call_tool(name: str, arguments: dict):
         return await _list_tool_apps(arguments or {})
     if name == SEARCH_TOOLS_TOOL.name:
         return await _search_tools(arguments or {})
+    if name == BROWSE_EXPERTS_TOOL.name:
+        return await _browse_experts(arguments or {})
+    if name == USE_EXPERTS_TOOL.name:
+        return await _use_experts(arguments or {})
     # `route` 를 **먼저** 본다 — bare 이름의 뜻은 그대로다. 없을 때만 호출 전용 별칭.
     resolved = route.get(name) or alias_route.get(name)
     if resolved is None:
@@ -1614,7 +1827,7 @@ def _bearer_gate(app, pat_verifier=None):
             _map.setdefault(LIST_APPS_TOOL.name, "_gateway")
             # search_tools·invoke_tool 도 게이트웨이 로컬이다 — 빠뜨리면 /tools-map 의 _gateway
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
-            for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL):
+            for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서

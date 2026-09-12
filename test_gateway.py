@@ -534,3 +534,13 @@ def test_한글_단위_수치도_대조한다(monkeypatch):
         {"text": "전문가 408명, 비용 1250.5원"})).content[0].text)
     assert body["unsourced"] == ["1250.5"], "한글 단위가 붙어도 대조해야 한다"
     assert body["checked"] == 2
+
+
+def test_신원_전달은_콜론을_인코딩하지_않는다():
+    """권한 키는 feat:chat·plat:aidatahub 꼴이다. quote 의 안전문자에 `:` 가 없으면 feat%3Achat
+    로 가고, 받는 쪽이 디코드하지 않으면 **전 키가 무효**가 된다(실측: 도구 465→3개, 좌석 0명)."""
+    src = open(__file__.replace("test_gateway.py", "gateway.py"), encoding="utf-8").read()
+    i = src.index("async def _call_with_identity(")
+    body = src[i: src.index("\n@_low.list_tools()", i)]
+    assert 'safe=",:"' in body, "그룹 헤더의 콜론은 그대로 실어야 한다"
+    assert "IDENTITY_FWD" in src and "hwax-deliberation" in src

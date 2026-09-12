@@ -1726,6 +1726,37 @@ async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: st
                                             read_timeout_seconds=timedelta(seconds=timeout_s))
 
 
+
+# 호출자 신원을 **백엔드까지** 전달할 백엔드 키. 영속 세션은 열 때의 헤더(서비스 계정)를 그대로
+# 물고 있어 호출마다 다른 신원이 닿지 않는다 — 그래서 MCP 심의는 늘 서비스 계정 시야로 돌았고,
+# 사용자별 스코프 앱(DynaForge 등)이 "내 것이 하나도 없다" 로 답했다(실측 2026-09-12).
+# 대상 백엔드는 호출당 단발 세션을 연다(핸드셰이크 비용 — 심의는 호출 빈도가 낮아 감당된다).
+IDENTITY_FWD = {k.strip() for k in os.environ.get(
+    "IDENTITY_FWD_BACKENDS", "hwax-deliberation").split(",") if k.strip()}
+
+
+async def _call_with_identity(b: "_Backend", original: str, arguments: dict, timeout_s: float,
+                              user: str, groups: list[str]):
+    """백엔드의 자격은 그대로 두고 **신원 헤더만** 실어 단발 세션으로 부른다.
+
+    그룹은 게이트웨이가 이미 검증·계산한 값이다(PAT 미들웨어가 위조 헤더를 버리고 포털의 지금
+    권한으로 덮어쓴다) — 백엔드는 게이트웨이를 통해서만 닿으므로 이 값을 신뢰해도 된다."""
+    hdrs = dict(b.headers or {})
+    if groups:
+        # ⚠ `:` 를 안전문자에 넣는다. 권한 키가 feat:chat·plat:aidatahub 꼴이라 인코딩하면
+        # feat%3Achat 로 가고, 받는 쪽이 디코드하지 않으면 **전 키가 무효**가 된다(실측: 도구
+        # 465 → 3개, 심의 좌석 0명). 헤더에 `:` 는 그대로 실어도 된다(latin-1 범위).
+        hdrs[GROUPS_HEADER] = quote(",".join(groups), safe=",:")
+    if user:
+        hdrs[USER_HEADER] = quote(user, safe="@.")
+    with anyio.fail_after(timeout_s):
+        async with streamablehttp_client(b.url, headers=hdrs) as (read, write, _sid):
+            async with ClientSession(read, write) as sess:
+                await sess.initialize()
+                return await sess.call_tool(original, arguments,
+                                            read_timeout_seconds=timedelta(seconds=timeout_s))
+
+
 @_low.list_tools()
 async def _list_tools():
     # 도구 목록을 caller groups로 필터(보이지 않는 도구는 LLM이 알 수도 없음).
@@ -1887,6 +1918,14 @@ async def _call_tool(name: str, arguments: dict):
     try:
         if b.session is None:
             raise RuntimeError("backend session down")
+        _u, _g = _request_user(), _request_groups()
+        if backend_key in IDENTITY_FWD and (_u or _g):
+            # 신원이 있는 호출은 그 신원으로 간다 — 심의가 서비스 계정 시야로 돌면 사용자별
+            # 데이터가 통째로 비어 보이고 보고서 귀속도 서비스 계정이 된다.
+            res = await _call_with_identity(b, original, arguments, CALL_TIMEOUT_S, _u, _g)
+            _audit(name, backend_key, not getattr(res, "isError", False), f"as-user:{_u or 'groups'}",
+                   round((time.monotonic() - t0) * 1000))
+            return _cache_put(ckey, _evid_keep(name, res))
         res = await b.session.call_tool(original, arguments, read_timeout_seconds=call_timeout)
         _audit(name, backend_key, not getattr(res, "isError", False), note,
                round((time.monotonic() - t0) * 1000))

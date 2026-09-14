@@ -626,3 +626,68 @@ def test_the_stuck_backend_is_reported_not_swallowed(monkeypatch, caplog):
 
     blob = caplog.text
     assert "stuck" in blob and ("초과" in blob or "실패" in blob), f"조용히 넘겼다: {blob!r}"
+
+
+# ── 감사 기록 — 성공에 `error` 가 실리면 안 된다 ─────────────────────────
+def test_감사의_error_는_실패에만_쓴다(tmp_path, monkeypatch):
+    """**실측 사고.** 위임 신원(`as:someone@…`)과 메모(`cache-hit`)를 `error` 칸으로 날라서
+    `ok:true` 인 기록에 `error` 가 실렸다 — 12,787줄 중 215줄이 그 모양이었다.
+    그러면 `error` 는 실패 신호로도, 신원 질의로도 못 쓴다. **성공이 실패처럼 생긴 것**이다.
+    """
+    import json as _j
+
+    f = tmp_path / "a.jsonl"
+    monkeypatch.setattr(gw, "AUDIT_PATH", str(f))
+    gw._audit("t", "b", True, None, 12, caller="a@b.c", mode="as-user-pat", corr="conv-9")
+    gw._audit("t", "b", True, None, 0, note="cache-hit")
+    gw._audit("t", "b", False, "진짜 실패", 5, caller="a@b.c")
+
+    rows = [_j.loads(x) for x in f.read_text(encoding="utf-8").splitlines()]
+    ok_rows = [r for r in rows if r["ok"]]
+    assert ok_rows and all("error" not in r for r in ok_rows), \
+        f"성공 기록에 error 가 실렸다: {ok_rows}"
+    assert rows[0]["caller"] == "a@b.c" and rows[0]["mode"] == "as-user-pat"
+    assert rows[0]["corr"] == "conv-9"
+    assert rows[1]["note"] == "cache-hit"
+    assert rows[2]["error"] == "진짜 실패", "실패에는 error 가 있어야 한다"
+
+
+def test_감사_시각이_밀리초까지_남는다(tmp_path, monkeypatch):
+    """초 단위라 같은 초의 호출들을 구분할 수 없었다 — 12,787줄이 7,879 키로 뭉갰다."""
+    import json as _j
+
+    f = tmp_path / "a.jsonl"
+    monkeypatch.setattr(gw, "AUDIT_PATH", str(f))
+    gw._audit("t", "b", True, None, 1)
+    ts = _j.loads(f.read_text(encoding="utf-8").strip())["ts"]
+    assert "." in ts, f"초 단위다: {ts}"
+
+
+def test_안_준_칸은_안_남긴다(tmp_path, monkeypatch):
+    """빈 칸을 만들면 '없다' 와 '빈 값이다' 가 섞인다."""
+    import json as _j
+
+    f = tmp_path / "a.jsonl"
+    monkeypatch.setattr(gw, "AUDIT_PATH", str(f))
+    gw._audit("t", "b", True, None, 1)
+    rec = _j.loads(f.read_text(encoding="utf-8").strip())
+    assert set(rec) == {"ts", "tool", "backend", "ok", "ms"}
+
+
+def test_감사_쓰기_실패가_호출을_막지_않는다(monkeypatch):
+    monkeypatch.setattr(gw, "AUDIT_PATH", "/없는디렉터리/a.jsonl")
+    gw._audit("t", "b", True, None, 1)   # 예외가 올라오면 실패
+
+
+def test_모든_호출자리가_error_칸을_메모로_쓰지_않는다():
+    """소스 정적 검사 — 새 자리가 다시 오남용하면 여기서 걸린다."""
+    import re
+
+    src = open("gateway.py", encoding="utf-8").read()
+    for m in re.finditer(r"_audit\((.{0,200}?)\)\n", src, re.S):
+        blob = m.group(1)
+        if 'True' not in blob:
+            continue
+        for bad in ('"cache-hit"', '"reconnected"', 'f"as:', 'f"as-conn:', 'f"as-user:'):
+            assert bad not in blob or "note=" in blob or "mode=" in blob, \
+                f"성공 기록의 error 칸에 메모를 넣는다: {blob[:90]}"

@@ -75,6 +75,8 @@ POLICY: dict[str, list[str]] = {k: list(v.get("allowed_groups", [])) for k, v in
 # 실제로 DynaForge 가 그랬다: 세션 12·K파일 25건이 있는데 심의는 0건을 봤다(2026-08-17).
 # groups 와 같은 규칙으로 퍼센트 인코딩한다(헤더는 latin-1 만 담는다).
 USER_HEADER = "x-hwax-user"
+# 어느 대화·실행의 호출인가. 호출부가 실어 주면 감사에 남는다(없으면 안 남는다).
+CORR_HEADER = "x-hwax-corr"
 # 백엔드별 사용자 위임 설정 — {app_id: {sso_url, secret, client, base?}}.
 # 값이 있는 백엔드만 사용자별 자격증명으로 호출한다(나머지는 종전대로 서비스 계정).
 PER_USER_SSO: dict[str, dict] = {k: v for k, v in (HEAX.get("per_user_sso") or {}).items()
@@ -224,13 +226,29 @@ def _cache_flush_backend(backend_key: str):
         _CACHE_STAT["flush"] += len(doomed)
 
 
-def _audit(tool, backend, ok, err, ms, caller=None):
-    """호출 1건을 JSONL 감사 로그에 append (감사 실패가 호출을 막지 않게). caller=REST PAT 주체."""
+def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=None):
+    """호출 1건을 JSONL 감사 로그에 append (감사 실패가 호출을 막지 않게).
+
+    ⚠ **`error` 는 실패에만 쓴다.** 종전에는 위임 신원(`as:someone@…`)과 메모(`cache-hit`·
+    `reconnected`)를 이 칸으로 날라서, `ok:true` 인 기록에 `error` 가 실렸다 — 12,787줄 중
+    215줄이 그 모양이었다. 그러면 `error` 는 실패 신호로 못 쓰고 신원 질의에도 못 쓴다.
+    **성공이 실패처럼 생긴 것**이라 이 리포가 싫어하는 그 모양이다. 칸을 갈랐다 —
+      caller : 누가 불렀나(MCP 경로도 이제 남긴다. 종전엔 93%가 신원 0이었다)
+      mode   : 어느 명의로 갔나(service | as-user | as-conn | identity-fwd)
+      note   : 실패가 아닌 메모(cache-hit · reconnected)
+      corr   : 어느 대화·실행의 호출인가(X-HWAX-Corr). 이게 없어서 감사와 대화를 못 이었다
+    """
     try:
-        rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                "tool": tool, "backend": backend, "ok": ok, "ms": ms}
         if caller:
             rec["caller"] = caller
+        if mode:
+            rec["mode"] = mode
+        if corr:
+            rec["corr"] = str(corr)[:120]
+        if note:
+            rec["note"] = str(note)[:120]
         if err:
             rec["error"] = err[:200]
         with open(AUDIT_PATH, "a") as f:
@@ -1647,6 +1665,25 @@ def _request_groups() -> list[str]:
     return _parse_groups(raw)
 
 
+def _request_corr() -> str:
+    """현재 요청 헤더(X-HWAX-Corr)의 상관 ID — 어느 대화·실행의 호출인가.
+
+    이게 없어서 감사 12,787줄을 대화에도 심의에도 이을 수 없었다. `(ts, tool, backend)`
+    로 이어 붙이면 6,584줄이 키를 공유한다(최악의 키 하나에 109줄). 호출부가 실어 주면
+    남기고, 안 실어 주면 그냥 없다 — **지어내지 않는다.**
+
+    ⚠ **이 값은 호출자가 주는 라벨이지 주장이 아니다.** 신원 헤더(X-HWAX-User)는 PAT 에서
+    다시 박아 위조를 막지만(2183행), 상관 ID 는 권한에 아무 영향이 없으므로 그대로 받는다.
+    읽는 쪽은 이것을 **묶는 데만** 쓰고 누구인지 판정하는 데 쓰면 안 된다 — 그건 `caller` 다.
+    """
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return ""
+    raw = req.headers.get(CORR_HEADER) if req is not None else None
+    return (raw or "").strip()[:120]
+
+
 def _request_user() -> str:
     """현재 요청 헤더(X-HWAX-User)의 호출자 이메일. 없으면 ''(=위임 없음)."""
     try:
@@ -1807,7 +1844,8 @@ async def _call_tool(name: str, arguments: dict):
         if (_orig.startswith(_INVOKE_DENY_PREFIX) or _orig.endswith(_INVOKE_DENY_SUFFIX)
                 or inner.startswith(_INVOKE_DENY_PREFIX)
                 or inner.endswith(_INVOKE_DENY_SUFFIX)):
-            _audit(name, None, False, f"invoke-denied:{inner}", 0)
+            _audit(name, None, False, f"invoke-denied:{inner}", 0,
+                   caller=_request_user() or None, corr=_request_corr())
             return types.CallToolResult(content=[types.TextContent(
                 type="text", text=(f"invoke_tool: '{inner}' 은 파괴·제어성 도구라 범용 실행기로 "
                                    "부를 수 없습니다. 직접 바인딩된 도구로만 호출하세요."))],
@@ -1834,7 +1872,8 @@ async def _call_tool(name: str, arguments: dict):
     # `route` 를 **먼저** 본다 — bare 이름의 뜻은 그대로다. 없을 때만 호출 전용 별칭.
     resolved = route.get(name) or alias_route.get(name)
     if resolved is None:
-        _audit(name, None, False, "unknown tool", 0)
+        _audit(name, None, False, "unknown tool", 0,
+               caller=_request_user() or None, corr=_request_corr())
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=f"unknown tool: {name}")],
             isError=True,
@@ -1842,7 +1881,8 @@ async def _call_tool(name: str, arguments: dict):
     backend_key, original = resolved
     # tools/list에서 숨겼더라도 직접 호출을 시도할 수 있으니 호출 시점에도 인가 재확인(enforcement).
     if not _backend_allowed(backend_key, _request_groups()):
-        _audit(name, backend_key, False, "forbidden", 0)
+        _audit(name, backend_key, False, "forbidden", 0,
+               caller=_request_user() or None, corr=_request_corr())
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=f"forbidden: {name}")],
             isError=True,
@@ -1854,7 +1894,8 @@ async def _call_tool(name: str, arguments: dict):
     if ckey is not None:
         _hit = _cache_get(ckey)
         if _hit is not None:
-            _audit(name, backend_key, True, "cache-hit", 0)
+            _audit(name, backend_key, True, None, 0, caller=_request_user() or None,
+                   note="cache-hit", corr=_request_corr())
             return _hit
     else:
         # 캐시 대상이 아니다 = 쓰기이거나 알 수 없는 도구. 그 백엔드의 캐시를 버린다 —
@@ -1897,8 +1938,9 @@ async def _call_tool(name: str, arguments: dict):
                             "이 앱은 사용자별 데이터라 서비스 계정 결과로 대체하지 않습니다."))],
                         isError=True,
                     )
-                _audit(name, backend_key, not getattr(res, "isError", False),
-                       f"as:{email}", round((time.monotonic() - t0) * 1000))
+                _audit(name, backend_key, not getattr(res, "isError", False), None,
+                       round((time.monotonic() - t0) * 1000),
+                       caller=email, mode="as-user-pat", corr=_request_corr())
                 return _cache_put(ckey, _evid_keep(name, res))
     elif backend_key in PORTAL_CONN_BACKENDS:
         # 포털 등록 연결 토큰 위임(RA 등) — 등록한 사용자만 본인 명의, 나머지는 서비스 계정.
@@ -1928,8 +1970,9 @@ async def _call_tool(name: str, arguments: dict):
                             "다시 등록하세요(만료·폐기 가능성)."))],
                         isError=True,
                     )
-                _audit(name, backend_key, not getattr(res, "isError", False),
-                       f"as-conn:{email}", round((time.monotonic() - t0) * 1000))
+                _audit(name, backend_key, not getattr(res, "isError", False), None,
+                       round((time.monotonic() - t0) * 1000),
+                       caller=email, mode="as-conn", corr=_request_corr())
                 return _cache_put(ckey, _evid_keep(name, res))
 
     # 이 호출이 쓰는 세션의 세대. 실패했을 때 "내가 죽었다고 본 그 세션" 을 가리키므로,
@@ -1944,12 +1987,14 @@ async def _call_tool(name: str, arguments: dict):
             # 신원이 있는 호출은 그 신원으로 간다 — 심의가 서비스 계정 시야로 돌면 사용자별
             # 데이터가 통째로 비어 보이고 보고서 귀속도 서비스 계정이 된다.
             res = await _call_with_identity(b, original, arguments, CALL_TIMEOUT_S, _u, _g)
-            _audit(name, backend_key, not getattr(res, "isError", False), f"as-user:{_u or 'groups'}",
-                   round((time.monotonic() - t0) * 1000))
+            _audit(name, backend_key, not getattr(res, "isError", False), None,
+                   round((time.monotonic() - t0) * 1000),
+                   caller=_u or None, mode="identity-fwd", corr=_request_corr())
             return _cache_put(ckey, _evid_keep(name, res))
         res = await b.session.call_tool(original, arguments, read_timeout_seconds=call_timeout)
-        _audit(name, backend_key, not getattr(res, "isError", False), note,
-               round((time.monotonic() - t0) * 1000))
+        _audit(name, backend_key, not getattr(res, "isError", False), None,
+               round((time.monotonic() - t0) * 1000),
+               caller=_u or None, mode="service", note=note, corr=_request_corr())
         return _cache_put(ckey, _evid_keep(name, res))
     except Exception as e:  # noqa: BLE001
         log.warning("call %s on %s failed (%r), reconnecting once", name, backend_key, e)
@@ -1964,14 +2009,17 @@ async def _call_tool(name: str, arguments: dict):
                     _REAGG["pending"] = True
                     res = await b.session.call_tool(original, arguments,
                                                     read_timeout_seconds=call_timeout)
-                    _audit(name, backend_key, not getattr(res, "isError", False),
-                           "reconnected" + (f"+{note}" if note else ""),
-                           round((time.monotonic() - t0) * 1000))
+                    _audit(name, backend_key, not getattr(res, "isError", False), None,
+                           round((time.monotonic() - t0) * 1000),
+                           caller=_request_user() or None, mode="service",
+                           note="reconnected" + (f"+{note}" if note else ""),
+                           corr=_request_corr())
                     return _cache_put(ckey, _evid_keep(name, res))
         except Exception as e2:  # noqa: BLE001 — 재시도 실패도 정돈된 isError 로 (프로토콜 에러 방지)
             log.warning("retry of %s on %s failed too (%r)", name, backend_key, e2)
             e = e2
-        _audit(name, backend_key, False, repr(e), round((time.monotonic() - t0) * 1000))
+        _audit(name, backend_key, False, repr(e), round((time.monotonic() - t0) * 1000),
+               caller=_request_user() or None, corr=_request_corr())
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=f"backend {backend_key} unavailable: {e!r}")],
             isError=True,

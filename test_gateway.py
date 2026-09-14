@@ -544,3 +544,85 @@ def test_신원_전달은_콜론을_인코딩하지_않는다():
     body = src[i: src.index("\n@_low.list_tools()", i)]
     assert 'safe=",:"' in body, "그룹 헤더의 콜론은 그대로 실어야 한다"
     assert "IDENTITY_FWD" in src and "hwax-deliberation" in src
+
+
+# ── 재집계가 백엔드 하나에 매달리면 게이트웨이 전체가 굳는다 ──────────────────
+class _NeverReadyB:
+    """`_ready` 를 영영 안 세우는 백엔드 — 재배포 중 아직 못 붙은 앱."""
+    def __init__(self):
+        import asyncio
+        self.session = object()          # 여기까지 가면 안 된다
+        self._failed = None
+        self._ready = asyncio.Event()    # set() 하지 않는다
+
+
+class _NeverAnswersSess:
+    async def list_tools(self):
+        import asyncio
+        await asyncio.sleep(3600)        # 연결은 살아 있는데 응답을 안 준다
+
+
+class _NeverAnswersB:
+    def __init__(self):
+        import asyncio
+        self.session = _NeverAnswersSess()
+        self._failed = None
+        self._ready = asyncio.Event()
+        self._ready.set()
+
+
+def test_a_backend_that_never_answers_does_not_freeze_the_catalogue(monkeypatch):
+    """**실사고 회귀(2026-09-12 18:07:54 ~ 09-14).**
+
+    `_aggregate` 의 `_ready.wait()` 와 `list_tools()` 에 데드라인이 없었다. 느린 앱
+    하나가 재집계 중에 응답을 멈추자 `_revive_loop` 가 거기서 섰고, 그 뒤 **이틀 동안**
+    죽은 백엔드 부활도 도구 목록 갱신도 일어나지 않았다.
+
+    최악인 것은 **아무도 못 봤다는 점**이다. 게이트웨이는 옛 카탈로그로 정상 응답을
+    계속 냈다 — 에러도 경고도 없다. StepForge 를 재배포했는데 새 도구가 안 보여서야
+    드러났다. 이 리포가 반복해서 만나는 "실패가 정상 응답과 똑같이 생겼다" 의 한 모양이다.
+
+    멈추는 것은 **예외가 아니라 행**이라 `except` 로는 못 잡는다 — 데드라인만이 잡는다.
+    """
+    import asyncio
+
+    monkeypatch.setattr(gw, "LIVENESS_TIMEOUT_S", 0.05)
+    stuck_ready, stuck_answer = _NeverReadyB(), _NeverAnswersB()
+    monkeypatch.setattr(gw, "backends", {
+        "ok_before": _B([_tool("before")]),
+        "stuck_ready": stuck_ready,
+        "stuck_answer": stuck_answer,
+        "ok_after": _B([_tool("after")]),      # 막힌 것 **뒤** 백엔드도 살아야 한다
+    })
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+
+    async def go():
+        # 데드라인이 없으면 여기서 매달린다 — 그게 실제로 일어난 일이다
+        await asyncio.wait_for(gw._aggregate(), timeout=5)
+
+    asyncio.run(go())
+
+    got = {t.name for t in gw.exposed_tools}
+    assert got == {"before", "after"}, f"막힌 백엔드가 나머지를 데려갔다: {got}"
+    # 응답 안 준 백엔드는 **죽은 것으로 표시**돼 다음 회차 재연결 루프가 집어 간다
+    assert stuck_answer.session is None, "재연결 예약이 안 됐다 — 영영 안 돌아온다"
+
+
+def test_the_stuck_backend_is_reported_not_swallowed(monkeypatch, caplog):
+    """건너뛴 것을 조용히 넘기면 도구가 사라진 이유를 아무도 못 찾는다."""
+    import asyncio
+    import logging
+
+    monkeypatch.setattr(gw, "LIVENESS_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(gw, "backends", {"stuck": _NeverAnswersB()})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+
+    with caplog.at_level(logging.ERROR, logger="hwax-mcp-gateway"):
+        asyncio.run(asyncio.wait_for(gw._aggregate(), timeout=5))
+
+    blob = caplog.text
+    assert "stuck" in blob and ("초과" in blob or "실패" in blob), f"조용히 넘겼다: {blob!r}"

@@ -321,11 +321,32 @@ async def _aggregate():
     """모든 백엔드에서 list_tools 수집, 충돌 도구만 프리픽스, exposed_tools/route 구축."""
     collected: list[tuple[str, types.Tool]] = []  # (backend_key, tool)
     for key, b in backends.items():
-        await b._ready.wait()
+        # ⚠ 이 두 await 에 데드라인이 없어서 **주기 루프가 이틀을 매달렸다**(실사고
+        #   2026-09-12 18:07:54 ~ 09-14). 느린 백엔드 하나가 재집계 중에 응답을 안 주면
+        #   _revive_loop 가 거기서 서고, 그때부터 죽은 백엔드 부활도 도구 목록 갱신도
+        #   영영 멈춘다. 그런데 게이트웨이는 **옛 카탈로그로 정상 응답을 계속 낸다** —
+        #   에러도 경고도 없어 아무도 못 본다. 실제로 StepForge 를 재배포했는데 새 도구가
+        #   안 보였고, 원인이 여기였다.
+        #   liveness(fail_after)·재연결(move_on_after) 경로엔 이미 데드라인이 있는데
+        #   여기만 비어 있었다. "멈추면 예외가 아니라 행이라 except 도 안 탄다."
+        with anyio.move_on_after(LIVENESS_TIMEOUT_S) as _sc:
+            await b._ready.wait()
+        if _sc.cancel_called:
+            log.error("backend %s aggregate 준비대기 %.0fs 초과 — 이번 회차 건너뛴다",
+                      key, LIVENESS_TIMEOUT_S)
+            continue
         if b.session is None:
             log.error("backend %s NOT available at aggregate time: %r", key, b._failed)
             continue
-        res = await b.session.list_tools()
+        try:
+            with anyio.fail_after(LIVENESS_TIMEOUT_S):
+                res = await b.session.list_tools()
+        except Exception as exc:  # noqa: BLE001 — 하나가 전체 재집계를 막으면 안 된다
+            # 세션을 죽은 것으로 표시해 **다음 회차 재연결 루프가 집어 가게** 한다.
+            # 이번 회차엔 이 백엔드 도구가 빠진다(session is None 갈래와 같은 동작).
+            log.error("backend %s list_tools 실패·초과 (%r) — 건너뛰고 재연결 예약", key, exc)
+            b.session = None
+            continue
         for t in res.tools:
             collected.append((key, t))
         log.info("backend %s -> %d tools", key, len(res.tools))

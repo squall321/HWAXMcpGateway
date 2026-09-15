@@ -727,3 +727,51 @@ def test_rest_프록시에_규칙이_실제로_주입된다():
     src = Path(__file__).resolve().parent.joinpath("gateway.py").read_text(encoding="utf-8")
     assert re.search(r"RestProxy\([^)]*allow=_rest_allowed", src), \
         "RestProxy 에 allow 가 안 꽂혔다"
+
+
+# ── 6차 감사 뒤 굳히는 것들(2026-09-15) ────────────────────────────────────
+def test_근거_원장이_섞이지_않는다(monkeypatch):
+    """신원이 없으면 그룹 문자열, 그것도 없으면 `_anon` 한 칸을 **모두가 공유**했다.
+    그래서 도구를 하나도 안 부른 새 세션에서 `verify_answer` 가 **남이 조회한 목록**을
+    냈다 — 환각 방어의 마지막 선이 그것이다."""
+    import gateway as gw
+
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["plat:x", "plat:y"])
+    monkeypatch.setattr(gw, "_request_session", lambda: "")
+    assert gw._evid_key() == "", "가를 수 없으면 빈 칸이어야 한다(섞느니 안 쌓는다)"
+
+    monkeypatch.setattr(gw, "_request_session", lambda: "S1")
+    k1 = gw._evid_key()
+    monkeypatch.setattr(gw, "_request_session", lambda: "S2")
+    assert k1 != gw._evid_key(), "세션이 다르면 칸도 달라야 한다"
+
+    monkeypatch.setattr(gw, "_request_user", lambda: "a@corp.com")
+    ku = gw._evid_key()
+    monkeypatch.setattr(gw, "_request_session", lambda: "S9")
+    assert gw._evid_key() == ku, "한 사람의 근거는 세션을 넘어 이어져야 한다"
+
+
+def test_파괴_관문이_이름_패턴_밖도_막는다():
+    """되돌리려면 남의 손이 필요한데 `delete_`·`_control` 어디에도 안 맞는 것들이 있다."""
+    import gateway as gw
+
+    for n in ("trash_report", "publish_report", "publish_report_to_datahub",
+              "request_unpublish", "restore_version", "job_stop"):
+        assert n in gw._INVOKE_DENY_EXACT, n
+    # 조회는 그대로 통과한다 — 관문이 너무 넓으면 범용 실행기가 무용지물이다
+    for n in ("list_operations", "get_material", "create_report_draft"):
+        assert n not in gw._INVOKE_DENY_EXACT, n
+
+
+def test_무인증_헬스는_권한_지도를_안_낸다():
+    """nginx 가 게이트웨이를 외부로 프록시한다 — 무인증 프로브에 내부 권한 지도가
+    나갈 이유가 없다. 다만 **실려 있는지**는 봐야 한다(비면 권한이 통째로 풀린 것)."""
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.joinpath("gateway.py").read_text(encoding="utf-8")
+    i = src.index('scope.get("path") == "/health"')
+    blk = src[i:i + 1800]
+    assert "access_policy_loaded" in blk
+    assert re.search(r'if _detail else \{\}', blk), "상세가 시크릿 뒤로 안 갔다"

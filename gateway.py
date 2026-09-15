@@ -1,5 +1,6 @@
 # 3개 백엔드 MCP를 집계해 단일 streamable-http 엔드포인트로 재노출하는 게이트웨이
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -352,19 +353,22 @@ async def _aggregate():
         if _sc.cancel_called:
             log.error("backend %s aggregate 준비대기 %.0fs 초과 — 이번 회차 건너뛴다",
                       key, LIVENESS_TIMEOUT_S)
+            _keep_last(key, collected, "준비대기 초과")
             continue
         if b.session is None:
             log.error("backend %s NOT available at aggregate time: %r", key, b._failed)
+            _keep_last(key, collected, "세션 없음")
             continue
         try:
             with anyio.fail_after(LIVENESS_TIMEOUT_S):
                 res = await b.session.list_tools()
         except Exception as exc:  # noqa: BLE001 — 하나가 전체 재집계를 막으면 안 된다
             # 세션을 죽은 것으로 표시해 **다음 회차 재연결 루프가 집어 가게** 한다.
-            # 이번 회차엔 이 백엔드 도구가 빠진다(session is None 갈래와 같은 동작).
-            log.error("backend %s list_tools 실패·초과 (%r) — 건너뛰고 재연결 예약", key, exc)
+            log.error("backend %s list_tools 실패·초과 (%r) — 재연결 예약", key, exc)
             b.session = None
+            _keep_last(key, collected, "list_tools 실패")
             continue
+        _LAST_TOOLS[key] = (list(res.tools), 0)
         for t in res.tools:
             collected.append((key, t))
         log.info("backend %s -> %d tools", key, len(res.tools))
@@ -456,6 +460,34 @@ async def _discover_heax() -> dict[str, dict] | None:
 
 
 # heax registry 연속 폴링 실패 횟수 — 일시적 불통과 '정말 사라짐'을 구분하기 위한 상태.
+# 레지스트리에 안 보인 연속 횟수. 한 번 빠졌다고 떼면 앱 재기동마다 카탈로그가 출렁인다.
+# 백엔드별 **직전 성공** 도구 목록과 연속 실패 횟수.
+# ⚠ 한 회차가 흔들렸다고 그 백엔드를 0종으로 집계하면 카탈로그가 통째로 출렁인다 —
+# 실측 로그에 460→426→460 이 남아 있다. 그 사이 호출은 "그런 도구 없습니다" 를 받는다.
+# 연속으로 실패할 때만 결국 비운다(영영 낡은 목록을 내걸지는 않는다).
+_LAST_TOOLS: dict[str, tuple] = {}
+AGG_STALE_ROUNDS = int(os.environ.get("GATEWAY_AGG_STALE_ROUNDS", "3"))
+
+
+def _keep_last(key: str, collected: list, why: str) -> None:
+    """이번 회차에 못 받은 백엔드는 **직전 목록**으로 메운다(상한까지)."""
+    got = _LAST_TOOLS.get(key)
+    if not got:
+        return
+    tools, misses = got
+    if misses >= AGG_STALE_ROUNDS:
+        log.warning("backend %s %d회 연속 실패 — 직전 목록(%d종)을 이제 버린다",
+                    key, misses, len(tools))
+        _LAST_TOOLS.pop(key, None)
+        return
+    _LAST_TOOLS[key] = (tools, misses + 1)
+    collected.extend((key, t) for t in tools)
+    log.warning("backend %s %s — 직전 목록 %d종을 유지한다(%d/%d)",
+                key, why, len(tools), misses + 1, AGG_STALE_ROUNDS)
+
+
+_HEAX_MISS: dict[str, int] = {}
+HEAX_MISS_BEFORE_DROP = int(os.environ.get("GATEWAY_HEAX_MISS_DROP", "3"))
 _HEAX_FAILS = {"n": 0}
 
 
@@ -496,12 +528,31 @@ async def _revive_once(tg) -> bool:
             if b.session is not None:
                 log.info("heax MCP %s 합류 (%s)", key, spec["url"])
                 revived = True
-        for key in ([k for k in list(backends)
-                     if k.startswith(HEAX_PREFIX) and k not in discovered]
-                    if _allow_removal else []):
+        # ⚠ **한 번 안 보인다고 떼지 않는다.** 폴링 실패(None)는 위에서 이미 지키는데,
+        # 200 인데 앱이 빠진 경우 — 그 앱이 재기동하며 스스로 등록을 내렸다든가 레지스트리가
+        # 순간 어긋났다든가 — 는 즉시 제거였다. 실측으로 백엔드 하나가 빠지며 **87종이
+        # 61초 사라졌고**(보관 로그에 제거/복귀 쌍 4회), 2026-08 에 고친 "그런 도구
+        # 없습니다" 가 다른 문으로 다시 들어온다. 연속으로 안 보일 때만 뗀다.
+        gone = []
+        if _allow_removal:
+            for k in list(backends):
+                if not k.startswith(HEAX_PREFIX):
+                    continue
+                if k in discovered:
+                    _HEAX_MISS.pop(k, None)
+                    continue
+                _HEAX_MISS[k] = _HEAX_MISS.get(k, 0) + 1
+                if _HEAX_MISS[k] >= HEAX_MISS_BEFORE_DROP:
+                    gone.append(k)
+                else:
+                    log.info("heax MCP %s 레지스트리에 안 보인다(%d/%d) — 아직 유지",
+                             k, _HEAX_MISS[k], HEAX_MISS_BEFORE_DROP)
+        for key in gone:
             backends.pop(key)._stop.set()
             POLICY.pop(key, None)
-            log.info("heax MCP %s 제거 (레지스트리에서 사라짐)", key)
+            _HEAX_MISS.pop(key, None)
+            log.info("heax MCP %s 제거 (레지스트리에서 %d회 연속 안 보임)",
+                     key, HEAX_MISS_BEFORE_DROP)
             revived = True
     # ── 연결된 백엔드의 도구 목록 재확인(G3) ──────────────────────────────
     # 앱 인스턴스가 교체돼도(SIF 재빌드·재기동) run() 은 _stop 대기로 park 중이라 예외가
@@ -1136,8 +1187,28 @@ INVOKE_TOOL = types.Tool(
     },
 )
 # 범용 실행기로는 못 부르는 것 — 한 번의 환각이 곧 파괴가 되는 도구들. 직접 바인딩 전용.
+def _secret_eq(got: str, want: str) -> bool:
+    """공유 시크릿 비교는 **상수 시간**으로. `==` 는 앞에서부터 갈려 길이·접두를 흘린다.
+    같은 코드베이스의 `require_csrf` 가 이미 `compare_digest` 를 쓴다 — 여기만 달랐다."""
+    if not want:
+        return False
+    return hmac.compare_digest(got or "", want)
+
+
 _INVOKE_DENY_PREFIX = ("delete_", "remove_", "cancel_", "purge_", "destroy_")
 _INVOKE_DENY_SUFFIX = ("_control", "_set_state")
+# ⚠ **이름 패턴만으로는 안 걸리는 것들이 있다.** 되돌리려면 **남의 손**이 필요한 바깥
+# 방향 행위인데 위 접두·접미 어디에도 안 맞는다. 포털이 이미 같은 목록을 `MUST_GATE`
+# 로 확정해 뒀으므로(HWAXPortal `app/procedures/models.py`) **그것을 그대로** 쓴다 —
+# 여기서 따로 고르면 두 곳이 어긋나고, 어긋난 쪽이 늘 느슨한 쪽이다.
+# 직접 바인딩으로는 여전히 부를 수 있다(사람이 고른 도구는 막지 않는다).
+# 실측(2026-09-15): 이 셋은 전부 **직접 호출**이었고 invoke_tool 경유는 조회 도구와
+# `create_report_draft` 뿐이라, 막아도 깨지는 흐름이 없다.
+_INVOKE_DENY_EXACT = frozenset({
+    "publish_report", "publish_report_to_datahub", "request_unpublish",
+    "trash_report", "restore_version", "job_stop", "risk_add_finding",
+    "add_report_tags",
+})
 
 
 SEARCH_TOOLS_TOOL = types.Tool(
@@ -1575,8 +1646,35 @@ EVID_MAX_CALLS = int(os.environ.get("EVID_MAX_CALLS", "20"))
 EVID_MAX_CHARS = int(os.environ.get("EVID_MAX_CHARS", "200000"))
 
 
+def _request_session() -> str:
+    """현재 MCP 세션 id. 없으면 ''."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return ""
+    raw = req.headers.get("mcp-session-id") if req is not None else None
+    return (raw or "").strip()[:80]
+
+
 def _evid_key() -> str:
-    return _request_user() or ",".join(sorted(_request_groups())) or "_anon"
+    """근거 원장의 칸 이름. **절대 섞이면 안 된다.**
+
+    ⚠ 예전엔 신원이 없으면 **그룹 문자열**, 그것도 없으면 `_anon` 한 칸을 모두가
+    공유했다. 그래서 도구를 하나도 안 부른 새 세션에서 `verify_answer` 를 불러도
+    **남이 조회한 도구 목록**이 나왔다(실측). 두 가지가 한꺼번에 깨진다 —
+      ① 남이 조회한 수치를 "내 조회 결과에 있다" 로 **초록 판정**한다. 이 허브 안내문이
+         지시하는 환각 방어의 **마지막 선**이 그것이다.
+      ② 다른 호출자가 무엇을 돌렸는지 열거된다(`list_my_notifications` 같은 사람 단위
+         도구 포함).
+    신원이 있으면 신원(한 사람의 근거는 세션을 넘어 이어져야 한다), 없으면 **세션**으로
+    가른다. 둘 다 없으면 **빈 문자열** — 호출부가 기록도 조회도 안 한다.
+    **섞느니 안 쌓는다.**
+    """
+    u = _request_user()
+    if u:
+        return "u:" + u
+    sid = _request_session()
+    return "s:" + sid if sid else ""
 
 
 def _evid_keep(tool: str, res):
@@ -1592,8 +1690,15 @@ def _evid_record(tool: str, res) -> None:
         if not txt:
             return
         key = _evid_key()
+        if not key:
+            return          # 누구 것인지 모르면 안 쌓는다 — 남의 칸에 들어가느니 없는 게 낫다
         now = time.monotonic()
-        _, calls = _EVID.get(key, (0.0, []))
+        exp, calls = _EVID.get(key, (0.0, []))
+        # ⚠ **만료를 무시하고 다시 도장 찍으면 안 된다.** 예전엔 저장된 exp 를 안 보고
+        # `now + TTL` 로 덮어써서, 30분 지난 수치가 **무관한 호출 하나로 부활**했다.
+        # 그러면 `verify_answer` 가 오래전 조회를 근거로 초록을 준다.
+        if exp and exp < now:
+            calls = []
         calls.append((tool, txt[:EVID_MAX_CHARS // 4]))
         del calls[:-EVID_MAX_CALLS]
         while sum(len(t) for _, t in calls) > EVID_MAX_CHARS and len(calls) > 1:
@@ -1622,7 +1727,16 @@ VERIFY_TOOL = types.Tool(
 
 async def _verify_answer(arguments: dict) -> types.CallToolResult:
     text = str((arguments or {}).get("text") or "")
-    exp, calls = _EVID.get(_evid_key(), (0.0, []))
+    key = _evid_key()
+    if not key:
+        # ⚠ **없는 것과 못 잇는 것은 다르다.** 칸을 못 정하면 "조회 기록 0건" 이 아니라
+        # "이을 수 없다" 다 — 전자로 답하면 사람이 '내가 조회를 안 했구나' 로 오독한다.
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(
+            {"ok": False, "reason": "no_evidence_scope",
+             "detail": "이 호출을 어느 조회 기록에 이을지 알 수 없습니다(신원·세션 없음) — "
+                       "검증을 건너뛴 것이지 수치가 맞다는 뜻이 아닙니다."},
+            ensure_ascii=False))], isError=False)
+    exp, calls = _EVID.get(key, (0.0, []))
     if exp and exp < time.monotonic():
         calls = []
     src = " ".join(t for _, t in calls).replace(",", "")
@@ -1849,6 +1963,7 @@ async def _call_tool(name: str, arguments: dict):
         _resolved = route.get(inner) or alias_route.get(inner)
         _orig = _resolved[1] if _resolved else inner
         if (_orig.startswith(_INVOKE_DENY_PREFIX) or _orig.endswith(_INVOKE_DENY_SUFFIX)
+                or inner in _INVOKE_DENY_EXACT
                 or inner.startswith(_INVOKE_DENY_PREFIX)
                 or inner.endswith(_INVOKE_DENY_SUFFIX)):
             _audit(name, None, False, f"invoke-denied:{inner}", 0,
@@ -1903,7 +2018,11 @@ async def _call_tool(name: str, arguments: dict):
         if _hit is not None:
             _audit(name, backend_key, True, None, 0, caller=_request_user() or None,
                    note="cache-hit", corr=_request_corr())
-            return _hit
+            # ⚠ **캐시 적중도 근거다.** 이 줄만 `_evid_keep` 이 빠져 있었다(나머지 반환
+            # 경로 다섯은 전부 감쌌다). 그래서 캐시가 데워진 뒤에는 `verify_answer` 가
+            # **방금 제대로 조회한 수치**를 지어낸 값이라고 고발했다 — 간헐적이라
+            # 모양이 가장 나쁘다(사람이 도구를 못 믿게 된다).
+            return _evid_keep(name, _hit)
     else:
         # 캐시 대상이 아니다 = 쓰기이거나 알 수 없는 도구. 그 백엔드의 캐시를 버린다 —
         # 방금 만든 것이 TTL 동안 목록에 안 보이는 read-after-write 를 막는다.
@@ -2043,16 +2162,24 @@ def _bearer_gate(app, pat_verifier=None):
             await app(scope, receive, send)
             return
         if scope.get("path") == "/health":
-            # 무인증 헬스: 오케스트레이터가 MCP 핸드셰이크 없이 싸게 프로브
+            # 무인증 헬스: 오케스트레이터가 MCP 핸드셰이크 없이 싸게 프로브.
+            # ⚠ **무인증에는 프로브가 쓰는 것만 낸다.** 예전엔 `policy`(백엔드별 허용 그룹)와
+            # `access_policy`(어느 자격이 어느 백엔드를 여는지)를 통째로 냈다 — nginx 가
+            # 게이트웨이를 외부로 프록시하므로 내부 권한 지도가 그대로 나갔다. 운영자가
+            # 보려면 **공유 시크릿**을 주면 된다(포털이 이미 그 값을 쓴다).
+            _detail = _secret_eq(
+                dict(scope.get("headers") or {}).get(b"authorization", b"").decode("latin-1"),
+                expected)
             body = json.dumps({
                 "status": "ok",
                 "tools": len(exposed_tools),
                 "backends": {k: (b.session is not None) for k, b in backends.items()},
                 # 캐시 효과를 밖에서 볼 수 있게 — 안 보이면 켜졌는지도 모른다.
                 "cache": {**_CACHE_STAT, "size": len(_RESP_CACHE), "ttl_s": CACHE_TTL_S},
-                "policy": POLICY,
-                # 포털 권한 정책(백엔드 → 필요 권한) — 비었으면 포털 정책 없이 도는 중이다.
-                "access_policy": _ACCESS_POLICY,
+                # 정책이 **실려 있는지**는 무인증으로도 봐야 한다 — 비어 있으면 권한이
+                # 통째로 풀린 채 도는 것이고, 그건 프로브가 잡아야 할 사고다. 내용은 가린다.
+                "access_policy_loaded": len(_ACCESS_POLICY),
+                **({"policy": POLICY, "access_policy": _ACCESS_POLICY} if _detail else {}),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
@@ -2108,7 +2235,9 @@ def _bearer_gate(app, pat_verifier=None):
             # PORTAL_CONN_TTL_S(기본 300초) 동안 안 먹어서, 방금 조직을 바꾼 사용자의 보고서가
             # 옛 워크스페이스로 조용히 간다 — 설정이 안 듣는 것처럼 보이는 그 실패다.
             # GW_TOKEN 을 요구한다(포털이 /internal/connections 를 읽을 때 쓰는 값과 같다).
-            if dict(scope.get("headers") or {}).get(b"authorization", b"").decode("latin-1") != expected:
+            if not _secret_eq(
+                    dict(scope.get("headers") or {}).get(b"authorization", b"").decode("latin-1"),
+                    expected):
                 await send({"type": "http.response.start", "status": 401,
                             "headers": [(b"content-type", b"application/json")]})
                 await send({"type": "http.response.body", "body": b'{"error":"unauthorized"}'})
@@ -2122,8 +2251,23 @@ def _bearer_gate(app, pat_verifier=None):
             else:
                 _gone = list(_CONN_CACHE)
                 _CONN_CACHE.clear()
-            log.info("connection cache invalidated: %s (%d entries)", _email or "(전체)", len(_gone))
-            _body = json.dumps({"ok": True, "dropped": len(_gone)}).encode()
+            # ⚠ **응답 캐시도 함께 비운다.** 연결 캐시만 지우면, 방금 워크스페이스를 바꾼
+            # 사람의 **캐시된 읽기 결과**가 300초를 마저 산다 — 포털이 이 엔드포인트를
+            # 부르는 이유가 "바뀐 값이 조용히 안 먹는 것" 을 막으려는 것인데 절반만 먹는다.
+            # 캐시 키에 호출자 신원이 들어 있어(177행) 그 사람 것만 정확히 골라낼 수 있다.
+            _rgone = [k for k in _RESP_CACHE if (not _email or (len(k) > 3 and k[3] == _email))]
+            for k in _rgone:
+                _RESP_CACHE.pop(k, None)
+            # 그 사람 명의 PAT 캐시도 비운다 — 연결이 바뀌었으면 위임 토큰도 다시 받는다.
+            _pgone = [k for k in _USER_PATS if (not _email or (isinstance(k, tuple) and _email in k)
+                                               or k == _email)]
+            for k in _pgone:
+                _USER_PATS.pop(k, None)
+            log.info("connection cache invalidated: %s (conn %d · resp %d · pat %d)",
+                     _email or "(전체)", len(_gone), len(_rgone), len(_pgone))
+            _body = json.dumps({"ok": True, "dropped": len(_gone),
+                                "resp_dropped": len(_rgone),
+                                "pat_dropped": len(_pgone)}).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": _body})
@@ -2132,7 +2276,9 @@ def _bearer_gate(app, pat_verifier=None):
             # 외부 MCP 의 기능 변경을 **즉시** 반영시키는 트리거. 주기 루프가 60초마다 같은
             # 일을 하지만, 배포 직후 검증(update-all)이 그때까지 옛 목록으로 판정하게 된다.
             # 백엔드에 I/O 를 일으키므로 GW_TOKEN 을 요구한다(무인증 /health·/tools-map 과 다름).
-            if dict(scope.get("headers") or {}).get(b"authorization", b"").decode("latin-1") != expected:
+            if not _secret_eq(
+                    dict(scope.get("headers") or {}).get(b"authorization", b"").decode("latin-1"),
+                    expected):
                 await send({"type": "http.response.start", "status": 401,
                             "headers": [(b"content-type", b"application/json")]})
                 await send({"type": "http.response.body", "body": b'{"error":"unauthorized"}'})
@@ -2165,7 +2311,7 @@ def _bearer_gate(app, pat_verifier=None):
             return
         headers = dict(scope.get("headers") or [])
         auth = headers.get(b"authorization", b"").decode("latin-1")
-        if auth == expected:
+        if _secret_eq(auth, expected):
             # 내부 에이전트 서버: GW_TOKEN. groups 는 에이전트가 x-hwax-groups 로 실어 보냄(신뢰).
             # 그룹 헤더가 아예 없으면 사용자를 대리하지 않는 내부 서비스 호출이다 — 표시 그룹을 붙여
             # 사람 권한 정책(포털)에서 뺀다. 권한 정책 이전과 같은 시야를 지킨다.

@@ -1182,6 +1182,13 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
         "그래프": ("plot", "chart"), "차트": ("chart", "plot"), "그림": ("plot", "render"),
         "템플릿": ("template",), "초안": ("draft",), "전문가": ("agent", "expert"),
         "부품": ("part",), "적층": ("laminate",), "대화": ("conversation",),
+        # 낙하/충격 리포트(DynaForge) 계열 — 도구 이름이 report_angle_stats·report_part_energy·
+        # report_scatter·report_geometry·report_upload_instructions 라 한국어 업무어가 이름을 못 맞힌다.
+        "낙하": ("drop", "impact", "sphere"), "충격": ("impact",), "전각도": ("sphere", "angle"),
+        "방향": ("angle", "direction", "scatter"), "각도": ("angle",), "산포": ("scatter",),
+        "에너지": ("energy",), "소성": ("plastic", "strain"), "변형률": ("strain",),
+        "응력": ("stress",), "속도": ("velocity",), "인테이크": ("intake", "upload"),
+        "반입": ("intake", "upload"), "시각화": ("geometry", "render"),
         # 심의 계열 — 도구 이름이 deliberate_* 라 한국어 업무 낱말이 이름을 못 맞힌다.
         # 앱 설명만으로는 app_hit 가산점뿐이라 다른 앱에 밀린다(실측: '안 선택' 이 물성·VOC 에 밀림).
         # 이름까지 맞히게 이어 준다 — 한 글자 토큰('안')은 위에서 이미 버려지므로 두 글자 이상만.

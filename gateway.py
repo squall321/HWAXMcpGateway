@@ -2213,12 +2213,25 @@ def _bearer_gate(app, pat_verifier=None):
     return middleware
 
 
+async def _rest_allowed(site: str, pat_groups: list[str], email: str) -> bool:
+    """REST 프록시의 자격 판정 — **MCP 경로와 같은 규칙**이다(`_backend_allowed`).
+
+    권한은 PAT 에 박힌 발급 때 값이 아니라 포털의 **지금** 값으로 본다(2183행과 같은 자세) —
+    거둔 권한이 PAT 수명(최대 100년) 동안 남으면 안 된다. 포털이 모르면 PAT 값 그대로 쓴다.
+    """
+    base = [g for g in pat_groups if g != SERVICE_GROUP and not _is_synthetic(g)]
+    now_keys = await _portal_entitlements(email.strip().lower(), base) if email else None
+    groups = base + (now_keys if now_keys is not None else
+                     [g for g in pat_groups if _is_synthetic(g)])
+    return _backend_allowed(site, groups)
+
+
 def main():
     star = fm.streamable_http_app()
     # REST 프록시 라우트(/api/<site>/<path>) 를 MCP 마운트보다 먼저 매칭되게 삽입.
     if REST:
         from rest_proxy import RestProxy
-        proxy = RestProxy(REST, PORTAL, _audit)
+        proxy = RestProxy(REST, PORTAL, _audit, allow=_rest_allowed)
         star.router.routes[:0] = proxy.routes()
         log.info("REST proxy enabled: %d sites (%s)", len(REST), ", ".join(REST))
     # streamable_http_app 의 lifespan 은 세션매니저 run() 만 돈다. 백엔드 집계 lifespan 을 함께 묶는다.

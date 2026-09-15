@@ -691,3 +691,39 @@ def test_모든_호출자리가_error_칸을_메모로_쓰지_않는다():
         for bad in ('"cache-hit"', '"reconnected"', 'f"as:', 'f"as-conn:', 'f"as-user:'):
             assert bad not in blob or "note=" in blob or "mode=" in blob, \
                 f"성공 기록의 error 칸에 메모를 넣는다: {blob[:90]}"
+
+
+# ── REST 프록시가 자격 체계를 우회하던 것(2026-09-15 6차 감사) ──────────────
+def test_rest_프록시가_MCP_와_같은_규칙을_본다(monkeypatch):
+    """PAT 서명·aud·scope·폐기목록까지만 보고 **groups 를 안 봤다** — 자격 0개인 사람이
+    MCP 로는 `forbidden:` 을 받는 백엔드를 이 경로로는 200 으로 읽었다(실측).
+    `inject` 없는 사이트는 권한 상승이 없다고 봤는데, 상류 AIDataHub 가 **인증 없이 200**
+    이라 이 프록시가 유일한 관문이었다.
+    """
+    import asyncio
+
+    import gateway as gw
+
+    monkeypatch.setitem(gw._ACCESS_POLICY, "ai-data-hub", ["plat:aidatahub"])
+
+    async def _no_portal(email, base):
+        return None
+    monkeypatch.setattr(gw, "_portal_entitlements", _no_portal)
+
+    run = asyncio.get_event_loop_policy().new_event_loop().run_until_complete
+    assert run(gw._rest_allowed("ai-data-hub", ["plat:aidatahub"], "")) is True
+    assert run(gw._rest_allowed("ai-data-hub", [], "")) is False
+    assert run(gw._rest_allowed("ai-data-hub", ["plat:stepforge"], "")) is False
+    # ⚠ PAT 이 서비스 그룹을 **주장해도** 인정하지 않는다 — 그러면 아무나 스스로 찍어
+    # 내부 서비스 면제를 받는다. MCP 경로가 그 그룹을 떼는 이유가 같다.
+    assert run(gw._rest_allowed("ai-data-hub", [gw.SERVICE_GROUP], "")) is False
+
+
+def test_rest_프록시에_규칙이_실제로_주입된다():
+    """함수만 있고 안 꽂혀 있으면 아무것도 안 지킨다."""
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.joinpath("gateway.py").read_text(encoding="utf-8")
+    assert re.search(r"RestProxy\([^)]*allow=_rest_allowed", src), \
+        "RestProxy 에 allow 가 안 꽂혔다"

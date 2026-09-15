@@ -77,7 +77,10 @@ class PortalPatVerifier:
 
 
 class RestProxy:
-    def __init__(self, rest_conf: dict, portal_conf: dict, audit):
+    def __init__(self, rest_conf: dict, portal_conf: dict, audit, allow=None):
+        # ⚠ `allow(site, groups)` 는 **MCP 경로와 같은 규칙**이다(`gateway._backend_allowed`).
+        # 없이 두면 이 프록시는 자격 체계를 통째로 우회한다 — 아래 handle() 참조.
+        self.allow = allow
         self.rest = rest_conf or {}
         self.audience_ok = set(portal_conf.get("audience_ok", list(self.rest)))
         self.audit = audit
@@ -158,6 +161,22 @@ class RestProxy:
                  "detail": f"{site} 는 {'/'.join(allowed)} 만 허용한다. 쓰기가 필요하면 "
                            f"게이트웨이 설정의 rest.{site}.methods 에 명시하라."},
                 status_code=405)
+
+        # ⚠ **자격을 MCP 와 같은 규칙으로 본다.** 여태 PAT 서명·aud·scope·폐기목록까지만
+        # 보고 **groups 를 안 봤다** — 그래서 자격 0개인 사람이 MCP 로는 `forbidden:` 을
+        # 받는 백엔드를 이 경로로는 200 으로 읽었다(실측). `inject` 없는 사이트는 권한
+        # 상승이 없다고 봤는데, 상류 AIDataHub 가 **인증 없이 200** 이라 이 프록시가
+        # 유일한 관문이었다(6차 감사). 규칙은 게이트웨이에서 주입받는다 — 여기서 다시
+        # 만들면 두 경로가 어긋난다.
+        if self.allow is not None:
+            groups = [str(g) for g in (claims.get("groups") or [])]
+            if not await self.allow(site, groups, str(claims.get("email") or "")):
+                self.audit(f"{request.method} /{path}", site, False, "forbidden", 0,
+                           caller=claims.get("sub"))
+                return JSONResponse(
+                    {"error": f"forbidden: {site}",
+                     "detail": "이 백엔드를 쓸 권한이 없습니다 — 포털 '내 권한' 에서 요청하세요."},
+                    status_code=403)
 
         url = conf["base"].rstrip("/") + "/" + path.lstrip("/")
         headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP}

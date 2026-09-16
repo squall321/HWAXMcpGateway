@@ -153,6 +153,13 @@ _CACHEABLE = ("list_", "get_", "search_", "find_", "query_", "describe_", "hybri
 #   걸리지만 원장에 쓴다. 쓰기가 캐시되면 TTL 안 재호출이 백엔드에 도달하지 않고 무음 드롭되고,
 #   flush 경로(캐시 비대상=쓰기 가정)도 안 탄다(감사 비판자 1-B 실증). 이름 명시로 막는다.
 _CACHE_DENY = ("report_ingest", "report_fragmentize", "get_agent_session")
+# ⚠ **시간에 따라 바뀌는 상태를 읽는 도구**는 접두사가 열어도 캐시하지 않는다. `get_` 이
+#   `get_task`(odb-hub 비동기 폴링)·`get_job`(DynaForge)·`get_job_details`(STE) 를 열어 두고
+#   있었다. 캐시되면 폴링이 TTL(300초) 동안 **첫 응답(running)을 그대로** 받는다 — 작업이 끝나도
+#   "아직 도는 중" 이고 오류도 안 난다(2026-09-16, odb-hub 연계 대조에서 발견. 그때 이미 붙은
+#   앱에서만 7개가 캐시되고 있었다). 이름 목록이 아니라 낱말로 막는 이유는 앱이 새로 붙을 때마다
+#   같은 구멍이 다시 열리기 때문이다. 틀려도 캐시를 안 할 뿐이라 넓게 잡는다.
+_CACHE_DENY_WORDS = re.compile(r"(task|status|progress|job)")
 # {(backend, tool, args, identity): (result, expiry)} — 삽입 순서 = LRU 근사(오래된 것부터 버린다)
 _RESP_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 _CACHE_STAT = {"hit": 0, "miss": 0, "flush": 0}
@@ -181,7 +188,8 @@ def _cache_key(backend_key: str, tool: str, arguments) -> tuple | None:
     ⚠ 키에 **호출자 신원**을 넣는다. PER_USER_SSO 백엔드는 사용자별 시야로 답하므로,
       신원을 빼면 A 가 부른 결과를 B 가 받는다 — 권한 우회다.
     """
-    if CACHE_TTL_S <= 0 or tool in _CACHE_DENY or not tool.startswith(_CACHEABLE):
+    if (CACHE_TTL_S <= 0 or tool in _CACHE_DENY or not tool.startswith(_CACHEABLE)
+            or _CACHE_DENY_WORDS.search(tool)):
         return None
     try:
         args = json.dumps(arguments or {}, sort_keys=True, ensure_ascii=False)
@@ -205,9 +213,42 @@ def _cache_get(key):
     return res
 
 
+# 봉투 판정을 할 본문 크기 상한. 봉투형 실패(`{"error": …, "hint": …}`)는 작다 — 큰 본문까지
+# 매번 JSON 으로 풀면 캐시 경로가 느려진다. 이보다 크면 실패가 아닌 것으로 본다(종전 동작).
+_ENVELOPE_SCAN_MAX = 64 * 1024
+
+
+def _looks_failed(res) -> bool:
+    """캐시에 넣으면 안 되는 **봉투형 실패**인가 — `isError` 는 아닌데 본문이 실패를 말하는 모양.
+
+    ⚠ `isError` 만 보면 안 된다. odb-hub 처럼 200 + `{"error": "결과가 없습니다"}` 로 답하는 앱이
+      있다(MCP 예외가 아니다). 그걸 캐시하면 방금 분석을 돌렸어도 TTL 동안 "결과 없음" 이 굳는다.
+
+    ⚠ 포털 판정기·에이전트서버 `envelope_failed` 와 **목적이 다르다.** 그쪽은 성공/실패를 정확히
+      갈라야 하지만 여기는 "캐시해도 되나" 만 묻는다 — 틀려도 캐시를 안 할 뿐이라 **넓게** 본다.
+      그래서 규칙을 베끼지 않는다(베끼면 판정기가 셋이 되고 서로 어긋난다 — 포털 W-77).
+    """
+    for blk in getattr(res, "content", None) or []:
+        txt = getattr(blk, "text", None)
+        if not isinstance(txt, str):
+            continue
+        if len(txt) > _ENVELOPE_SCAN_MAX or not txt.lstrip().startswith("{"):
+            return False
+        try:
+            obj = json.loads(txt)
+        except Exception:  # noqa: BLE001 — JSON 이 아니면 봉투가 아니다
+            return False
+        if not isinstance(obj, dict):
+            return False
+        return bool(obj.get("error") or obj.get("errors") or obj.get("ok") is False
+                    or obj.get("refused") is True
+                    or str(obj.get("status", "")).lower() in ("error", "failed", "failure"))
+    return False
+
+
 def _cache_put(key, res):
     """성공 결과만 담는다 — 오류를 캐시하면 일시적 실패가 TTL 동안 굳는다."""
-    if key is None or getattr(res, "isError", False):
+    if key is None or getattr(res, "isError", False) or _looks_failed(res):
         return res
     _RESP_CACHE[key] = (res, time.monotonic() + CACHE_TTL_S)
     _RESP_CACHE.move_to_end(key)

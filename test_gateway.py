@@ -775,3 +775,43 @@ def test_무인증_헬스는_권한_지도를_안_낸다():
     blk = src[i:i + 1800]
     assert "access_policy_loaded" in blk
     assert re.search(r'if _detail else \{\}', blk), "상세가 시크릿 뒤로 안 갔다"
+
+
+# ── 응답 캐시 — 상태 조회·봉투형 실패는 담지 않는다 (2026-09-16, odb-hub 연계 대조) ──────────
+def _txt(s: str):
+    return types.CallToolResult(content=[types.TextContent(type="text", text=s)])
+
+
+def test_상태_조회는_접두사가_열어도_캐시하지_않는다(monkeypatch):
+    """`get_` 접두가 `get_task`(odb-hub 폴링)·`get_job`(DynaForge)을 열어 두면 폴링이 300초 동안
+    첫 응답(running)을 그대로 받는다 — 작업이 끝나도 "도는 중" 이고 오류도 안 난다."""
+    monkeypatch.setattr(gw, "CACHE_TTL_S", 300.0)
+    for name in ("get_task", "get_job", "get_job_details", "get_job_outputs", "list_jobs",
+                 "list_recent_jobs", "list_session_jobs", "describe_search_status"):
+        assert gw._cache_key("b", name, {"id": "x"}) is None, f"{name} 가 캐시된다"
+    # 이 검사가 캐시를 통째로 꺼서 통과하는 게 아니라는 확인 — 보통 읽기는 여전히 담긴다
+    for name in ("get_part_detail", "list_parts", "get_board_layers", "report_summary"):
+        assert gw._cache_key("b", name, {"id": "x"}) is not None, f"{name} 가 캐시에서 빠졌다"
+
+
+def test_봉투형_실패는_캐시에_넣지_않는다(monkeypatch):
+    """odb-hub 는 미실행 결과를 200 + `{"error": …}` 로 준다(isError 아님). 그걸 담으면 방금
+    분석을 돌렸어도 TTL 동안 "결과가 없습니다" 가 굳는다."""
+    monkeypatch.setattr(gw, "CACHE_TTL_S", 300.0)
+    monkeypatch.setattr(gw, "_RESP_CACHE", gw.OrderedDict())
+    # odb-hub 원문 표본 그대로(reference.md §4.13) — 게이트웨이가 넘기는 들여쓰기 모양으로
+    env = json.dumps({"error": "동박율 결과가 없습니다",
+                      "hint": "run_analysis(job_id, analysis=\"copper\") 로 계산을 실행하고 "
+                              "get_task 로 완료를 확인한 뒤 다시 조회하세요"},
+                     ensure_ascii=False, indent=2)
+    for i, body in enumerate((env, '{"ok": false, "reason": "x"}', '{"refused": true}',
+                              '{"status": "error", "detail": "x"}', '{"errors": ["bad"]}')):
+        k = gw._cache_key("b", f"get_copper_result_{i}", {})
+        gw._cache_put(k, _txt(body))
+        assert k not in gw._RESP_CACHE, f"봉투형 실패가 캐시됐다: {body[:40]}"
+    # 담아야 할 것은 담긴다 — 판정이 넓다고 성공까지 버리면 캐시가 죽는다
+    for i, body in enumerate(('{"verdict": "standard", "error": null}', '{"errors": []}',
+                              '{"status": "ok", "jobs": 108}', "평문 결과", "[1, 2]")):
+        k = gw._cache_key("b", f"get_board_layers_{i}", {})
+        gw._cache_put(k, _txt(body))
+        assert k in gw._RESP_CACHE, f"성공 결과가 캐시되지 않았다: {body[:40]}"

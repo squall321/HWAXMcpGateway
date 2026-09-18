@@ -2,8 +2,22 @@
 import json
 
 import mcp.types as types
+import pytest
 
 import gateway as gw
+
+
+@pytest.fixture(autouse=True)
+def _no_prod_audit(monkeypatch, tmp_path):
+    """감사원장 격리 — **모든 시험에 자동으로** 건다.
+
+    ⚠ 안 걸면 시험이 운영 `audit.jsonl`(→ /data/svc/mcp-gateway/)에 `reportarchive_trash_report
+    ok:true` 같은 **일어난 적 없는 파괴 도구 성공**을 남긴다. 실제 호출과 모양이 똑같아서 "누가
+    보고서를 버렸나" 를 감사원장으로 물으면 허구가 잡힌다(2026-09-18 검토에서 29줄 발견).
+    시험마다 격리하던 관례가 있었는데 새 시험 하나가 빠뜨렸다 — 그래서 자동으로 바꿨다.
+    `AUDIT_PATH` 를 직접 거는 시험은 이 뒤에 다시 걸므로 그대로 돈다.
+    """
+    monkeypatch.setattr(gw, "AUDIT_PATH", str(tmp_path / "audit.jsonl"))
 
 
 def _tool(name: str) -> types.Tool:
@@ -987,3 +1001,156 @@ def test_소속이_캐시_키에_들어간다(monkeypatch):
     b = gw._cache_key("b", "get_x", {"i": 1}, "")
     assert a is not None and a != b
     assert a[3] == "u@corp.com", "/conn-invalidate 가 k[3] 로 고른다 — 앞을 밀면 안 된다"
+
+
+# ── 별칭이 정확이름 차단을 우회하던 것(2026-09-18) ─────────────────────────
+def _set_request_headers(monkeypatch, headers: dict):
+    """`_low.request_context.request.headers` 를 세운다 — `_request_*` 들이 실제로 읽는 자리다."""
+    from types import SimpleNamespace as NS
+    monkeypatch.setattr(gw, "_low", NS(request_context=NS(request=NS(headers=headers))))
+
+
+def test_목적_헤더를_실제로_읽는다(monkeypatch):
+    """면제 판정의 **입력**이다. fail-open 이면(헤더를 안 보고 늘 'procedure') 이번 변경이 막으려던
+    구멍이 통째로 되돌아온다 — 그래서 없음·다른 값·요청 문맥 없음을 전부 닫힘으로 본다."""
+    from types import SimpleNamespace as NS
+
+    class _NoCtx:
+        @property
+        def request_context(self):
+            raise LookupError
+    monkeypatch.setattr(gw, "_low", _NoCtx())
+    assert gw._request_purpose() == "", "요청 문맥이 없으면 면제 없음"
+    _set_request_headers(monkeypatch, {})
+    assert gw._request_purpose() == "", "헤더가 없으면 면제 없음"
+    _set_request_headers(monkeypatch, {gw.PURPOSE_HEADER: "chat"})
+    assert gw._request_purpose() != gw.PROCEDURE_PURPOSE, "다른 값은 면제가 아니다"
+    _set_request_headers(monkeypatch, {gw.PURPOSE_HEADER: gw.PROCEDURE_PURPOSE})
+    assert gw._request_purpose() == gw.PROCEDURE_PURPOSE
+    monkeypatch.setattr(gw, "_low", NS(request_context=NS(request=None)))
+    assert gw._request_purpose() == ""
+
+
+def _deny_kit(monkeypatch, purpose=""):
+    """RA 백엔드 하나를 세우고 invoke_tool 을 실제로 태운다. 반환은 (호출함수, 백엔드)."""
+    import asyncio
+
+    # ⚠ delete_project 를 **실재하는 도구로** 둔다. 없으면 별칭이 해석되지 않아 "unknown tool"
+    # 로 막히고, 그러면 "차단됐다" 가 아니라 "이름이 없다" 를 시험하게 된다(실제로 그렇게
+    # 짰다가 변이 시험에서 잡혔다 — 면제를 이름 패턴까지 넓혀도 초록이었다).
+    b = _CallB(["trash_report", "add_report_tags", "publish_report", "get_report",
+                "delete_project"])
+    monkeypatch.setattr(gw, "backends", {"reportarchive": b})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    # ⚠ `_request_purpose` 를 갈아끼우면 안 된다 — 처음에 그렇게 짰다가 검토에서 잡혔다. 그 함수를
+    # `return "procedure"` 로 바꿔(= 모든 호출자에게 면제) 48개가 전부 초록이었다. 헤더를 **싣는 쪽**
+    # (미들웨어)과 면제를 **판정하는 쪽**만 걸려 있고 헤더를 **읽는 쪽**은 아무도 안 봤다.
+    # 그래서 요청 문맥에 실제 헤더를 싣고 진짜 함수를 태운다.
+    _set_request_headers(monkeypatch, {gw.PURPOSE_HEADER: purpose} if purpose else {})
+    asyncio.run(gw._aggregate())
+
+    def invoke(name):
+        gw._RESP_CACHE.clear()
+        r = asyncio.run(gw._call_tool("invoke_tool", {"name": name, "arguments": {}}))
+        return bool(getattr(r, "isError", False))
+
+    return invoke, b
+
+
+def test_별칭도_정확이름_차단에_걸린다(monkeypatch):
+    """`inner` 로만 보면 별칭이 그대로 우회로다 — 실측으로 trash_report·publish_report·
+    add_report_tags 가 백엔드까지 도달했다(2026-09-18 재현). 접두·접미 규칙은 이미 원본을
+    보고 있었는데 **정확이름 목록만** 호출자 문자열을 보고 있었다."""
+    invoke, b = _deny_kit(monkeypatch)
+    for n in ("trash_report", "reportarchive_trash_report",
+              "publish_report", "reportarchive_publish_report",
+              "add_report_tags", "reportarchive_add_report_tags"):
+        assert invoke(n), f"{n} 이 차단을 지났다"
+    assert b.session.calls == [], f"파괴 도구가 백엔드까지 갔다: {b.session.calls}"
+    assert not invoke("reportarchive_get_report"), "파괴 계열이 아니면 별칭으로도 돌아야 한다"
+    assert b.session.calls == ["get_report"]
+
+
+def test_절차_실행기만_정확이름_차단을_면제받는다(monkeypatch):
+    """면제가 없으면 절차는 MUST_GATE 도구를 영영 못 부른다(늘 별칭으로 부른다).
+    면제의 근거는 포털이 이미 `gate: human` 으로 사람 승인을 받았다는 것이다."""
+    invoke, b = _deny_kit(monkeypatch, purpose=gw.PROCEDURE_PURPOSE)
+    assert not invoke("reportarchive_add_report_tags"), "절차는 통과해야 한다"
+    assert b.session.calls == ["add_report_tags"]
+    # 이름 패턴 차단(delete_·cancel_)은 절차에도 그대로다 — 면제는 정확이름 목록에만 준다.
+    b.session.calls.clear()
+    assert invoke("delete_project"), "bare 이름은 절차라도 막힌다"
+    assert invoke("reportarchive_delete_project"), "별칭이어도 원본이 delete_ 면 절차라도 막힌다"
+    assert b.session.calls == [], f"파괴 도구가 백엔드까지 갔다: {b.session.calls}"
+
+
+def test_목적_헤더는_검증된_PAT_에서만_나온다(monkeypatch):
+    """사람이 헤더에 직접 적으면 아무나 면제를 받는다. 미들웨어가 클라이언트 값을 버리고
+    PAT 클레임으로만 싣는지 — 그리고 GW_TOKEN 경로에서도 버리는지 본다."""
+    import asyncio
+
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["headers"] = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+
+    async def no_portal(email, base):
+        return None
+    monkeypatch.setattr(gw, "_portal_entitlements", no_portal)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        def __init__(self, claims): self.claims = claims
+        async def verify(self, token, aud): return self.claims
+
+    def run(auth, claims, client_purpose=b"procedure"):
+        seen.clear()
+        mw = gw._bearer_gate(app, _V(claims))
+        hdrs = [(b"authorization", auth), (gw.PURPOSE_HEADER.encode(), client_purpose)]
+        asyncio.run(mw({"type": "http", "path": "/mcp", "headers": hdrs}, None, None))
+        return seen.get("headers", {})
+
+    # ① 클라이언트가 실어 보낸 값은 버린다(PAT 에 클레임이 없을 때)
+    h = run(b"Bearer user-pat", {"email": "u@x.io", "groups": []})
+    assert gw.PURPOSE_HEADER not in h, "위조 헤더가 살아남으면 아무나 면제를 받는다"
+    # ② PAT 클레임이 있으면 싣는다
+    h = run(b"Bearer proc-pat", {"email": "u@x.io", "groups": [], "purpose": "procedure"})
+    assert h[gw.PURPOSE_HEADER] == "procedure"
+    # ③ GW_TOKEN(서비스) 경로에서도 클라이언트 값은 버린다
+    h = run(b"Bearer gw-secret", None)
+    assert gw.PURPOSE_HEADER not in h, "GW_TOKEN 을 쥔 쪽이 면제를 자칭하면 안 된다"
+
+
+def test_면제된_호출은_감사원장에서_구별된다(monkeypatch):
+    """면제로 지나간 파괴 호출이 직접 호출과 똑같이 찍히면 '이 문을 누가 몇 번 썼나' 를 감사로
+    영영 못 묻는다. 절차 호출에는 `purpose` 칸이 붙고, 사람 호출에는 안 붙는다."""
+    invoke, b = _deny_kit(monkeypatch, purpose=gw.PROCEDURE_PURPOSE)
+    assert not invoke("reportarchive_add_report_tags")
+    rows = [json.loads(ln) for ln in open(gw.AUDIT_PATH, encoding="utf-8")]
+    hit = [r for r in rows if "add_report_tags" in r["tool"]]
+    assert hit and all(r.get("purpose") == gw.PROCEDURE_PURPOSE for r in hit), hit
+
+    invoke2, _ = _deny_kit(monkeypatch, purpose="")
+    open(gw.AUDIT_PATH, "w").close()
+    assert invoke2("reportarchive_get_report") is False
+    rows = [json.loads(ln) for ln in open(gw.AUDIT_PATH, encoding="utf-8")]
+    assert rows and all("purpose" not in r for r in rows), "사람 호출에 purpose 가 붙으면 구분이 무너진다"
+
+
+def test_포털이_찍는_목적_값과_게이트웨이가_보는_값이_같다():
+    """두 리포에 흩어진 문자열이다 — 한쪽만 바꾸면 양쪽 시험이 **각자 초록인 채** 면제만 꺼지고,
+    증상은 사람이 게이트를 승인한 **뒤에** 그 단계가 '범용 실행기로 부를 수 없습니다' 로 죽는 것이다.
+    형제 리포가 이 박스에 있을 때만 본다(없으면 건너뛴다)."""
+    from pathlib import Path
+    portal = Path(gw.__file__).resolve().parent.parent / "HWAXPortal" / "backend" / "app" / "procedures" / "pat.py"
+    if not portal.exists():
+        pytest.skip("형제 리포 HWAXPortal 이 이 박스에 없다")
+    src = portal.read_text(encoding="utf-8")
+    assert f'"purpose": "{gw.PROCEDURE_PURPOSE}"' in src, \
+        f"포털 절차 PAT 의 purpose 값이 게이트웨이 PROCEDURE_PURPOSE({gw.PROCEDURE_PURPOSE!r})와 다르다"

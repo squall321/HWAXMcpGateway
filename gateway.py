@@ -93,6 +93,12 @@ AFF_HEADER = "X-Heax-User-Affiliation"
 # 이메일과 같을 때만** 소속을 인정한다. 키는 이미 양쪽이 쥔 앱별 게이트웨이 시크릿이다
 # (`per_user_sso.<app>.secret` == 앱의 `heax_gateway_secret` — SSO 발급이 쓰는 그 값).
 AFF_PROOF_HEADER = "X-Heax-Aff-Proof"
+# 이 호출이 **포털 절차 실행기**에서 왔나. 검증된 PAT 의 `purpose` 클레임에서만 나오고, 클라이언트가
+# 실어 보낸 같은 이름 헤더는 미들웨어가 버린다(groups·user 와 같은 규칙).
+# 쓰임은 하나다 — `invoke_tool` 의 **정확이름 차단 면제**(_INVOKE_DENY_EXACT). 절차는 늘 별칭으로
+# 부르고, 그 도구들은 포털이 이미 `gate: human` 으로 사람 승인을 받은 것이다.
+PURPOSE_HEADER = "x-hwax-purpose"
+PROCEDURE_PURPOSE = "procedure"
 AFF_PROOF_TTL_S = int(os.environ.get("GATEWAY_AFF_PROOF_TTL", "120"))
 
 
@@ -311,6 +317,9 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
       mode   : 어느 명의로 갔나(service | as-user | as-conn | identity-fwd)
       note   : 실패가 아닌 메모(cache-hit · reconnected)
       corr   : 어느 대화·실행의 호출인가(X-HWAX-Corr). 이게 없어서 감사와 대화를 못 이었다
+      purpose: 포털 **절차 실행기**가 부른 호출이면 `procedure`. 절차는 정확이름 차단을 면제받으므로,
+               이 칸이 없으면 "면제로 지나간 파괴 호출" 이 직접 호출과 글자 하나 다르지 않았다
+               (2026-09-18 검토). `purpose=procedure` 이고 도구가 `_INVOKE_DENY_EXACT` 면 면제 건이다.
     """
     try:
         rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
@@ -325,6 +334,9 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
             rec["note"] = str(note)[:120]
         if err:
             rec["error"] = err[:200]
+        purpose = _request_purpose()
+        if purpose:
+            rec["purpose"] = purpose
         with open(AUDIT_PATH, "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001
@@ -1307,8 +1319,10 @@ _INVOKE_DENY_SUFFIX = ("_control", "_set_state")
 # 로 확정해 뒀으므로(HWAXPortal `app/procedures/models.py`) **그것을 그대로** 쓴다 —
 # 여기서 따로 고르면 두 곳이 어긋나고, 어긋난 쪽이 늘 느슨한 쪽이다.
 # 직접 바인딩으로는 여전히 부를 수 있다(사람이 고른 도구는 막지 않는다).
-# 실측(2026-09-15): 이 셋은 전부 **직접 호출**이었고 invoke_tool 경유는 조회 도구와
-# `create_report_draft` 뿐이라, 막아도 깨지는 흐름이 없다.
+# 실측(2026-09-15): 그때는 이 도구들이 전부 **직접 호출**이었다. ⚠ 지금은 아니다 — 포털 절차
+# 실행기가 **늘 별칭으로** invoke_tool 을 거쳐 부른다(R2c 축 태그 붙이기 등). 그래서 이 목록은
+# 해석된 원본 이름으로도 보고(별칭 우회 차단), 절차 PAT 만 면제한다(`_request_purpose`).
+# 면제를 걷어내면 사람이 승인한 절차 단계가 승인 **뒤에** 죽는다 — 걷어낼 근거로 읽지 마라.
 _INVOKE_DENY_EXACT = frozenset({
     "publish_report", "publish_report_to_datahub", "request_unpublish",
     "trash_report", "restore_version", "job_stop", "risk_add_finding",
@@ -1891,6 +1905,16 @@ def _request_groups() -> list[str]:
     return _parse_groups(raw)
 
 
+def _request_purpose() -> str:
+    """검증된 PAT 이 말한 호출 목적. 없으면 ''(=면제 없음, fail-closed)."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return ""
+    raw = req.headers.get(PURPOSE_HEADER) if req is not None else None
+    return (raw or "").strip()[:40]
+
+
 def _request_corr() -> str:
     """현재 요청 헤더(X-HWAX-Corr)의 상관 ID — 어느 대화·실행의 호출인가.
 
@@ -2067,8 +2091,19 @@ async def _call_tool(name: str, arguments: dict):
         # 안 되는 이름(오타·미접속 백엔드)이 파괴 꼴이면 `unknown tool` 보다 이 쪽이 낫다.
         _resolved = route.get(inner) or alias_route.get(inner)
         _orig = _resolved[1] if _resolved else inner
+        # ⚠ **정확이름 목록도 해석된 원본으로 본다**(2026-09-18). 여태 `inner` 로만 봐서 별칭
+        # (`reportarchive_trash_report`)이 그냥 통과했다 — 접두·접미 규칙만 원본으로 보고 있었다.
+        # 실측으로 trash_report·publish_report·add_report_tags 가 백엔드까지 도달했다.
+        _exact = inner in _INVOKE_DENY_EXACT or _orig in _INVOKE_DENY_EXACT
+        # 면제는 **포털 절차 실행기**에만. 그 목록은 포털 `MUST_GATE` 와 같은 것이고, 절차는 그
+        # 도구들을 `gate: human` 없이는 저장조차 못 한다 — 즉 사람이 이미 승인한 호출이다.
+        # 면제가 없으면 절차는 이 도구들을 영영 못 부른다(늘 별칭으로 부르므로).
+        _procedure = _request_purpose() == PROCEDURE_PURPOSE
+        if _exact and _procedure:
+            log.info("invoke_tool 정확이름 차단 면제(절차) — %s caller=%s corr=%s",
+                     _orig, _request_user() or "-", _request_corr() or "-")
         if (_orig.startswith(_INVOKE_DENY_PREFIX) or _orig.endswith(_INVOKE_DENY_SUFFIX)
-                or inner in _INVOKE_DENY_EXACT
+                or (_exact and not _procedure)
                 or inner.startswith(_INVOKE_DENY_PREFIX)
                 or inner.endswith(_INVOKE_DENY_SUFFIX)):
             _audit(name, None, False, f"invoke-denied:{inner}", 0,
@@ -2435,10 +2470,13 @@ def _bearer_gate(app, pat_verifier=None):
             # 내부 에이전트 서버: GW_TOKEN. groups 는 에이전트가 x-hwax-groups 로 실어 보냄(신뢰).
             # 그룹 헤더가 아예 없으면 사용자를 대리하지 않는 내부 서비스 호출이다 — 표시 그룹을 붙여
             # 사람 권한 정책(포털)에서 뺀다. 권한 정책 이전과 같은 시야를 지킨다.
+            # 목적 헤더는 **검증된 PAT 에서만** 나온다 — 이 경로(GW_TOKEN)는 PAT 검증을 안 하므로
+            # 클라이언트가 실어 보낸 값을 버린다. 안 버리면 GW_TOKEN 을 쥔 쪽이 차단을 면제받는다.
+            _kept = [(k, v) for (k, v) in (scope.get("headers") or [])
+                     if k.lower() != PURPOSE_HEADER.encode()]
             if GROUPS_HEADER.encode() not in headers:
-                scope = {**scope, "headers": [*(scope.get("headers") or []),
-                                              (GROUPS_HEADER.encode(), SERVICE_GROUP.encode())]}
-            await app(scope, receive, send)
+                _kept.append((GROUPS_HEADER.encode(), SERVICE_GROUP.encode()))
+            await app({**scope, "headers": _kept}, receive, send)
             return
         # GW_TOKEN 이 아니면 포털 PAT(개인 Claude 등) 로 검증 시도 → 성공 시 PAT 의 groups 로 도구 필터.
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
@@ -2457,12 +2495,17 @@ def _bearer_gate(app, pat_verifier=None):
             # PAT 의 것만 싣는다. PAT 에 이메일이 없으면 아무것도 싣지 않는다(위조로 남의 시야를
             # 얻는 경로가 생기면 안 되므로, 신원 없음 쪽으로 닫는다).
             fresh = [(k, v) for (k, v) in (scope.get("headers") or [])
-                     if k.lower() not in (GROUPS_HEADER.encode(), USER_HEADER.encode())]
+                     if k.lower() not in (GROUPS_HEADER.encode(), USER_HEADER.encode(),
+                                          PURPOSE_HEADER.encode())]
             # PAT 의 groups 에도 한글이 올 수 있다 — 같은 규칙으로 인코딩해 실어야 헤더가 안 깨진다.
             fresh.append((GROUPS_HEADER.encode(), quote(groups, safe=",").encode("latin-1")))
             _email = str(claims.get("email") or "").strip().lower()
             if _email:
                 fresh.append((USER_HEADER.encode(), quote(_email, safe="@.").encode("latin-1")))
+            # 포털 절차 실행기가 찍은 토큰만 이 값을 가진다 — 사람이 `/auth/pat` 으로 만드는 토큰에는
+            # 이 클레임을 넣는 자리가 없다(포털 `app/procedures/pat.py` 하나뿐, 시험이 건다).
+            if str(claims.get("purpose") or "") == PROCEDURE_PURPOSE:
+                fresh.append((PURPOSE_HEADER.encode(), PROCEDURE_PURPOSE.encode()))
             await app({**scope, "headers": fresh}, receive, send)
             return
         await send({

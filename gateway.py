@@ -78,6 +78,34 @@ POLICY: dict[str, list[str]] = {k: list(v.get("allowed_groups", [])) for k, v in
 USER_HEADER = "x-hwax-user"
 # 어느 대화·실행의 호출인가. 호출부가 실어 주면 감사에 남는다(없으면 안 남는다).
 CORR_HEADER = "x-hwax-corr"
+# 호출자의 **소속 id**(포털 원장). 앱이 "소속 단위 읽기 공유" 를 판정하는 값이다 — 자동 반입
+# 리포트의 주인은 예약자이고 같은 소속은 읽을 수 있다(포털 W-93). SSO 발급 헤더
+# (`X-Heax-User-Email` 과 같은 계열)와 이름을 맞춘다. 값은 groups·user 와 같은 규칙으로
+# 퍼센트 인코딩한다 — 소속 id 에 한글이 올 수 있고 헤더는 latin-1 만 담는다.
+# ⚠ **없으면 아예 안 싣는다.** 빈 문자열을 실으면 받는 쪽이 "소속 없음" 을 하나의 소속으로
+# 묶을 수 있다 — 소속 없는 사람끼리 서로의 문서를 읽는 길이 된다.
+AFF_HEADER = "X-Heax-User-Affiliation"
+# ⚠⚠ **평문 헤더만으로는 앱이 이 값을 믿으면 안 된다.** 앱의 정문이 게이트웨이 하나가 아니다 —
+# 사용자는 자기 PAT 로 앱 MCP(`:8443/mcp`)·REST 에 직접 붙을 수 있고, HEAXHub Caddy 가 지우는
+# 위조 헤더 목록은 `X-Heax-User-Email`·`X-Heax-User-Name` **둘뿐**이다(proxy_manager.py `_IDENTITY_HEADERS`).
+# 그래서 소속만 평문으로 보내면 "나는 CAEG 다" 를 사용자가 스스로 적어 남의 문서를 읽는다.
+# 값을 **호출자에 결속된 서명**과 함께 보낸다 — 앱은 서명이 맞고 만료 전이고 **PAT 주인의
+# 이메일과 같을 때만** 소속을 인정한다. 키는 이미 양쪽이 쥔 앱별 게이트웨이 시크릿이다
+# (`per_user_sso.<app>.secret` == 앱의 `heax_gateway_secret` — SSO 발급이 쓰는 그 값).
+AFF_PROOF_HEADER = "X-Heax-Aff-Proof"
+AFF_PROOF_TTL_S = int(os.environ.get("GATEWAY_AFF_PROOF_TTL", "120"))
+
+
+def _aff_proof(secret: str, email: str, aff: str, now: float | None = None) -> str:
+    """`v1.<exp>.<hmac>` — 서명 대상은 **인코딩 전** 값이다(`v1|email|aff|exp`).
+
+    앱은 헤더를 `unquote` 한 뒤 같은 문자열로 다시 계산해 `compare_digest` 로 본다.
+    이메일을 넣는 것이 핵심이다 — 증명을 가로채도 **다른 사람의 호출에는 못 쓴다**.
+    """
+    exp = int((now if now is not None else time.time()) + AFF_PROOF_TTL_S)
+    msg = f"v1|{email}|{aff}|{exp}"
+    sig = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"v1.{exp}.{sig}"
 # 백엔드별 사용자 위임 설정 — {app_id: {sso_url, secret, client, base?}}.
 # 값이 있는 백엔드만 사용자별 자격증명으로 호출한다(나머지는 종전대로 서비스 계정).
 PER_USER_SSO: dict[str, dict] = {k: v for k, v in (HEAX.get("per_user_sso") or {}).items()
@@ -182,11 +210,15 @@ def _tools_fp(tools) -> dict:
     return out
 
 
-def _cache_key(backend_key: str, tool: str, arguments) -> tuple | None:
+def _cache_key(backend_key: str, tool: str, arguments, aff: str = "") -> tuple | None:
     """캐시 키. 캐시 불가면 None.
 
     ⚠ 키에 **호출자 신원**을 넣는다. PER_USER_SSO 백엔드는 사용자별 시야로 답하므로,
       신원을 빼면 A 가 부른 결과를 B 가 받는다 — 권한 우회다.
+    ⚠ **소속도 넣는다.** 앱이 소속으로 읽기를 넓히므로 같은 사람·같은 인자라도 소속이 바뀌면
+      다른 답이다. 안 넣으면 권한 키가 안 바뀌는 소속 변경(관리자 이동, grants 가 같은 두 소속
+      사이 이동)이 최대 300초 동안 **옛 소속 기준 결과**를 정상 응답으로 준다. 튜플 **끝**에
+      붙인다 — `/conn-invalidate` 가 `k[3] == 이메일` 로 고르므로 앞을 밀면 그게 깨진다.
     """
     if (CACHE_TTL_S <= 0 or tool in _CACHE_DENY or not tool.startswith(_CACHEABLE)
             or _CACHE_DENY_WORDS.search(tool)):
@@ -195,7 +227,7 @@ def _cache_key(backend_key: str, tool: str, arguments) -> tuple | None:
         args = json.dumps(arguments or {}, sort_keys=True, ensure_ascii=False)
     except Exception:  # noqa: BLE001 — 직렬화 안 되는 인자는 캐시하지 않는다
         return None
-    return (backend_key, tool, args, _request_user(), tuple(sorted(_request_groups())))
+    return (backend_key, tool, args, _request_user(), tuple(sorted(_request_groups())), aff)
 
 
 def _cache_get(key):
@@ -789,8 +821,8 @@ _ACCESS_CACHE_FILE = Path(__file__).resolve().parent / ".access_policy_cache.jso
 SERVICE_GROUP = "gateway:service"
 _ACCESS_POLICY: dict[str, list[str]] = {}
 # {(email, 로그인 그룹): (권한 키 | None, 만료)} — PAT 호출자의 **지금** 권한.
-_ENT_CACHE: dict[tuple[str, str], tuple[list[str] | None, float]] = {}
-_ENT_LAST: dict[tuple[str, str], list[str]] = {}     # 포털이 죽었을 때 쓸 직전 값(만료 없음)
+_ENT_CACHE: dict[tuple[str, str], tuple[dict | None, float]] = {}
+_ENT_LAST: dict[tuple[str, str], dict] = {}          # 포털이 죽었을 때 쓸 직전 값(만료 없음)
 
 
 def _is_synthetic(group: str) -> bool:
@@ -844,9 +876,13 @@ async def _access_policy_loop() -> None:
         await _refresh_access_policy()
 
 
-async def _portal_entitlements(email: str, base_groups: list[str]) -> list[str] | None:
-    """이 사람의 지금 권한 키 — PAT 에 박힌 발급 때 값 대신 쓴다. 포털이 모르면(권한 기능 이전)
-    None. 조회가 실패하면 직전에 받은 값, 그것도 없으면 None(호출부가 PAT 값으로 돈다)."""
+async def _portal_access(email: str, base_groups: list[str], *,
+                         allow_stale: bool = True) -> dict | None:
+    """포털의 **지금** 권한·소속 응답 전체(`{keys, affiliation, affiliation_label}`).
+
+    포털이 모르면(권한 기능 이전) None. 조회가 실패하면 직전에 받은 값, 그것도 없으면 None.
+    권한과 소속이 **같은 조회**에서 온다 — 포털은 정지된 계정에 둘 다 빈 값을 주므로,
+    따로 물으면 한쪽만 거둬진 순간이 생긴다."""
     key = (email, ",".join(sorted(base_groups)))
     hit = _ENT_CACHE.get(key)
     if hit and hit[1] > time.monotonic():
@@ -863,13 +899,41 @@ async def _portal_entitlements(email: str, base_groups: list[str]) -> list[str] 
             _ENT_CACHE[key] = (None, time.monotonic() + 300)
             return None
         resp.raise_for_status()
-        keys = [str(k) for k in (resp.json() or {}).get("keys") or []]
+        got = resp.json() or {}
+        if not isinstance(got, dict):
+            raise TypeError(f"포털 응답이 객체가 아니다: {type(got).__name__}")
     except Exception as exc:  # noqa: BLE001 — 직전 값으로(가용성), 없으면 None
-        log.warning("포털 권한 조회 실패(%s) — 직전 값으로: %r", email, exc)
-        return _ENT_LAST.get(key)
-    _ENT_CACHE[key] = (keys, time.monotonic() + ACCESS_ENT_TTL_S)
-    _ENT_LAST[key] = keys
-    return keys
+        # ⚠ `_ENT_LAST` 에는 **만료가 없다.** 권한 키는 그래도 직전 값으로 버티는 것이
+        # 낫지만(포털이 죽었다고 도구가 다 사라지면 안 된다), **소속은 아니다** — 소속을
+        # 벗어난 사람이 포털이 돌아올 때까지 **몇 시간이든** 남의 문서를 계속 읽는다.
+        # 소속은 "모르면 안 싣는다" 가 규율이라 이 경로에서만 뒤집히면 안 된다.
+        log.warning("포털 권한 조회 실패(%s) — 권한만 직전 값으로(소속은 버린다): %r", email, exc)
+        return _ENT_LAST.get(key) if allow_stale else None
+    _ENT_CACHE[key] = (got, time.monotonic() + ACCESS_ENT_TTL_S)
+    _ENT_LAST[key] = got
+    return got
+
+
+async def _portal_entitlements(email: str, base_groups: list[str]) -> list[str] | None:
+    """이 사람의 지금 권한 키 — PAT 에 박힌 발급 때 값 대신 쓴다. 포털이 모르면 None."""
+    got = await _portal_access(email, base_groups)
+    return None if got is None else [str(k) for k in got.get("keys") or []]
+
+
+async def _portal_affiliation(email: str, base_groups: list[str]) -> str:
+    """이 사람의 **소속 id** — 앱의 소속 단위 읽기 공유가 이 값에 걸린다(포털 W-93).
+
+    ⚠ 발급 때가 아니라 **호출마다** 본다. 사용자 PAT 캐시는 12시간이라(`USER_PAT_TTL_S`)
+    SSO 발급 헤더로만 넘기면 소속이 바뀌거나 빠진 사람이 반나절 동안 남의 소속 문서를 읽는다 —
+    포털이 권한을 60초마다 다시 보는 이유(D-2)와 똑같은 자리다.
+
+    `base_groups` 는 권한 조회와 **같은 값**을 줘야 한다 — 그래야 캐시가 한 항목이고 호출이 안
+    는다. 소속 자체는 원장 행에서만 나오므로 그룹이 달라도 답은 같다.
+
+    ⚠ `allow_stale=False` — 포털을 못 읽으면 **빈 값**이다. 권한 키는 만료 없는 직전 값으로
+    버티지만(가용성), 소속까지 그러면 포털이 죽어 있는 동안 소속 해제가 반영되지 않는다."""
+    got = await _portal_access(email, base_groups, allow_stale=False)
+    return str((got or {}).get("affiliation") or "")
 
 
 # ── 게이트웨이 로컬 도구: save_conversation ─────────────────────────────────
@@ -2051,9 +2115,16 @@ async def _call_tool(name: str, arguments: dict):
             isError=True,
         )
     b = backends[backend_key]
+    # 사용자 위임 백엔드인가 — **캐시 키에 소속이 들어가야** 하므로 조회보다 먼저 정한다.
+    app_id = backend_key[len(HEAX_PREFIX):] if backend_key.startswith(HEAX_PREFIX) else ""
+    _aff = ""
+    if app_id in PER_USER_SSO and _request_user():
+        # 권한 조회와 같은 키라 이미 데워져 있다(추가 HTTP 없음). 실패하면 빈 값 — 모르면 안 싣는다.
+        _aff = await _portal_affiliation(
+            _request_user(), [g for g in _request_groups() if not _is_synthetic(g)])
     # ── 읽기 전용 캐시 ── 인가(위)를 통과한 뒤에 본다. 순서가 반대면 권한 없는 호출자가
     #    캐시된 남의 결과를 받는다. 키에도 신원이 들어간다(_cache_key 주석 참조).
-    ckey = _cache_key(backend_key, original, arguments)
+    ckey = _cache_key(backend_key, original, arguments, _aff)
     if ckey is not None:
         _hit = _cache_get(ckey)
         if _hit is not None:
@@ -2073,7 +2144,6 @@ async def _call_tool(name: str, arguments: dict):
 
     # 사용자 위임 — 이 백엔드가 사용자별 스코프를 쓰고 호출자 신원이 있으면, 서비스 계정이 아니라
     # 그 사용자의 자격증명으로 부른다. 신원이 없으면 종전대로 서비스 계정(감사에 사유를 남긴다).
-    app_id = backend_key[len(HEAX_PREFIX):] if backend_key.startswith(HEAX_PREFIX) else ""
     note = None   # 서비스 계정으로 강등된 사유 — 아래 정상 경로의 감사기록에 실린다.
     if app_id in PER_USER_SSO:
         email = _request_user()
@@ -2084,11 +2154,20 @@ async def _call_tool(name: str, arguments: dict):
             # 한 호출에 기록이 두 줄(가짜 성공 + 진짜)이 되어 감사로그가 호출 수를 부풀린다.
             note = "no-identity"
         else:
+            # 소속을 **이 호출에** 싣는다 — 앱이 소속 단위 읽기 공유를 판정한다(포털 W-93).
+            # 값이 없으면 두 헤더를 **지운다**(None) — 서비스 계정 헤더가 남아 남의 소속으로
+            # 읽히는 길을 만들지 않는다(RA X-Workspace-Slug 실사고와 같은 자세).
+            # 증명을 같이 싣는 이유는 AFF_PROOF_HEADER 주석에 있다 — 앱의 정문이 여럿이다.
+            extra = {AFF_HEADER: None, AFF_PROOF_HEADER: None}
+            if _aff:
+                extra = {AFF_HEADER: quote(_aff, safe=""),
+                         AFF_PROOF_HEADER: _aff_proof(PER_USER_SSO[app_id]["secret"],
+                                                      email, _aff)}
             for attempt in (0, 1):   # 폐기된 캐시 토큰은 1회 재발급 후 재시도
                 try:
                     tok = await _user_pat(app_id, email, force=bool(attempt))
                     res = await _call_as_user(
-                        b, original, arguments, tok, CALL_TIMEOUT_S,
+                        b, original, arguments, tok, CALL_TIMEOUT_S, extra_headers=extra,
                         token_header=PER_USER_SSO[app_id].get("token_header"))
                 except Exception as exc:  # noqa: BLE001
                     if attempt == 0:

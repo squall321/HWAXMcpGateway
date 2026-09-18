@@ -815,3 +815,175 @@ def test_봉투형_실패는_캐시에_넣지_않는다(monkeypatch):
         k = gw._cache_key("b", f"get_board_layers_{i}", {})
         gw._cache_put(k, _txt(body))
         assert k in gw._RESP_CACHE, f"성공 결과가 캐시되지 않았다: {body[:40]}"
+
+
+# ── 소속을 호출마다 싣는다(포털 W-93) ──────────────────────────────────────
+def test_소속은_권한과_같은_조회에서_온다(monkeypatch):
+    """따로 물으면 **한쪽만 거둬진 순간**이 생긴다(정지 계정은 둘 다 빈 값이어야 한다).
+    캐시도 한 항목이라 호출이 늘지 않는다."""
+    import asyncio
+
+    monkeypatch.setattr(gw, "_ENT_CACHE", {})
+    monkeypatch.setattr(gw, "_ENT_LAST", {})
+    calls = []
+
+    def ok(req):
+        calls.append(dict(req.url.params))
+        return httpx.Response(200, json={"keys": ["feat:chat"], "affiliation": "CAEG",
+                                         "affiliation_label": "CAE그룹"})
+    _mock_http(monkeypatch, ok)
+    assert asyncio.run(gw._portal_entitlements("u@corp.com", ["mes-user"])) == ["feat:chat"]
+    assert asyncio.run(gw._portal_affiliation("u@corp.com", ["mes-user"])) == "CAEG"
+    assert len(calls) == 1, f"같은 조회를 두 번 했다: {calls}"
+
+    # 권한 기능 이전 포털(404) — 소속은 빈 값이고 권한은 None(PAT 값 그대로)
+    gw._ENT_CACHE.clear(); gw._ENT_LAST.clear()
+    _mock_http(monkeypatch, lambda req: httpx.Response(404))
+    assert asyncio.run(gw._portal_affiliation("new@corp.com", [])) == ""
+    assert asyncio.run(gw._portal_entitlements("new@corp.com", [])) is None
+
+    # 소속 칸이 없는 응답(구 포털)도 빈 값이지 예외가 아니다
+    gw._ENT_CACHE.clear(); gw._ENT_LAST.clear()
+    _mock_http(monkeypatch, lambda req: httpx.Response(200, json={"keys": []}))
+    assert asyncio.run(gw._portal_affiliation("u@corp.com", [])) == ""
+
+
+class _StubCM:
+    """async with 한 겹 — streamablehttp_client·ClientSession 자리를 대신한다."""
+
+    def __init__(self, value): self.value = value
+
+    async def __aenter__(self): return self.value
+
+    async def __aexit__(self, *a): return False
+
+
+def _per_user_kit(monkeypatch, aff_payload, base_headers=None):
+    """사용자 위임 경로를 실제로 태우고 **백엔드에 닿은 헤더**를 돌려준다.
+
+    ⚠ `_call_as_user` 를 가짜로 갈아끼우면 안 된다 — 처음에 그렇게 짰다가 검토에서 잡혔다.
+    그 함수의 병합 규칙(같은 이름 헤더 제거 + `None` 이면 삭제)을 테스트가 **베껴** 검사하고
+    있어서, 진짜 병합을 깨뜨려도(예: `if v is not None` 삭제) 네 테스트가 전부 초록이었다.
+    막으려던 것이 바로 그 회귀다. 그래서 전송 계층(streamablehttp_client·ClientSession)만
+    막고 진짜 함수를 태운다.
+    """
+    import asyncio
+
+    b = _CallB(["report_summary"])
+    b.headers = dict(base_headers or {})
+    seen = {}
+
+    class _Sess:
+        async def initialize(self): return None
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            seen["tool"] = original
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="{}")], isError=False)
+
+    def fake_stream(url, headers=None):
+        seen["headers"] = dict(headers or {})
+        return _StubCM((None, None, "sid"))
+
+    monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+
+    # ⚠ 응답 캐시가 300초라 같은 테스트의 두 번째 호출이 백엔드에 안 닿는다(처음에 이걸로 깨졌다).
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {"heax-kooremapper_mcp": b})
+    monkeypatch.setattr(gw, "route", {"report_summary": ("heax-kooremapper_mcp", "report_summary")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"kooremapper_mcp": {"sso_url": "http://x",
+                                                                 "secret": "app-secret"}})
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["mes-user", "plat:dynaforge"])
+
+    async def fake_pat(app_id, email, *, force=False):
+        return "kr_tok"
+    monkeypatch.setattr(gw, "_user_pat", fake_pat)
+    seen_groups = []
+
+    async def fake_access(email, base_groups, *, allow_stale=True):
+        seen_groups.append((list(base_groups), allow_stale))
+        return aff_payload
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    asyncio.run(gw._call_tool("report_summary", {"report_id": "r1"}))
+    seen["lookups"] = seen_groups
+    return seen
+
+
+def test_사용자_위임_호출에_소속이_증명과_함께_실린다(monkeypatch):
+    """발급 때가 아니라 **호출마다**다 — 사용자 PAT 캐시는 12시간이라 발급 헤더로만 넘기면
+    소속이 바뀐 사람이 반나절 동안 남의 소속 문서를 읽는다.
+
+    그리고 **평문만으로는 안 된다.** 앱의 정문이 게이트웨이 하나가 아니라(사용자가 자기 PAT 로
+    앱 MCP 에 직접 붙는다) 소속을 평문으로만 보내면 "나는 CAEG 다" 를 사용자가 스스로 적는다.
+    """
+    import hashlib
+    import hmac
+
+    seen = _per_user_kit(monkeypatch, {"keys": ["plat:dynaforge"], "affiliation": "CAEG"})
+    assert seen["headers"][gw.AFF_HEADER] == "CAEG"
+    assert seen["headers"]["Authorization"] == "Bearer kr_tok"
+    assert seen["lookups"] == [(["mes-user"], False)], \
+        "권한 조회와 같은 키여야 캐시가 하나다(합성 그룹은 뺀다) · 소속은 낡은 값을 안 쓴다"
+
+    ver, exp, sig = seen["headers"][gw.AFF_PROOF_HEADER].split(".")
+    assert ver == "v1" and int(exp) > 0
+    want = hmac.new(b"app-secret", f"v1|u@corp.com|CAEG|{exp}".encode(), hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(sig, want), "서명이 이메일·소속·만료에 결속돼야 한다"
+
+
+def test_증명은_다른_사람의_호출에는_못_쓴다(monkeypatch):
+    """증명을 가로채도 남의 호출에 실으면 안 맞아야 한다 — 그래서 이메일을 서명에 넣는다."""
+    import hashlib
+    import hmac
+
+    seen = _per_user_kit(monkeypatch, {"keys": [], "affiliation": "CAEG"})
+    _v, exp, sig = seen["headers"][gw.AFF_PROOF_HEADER].split(".")
+    other = hmac.new(b"app-secret", f"v1|bob@corp.com|CAEG|{exp}".encode(),
+                     hashlib.sha256).hexdigest()
+    assert sig != other
+
+
+def test_소속이_없으면_두_헤더를_아예_안_싣는다(monkeypatch):
+    """빈 문자열을 실으면 받는 쪽이 '소속 없음' 을 하나의 소속으로 묶을 수 있다 —
+    소속 없는 사람끼리 서로의 문서를 읽는 길이 된다. 백엔드 설정에 남아 있던 값도 지운다."""
+    svc = {gw.AFF_HEADER: "SVC", gw.AFF_PROOF_HEADER: "v1.0.dead", "X-Keep": "1"}
+    seen = _per_user_kit(monkeypatch, {"keys": [], "affiliation": ""}, base_headers=svc)
+    assert gw.AFF_HEADER not in seen["headers"], "서비스 계정 헤더가 남으면 남의 소속으로 읽힌다"
+    assert gw.AFF_PROOF_HEADER not in seen["headers"]
+    assert seen["headers"]["X-Keep"] == "1", "관계없는 백엔드 헤더까지 지우면 안 된다"
+
+    # 포털을 아예 못 읽는 경우(None)도 같다 — 모르면 안 싣는다
+    seen = _per_user_kit(monkeypatch, None, base_headers=svc)
+    assert gw.AFF_HEADER not in seen["headers"]
+
+
+def test_소속에_한글이_와도_헤더가_안_깨진다(monkeypatch):
+    """헤더는 latin-1 만 담는다 — groups·user 와 같은 규칙으로 인코딩한다(받는 쪽은 unquote).
+    서명은 **인코딩 전** 값으로 한다 — 앱이 unquote 한 뒤 같은 문자열로 계산하기 때문이다."""
+    import hashlib
+    import hmac
+    from urllib.parse import unquote
+
+    seen = _per_user_kit(monkeypatch, {"keys": [], "affiliation": "CAE그룹"})
+    got = seen["headers"][gw.AFF_HEADER]
+    got.encode("latin-1")            # 안 깨지는지
+    assert unquote(got) == "CAE그룹"
+    _v, exp, sig = seen["headers"][gw.AFF_PROOF_HEADER].split(".")
+    want = hmac.new(b"app-secret", f"v1|u@corp.com|CAE그룹|{exp}".encode(), hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(sig, want)
+
+
+def test_소속이_캐시_키에_들어간다(monkeypatch):
+    """앱이 소속으로 읽기를 넓히므로 같은 사람·같은 인자라도 소속이 다르면 다른 답이다.
+    키에 없으면 권한 키가 안 바뀌는 소속 변경이 300초 동안 옛 결과를 정상 응답으로 준다."""
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["mes-user"])
+    a = gw._cache_key("b", "get_x", {"i": 1}, "CAEG")
+    b = gw._cache_key("b", "get_x", {"i": 1}, "")
+    assert a is not None and a != b
+    assert a[3] == "u@corp.com", "/conn-invalidate 가 k[3] 로 고른다 — 앞을 밀면 안 된다"

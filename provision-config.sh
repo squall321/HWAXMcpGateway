@@ -14,6 +14,11 @@
 # 백엔드 주소는 전부 오버라이드 가능하다 — 서비스가 다른 서버로 빠질 수 있기 때문이다.
 # 우선순위는 env > 기존 config(.bak) > 같은 박스 localhost 기본값이다. env 를 안 쓰더라도
 # 손으로 바꿔 둔 주소는 --force 재생성에서 보존된다.
+# ⚠ 단 **자기 .env 에 포트를 선언하는 형제 서비스**(지금은 SignalForge MCP_PORT)는 그 선언이
+#   로컬 .bak 을 이긴다(provision_urls.py). 기본값이 한 번 박히면 .bak 이 그 틀린 값을 영원히
+#   물려받았다 — cae00 은 8008 인데 8013 이 박혀 signalforge 가 09-18 부터 DOWN 이었다.
+#   .bak 이 원격 호스트를 가리키면(사람이 옮긴 것) 그대로 둔다. update-all 이 같은 판정으로
+#   드리프트를 찾아 이 스크립트를 --force 로 다시 부른다.
 #   RA_MCP_URL   SF_MCP_URL   MXWP_MCP_URL   AIDH_MCP_URL      (MCP 엔드포인트)
 #   SF_REST_BASE MXWP_REST_BASE AIDH_REST_BASE                 (REST 베이스)
 #   HEAX_MCP_SERVERS_URL / HEAX_MCP_BASE                       (heax registry — 기존부터 있던 손잡이)
@@ -341,9 +346,11 @@ RA_MCP_URL="${RA_MCP_URL:-}" SF_MCP_URL="${SF_MCP_URL:-}" MXWP_MCP_URL="${MXWP_M
 AIDH_MCP_URL="${AIDH_MCP_URL:-}" AIDH_REST_BASE="${AIDH_REST_BASE:-}" \
 MXWP_REST_BASE="${MXWP_REST_BASE:-}" SF_REST_BASE="${SF_REST_BASE:-}" \
 HWAXRISK_SSO_URL="${HWAXRISK_SSO_URL:-}" HWAXRISK_SSO_SECRET="${HWAXRISK_SSO_SECRET:-}" \
-CFG="$CFG" AGENT_DIR="$AGENT_DIR" python3 - <<'PYEOF'
-import json, os, re
+CFG="$CFG" AGENT_DIR="$AGENT_DIR" HERE="$HERE" SIBLING_ROOT="$PARENT" python3 - <<'PYEOF'
+import json, os, re, sys
 e = os.environ
+sys.path.insert(0, e["HERE"])
+import provision_urls  # 형제 서비스가 선언한 포트로 주소를 정한다(update-all 도 같은 판정을 쓴다)
 
 
 def _prev(key, field="url"):
@@ -406,7 +413,14 @@ if _RAT:
                     # 기존 config 값 > env > "dev" 순으로 존중한다.
                     "X-Workspace-Slug": e.get("RA_WORKSPACE_SLUG") or _prev_ra_slug() or "dev"}}
 # SF MCP 는 SF_MCP_TOKEN 미설정 시 무인증 모드로 돌므로 헤더 없이도 포함한다.
-cfg["signalforge"] = {"url": _url("SF_MCP_URL", "signalforge", "http://127.0.0.1:8013/mcp"),
+# ⚠ 주소는 SignalForge 자신의 `.env`(MCP_PORT)가 정본이다 — 박스마다 다르다(dev 8013, cae00 8008).
+#   전에는 기본값 8013 이 한 번 박히면 `.bak` 이 그 값을 영원히 물려받아 cae00 에서
+#   `signalforge: false` 가 09-18 부터 떠 있었다(재기동으로도 안 고쳐졌다).
+_sf_url, _sf_why = provision_urls.resolve(
+    "signalforge", env_url=e.get("SF_MCP_URL"), prev_url=_prev("signalforge", "url"),
+    sibling_root=e.get("SIBLING_ROOT"), default="http://127.0.0.1:8013/mcp")
+print(f"  · signalforge MCP 주소: {_sf_url}  (근거: {_sf_why})")
+cfg["signalforge"] = {"url": _sf_url,
                       "transport": "streamable_http"}
 if e.get("SF_MCP_TOKEN"):
     cfg["signalforge"]["headers"] = {"Authorization": f"Bearer {e['SF_MCP_TOKEN']}"}

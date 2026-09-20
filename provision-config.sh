@@ -198,7 +198,14 @@ koorm_token_alive() {  # kr_ PAT 가 아직 유효한가 — 읽기 전용 엔�
 }
 
 MXWP_MCP=""; MXWP_REST=""
-if apptainer instance list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx mxwp_api; then
+# 파이프+조기종료(grep -q)는 pipefail 아래서 SIGPIPE(141) 오판을 만든다 — 목록을 먼저 받는다.
+# 실측: 경합 중 600회 중 88회(14.7%)가 '떠 있는데 없다'로 읽혔다(HEAXHub _common.sh:instance_running 주석).
+_inst_list="$(apptainer instance list 2>/dev/null || true)"
+case $'\n'"$(printf '%s\n' "$_inst_list" | awk 'NR>1{print $1}')"$'\n' in
+  *$'\n'mxwp_api$'\n'*) _has_mxwp=1 ;;
+  *) _has_mxwp=0 ;;
+esac
+if [ "$_has_mxwp" = "1" ]; then
   # 앱 코드 경로 자동 탐지 (배포마다 다를 수 있음: apps/api, dist/… 등)
   MXAPP="$(apptainer exec instance://mxwp_api bash -lc \
     'find /workspace -maxdepth 6 -path "*/app/routers/api_tokens.py" -not -path "*/node_modules/*" 2>/dev/null | head -1')"

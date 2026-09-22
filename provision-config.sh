@@ -442,6 +442,11 @@ cfg["ai-data-hub"] = {"url": _url("AIDH_MCP_URL", "ai-data-hub", "http://127.0.0
 # 별개 서버다. 이게 없으면 잡을 던질 수는 있어도 후처리·결과 수집 도구가 통째로 안 보인다.
 cfg["smart-twin-mcp"] = {"url": _url("SMARTTWIN_MCP_URL", "smart-twin-mcp", "http://127.0.0.1:5013/mcp"),
                          "transport": "streamable_http"}
+# ste(SmartTwinExplorer 웹) MCP — REST 의 얇은 래퍼(:15812). 잡 제출·상태·결과를 낸다.
+# 별도 프로세스인 이유는 starlette 버전 충돌이고, 그 덕에 인증·쿼터가 REST 한 곳에서만
+# 강제된다. **ste 는 stcx 와 다른 클러스터다**(ste 24대 / stcx 356대).
+cfg["ste"] = {"url": _url("STE_MCP_URL", "ste", "http://127.0.0.1:15812/mcp"),
+              "transport": "streamable_http"}
 # 심의 MCP 는 HWAXAgentServer 에 내장(:9009/mcp, 루프백 무인증) — 항상 포함.
 # 이게 없으면 MCP 클라이언트에서 심의를 시작할 방법이 아예 없다(도구 목록에 진입점 0개).
 cfg["hwax-deliberation"] = {"url": _url("DELIB_MCP_URL", "hwax-deliberation", "http://127.0.0.1:9009/mcp/"),
@@ -528,6 +533,14 @@ if e.get("HEAX_MCP_TOKEN"):
             # Authorization 이 아니라 이 헤더로 싣는다(token_header) — 둘 다 forward_auth 때문이다.
             "auth": "heax",
             "token_header": "X-Heax-Sso-Assertion"}
+    if e.get("STE_SSO_SECRET"):
+        # ste 는 heax-hub 앱이 아니라 설정에 직접 적은 백엔드다 — 키가 곧 위임 식별자다.
+        # Caddy forward_auth 뒤가 아니므로 auth/token_header 는 쓰지 않는다(그 둘은 Caddy 전용
+        # 손잡이다). ste MCP 가 호출자 Authorization 을 REST 로 그대로 넘기므로 잡 소유권이 산다.
+        per_user["ste"] = {
+            "sso_url": e.get("STE_SSO_URL") or "http://127.0.0.1:15810/api/auth/sso",
+            "secret": e["STE_SSO_SECRET"],
+            "client": "gateway"}
     if per_user:
         cfg["heax_registry"]["per_user_sso"] = per_user
 # 프로비저너가 만드는 키는 아래가 전부다. 그 밖의 백엔드는 손으로 붙인 것이므로 보존한다.
@@ -537,7 +550,7 @@ if e.get("HEAX_MCP_TOKEN"):
 # 관리 키 중 토큰이 필요한 것(reportarchive·odb-hub)은 env 가 없어도 직전 config 에서
 # 이어받으므로(_carry) 여기까지 와서 사라지는 일은 없다.
 MANAGED = {"_gateway", "reportarchive", "signalforge", "mx-white-paper",
-           "ai-data-hub", "hwax-deliberation", "smart-twin-mcp",
+           "ai-data-hub", "hwax-deliberation", "smart-twin-mcp", "ste",
            "rest", "portal", "heax_registry", "odb-hub", "arp"}
 try:
     with open(e["CFG"]) as f:

@@ -116,6 +116,21 @@ def _aff_proof(secret: str, email: str, aff: str, now: float | None = None) -> s
 # 값이 있는 백엔드만 사용자별 자격증명으로 호출한다(나머지는 종전대로 서비스 계정).
 PER_USER_SSO: dict[str, dict] = {k: v for k, v in (HEAX.get("per_user_sso") or {}).items()
                                  if isinstance(v, dict) and v.get("sso_url") and v.get("secret")}
+def _delegation_app_id(backend_key: str) -> str:
+    """이 백엔드의 **사용자 위임 식별자**. 위임 대상이 아니면 빈 문자열.
+
+    heax-hub 앱은 자동탐지되어 키에 `heax-` 접두사가 붙으므로 그것을 뗀 이름이 앱 id 다.
+    설정 파일에 직접 적은 **정적 백엔드**(ste 등)는 접두사가 없으므로 **키가 곧 id** 다.
+
+    ⚠ 예전엔 앞쪽만 봤다. 그래서 정적 백엔드를 `per_user_sso` 에 넣어도 이 분기에 영영
+    들어오지 못했고, 위임을 켠 줄 알았는데 호출은 **서비스 계정**으로 나갔다 — 잡 소유자가
+    한 명으로 뭉치고, 감사 원장에는 그 한 명이 전부 한 것으로 남는다.
+    """
+    if backend_key.startswith(HEAX_PREFIX):
+        return backend_key[len(HEAX_PREFIX):]
+    return backend_key if backend_key in PER_USER_SSO else ""
+
+
 # 사용자 PAT 캐시 수명(초). PAT 자체는 장수명이라 만료 때문이 아니라 '권한 회수 반영'을 위한 값이다.
 # 짧게 잡으면 재발급이 잦아 백엔드에 폐기 토큰 행이 쌓인다(발급이 직전 것을 회수하는 구조).
 USER_PAT_TTL_S = int(os.environ.get("GATEWAY_USER_PAT_TTL", "43200"))
@@ -2151,7 +2166,7 @@ async def _call_tool(name: str, arguments: dict):
         )
     b = backends[backend_key]
     # 사용자 위임 백엔드인가 — **캐시 키에 소속이 들어가야** 하므로 조회보다 먼저 정한다.
-    app_id = backend_key[len(HEAX_PREFIX):] if backend_key.startswith(HEAX_PREFIX) else ""
+    app_id = _delegation_app_id(backend_key)
     _aff = ""
     if app_id in PER_USER_SSO and _request_user():
         # 권한 조회와 같은 키라 이미 데워져 있다(추가 HTTP 없음). 실패하면 빈 값 — 모르면 안 싣는다.

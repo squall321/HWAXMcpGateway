@@ -1154,3 +1154,32 @@ def test_포털이_찍는_목적_값과_게이트웨이가_보는_값이_같다(
     src = portal.read_text(encoding="utf-8")
     assert f'"purpose": "{gw.PROCEDURE_PURPOSE}"' in src, \
         f"포털 절차 PAT 의 purpose 값이 게이트웨이 PROCEDURE_PURPOSE({gw.PROCEDURE_PURPOSE!r})와 다르다"
+
+
+# ── 사용자 위임 식별자 — 정적 백엔드도 위임 대상이 될 수 있다 ───────────────
+#
+# 이 한 줄이 틀리면 **위임을 켠 줄 알았는데 서비스 계정으로 나간다.** 호출은 성공하고
+# 도구 목록도 정상이라, 잡 소유자가 한 명으로 뭉친 것을 한참 뒤에야 안다.
+def test_heax_backend_keys_drop_the_prefix(monkeypatch):
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"hwax_risk": {"sso_url": "x", "secret": "y"}})
+    assert gw._delegation_app_id("heax-hwax_risk") == "hwax_risk"
+
+
+def test_a_static_backend_in_per_user_sso_uses_its_own_key(monkeypatch):
+    """ste 처럼 설정에 직접 적은 백엔드는 접두사가 없다 — 키가 곧 식별자다."""
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"ste": {"sso_url": "x", "secret": "y"}})
+    assert gw._delegation_app_id("ste") == "ste"
+
+
+def test_a_static_backend_not_in_per_user_sso_is_not_delegated(monkeypatch):
+    """위임 설정이 없는 백엔드까지 끌어들이면 없는 SSO 를 부르다 매 호출이 실패한다."""
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"ste": {"sso_url": "x", "secret": "y"}})
+    assert gw._delegation_app_id("ai-data-hub") == ""
+    assert gw._delegation_app_id("smart-twin-mcp") == ""
+
+
+def test_empty_per_user_sso_delegates_nothing_static(monkeypatch):
+    monkeypatch.setattr(gw, "PER_USER_SSO", {})
+    assert gw._delegation_app_id("ste") == ""
+    # heax 앱은 목록과 무관하게 접두사를 뗀다(그다음 단계에서 PER_USER_SSO 를 다시 본다)
+    assert gw._delegation_app_id("heax-kooremapper_mcp") == "kooremapper_mcp"

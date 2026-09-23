@@ -20,6 +20,10 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+# 메서드 허용 규칙의 정본. REST 프록시 라우트와 MCP 다리가 **같은 함수**를 봐야 한다.
+# (rest_proxy 는 gateway 를 import 하지 않으므로 이 방향은 순환이 아니다.)
+from rest_proxy import allowed_methods, credential_mode
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("hwax-mcp-gateway")
 
@@ -1299,6 +1303,46 @@ LIST_APPS_TOOL = types.Tool(
 )
 
 
+# ── REST 다리 ────────────────────────────────────────────────────────────────
+# **용도를 가른다.** 이 게이트웨이의 도구는 두 갈래다.
+#   ① **의도적으로 열어 놓은 MCP 도구** — 앱이 "이건 이렇게 쓰라" 고 골라서 낸 것. **이쪽이 먼저다.**
+#      인자·검증·후처리가 그 도구 안에 들어 있어서, 부르는 쪽이 앱 내부를 몰라도 된다.
+#   ② **REST 를 얇게 얹은 이 두 도구** — ①로 안 되는 것(웹 화면에서만 되던 조작)을 위한 우회로다.
+#
+# 왜 도구를 자동 생성하지 않았나 — 하위 앱의 REST 경로를 전부 도구로 펴면 수백 개가 된다.
+# 그러면 도구 목록이 모델 컨텍스트를 먹고, 이름이 겹치고, 정작 ①의 좋은 도구가 묻힌다.
+# 그래서 **둘만** 둔다: 무엇이 있는지 묻는 것과, 하나를 부르는 것.
+REST_CATALOG_TOOL = types.Tool(
+    name="rest_catalog",
+    description='⚠ **먼저 전용 도구를 찾아라** — `list_tool_apps` / `search_tools` 로 그 일을 하는 도구가 있는지 \n보고, 있으면 그걸 써라. 이 도구는 **전용 도구로 안 되는 것**(웹 화면에서만 되던 조작)을 위한 우회로다.\n\n하위 사이트가 여는 REST API 목록을 돌려준다. 사이트별로 base 경로와, 그 사이트가 OpenAPI 를 \n내면 **경로·메서드·요약**까지 준다. 내 포털 권한으로 **쓸 수 있는 사이트만** 보인다.\n\nsite 를 주면 그 사이트만 상세히. q 를 주면 경로·요약에 그 말이 든 것만 추린다\n(경로가 많은 사이트는 q 없이 부르면 요약만 준다).',
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "site": {"type": "string", "description": "특정 사이트만(생략 시 전체 요약)"},
+            "q": {"type": "string", "description": "경로·요약에서 찾을 말(예: upload, job, report)"},
+            "limit": {"type": "integer", "description": "사이트당 반환할 경로 수(기본 40)"},
+        },
+    },
+)
+
+REST_CALL_TOOL = types.Tool(
+    name="rest_call",
+    description='⚠ **먼저 전용 도구를 찾아라**(`list_tool_apps`/`search_tools`). 이건 그것으로 안 될 때의 우회로다.\n\n`rest_catalog` 로 확인한 하위 사이트 REST 를 **내 이름으로** 부른다. 게이트웨이가 그 사이트의 \n자격을 대신 붙이므로 사이트별 토큰이 따로 필요 없고, **내 포털 권한**으로 열리는 것만 통한다.\n\n경로·메서드를 추측하지 마라 — `rest_catalog` 에 없는 경로는 404 다. \n파일 본문은 이 도구로 나르지 않는다(대용량은 경로를 넘기는 전용 도구를 쓴다).',
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "site": {"type": "string", "description": "rest_catalog 가 준 사이트 키"},
+            "path": {"type": "string", "description": "사이트 기준 경로(예: /api/v1/jobs). 앞 슬래시 포함"},
+            "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                       "description": "기본 GET"},
+            "query": {"type": "object", "description": "쿼리 문자열로 붙일 값들"},
+            "body": {"type": "object", "description": "JSON 본문(POST/PUT/PATCH)"},
+        },
+        "required": ["site", "path"],
+    },
+)
+
+
 INVOKE_TOOL = types.Tool(
     name="invoke_tool",
     description=(
@@ -1462,6 +1506,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         by_app.setdefault(route[t.name][0], []).append(t)
     by_app.setdefault("_gateway", []).extend([SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
                                               BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL])
+    if REST:                                   # _visible_tools 와 같은 조건 — 두 목록이 어긋나면 안 된다
+        by_app["_gateway"].extend([REST_CATALOG_TOOL, REST_CALL_TOOL])
     # 연결이 끊긴 백엔드는 도구가 집계되지 않아 목록에서 통째로 사라진다 — 접근성 점검이
     # 목적이므로 '앱은 있는데 지금 불통'을 보이게 빈 항목으로 채운다.
     for _k in backends:
@@ -1903,10 +1949,219 @@ async def _verify_answer(arguments: dict) -> types.CallToolResult:
         type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
 
 
+# ── REST 다리 핸들러 ─────────────────────────────────────────────────────────
+# 판정은 **MCP 경로와 같은 규칙**이다(`_backend_allowed`). 미들웨어가 이미 포털의 지금 값으로
+# groups 를 다시 계산해 헤더에 실어 두었으므로 여기서 다시 묻지 않는다 — 다시 물으면 두 경로가
+# 어긋난다(`_rest_allowed` 주석과 같은 이유).
+_OPENAPI_TTL_S = 300
+_openapi_cache: dict[str, tuple[dict | None, float]] = {}
+
+
+def _rest_text(payload: dict) -> types.CallToolResult:
+    return types.CallToolResult(content=[types.TextContent(
+        type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
+
+
+async def _openapi_of(site: str) -> dict | None:
+    """사이트의 OpenAPI 문서(5분 캐시). 못 받으면 **None 이고 빈 dict 가 아니다** —
+    빈 목록은 "경로가 없다" 로 읽히는데 실제로는 물어보지도 못한 것이다."""
+    now = time.monotonic()
+    hit = _openapi_cache.get(site)
+    if hit and now - hit[1] < _OPENAPI_TTL_S:
+        return hit[0]
+    conf = REST.get(site) or {}
+    base = str(conf.get("base") or "").rstrip("/")
+    doc = None
+    if base:
+        headers = {}
+        if credential_mode(conf) == "inject":
+            headers[conf["inject"]["header"]] = conf["inject"]["value"]
+        for suffix in ("/openapi.json", "/api/openapi.json", "/api/v1/openapi.json"):
+            try:
+                async with httpx.AsyncClient(timeout=8) as cli:
+                    r = await cli.get(base + suffix, headers=headers)
+                body = r.json() if r.status_code == 200 else None
+                if isinstance(body, dict) and isinstance(body.get("paths"), dict):
+                    doc = body
+                    break
+            except Exception:  # noqa: BLE001 — 못 받으면 base 만 안내한다
+                continue
+    _openapi_cache[site] = (doc, now)
+    return doc
+
+
+def _openapi_rows(doc: dict) -> list[dict]:
+    rows = []
+    for p, ops in (doc.get("paths") or {}).items():
+        if not isinstance(ops, dict):
+            continue
+        for m, op in ops.items():
+            if m.upper() not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}:
+                continue
+            text = ""
+            if isinstance(op, dict):
+                text = str(op.get("summary") or op.get("description") or "")
+            summary = text.strip().splitlines()[0][:120] if text.strip() else ""
+            rows.append({"method": m.upper(), "path": p, "summary": summary})
+    rows.sort(key=lambda r: (r["path"], r["method"]))
+    return rows
+
+
+async def _rest_catalog(args: dict) -> types.CallToolResult:
+    groups = _request_groups()
+    want = str(args.get("site") or "").strip()
+    q = str(args.get("q") or "").strip().lower()
+    try:
+        limit = max(1, min(200, int(args.get("limit") or 40)))
+    except (TypeError, ValueError):
+        limit = 40
+
+    mine = [s for s in REST if _backend_allowed(s, groups)]
+    if want:
+        if want not in REST:
+            return _rest_text({"error": f"unknown site: {want}", "known": mine})
+        if want not in mine:
+            return _rest_text({"error": f"forbidden: {want}",
+                               "detail": "이 사이트를 쓸 권한이 없다 — 포털 '내 권한' 에서 요청하라."})
+        mine = [want]
+
+    detailed = bool(want or q)
+    out = []
+    for s in mine:
+        conf = REST[s]
+        allowed = allowed_methods(conf)
+        info = {
+            "site": s,
+            "methods": allowed or ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
+            "readonly": allowed is not None and {m.upper() for m in allowed} <= {"GET", "HEAD"},
+        }
+        doc = await _openapi_of(s)
+        if doc is None:
+            info["paths"] = None
+            info["note"] = ("이 사이트는 OpenAPI 를 내지 않는다(또는 지금 안 닿는다) — 경로를 "
+                            "추측하지 말고 그 사이트 문서나 전용 MCP 도구를 보라.")
+            out.append(info)
+            continue
+        title = str(((doc.get("info") or {}).get("title") or "")).strip()
+        if title:
+            info["title"] = title
+        rows = _openapi_rows(doc)
+        if q:
+            rows = [r for r in rows if q in r["path"].lower() or q in r["summary"].lower()]
+        info["path_count"] = len(rows)
+        if detailed:
+            info["paths"] = rows[:limit]
+            if len(rows) > limit:
+                info["truncated"] = f"{len(rows)}건 중 {limit}건만 보였다 — q 로 좁히거나 limit 를 올려라."
+        else:
+            info["hint"] = "경로 목록은 site 나 q 를 주면 나온다."
+        out.append(info)
+
+    payload = {
+        "priority": ("전용 MCP 도구가 먼저다(`list_tool_apps`·`search_tools`). 이 표는 전용 도구로 "
+                     "안 되는 것을 웹 API 로 직접 하려 할 때만 쓴다."),
+        "sites": out,
+        "how_to_call": "rest_call(site=…, path=…, method=…, query=…, body=…) — path 는 위 목록 그대로.",
+    }
+    if not mine:
+        payload["note"] = ("내 권한으로 열리는 REST 사이트가 없다. 포털 '내 권한' 에서 요청하거나, "
+                           "전용 MCP 도구로 같은 일이 되는지 `search_tools` 로 보라.")
+    return _rest_text(payload)
+
+
+async def _rest_call(args: dict) -> types.CallToolResult:
+    site = str(args.get("site") or "").strip()
+    path = str(args.get("path") or "").strip()
+    method = (str(args.get("method") or "GET").strip() or "GET").upper()
+    groups = _request_groups()
+    caller = _request_user()
+    t0 = time.monotonic()
+
+    conf = REST.get(site)
+    if not conf:
+        return _rest_text({"error": f"unknown site: {site}",
+                           "known": [s for s in REST if _backend_allowed(s, groups)]})
+    if not _backend_allowed(site, groups):
+        _audit(f"rest_call {method} {path}", site, False, "forbidden", 0, caller=caller)
+        return _rest_text({"error": f"forbidden: {site}",
+                           "detail": "이 사이트를 쓸 권한이 없다 — 포털 '내 권한' 에서 요청하라."})
+    if not path:
+        return _rest_text({"error": "path 가 비었다", "detail": "rest_catalog 로 경로를 먼저 확인하라."})
+    if not path.startswith("/"):
+        path = "/" + path
+    allowed = allowed_methods(conf)
+    if allowed is not None and method not in {m.upper() for m in allowed}:
+        _audit(f"rest_call {method} {path}", site, False, "method not allowed", 0, caller=caller)
+        return _rest_text({"error": "method not allowed for this site",
+                           "detail": f"{site} 는 {'/'.join(allowed)} 만 허용한다. 쓰기가 필요하면 "
+                                     f"게이트웨이 설정의 rest.{site}.methods 에 명시해야 한다."})
+
+    headers = {"accept": "application/json"}
+    mode = credential_mode(conf)
+    if mode == "per_user":
+        app_id = str(conf["per_user"])
+        if not caller:
+            return _rest_text({"error": "신원이 없다",
+                               "detail": f"{site} 는 본인 명의로만 부른다. 포털 PAT(이메일이 든 것)로 "
+                                         f"게이트웨이에 붙어야 한다."})
+        if app_id not in PER_USER_SSO:
+            return _rest_text({"error": f"{site} 의 사용자 위임 설정이 없다",
+                               "detail": f"게이트웨이 heax_registry.per_user_sso.{app_id} 가 비어 있다."})
+        try:
+            tok = await _user_pat(app_id, caller)
+        except Exception as e:  # noqa: BLE001
+            _audit(f"rest_call {method} {path}", site, False, f"per-user: {e!r}", 0, caller=caller)
+            # 서비스 자격으로 조용히 강등하지 않는다 — 그러면 남의 시야로 답하고,
+            # 실패가 정상 응답과 구분되지 않는다(MCP 경로와 같은 자세).
+            return _rest_text({"error": f"{caller} 자격증명을 받지 못했다", "detail": str(e)[:300]})
+        # Caddy forward_auth 뒤의 앱은 Authorization 을 그 문이 아는 토큰으로 지켜야 통과하므로
+        # 앱 전용 자격을 따로 싣는다(`_call_as_user` 의 token_header 와 같은 이유).
+        hdr = PER_USER_SSO[app_id].get("token_header")
+        if hdr:
+            headers[hdr] = tok
+        else:
+            headers["Authorization"] = f"Bearer {tok}"
+    elif mode == "inject":
+        inj = conf["inject"]
+        headers[inj["header"]] = inj["value"]          # 그 사이트의 자기 서비스 자격
+    if caller:
+        headers["x-forwarded-user"] = caller           # 신원 힌트(사이트가 무시할 수 있다)
+    body = args.get("body")
+    query = args.get("query") or {}
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as cli:
+            up = await cli.request(method, conf["base"].rstrip("/") + path,
+                                   params={k: str(v) for k, v in dict(query).items()},
+                                   json=body if isinstance(body, (dict, list)) else None,
+                                   headers=headers)
+    except Exception as e:  # noqa: BLE001
+        ms = round((time.monotonic() - t0) * 1000)
+        _audit(f"rest_call {method} {path}", site, False, f"upstream: {e!r}", ms, caller=caller)
+        return _rest_text({"error": "upstream unreachable", "site": site, "detail": str(e)[:300]})
+
+    ms = round((time.monotonic() - t0) * 1000)
+    _audit(f"rest_call {method} {path}", site, up.status_code < 400, None, ms, caller=caller)
+    try:
+        parsed = up.json()
+    except Exception:  # noqa: BLE001 — JSON 이 아니면 본문을 잘라서 그대로 보인다
+        parsed = up.text[:8000]
+    payload = {"site": site, "method": method, "path": path,
+               "status": up.status_code, "ms": ms, "body": parsed}
+    if up.status_code >= 400:
+        # 실패를 성공처럼 생기게 두지 않는다 — 상태코드만 실으면 모델이 body 를 답으로 읽는다.
+        payload["error"] = f"{site} 가 {up.status_code} 로 답했다"
+    return _rest_text(payload)
+
+
 def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
-    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
-            BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL]
+    local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
+             BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL]
+    # REST 다리는 **등록된 사이트가 있을 때만** 낸다 — 쓸 수 없는 도구를 목록에 두면
+    # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
+    if REST:
+        local += [REST_CATALOG_TOOL, REST_CALL_TOOL]
+    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + local
 
 
 def _request_groups() -> list[str]:
@@ -2146,6 +2401,11 @@ async def _call_tool(name: str, arguments: dict):
         return await _use_experts(arguments or {})
     if name == VERIFY_TOOL.name:
         return await _verify_answer(arguments or {})
+
+    if name == REST_CATALOG_TOOL.name:
+        return await _rest_catalog(arguments or {})
+    if name == REST_CALL_TOOL.name:
+        return await _rest_call(arguments or {})
     # `route` 를 **먼저** 본다 — bare 이름의 뜻은 그대로다. 없을 때만 호출 전용 별칭.
     resolved = route.get(name) or alias_route.get(name)
     if resolved is None:
@@ -2537,6 +2797,13 @@ def _bearer_gate(app, pat_verifier=None):
     return middleware
 
 
+async def _rest_mint(app_id: str, email: str) -> tuple[str, str | None]:
+    """REST 프록시가 per_user 사이트를 부를 때 쓸 (토큰, 실을 헤더). MCP 경로와 같은 기계다."""
+    if app_id not in PER_USER_SSO:
+        raise RuntimeError(f"per_user_sso.{app_id} 설정이 없다")
+    return await _user_pat(app_id, email), PER_USER_SSO[app_id].get("token_header")
+
+
 async def _rest_allowed(site: str, pat_groups: list[str], email: str) -> bool:
     """REST 프록시의 자격 판정 — **MCP 경로와 같은 규칙**이다(`_backend_allowed`).
 
@@ -2555,7 +2822,7 @@ def main():
     # REST 프록시 라우트(/api/<site>/<path>) 를 MCP 마운트보다 먼저 매칭되게 삽입.
     if REST:
         from rest_proxy import RestProxy
-        proxy = RestProxy(REST, PORTAL, _audit, allow=_rest_allowed)
+        proxy = RestProxy(REST, PORTAL, _audit, allow=_rest_allowed, mint=_rest_mint)
         star.router.routes[:0] = proxy.routes()
         log.info("REST proxy enabled: %d sites (%s)", len(REST), ", ".join(REST))
     # streamable_http_app 의 lifespan 은 세션매니저 run() 만 돈다. 백엔드 집계 lifespan 을 함께 묶는다.

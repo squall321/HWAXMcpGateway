@@ -49,7 +49,8 @@ def test_visible_tools(monkeypatch):
     # 그것들은 백엔드 인가와 무관하므로 백엔드에서 온 것만 골라 본다(이 테스트의 관심사다).
     local = {t.name for t in (gw.SAVE_CONV_TOOL, gw.SEARCH_CONV_TOOL, gw.LIST_APPS_TOOL,
                               gw.SEARCH_TOOLS_TOOL, gw.INVOKE_TOOL,
-                              gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL)}
+                              gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL,
+                              gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -1183,3 +1184,165 @@ def test_empty_per_user_sso_delegates_nothing_static(monkeypatch):
     assert gw._delegation_app_id("ste") == ""
     # heax 앱은 목록과 무관하게 접두사를 뗀다(그다음 단계에서 PER_USER_SSO 를 다시 본다)
     assert gw._delegation_app_id("heax-kooremapper_mcp") == "kooremapper_mcp"
+
+
+# ── REST 다리(rest_catalog·rest_call) ─────────────────────────────────────────
+# 이 표면이 틀리면 **실패가 성공처럼 생긴다.** 세 모양을 특히 못 하게 못박는다.
+#   ① 권한 없는 사이트가 '빈 목록' 으로 보여 "REST 가 없다" 로 읽히는 것
+#   ② OpenAPI 를 못 받았는데 paths:[] 로 내려 "경로가 없다" 로 읽히는 것
+#   ③ 상류가 4xx 인데 payload 에 error 가 없어 모델이 body 를 답으로 읽는 것
+def _payload(res):
+    return json.loads(res.content[0].text)
+
+
+@pytest.fixture
+def _rest(monkeypatch):
+    """rest 사이트 둘 — inject 있는 것(읽기전용)과 없는 것(제한 없음)."""
+    conf = {
+        "locked": {"base": "http://127.0.0.1:1", "inject": {"header": "X-Key", "value": "k"}},
+        "open": {"base": "http://127.0.0.1:2"},
+    }
+    monkeypatch.setattr(gw, "REST", conf)
+    monkeypatch.setattr(gw, "POLICY", {"locked": [], "open": ["analyst"]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_user", lambda: "me@x.com")
+    gw._openapi_cache.clear()
+    return conf
+
+
+def test_rest_tools_hidden_without_sites(monkeypatch):
+    """사이트가 0개면 다리를 아예 안 낸다 — 못 쓰는 도구를 목록에 두면 모델이 그것을 고른다."""
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "REST", {})
+    assert {"rest_catalog", "rest_call"} & {t.name for t in gw._visible_tools([])} == set()
+    monkeypatch.setattr(gw, "REST", {"s": {"base": "http://x"}})
+    assert {"rest_catalog", "rest_call"} <= {t.name for t in gw._visible_tools([])}
+
+
+def test_allowed_methods_is_one_definition():
+    """메서드 규칙의 정본은 rest_proxy 하나다 — 게이트웨이가 그것을 부른다."""
+    import rest_proxy
+    assert gw.allowed_methods is rest_proxy.allowed_methods
+    assert gw.allowed_methods({"inject": {"header": "a", "value": "b"}}) == ["GET", "HEAD"]
+    assert gw.allowed_methods({"inject": {}, "methods": ["POST"]}) == ["POST"]   # 명시가 이긴다
+    # **쓰기의 기본은 닫힘이다.** 자격이 아무것도 없는 사이트(`none`)도 묶는다 —
+    # 상류가 무인증 200 이면(ai-data-hub 실측) 이 관문이 유일한 통제라, 여기서 열면
+    # 전문가챗 허가만 가진 사람이 LLM 으로 변경 op 를 그대로 부른다.
+    assert gw.allowed_methods({}) == ["GET", "HEAD"]
+    # per_user 만 제한이 풀린다 — 호출자 본인 토큰이라 그 사이트 규칙이 그대로 적용된다.
+    assert gw.allowed_methods({"per_user": "ste"}) is None
+
+
+@pytest.mark.anyio
+async def test_rest_catalog_hides_what_i_cannot_use(_rest, monkeypatch):
+    monkeypatch.setattr(gw, "_openapi_of", _noop_openapi)
+    out = _payload(await gw._rest_catalog({}))
+    assert [s["site"] for s in out["sites"]] == ["locked"]      # open 은 analyst 전용
+    assert "note" not in out                                    # 하나라도 보이면 잔소리 안 한다
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["analyst"])
+    out = _payload(await gw._rest_catalog({}))
+    assert sorted(s["site"] for s in out["sites"]) == ["locked", "open"]
+    # 하나도 못 쓰면 **빈 목록만 주고 끝내지 않는다** — 왜 비었고 어디서 권한을 받는지 말한다.
+    monkeypatch.setattr(gw, "POLICY", {"locked": ["x"], "open": ["y"]})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    out = _payload(await gw._rest_catalog({}))
+    assert out["sites"] == [] and "내 권한" in out["note"]
+
+
+@pytest.mark.anyio
+async def test_rest_catalog_forbidden_is_not_an_empty_list(_rest, monkeypatch):
+    """권한 없는 사이트를 콕 찍으면 **사유**가 온다. 빈 목록은 '없다' 로 읽힌다."""
+    monkeypatch.setattr(gw, "_openapi_of", _noop_openapi)
+    out = _payload(await gw._rest_catalog({"site": "open"}))
+    assert out["error"].startswith("forbidden:")
+    out = _payload(await gw._rest_catalog({"site": "nope"}))
+    assert out["error"].startswith("unknown site:") and out["known"] == ["locked"]
+
+
+async def _noop_openapi(site):
+    return None
+
+
+@pytest.mark.anyio
+async def test_rest_catalog_unreachable_openapi_says_so(_rest, monkeypatch):
+    """OpenAPI 를 못 받으면 paths 는 **None** 이고 note 가 붙는다(빈 목록이 아니다)."""
+    monkeypatch.setattr(gw, "_openapi_of", _noop_openapi)
+    row = _payload(await gw._rest_catalog({"site": "locked"}))["sites"][0]
+    assert row["paths"] is None and "note" in row and "path_count" not in row
+    assert row["readonly"] is True and row["methods"] == ["GET", "HEAD"]
+
+
+@pytest.mark.anyio
+async def test_rest_catalog_summary_until_asked(_rest, monkeypatch):
+    doc = {"info": {"title": "T"}, "paths": {
+        "/api/jobs": {"get": {"summary": "잡 목록"}, "post": {"summary": "잡 제출"}},
+        "/api/health": {"get": {"description": "상태\n둘째줄"}},
+        "/api/x": {"options": {}},                              # 대상 메서드가 아니면 버린다
+    }}
+
+    async def _doc(site):
+        return doc
+    monkeypatch.setattr(gw, "_openapi_of", _doc)
+    bare = _payload(await gw._rest_catalog({}))["sites"][0]
+    assert bare["path_count"] == 3 and "paths" not in bare and "hint" in bare
+    got = _payload(await gw._rest_catalog({"site": "locked"}))["sites"][0]
+    assert [(r["method"], r["path"]) for r in got["paths"]] == [
+        ("GET", "/api/health"), ("GET", "/api/jobs"), ("POST", "/api/jobs")]
+    assert got["paths"][0]["summary"] == "상태"                  # 첫 줄만
+    q = _payload(await gw._rest_catalog({"q": "제출"}))["sites"][0]
+    assert [r["path"] for r in q["paths"]] == ["/api/jobs"] and q["path_count"] == 1
+    cut = _payload(await gw._rest_catalog({"site": "locked", "limit": 1}))["sites"][0]
+    assert len(cut["paths"]) == 1 and "truncated" in cut        # 잘랐으면 잘랐다고 말한다
+
+
+@pytest.mark.anyio
+async def test_rest_call_gates_before_touching_upstream(_rest, monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("막혀야 하는 호출이 상류로 나갔다")
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _boom)
+    assert _payload(await gw._rest_call({"site": "nope", "path": "/x"}))["error"] \
+        .startswith("unknown site:")
+    assert _payload(await gw._rest_call({"site": "open", "path": "/x"}))["error"] \
+        .startswith("forbidden:")
+    assert "path 가 비었다" in _payload(await gw._rest_call({"site": "locked", "path": " "}))["error"]
+    bad = _payload(await gw._rest_call({"site": "locked", "path": "/x", "method": "post"}))
+    assert bad["error"] == "method not allowed for this site" and "GET/HEAD" in bad["detail"]
+
+
+class _Up:
+    def __init__(self, status, payload): self.status_code, self._p = status, payload
+    def json(self): return self._p
+    @property
+    def text(self): return json.dumps(self._p)
+
+
+class _Cli:
+    seen = {}
+
+    def __init__(self, *a, **k): pass
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+
+    async def request(self, method, url, params=None, json=None, headers=None):
+        _Cli.seen = {"method": method, "url": url, "params": params, "json": json,
+                     "headers": headers}
+        return _Up(_Cli.status, {"ok": True})
+
+
+@pytest.mark.anyio
+async def test_rest_call_forwards_and_marks_failure(_rest, monkeypatch):
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    _Cli.status = 200
+    out = _payload(await gw._rest_call({"site": "locked", "path": "health",
+                                        "query": {"n": 2}}))
+    assert out["status"] == 200 and out["body"] == {"ok": True} and "error" not in out
+    assert _Cli.seen["url"] == "http://127.0.0.1:1/health"      # 앞 슬래시를 붙여 준다
+    assert _Cli.seen["params"] == {"n": "2"}
+    assert _Cli.seen["headers"]["X-Key"] == "k"                 # 사이트 자기 자격 주입
+    assert _Cli.seen["headers"]["x-forwarded-user"] == "me@x.com"
+    _Cli.status = 404
+    bad = _payload(await gw._rest_call({"site": "locked", "path": "/nope"}))
+    assert bad["status"] == 404 and bad["error"].endswith("404 로 답했다")

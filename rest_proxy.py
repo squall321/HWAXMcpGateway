@@ -26,6 +26,40 @@ _HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 
 log = logging.getLogger("hwax-mcp-gateway")
 
+
+def credential_mode(conf: dict) -> str:
+    """이 사이트를 **누구 명의로** 부르는가. `per_user` | `inject` | `none`.
+
+    **정본은 여기 하나다** — REST 프록시와 게이트웨이의 MCP 다리가 같은 답을 봐야 한다.
+    `per_user` 가 `inject` 를 이긴다. 사용자 위임이 가능한 사이트를 서비스 자격으로 부르면
+    잡 소유자가 한 명으로 뭉치고 감사 원장에는 그 한 명이 전부 한 것으로 남는다.
+    """
+    if conf.get("per_user"):
+        return "per_user"
+    return "inject" if conf.get("inject") else "none"
+
+
+def allowed_methods(conf: dict) -> list[str] | None:
+    """이 사이트에서 허용되는 HTTP 메서드. None = 제한 없음.
+
+    **정본은 여기 하나다.** 게이트웨이의 MCP 다리(`gateway._rest_call`)도 이것을 부른다 —
+    같은 규칙을 두 군데 적어 두면 MCP 로는 통하고 REST 로는 막히는(또는 그 반대) 두 얼굴이 된다.
+    """
+    if conf.get("methods"):
+        return list(conf["methods"])        # 사이트가 명시했으면 그대로
+    # **쓰기의 기본은 닫힘이다.** 여는 길은 둘뿐 —
+    #   · `per_user` : 호출자 본인의 토큰으로 가므로 권한 상승이 없다. 그 사이트가 자기
+    #     사용자에게 허용하는 만큼만 되고, 누가 했는지도 상류 원장에 남는다.
+    #   · `methods`  : 사람이 그 사이트에 대해 명시적으로 열었다.
+    #
+    # ⚠ `inject` 는 그 사이트의 **마스터 키**라 당연히 묶이지만, 자격이 **아무것도 없는**
+    # 사이트(`none`)도 똑같이 묶는다. 예전엔 "주입이 없으니 권한 상승도 없다" 고 보고 열어
+    # 뒀는데, 그 전제가 틀렸다 — 상류가 무인증 200 이면(ai-data-hub 실측) 이 프록시가
+    # **유일한 관문**이라 '권한 상승이 없다' 가 아니라 '아무 통제도 없다' 였다. 게다가 이제
+    # `rest_call` 로 LLM 이 부를 수 있어서, 전문가챗 허가만 있는 사람(feat:expert-chat 이
+    # plat:aidatahub 를 함의한다)이 변경 op 를 그대로 부를 수 있었다.
+    return None if credential_mode(conf) == "per_user" else ["GET", "HEAD"]
+
 class PortalPatVerifier:
     """포털 PAT 검증(JWKS RS256, scope=api, aud, 폐기목록 60s 캐시). /mcp 게이트와 REST 프록시가 공유.
     verify(token, audience) → 성공 시 claims dict, 실패 시 None(모든 오류를 None 으로 흡수)."""
@@ -77,10 +111,13 @@ class PortalPatVerifier:
 
 
 class RestProxy:
-    def __init__(self, rest_conf: dict, portal_conf: dict, audit, allow=None):
+    def __init__(self, rest_conf: dict, portal_conf: dict, audit, allow=None, mint=None):
         # ⚠ `allow(site, groups)` 는 **MCP 경로와 같은 규칙**이다(`gateway._backend_allowed`).
         # 없이 두면 이 프록시는 자격 체계를 통째로 우회한다 — 아래 handle() 참조.
         self.allow = allow
+        # `mint(app_id, email) -> token` — per_user 사이트를 **호출자 본인 명의로** 부를 때 쓴다.
+        # 게이트웨이가 쥔 기계(`_user_pat`)를 주입받는다. 없으면 per_user 사이트는 막는다.
+        self.mint = mint
         self.rest = rest_conf or {}
         self.audience_ok = set(portal_conf.get("audience_ok", list(self.rest)))
         self.audit = audit
@@ -152,7 +189,7 @@ class RestProxy:
         # 쓰기를 열려면 사이트 설정에 methods 를 명시하게 한다(감사로그 기준 이 프록시는
         # 아직 호출 0건이라, 닫아도 깨지는 사용처가 없다).
         # inject 가 없는 사이트는 권한 상승이 없으므로 종전대로 둔다.
-        allowed = conf.get("methods") or (["GET", "HEAD"] if conf.get("inject") else None)
+        allowed = allowed_methods(conf)
         if allowed is not None and request.method.upper() not in {m.upper() for m in allowed}:
             self.audit(f"{request.method} /{path}", site, False, "method not allowed", 0,
                        caller=claims.get("sub"))
@@ -180,10 +217,31 @@ class RestProxy:
 
         url = conf["base"].rstrip("/") + "/" + path.lstrip("/")
         headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP}
-        inj = conf.get("inject")                           # optional (a site may allow anonymous)
-        if inj:
-            headers[inj["header"]] = inj["value"]          # the site's OWN service credential
-        headers["x-forwarded-user"] = claims.get("email", "")  # identity hint (site may ignore)
+        email = str(claims.get("email") or "").strip().lower()
+        mode = credential_mode(conf)                       # per_user | inject | none
+        if mode == "per_user":
+            # 서비스 자격으로 조용히 강등하지 않는다 — 그러면 남의 시야로 200 을 돌려주고,
+            # 실패가 정상 응답과 구분되지 않는다(MCP 경로와 같은 자세).
+            if not self.mint:
+                return JSONResponse({"error": "per-user credential minting not wired",
+                                     "detail": f"{site} 는 본인 명의로만 부른다."}, status_code=503)
+            if not email:
+                return JSONResponse({"error": "PAT 에 이메일이 없다",
+                                     "detail": f"{site} 는 본인 명의로만 부른다."}, status_code=401)
+            try:
+                tok, tok_header = await self.mint(str(conf["per_user"]), email)
+            except Exception as e:  # noqa: BLE001
+                self.audit(f"{request.method} /{path}", site, False, f"per-user: {e!r}", 0,
+                           caller=claims.get("sub"))
+                return JSONResponse({"error": f"{email} 자격증명을 받지 못했다",
+                                     "detail": str(e)[:300]}, status_code=502)
+            if tok_header:
+                headers[tok_header] = tok
+            else:
+                headers["Authorization"] = f"Bearer {tok}"
+        elif mode == "inject":
+            headers[conf["inject"]["header"]] = conf["inject"]["value"]  # the site's OWN service credential
+        headers["x-forwarded-user"] = email                # identity hint (site may ignore)
         body = await request.body()
         try:
             up = await self._client.request(

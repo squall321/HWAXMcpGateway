@@ -113,3 +113,64 @@ def test_프로비저너가_signalforge_주소를_이_판정으로_정한다():
     assert 'cfg["signalforge"] = {"url": _sf_url' in src
     assert '_url("SF_MCP_URL", "signalforge"' not in src, "옛 경로(.bak 물려받기)가 남아 있다"
     assert 'SIBLING_ROOT="$PARENT"' in src, "형제 리포 루트를 파이썬 블록에 안 넘긴다"
+
+
+# ── REST 다리 사이트 확장 ────────────────────────────────────────────────────
+# provision-config.sh 의 파이썬 블록을 **그대로 떼어 돌린다.** 로직을 시험 안에 베껴 쓰면
+# 스크립트가 바뀌어도 시험은 계속 통과한다 — 그러면 시험이 아니라 사본이다.
+def _run_provision(tmp_path, env: dict) -> dict:
+    body = re.search(r"python3 - <<'PYEOF'\n(.*?)\nPYEOF\n",
+                     (HERE / "provision-config.sh").read_text(encoding="utf-8"), re.S).group(1)
+    script = tmp_path / "block.py"
+    script.write_text(body, encoding="utf-8")
+    cfg = tmp_path / "gateway_config.json"
+    full = {"CFG": str(cfg), "AGENT_DIR": str(tmp_path / "noagent"), "HERE": str(HERE),
+            "SIBLING_ROOT": str(tmp_path / "siblings"), "GW_TOKEN": "gw", **env}
+    r = subprocess.run([sys.executable, str(script)], env=full, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return json.loads(cfg.read_text(encoding="utf-8"))
+
+
+def test_rest_사이트는_본인_명의로_갈_수_있으면_그렇게_간다(tmp_path):
+    out = _run_provision(tmp_path, {
+        "HEAX_MCP_TOKEN": "heax-svc", "KOORM_SSO_SECRET": "s1", "STE_SSO_SECRET": "s2",
+        "STE_SSO_URL": "http://10.0.0.9:15810/api/auth/sso",
+    })
+    rest = out["rest"]
+    # ste·DynaForge 는 사용자 위임이 있으니 주입 없이 per_user 로 간다 → 쓰기가 막히지 않는다.
+    assert rest["ste"] == {"base": "http://10.0.0.9:15810", "per_user": "ste"}
+    assert rest["dyna-forge"]["per_user"] == "kooremapper_mcp"
+    assert "inject" not in rest["ste"] and "inject" not in rest["dyna-forge"]
+    import rest_proxy
+    assert rest_proxy.allowed_methods(rest["ste"]) is None
+    # StepForge 는 서비스 토큰뿐이다 → 읽기전용으로 묶인다(마스터 키로 쓰지 못하게).
+    assert rest["step-forge"]["base"].endswith("/apps/step_forge")
+    assert rest_proxy.allowed_methods(rest["step-forge"]) == ["GET", "HEAD"]
+    # 사이트를 늘렸으면 허용 청중도 같이 늘어야 한다 — 안 그러면 프록시가 404 로 답한다.
+    assert set(out["portal"]["audience_ok"]) == set(rest)
+
+
+def test_위임_시크릿이_없으면_그_사이트를_아예_안_만든다(tmp_path):
+    """자격 없이 사이트만 만들면 '있는데 401' 이 된다 — 없는 것보다 나쁘다."""
+    out = _run_provision(tmp_path, {"HEAX_MCP_TOKEN": "heax-svc"})
+    assert "ste" not in out["rest"] and "dyna-forge" not in out["rest"]
+    assert "step-forge" in out["rest"]
+    out2 = _run_provision(tmp_path, {})           # heax 토큰도 없으면 StepForge 도 빠진다
+    assert set(out2["rest"]) == {"ai-data-hub"}
+    assert set(out2["portal"]["audience_ok"]) == {"ai-data-hub"}
+    # 자격이 아무것도 없는 사이트도 읽기전용이다 — 상류(AIDataHub)가 무인증 200 이라
+    # 이 프록시가 유일한 관문이고, rest_call 로 LLM 이 부를 수 있게 된 뒤로는 더 그렇다.
+    import rest_proxy
+    assert rest_proxy.allowed_methods(out2["rest"]["ai-data-hub"]) == ["GET", "HEAD"]
+
+
+def test_손으로_바꾼_rest_base_는_재생성에서_보존된다(tmp_path):
+    env = {"HEAX_MCP_TOKEN": "heax-svc", "STE_SSO_SECRET": "s2",
+           "STE_SSO_URL": "http://10.0.0.9:15810/api/auth/sso"}
+    _run_provision(tmp_path, env)
+    cfg = tmp_path / "gateway_config.json"
+    (tmp_path / "gateway_config.json.bak").write_text(
+        json.dumps({"rest": {"ste": {"base": "http://192.168.130.10:15810"}}}), encoding="utf-8")
+    cfg.unlink()
+    out = _run_provision(tmp_path, env)
+    assert out["rest"]["ste"]["base"] == "http://192.168.130.10:15810"   # sso_url 유도보다 앞선다

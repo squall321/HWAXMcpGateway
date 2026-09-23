@@ -470,7 +470,7 @@ if e.get("SF_API_KEY"):
 cfg["rest"] = rest
 cfg["portal"] = {"jwks_url": "http://127.0.0.1:8723/.well-known/jwks.json",
                  "revoked_url": "http://127.0.0.1:8723/auth/pat/revoked.json",
-                 "audience_ok": ["mx-white-paper", "ai-data-hub", "signalforge"]}
+                 "audience_ok": []}          # rest 사이트가 정해진 뒤 아래에서 채운다
 # ODB 자동화 허브 — cae00 에서만 도달하는 사내 MCP 서버. dev 에서는 닿지 않는다(실측: 포트 차단).
 # 반드시 url 형식이어야 한다 — 게이트웨이는 `"url" in v` 인 항목만 백엔드로 읽는다(gateway.py:42).
 # mcp-remote 의 {"command":"npx","args":[...]} 형식을 그대로 넣으면 에러 없이 조용히 무시된다.
@@ -543,6 +543,45 @@ if e.get("HEAX_MCP_TOKEN"):
             "client": "gateway"}
     if per_user:
         cfg["heax_registry"]["per_user_sso"] = per_user
+
+# ── REST 다리 사이트 확장 ────────────────────────────────────────────────────
+# per_user 블록 **뒤에** 둔다 — ste 의 REST base 는 그 sso_url 이 가리키는 곳이 정본이라
+# (같은 웹 백엔드다) 여기서 유도한다. 앞에 두면 박스마다 포트를 손으로 또 적게 된다.
+#
+# 자격은 셋이 다르다. **본인 명의로 갈 수 있는 곳은 본인 명의로 간다** —
+#   · ste·DynaForge : per_user(사용자 위임이 이미 있다) → 쓰기까지 그 사람 권한 그대로
+#   · StepForge     : 서비스 토큰 주입뿐이라 읽기전용으로 묶인다(allowed_methods 가 자동으로)
+#                     — 이 앱은 자체 소유권 판정이 없어서 서비스 자격 = 전체 시야다
+def _origin(url, default):
+    m = re.match(r"^(https?://[^/]+)", str(url or ""))
+    return m.group(1) if m else default
+
+
+# per_user 는 heax 분기 안에서만 정의되므로 지역변수가 아니라 **방금 쓴 cfg** 에서 읽는다.
+_pu = (cfg.get("heax_registry") or {}).get("per_user_sso") or {}
+if "ste" in _pu:
+    rest["ste"] = {"base": _rest_base("STE_REST_BASE", "ste",
+                                      _origin((_pu["ste"] or {}).get("sso_url"),
+                                              "http://127.0.0.1:15810")),
+                   "per_user": "ste"}
+if "kooremapper_mcp" in _pu:
+    rest["dyna-forge"] = {"base": _rest_base("KOORM_REST_BASE", "dyna-forge",
+                                             _origin((_pu["kooremapper_mcp"] or {}).get("sso_url"),
+                                                     "http://127.0.0.1:8700")),
+                          "per_user": "kooremapper_mcp"}
+if e.get("HEAX_MCP_TOKEN"):
+    # StepForge 는 Caddy forward_auth 뒤다 — 문을 통과하려면 이 토큰이어야 한다.
+    rest["step-forge"] = {
+        "base": _rest_base("STEPFORGE_REST_BASE", "step-forge",
+                           (e.get("HEAX_MCP_BASE") or "http://127.0.0.1:4180").rstrip("/")
+                           + "/apps/step_forge"),
+        "inject": {"header": "Authorization", "value": f"Bearer {e['HEAX_MCP_TOKEN']}"}}
+cfg["rest"] = rest
+# 허용 청중은 **rest 사이트와 정확히 같다.** 손으로 적어 두면 두 방향으로 어긋난다 —
+#   · 사이트는 있는데 청중에 없으면 프록시가 `unknown site` 404 로 답한다(`handle()`).
+#   · 청중에 있는데 사이트가 없으면 그 aud 로 PAT 를 찍어도 아무 효과가 없다. 포털 허용
+#     목록의 heax-hub 가 정확히 그 모양이었다 — 소비처 없는 허용은 사람을 헷갈리게 한다.
+cfg["portal"]["audience_ok"] = sorted(rest)
 # 프로비저너가 만드는 키는 아래가 전부다. 그 밖의 백엔드는 손으로 붙인 것이므로 보존한다.
 # 예전엔 cfg 를 빈 dict 에서 시작해 파일을 통째로 덮어썼다 — 그래서 --force 한 번에
 # smart-twin-cluster(slurm 도구 19개)가 조용히 사라진다. update-all 의 기대 목록에도

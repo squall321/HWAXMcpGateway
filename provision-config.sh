@@ -391,6 +391,15 @@ def _prev_ra_slug():
 # 26행에서 라이브를 그대로 복사해 둔 것)에 토큰이 있으면 그걸 이어받는다.
 # cae00 에서 실제로 이것 때문에 reportarchive(24개)+odb-hub 가 한 번에 사라졌다(2026-08-12).
 # 경고는 config 를 이미 쓴 뒤에 나오므로 사후약방문이었다. 지우려면 config 를 직접 편집하면 된다.
+def _prev_rest(site):
+    """직전 config 의 rest.<site> 설정 전체(base·inject·per_user)."""
+    try:
+        with open(e["CFG"] + ".bak") as f:
+            return (json.load(f).get("rest") or {}).get(site)
+    except Exception:
+        return None
+
+
 def _carry(env_key, getter, label):
     v = e.get(env_key)
     if v:
@@ -408,6 +417,19 @@ _ODB = _carry("ODB_HUB_TOKEN",
               lambda: (re.search(r'[?&]token=([^&]+)', _prev("odb-hub") or "") or [None, None])[1]
                       if re.search(r'[?&]token=([^&]+)', _prev("odb-hub") or "") else None,
               "ODB_HUB_TOKEN")
+
+# mxwp 토큰은 **떠 있는 컨테이너 안에서** 발급한다. 그 인스턴스가 죽어 있으면 발급이 실패하고,
+# 그러면 종전에는 mx-white-paper 백엔드와 REST 사이트가 통째로 사라졌다 — 토큰이 만료된 것도
+# 아니고 그냥 못 물어본 것인데도. 마운트 네임스페이스가 끊긴 인스턴스에서 실제로 그렇게 됐다
+# (`transport endpoint is not connected`, 2026-09-23). 직전 config 의 토큰을 이어받는다.
+_MXWP_MCP = _carry("MXWP_MCP",
+                   lambda: ((_prev("mx-white-paper", "headers") or {}).get("Authorization") or "")
+                           .replace("Bearer ", "").strip() or None,
+                   "MXWP_MCP")
+_MXWP_REST = _carry("MXWP_REST",
+                    lambda: (((_prev_rest("mx-white-paper") or {}).get("inject") or {})
+                             .get("value") or "").replace("Bearer ", "").strip() or None,
+                    "MXWP_REST")
 
 cfg = {"_gateway": {"host": "127.0.0.1", "port": 9110, "token": e["GW_TOKEN"]}}
 if _RAT:
@@ -431,10 +453,10 @@ cfg["signalforge"] = {"url": _sf_url,
                       "transport": "streamable_http"}
 if e.get("SF_MCP_TOKEN"):
     cfg["signalforge"]["headers"] = {"Authorization": f"Bearer {e['SF_MCP_TOKEN']}"}
-if e.get("MXWP_MCP"):
+if _MXWP_MCP:
     cfg["mx-white-paper"] = {"url": _url("MXWP_MCP_URL", "mx-white-paper", "http://127.0.0.1:8765/mcp"),
         "transport": "streamable_http",
-        "headers": {"Authorization": f"Bearer {e['MXWP_MCP']}"}}
+        "headers": {"Authorization": f"Bearer {_MXWP_MCP}"}}
 # AIDH MCP 는 api_server 에 내장(:8001/mcp, auth_required=false → 무인증) — 항상 포함.
 cfg["ai-data-hub"] = {"url": _url("AIDH_MCP_URL", "ai-data-hub", "http://127.0.0.1:8001/mcp/"),
                       "transport": "streamable_http"}
@@ -452,18 +474,13 @@ cfg["ste"] = {"url": _url("STE_MCP_URL", "ste", "http://127.0.0.1:15812/mcp"),
 cfg["hwax-deliberation"] = {"url": _url("DELIB_MCP_URL", "hwax-deliberation", "http://127.0.0.1:9009/mcp/"),
                             "transport": "streamable_http"}
 def _rest_base(env_key, key, default):
-    try:
-        with open(e["CFG"] + ".bak") as f:
-            prev = ((json.load(f).get("rest") or {}).get(key) or {}).get("base")
-    except Exception:
-        prev = None
-    return e.get(env_key) or prev or default
+    return e.get(env_key) or (_prev_rest(key) or {}).get("base") or default
 
 
 rest = {"ai-data-hub": {"base": _rest_base("AIDH_REST_BASE", "ai-data-hub", "http://127.0.0.1:8001")}}
-if e.get("MXWP_REST"):
+if _MXWP_REST:
     rest["mx-white-paper"] = {"base": _rest_base("MXWP_REST_BASE", "mx-white-paper", "http://127.0.0.1:8800"),
-        "inject": {"header": "Authorization", "value": f"Bearer {e['MXWP_REST']}"}}
+        "inject": {"header": "Authorization", "value": f"Bearer {_MXWP_REST}"}}
 if e.get("SF_API_KEY"):
     rest["signalforge"] = {"base": _rest_base("SF_REST_BASE", "signalforge", "http://127.0.0.1:17370"),
         "inject": {"header": "X-API-Key", "value": e["SF_API_KEY"]}}

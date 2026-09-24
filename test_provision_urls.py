@@ -174,3 +174,23 @@ def test_손으로_바꾼_rest_base_는_재생성에서_보존된다(tmp_path):
     cfg.unlink()
     out = _run_provision(tmp_path, env)
     assert out["rest"]["ste"]["base"] == "http://192.168.130.10:15810"   # sso_url 유도보다 앞선다
+
+
+def test_ste_sso_url_은_env_가_없으면_직전_config_를_보존한다(tmp_path):
+    """MCP url 은 `_url()` 이 직전값을 지키는데 sso_url 만 env → 기본값이었다. 그래서
+    STE_SSO_URL 없이 --force 를 돌리면 VM 주소가 127.0.0.1 로 **덮였다**(dev 실측 2026-09-24)."""
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({
+        "heax_registry": {"per_user_sso": {"ste": {
+            "sso_url": "http://192.168.130.10:15810/api/auth/sso", "secret": "old", "client": "gateway"}}},
+    }), encoding="utf-8")
+    out = _run_provision(tmp_path, {"HEAX_MCP_TOKEN": "heax-svc", "STE_SSO_SECRET": "s2"})   # STE_SSO_URL 없음
+    assert out["heax_registry"]["per_user_sso"]["ste"]["sso_url"] == "http://192.168.130.10:15810/api/auth/sso"
+    # env 가 있으면 그것이 이긴다
+    out = _run_provision(tmp_path, {"HEAX_MCP_TOKEN": "heax-svc", "STE_SSO_SECRET": "s2",
+                                    "STE_SSO_URL": "http://10.0.0.9:15810/api/auth/sso"})
+    assert out["heax_registry"]["per_user_sso"]["ste"]["sso_url"] == "http://10.0.0.9:15810/api/auth/sso"
+    # 직전값도 env 도 없을 때만 기본값
+    (tmp_path / "gateway_config.json.bak").unlink()
+    (tmp_path / "gateway_config.json").unlink(missing_ok=True)
+    out = _run_provision(tmp_path, {"HEAX_MCP_TOKEN": "heax-svc", "STE_SSO_SECRET": "s2"})
+    assert out["heax_registry"]["per_user_sso"]["ste"]["sso_url"] == "http://127.0.0.1:15810/api/auth/sso"

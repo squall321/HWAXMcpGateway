@@ -554,8 +554,13 @@ if e.get("HEAX_MCP_TOKEN"):
         # ste 는 heax-hub 앱이 아니라 설정에 직접 적은 백엔드다 — 키가 곧 위임 식별자다.
         # Caddy forward_auth 뒤가 아니므로 auth/token_header 는 쓰지 않는다(그 둘은 Caddy 전용
         # 손잡이다). ste MCP 가 호출자 Authorization 을 REST 로 그대로 넘기므로 잡 소유권이 산다.
+        # ⚠ MCP url 은 `_url()` 이 직전 config 값을 보존하는데 sso_url 만 env → 기본값이었다.
+        #   그래서 STE_SSO_URL 없이 --force 를 돌리면 멀쩡하던 VM 주소가 127.0.0.1 로 **덮였다**.
+        #   같은 규칙으로 맞춘다: env > 직전 config > 기본값.
         per_user["ste"] = {
-            "sso_url": e.get("STE_SSO_URL") or "http://127.0.0.1:15810/api/auth/sso",
+            "sso_url": e.get("STE_SSO_URL")
+                       or (per_user.get("ste") or {}).get("sso_url")
+                       or "http://127.0.0.1:15810/api/auth/sso",
             "secret": e["STE_SSO_SECRET"],
             "client": "gateway"}
     if per_user:

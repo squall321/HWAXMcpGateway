@@ -527,6 +527,12 @@ def test_거부_사유가_다르면_안내도_다르다(monkeypatch):
     d = body["denied_apps"][0]
     assert d["reason"] == "policy_not_ready" and d.get("retry") is True and d["request"] is None
     assert "그룹 제한" not in d["how"]
+    # 콕 집어 물어도·호출해도·지시문에서도 같은 사유를 말한다 — how 하나만 고치면 나머지가 반대로 말한다(2라운드).
+    one = json.loads(asyncio.run(gw._list_tool_apps({"app": "ste"})).content[0].text)
+    assert one["error"].startswith("not_ready:") and "권한이 없는 앱" not in one["error"]
+    assert "일시" in gw._deny_text("ste", ["plat:smarttwin"])
+    assert "policy_not_ready" in gw._INSTRUCTIONS and "gateway_group" in gw._INSTRUCTIONS
+    assert "재시도" in body["note"] or "policy_not_ready" in body["note"]
     # 정책이 오면 같은 호출자가 바로 열린다 — 일시 상태였다는 증거.
     monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
     assert "ste" in {a["app"] for a in json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["apps"]}

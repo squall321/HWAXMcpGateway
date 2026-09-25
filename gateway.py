@@ -794,9 +794,11 @@ _INSTRUCTIONS = """HWAX 엔지니어링 허브 — 사내 설계·해석·품질
    `use_experts(keys=[...])` 로 역할·도구를 받아 그 전문가로서 답하라(첫 명이 주 전문가).
 8. 도구가 실패하면 인자만 바꿔 반복하지 마라. 응답이 '인자 문제가 아니다' 라고 말하면
    연결·시간초과이므로 다른 방법을 찾거나 사용자에게 알려라.
-9. 권한 없는 앱은 `list_tool_apps` 목록에 없고 `denied_apps` 에 라벨·필요 권한·요청 경로만 있다.
-   그 앱의 도구 이름을 지어내거나 `invoke_tool` 로 우회하지 말고, 사용자에게 포털 '내 권한'
-   (`/access?need=<권한>`)에서 요청하라고 안내하라 — 승인은 관리자가 한다.
+9. 권한 없는 앱은 `list_tool_apps` 목록에 없고 `denied_apps` 에 라벨·사유(`reason`)·필요 권한·요청 경로만
+   있다. 그 앱의 도구 이름을 지어내거나 `invoke_tool` 로 우회하지 마라. 사유별로 안내가 다르다 —
+   `portal_access`: 포털 '내 권한'(`request` = `/access?need=<권한>`)에서 요청하라, 승인은 관리자가 한다 ·
+   `gateway_group`: 포털에서 청할 수 있는 것이 아니다, 포털 관리자에게 문의 · `policy_not_ready`(`retry:true`):
+   게이트웨이가 정책을 아직 못 받은 일시 상태다, 잠시 뒤 같은 호출을 다시 하라(요청하라고 하지 마라).
 """
 
 fm = FastMCP("hwax-mcp-gateway", instructions=_INSTRUCTIONS)
@@ -859,6 +861,20 @@ def _deny_reason(backend_key: str, groups: list[str]) -> str | None:
 def _backend_allowed(backend_key: str, groups: list[str]) -> bool:
     """백엔드 공개 여부 — 판정 규칙은 _deny_reason 에 있다(사유만 버린다)."""
     return _deny_reason(backend_key, groups) is None
+
+
+def _deny_text(backend_key: str, groups: list[str]) -> str:
+    """거부 응답에 붙이는 사유 한 줄 — list_tool_apps 의 denied_apps[].how 와 같은 말을 한다.
+    호출 시점 거부(forbidden:)가 '권한 없음 → 포털에서 청하라' 로만 읽히면 정책 미수신의 일시 닫힘도
+    영구 제한처럼 보인다(2라운드 검토)."""
+    reason = _deny_reason(backend_key, groups)
+    if reason == "policy_not_ready":
+        return "게이트웨이가 포털 권한 정책을 아직 못 받았다(일시) — 잠시 뒤 다시 부르면 풀린다"
+    if reason == "gateway_group":
+        return "게이트웨이 그룹 제한 — 포털에서 청할 수 있는 것이 아니다, 포털 관리자에게 문의"
+    needs = sorted(_ACCESS_POLICY.get(backend_key) or [])
+    first = next((n for n in needs if n.startswith(("plat:", "feat:"))), None)
+    return ("이 계정에는 권한이 없다 — 포털 '내 권한'" + (f"(/access?need={first})" if first else "") + " 에서 요청하라")
 
 
 # ── 포털 권한 정책(HWAXPortal docs/access-control) ─────────────────────────────
@@ -1609,15 +1625,18 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         # 아니다" 를 사용자에게 말할 수 있게 하는 것이 목적이다(권한 없음 ≠ 앱 없음).
         "denied_apps": denied_apps,
         "note": "여기 있는 앱은 모두 내 권한으로 호출 가능하다(reachable=백엔드 연결 정상). "
-                "권한 없는 앱은 목록에 없고 denied_apps 에 라벨·필요 권한·요청 경로만 있다 — "
-                "포털 '내 권한'(request 경로)에서 요청하면 관리자가 승인한다. "
+                "권한 없는 앱은 목록에 없고 denied_apps 에 라벨·사유·필요 권한·요청 경로만 있다 — 각 항목의 "
+                "reason/how 를 따른다(portal_access 만 포털 '내 권한' 요청, policy_not_ready 는 잠시 뒤 재시도). "
                 "특정 앱의 도구 설명은 list_tool_apps(app='<키>') 로 조회.",
     }
     if want_app and not apps:
-        payload["error"] = (f"no_access: {want_app} — 이 계정에는 권한이 없는 앱이다"
-                            if denied else f"unknown app: {want_app}")
         if denied:
-            payload["denied"] = denied_apps[0]
+            d0 = denied_apps[0]
+            payload["error"] = (f"not_ready: {want_app} — {d0['how']}" if d0["reason"] == "policy_not_ready"
+                                else f"no_access: {want_app} — 이 계정에는 권한이 없는 앱이다. {d0['how']}")
+            payload["denied"] = d0
+        else:
+            payload["error"] = f"unknown app: {want_app}"
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
     )
@@ -2080,8 +2099,7 @@ async def _rest_catalog(args: dict) -> types.CallToolResult:
         if want not in REST:
             return _rest_text({"error": f"unknown site: {want}", "known": mine})
         if want not in mine:
-            return _rest_text({"error": f"forbidden: {want}",
-                               "detail": "이 사이트를 쓸 권한이 없다 — 포털 '내 권한' 에서 요청하라."})
+            return _rest_text({"error": f"forbidden: {want}", "detail": _deny_text(want, groups)})
         mine = [want]
 
     detailed = bool(want or q)
@@ -2142,8 +2160,7 @@ async def _rest_call(args: dict) -> types.CallToolResult:
                            "known": [s for s in REST if _backend_allowed(s, groups)]})
     if not _backend_allowed(site, groups):
         _audit(f"rest_call {method} {path}", site, False, "forbidden", 0, caller=caller)
-        return _rest_text({"error": f"forbidden: {site}",
-                           "detail": "이 사이트를 쓸 권한이 없다 — 포털 '내 권한' 에서 요청하라."})
+        return _rest_text({"error": f"forbidden: {site}", "detail": _deny_text(site, groups)})
     if not path:
         return _rest_text({"error": "path 가 비었다", "detail": "rest_catalog 로 경로를 먼저 확인하라."})
     if not path.startswith("/"):
@@ -2506,7 +2523,7 @@ async def _call_tool(name: str, arguments: dict):
         _audit(name, backend_key, False, "forbidden", 0,
                caller=_request_user() or None, corr=_request_corr())
         return types.CallToolResult(
-            content=[types.TextContent(type="text", text=f"forbidden: {name}")],
+            content=[types.TextContent(type="text", text=f"forbidden: {name} — {_deny_text(backend_key, _request_groups())}")],
             isError=True,
         )
     b = backends[backend_key]

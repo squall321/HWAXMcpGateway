@@ -470,6 +470,7 @@ def test_list_tool_apps_는_권한없는_앱을_아예_안_보여준다(monkeypa
     # 라벨·필요 권한·요청 경로는 준다 — "권한 없음" 과 "그런 앱 없음" 을 모델이 가르게(S3 권한 안내).
     assert [d["app"] for d in body["denied_apps"]] == ["secret"] and body["denied_apps"][0]["label"]
     assert body["denied_apps"][0]["request"] is None, "게이트웨이 그룹 제한은 포털에서 청할 수 없다"
+    assert body["denied_apps"][0]["reason"] == "gateway_group"
     assert one["denied"]["app"] == "secret"
 
     # 권한이 있으면 종전대로 보인다.
@@ -493,8 +494,46 @@ def test_list_tool_apps_거부_안내는_포털_권한키와_요청_경로를_�
     body = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
     d = body["denied_apps"][0]
     assert d["app"] == "ste" and d["needs"] == ["plat:smarttwin"] and d["request"] == "/access?need=plat:smarttwin"
+    assert d["reason"] == "portal_access"
     assert "ste_submit_job" not in json.dumps(body), "거부 안내에 도구 이름이 새면 모델이 계획에 넣는다"
     assert "denied_apps" in gw._INSTRUCTIONS and "/access?need=" in gw._INSTRUCTIONS
+
+
+def test_거부_사유가_다르면_안내도_다르다(monkeypatch):
+    """적대 검토(2026-09-25)에서 잡힌 둘 — 게이트웨이 그룹으로 막힌 사람에게 이미 가진 포털 권한을
+    청하라 했고, 정책 미수신의 일시 닫힘을 '그룹 제한' 영구 상태처럼 말했다."""
+    class _S:
+        session = object()
+    monkeypatch.setattr(gw, "backends", {"ste": _S()})
+    monkeypatch.setattr(gw, "exposed_tools", [_tool("ste_submit_job")])
+    monkeypatch.setattr(gw, "route", {"ste_submit_job": ("ste", "submit_job")})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {"ste": ["plat:smarttwin"]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+
+    # 1) 포털 권한은 이미 있는데 게이트웨이 그룹이 막는다 → 청할 것이 없다.
+    monkeypatch.setattr(gw, "POLICY", {"ste": ["ops"]})
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["plat:smarttwin"])
+    d = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["denied_apps"][0]
+    assert d["reason"] == "gateway_group" and d["request"] is None and d["needs"] == []
+    assert "청할 수 있는 것이 아니다" in d["how"]
+
+    # 2) 정책을 아직 못 받아 per_user 백엔드가 잠시 닫힘 → 일시 상태, 재시도 안내.
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", False)
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"ste": {}})
+    monkeypatch.setattr(gw, "_delegation_app_id", lambda k: k)
+    body = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    d = body["denied_apps"][0]
+    assert d["reason"] == "policy_not_ready" and d.get("retry") is True and d["request"] is None
+    assert "그룹 제한" not in d["how"]
+    # 정책이 오면 같은 호출자가 바로 열린다 — 일시 상태였다는 증거.
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    assert "ste" in {a["app"] for a in json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["apps"]}
+
+    # 3) _backend_allowed 는 사유만 버린 같은 판정이다.
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {"ste": ["plat:smarttwin"]})
+    assert gw._backend_allowed("ste", ["plat:smarttwin"]) and not gw._backend_allowed("ste", ["feat:chat"])
 
 
 def test_조직도_도구가_라벨없이도_돈다(monkeypatch):

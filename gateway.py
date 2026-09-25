@@ -828,28 +828,37 @@ def _parse_groups(raw: str | None) -> list[str]:
     return out
 
 
-def _backend_allowed(backend_key: str, groups: list[str]) -> bool:
-    """백엔드 공개 여부: allowed_groups 비었으면 전체 공개, 아니면 caller groups와 교집합 필요.
+def _deny_reason(backend_key: str, groups: list[str]) -> str | None:
+    """왜 막히는가 — None(허용) · "gateway_group"(allowed_groups 교집합 없음) ·
+    "policy_not_ready"(포털 정책 미수신, 일시) · "portal_access"(포털 feat:/plat: 권한 없음).
 
-    포털 권한 정책(_ACCESS_POLICY)이 이 백엔드에 필요 권한을 걸었으면 그것도 통과해야 한다(둘 다).
-    POLICY 에 덮어쓰지 않는 이유 — heax registry 재탐지가 POLICY[key] 를 빈 값으로 되돌려 권한이
-    소리 없이 풀린다."""
+    allowed_groups 비었으면 전체 공개, 아니면 caller groups와 교집합 필요. 포털 권한 정책(_ACCESS_POLICY)이
+    이 백엔드에 필요 권한을 걸었으면 그것도 통과해야 한다(둘 다). POLICY 에 덮어쓰지 않는 이유 — heax
+    registry 재탐지가 POLICY[key] 를 빈 값으로 되돌려 권한이 소리 없이 풀린다.
+    사유를 구분해 돌려주는 이유 — denied_apps 안내가 "포털에서 청하라" 를 잘못 말했다(적대 검토 2026-09-25):
+    게이트웨이 그룹으로 막힌 사람에게 이미 가진 포털 권한을 청하라 하고, 정책 미수신의 일시 닫힘을 영구
+    제한처럼 말했다. 허용/거부 판정 자체는 _backend_allowed 그대로다."""
     gs = set(groups)
     allowed = POLICY.get(backend_key, [])
     if allowed and not (gs & set(allowed)):
-        return False
+        return "gateway_group"
     need = _ACCESS_POLICY.get(backend_key)
     # 내부 서비스(GW_TOKEN 으로 그룹 헤더 없이 부름)는 사람이 아니다 — 사람 권한 정책을 받지 않는다.
     if SERVICE_GROUP in gs:
-        return True
+        return None
     # ⚠ 정책을 **아직 못 받은** 상태는 "제한 없음" 이 아니다. 전면 fail-closed 는 가용성을 위해
     #   일부러 안 한 자리라(위 fail-open 주석), 사용자 위임으로 **계정을 만들 수 있는** 백엔드만 닫는다.
     #   새 클론(캐시 없음)·옛 포털(404)·포털 미기동 부팅에서 생기고, 60초마다 재시도해 곧 풀린다.
     #   ⚠ `_delegation_app_id` 는 heax- 접두 키면 위임 여부와 무관하게 id 를 돌려준다 — 실제 위임
     #   백엔드인지는 PER_USER_SSO 에 있는지까지 봐야 한다(처음에 이걸 빼먹어 step_forge 가 닫혔다).
     if not _ACCESS_POLICY_READY and _delegation_app_id(backend_key) in PER_USER_SSO:
-        return False
-    return (not need) or bool(gs & set(need))
+        return "policy_not_ready"
+    return None if (not need) or bool(gs & set(need)) else "portal_access"
+
+
+def _backend_allowed(backend_key: str, groups: list[str]) -> bool:
+    """백엔드 공개 여부 — 판정 규칙은 _deny_reason 에 있다(사유만 버린다)."""
+    return _deny_reason(backend_key, groups) is None
 
 
 # ── 포털 권한 정책(HWAXPortal docs/access-control) ─────────────────────────────
@@ -1515,16 +1524,23 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
     )
 
 
-def _denied_entry(key: str, meta: dict) -> dict:
-    """권한 없는 앱의 안내 — 라벨·필요 권한·요청 경로만. 도구 이름은 싣지 않는다(모델이 계획에 넣는다).
-    필요 권한은 포털 정책(_ACCESS_POLICY)의 feat:/plat: 키다. 게이트웨이 그룹 제한(POLICY)뿐이면 요청
-    경로가 없다 — 그건 사용자가 포털에서 청할 수 있는 것이 아니다."""
-    needs = sorted(_ACCESS_POLICY.get(key) or [])
-    first = next((n for n in needs if n.startswith(("plat:", "feat:"))), None)
-    return {"app": key, "label": meta["label"], "needs": needs,
-            "request": f"/access?need={first}" if first else None,
-            "how": ("포털 '내 권한' 페이지에서 요청하면 관리자가 승인한다" if first
-                    else "게이트웨이 그룹 제한 — 포털 관리자에게 문의")}
+def _denied_entry(key: str, meta: dict, reason: str) -> dict:
+    """권한 없는 앱의 안내 — 라벨·사유·필요 권한·요청 경로만. 도구 이름은 싣지 않는다(모델이 계획에 넣는다).
+    사유(_deny_reason)에 따라 갈린다: 포털 권한이 없을 때만 feat:/plat: 키와 요청 경로를 준다. 게이트웨이
+    그룹 제한은 포털에서 청할 수 있는 것이 아니고, 정책 미수신은 잠시 뒤 저절로 풀리는 일시 상태다."""
+    entry: dict = {"app": key, "label": meta["label"], "reason": reason, "needs": [], "request": None}
+    if reason == "portal_access":
+        needs = sorted(_ACCESS_POLICY.get(key) or [])
+        first = next((n for n in needs if n.startswith(("plat:", "feat:"))), None)
+        entry.update(needs=needs, request=f"/access?need={first}" if first else None,
+                     how="포털 '내 권한' 페이지에서 요청하면 관리자가 승인한다")
+    elif reason == "policy_not_ready":
+        entry.update(retry=True,
+                     how="게이트웨이가 포털 권한 정책을 아직 못 받았다(부팅 직후·포털 미기동) — "
+                         "잠시 뒤 다시 부르면 풀린다. 포털에서 청할 것이 아니다")
+    else:
+        entry.update(how="게이트웨이 그룹 제한 — 포털에서 청할 수 있는 것이 아니다. 포털 관리자에게 문의")
+    return entry
 
 
 async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
@@ -1554,8 +1570,9 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     for key in sorted(by_app, key=lambda k: -len(by_app[k])):
         tools = by_app[key]
         local = key == "_gateway"
-        # 접근성: 그룹 인가(로컬 도구는 전 그룹) + 백엔드 세션 생존.
-        accessible = True if local else _backend_allowed(key, groups)
+        # 접근성: 그룹 인가(로컬 도구는 전 그룹) + 백엔드 세션 생존. 사유는 거부 안내에 쓴다.
+        deny = None if local else _deny_reason(key, groups)
+        accessible = deny is None
         reachable = True if local else (key in backends and backends[key].session is not None)
         if want_app and key != want_app:
             continue
@@ -1565,7 +1582,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         meta = _app_meta(key)
         if not accessible:
             denied += 1
-            denied_apps.append(_denied_entry(key, meta))
+            denied_apps.append(_denied_entry(key, meta, deny))
             continue
         entry = {
             "app": key,

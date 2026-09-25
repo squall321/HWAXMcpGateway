@@ -15,7 +15,7 @@ import httpx
 import jwt
 from jwt import PyJWKClient
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 # hop-by-hop headers not forwarded verbatim (+ host/authorization which we rewrite)
@@ -242,12 +242,18 @@ class RestProxy:
         elif mode == "inject":
             headers[conf["inject"]["header"]] = conf["inject"]["value"]  # the site's OWN service credential
         headers["x-forwarded-user"] = email                # identity hint (site may ignore)
-        body = await request.body()
+        # ⚠ **요청도 응답도 버퍼링하지 않는다.** 종전엔 `await request.body()` 가 업로드 전량을 메모리에 받았고
+        #   응답도 `up.content` 로 통째였다 — 2GB k파일이 이 경로로 못 가던 확정 원인이고(2026-09-24 적대 검토),
+        #   result.zip 을 받으면 게이트웨이가 그만큼 부풀었다. 요청은 request.stream() 을 그대로 흘리고,
+        #   응답은 StreamingResponse 로 흘린다. 스트림 자체는 이 프록시가 만들지 않으므로 상한을 두지 않는다 —
+        #   받는 쪽(브라우저·curl)이 바이트를 감당한다. 모델에 보이는 rest_call 만 상한이 있다.
+        async def _body():
+            async for chunk in request.stream():
+                yield chunk
         try:
-            up = await self._client.request(
-                request.method, url, params=dict(request.query_params),
-                content=body, headers=headers,
-            )
+            req = self._client.build_request(request.method, url, params=dict(request.query_params),
+                                             content=_body(), headers=headers)
+            up = await self._client.send(req, stream=True)
         except Exception as e:  # noqa: BLE001
             self.audit(f"{request.method} /{path}", site, False, f"upstream: {e!r}",
                        round((time.monotonic() - t0) * 1000), caller=claims.get("sub"))
@@ -255,7 +261,14 @@ class RestProxy:
         self.audit(f"{request.method} /{path}", site, up.status_code < 400, None,
                    round((time.monotonic() - t0) * 1000), caller=claims.get("sub"))
         out_headers = {k: v for k, v in up.headers.items() if k.lower() not in _HOP}
-        return Response(content=up.content, status_code=up.status_code, headers=out_headers)
+
+        async def _out():
+            try:
+                async for chunk in up.aiter_raw():
+                    yield chunk
+            finally:
+                await up.aclose()
+        return StreamingResponse(_out(), status_code=up.status_code, headers=out_headers)
 
     def routes(self) -> list[Route]:
         return [Route("/api/{site}/{path:path}", self.handle,

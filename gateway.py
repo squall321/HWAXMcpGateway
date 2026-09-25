@@ -1971,6 +1971,8 @@ async def _verify_answer(arguments: dict) -> types.CallToolResult:
 # groups 를 다시 계산해 헤더에 실어 두었으므로 여기서 다시 묻지 않는다 — 다시 물으면 두 경로가
 # 어긋난다(`_rest_allowed` 주석과 같은 이유).
 _OPENAPI_TTL_S = 300
+# rest_call 이 모델에 보여 줄 응답 상한. 넘으면 스트림을 끊는다(위 _rest_call 주석).
+REST_CALL_MAX_BYTES = int(os.environ.get("GATEWAY_REST_CALL_MAX_BYTES", str(1024 * 1024)))
 _openapi_cache: dict[str, tuple[dict | None, float]] = {}
 
 
@@ -2145,28 +2147,54 @@ async def _rest_call(args: dict) -> types.CallToolResult:
         headers["x-forwarded-user"] = caller           # 신원 힌트(사이트가 무시할 수 있다)
     body = args.get("body")
     query = args.get("query") or {}
+    # ⚠ 응답을 **끝까지 받지 않는다.** 종전엔 `cli.request` 가 본문 전체를 메모리에 받은 뒤 json 을 시도하고
+    #   text 로 한 벌 더 만들었다 — 모델이 `get_job_result` 설명대로 `result.zip` 을 이 도구로 부르면 게이트웨이가
+    #   수 GB 를 삼킨다(120MB 응답에 피크 521MB 실측, 2026-09-24). 이 도구는 **텍스트/JSON 답을 모델에 보이는**
+    #   용도라 상한을 두고, 넘치면 스트림을 끊고 error 로 돌려준다(파일은 전용 도구·ste-sync 로 받는다).
+    cap = REST_CALL_MAX_BYTES
     try:
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as cli:
-            up = await cli.request(method, conf["base"].rstrip("/") + path,
-                                   params={k: str(v) for k, v in dict(query).items()},
-                                   json=body if isinstance(body, (dict, list)) else None,
-                                   headers=headers)
+            async with cli.stream(method, conf["base"].rstrip("/") + path,
+                                  params={k: str(v) for k, v in dict(query).items()},
+                                  json=body if isinstance(body, (dict, list)) else None,
+                                  headers=headers) as up:
+                ctype = (up.headers.get("content-type") or "").lower()
+                clen = up.headers.get("content-length")
+                too_big = (clen is not None and clen.isdigit() and int(clen) > cap)
+                chunks: list[bytes] = []
+                got = 0
+                if not too_big:
+                    async for ch in up.aiter_bytes():
+                        chunks.append(ch)
+                        got += len(ch)
+                        if got > cap:
+                            too_big = True
+                            break                       # 스트림을 여기서 끊는다 — 나머지는 안 받는다
+                status = up.status_code
+                raw = b"".join(chunks)
     except Exception as e:  # noqa: BLE001
         ms = round((time.monotonic() - t0) * 1000)
         _audit(f"rest_call {method} {path}", site, False, f"upstream: {e!r}", ms, caller=caller)
         return _rest_text({"error": "upstream unreachable", "site": site, "detail": str(e)[:300]})
 
     ms = round((time.monotonic() - t0) * 1000)
-    _audit(f"rest_call {method} {path}", site, up.status_code < 400, None, ms, caller=caller)
+    if too_big:
+        _audit(f"rest_call {method} {path}", site, False, f"response > {cap}B", ms, caller=caller)
+        return _rest_text({"error": f"응답이 {cap // (1024 * 1024)}MB 를 넘는다 — 이 도구로 나르지 않는다",
+                           "site": site, "method": method, "path": path, "status": status,
+                           "content_type": ctype,
+                           "detail": "파일·아카이브는 전용 도구(예: ste 의 get_job_file·ste-sync)로 받는다. "
+                                     "rest_call 은 모델에 보일 텍스트/JSON 답 전용이다."})
+    _audit(f"rest_call {method} {path}", site, status < 400, None, ms, caller=caller)
     try:
-        parsed = up.json()
+        parsed = json.loads(raw.decode("utf-8"))
     except Exception:  # noqa: BLE001 — JSON 이 아니면 본문을 잘라서 그대로 보인다
-        parsed = up.text[:8000]
+        parsed = raw.decode("utf-8", errors="replace")[:8000]
     payload = {"site": site, "method": method, "path": path,
-               "status": up.status_code, "ms": ms, "body": parsed}
-    if up.status_code >= 400:
+               "status": status, "ms": ms, "body": parsed}
+    if status >= 400:
         # 실패를 성공처럼 생기게 두지 않는다 — 상태코드만 실으면 모델이 body 를 답으로 읽는다.
-        payload["error"] = f"{site} 가 {up.status_code} 로 답했다"
+        payload["error"] = f"{site} 가 {status} 로 답했다"
     return _rest_text(payload)
 
 

@@ -1314,29 +1314,42 @@ async def test_rest_call_gates_before_touching_upstream(_rest, monkeypatch):
 
 
 class _Up:
-    def __init__(self, status, payload): self.status_code, self._p = status, payload
-    def json(self): return self._p
-    @property
-    def text(self): return json.dumps(self._p)
+    """rest_call 이 이제 `cli.stream()` 으로 받는다 — 본문을 청크로 흘리는 가짜 응답."""
+    def __init__(self, status, raw: bytes, ctype="application/json", clen=None):
+        self.status_code, self._raw = status, raw
+        self.headers = {"content-type": ctype}
+        if clen is not None:
+            self.headers["content-length"] = str(clen)
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+    async def aiter_bytes(self):
+        for i in range(0, len(self._raw), 4096):
+            _Cli.streamed += 1
+            yield self._raw[i:i + 4096]
 
 
 class _Cli:
     seen = {}
+    status = 200
+    raw = b'{"ok": true}'
+    ctype = "application/json"
+    clen = None
+    streamed = 0
 
     def __init__(self, *a, **k): pass
     async def __aenter__(self): return self
     async def __aexit__(self, *a): return False
 
-    async def request(self, method, url, params=None, json=None, headers=None):
+    def stream(self, method, url, params=None, json=None, headers=None):
         _Cli.seen = {"method": method, "url": url, "params": params, "json": json,
                      "headers": headers}
-        return _Up(_Cli.status, {"ok": True})
+        return _Up(_Cli.status, _Cli.raw, _Cli.ctype, _Cli.clen)
 
 
 @pytest.mark.anyio
 async def test_rest_call_forwards_and_marks_failure(_rest, monkeypatch):
     monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
-    _Cli.status = 200
+    _Cli.status, _Cli.raw, _Cli.ctype, _Cli.clen = 200, b'{"ok": true}', "application/json", None
     out = _payload(await gw._rest_call({"site": "locked", "path": "health",
                                         "query": {"n": 2}}))
     assert out["status"] == 200 and out["body"] == {"ok": True} and "error" not in out
@@ -1399,3 +1412,36 @@ def test_loading_the_disk_cache_marks_ready(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", False)
     gw._load_access_cache()
     assert gw._ACCESS_POLICY_READY is True and gw._ACCESS_POLICY == {"ste": ["plat:smarttwin"]}
+
+
+
+# ── rest_call 응답 상한 — 모델에 보일 텍스트/JSON 전용이다 ─────────────────────────
+# 종전엔 본문 전체를 받은 뒤 json·text 로 두 벌을 더 만들었다. 모델이 `result.zip` 을 이 도구로 부르면
+# 게이트웨이가 수 GB 를 삼킨다(120MB 에 피크 521MB 실측, 2026-09-24). 넘치면 **스트림을 끊는다.**
+@pytest.mark.anyio
+async def test_rest_call_cuts_the_stream_when_the_body_exceeds_the_cap(_rest, monkeypatch):
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    monkeypatch.setattr(gw, "REST_CALL_MAX_BYTES", 10_000)
+    _Cli.status, _Cli.raw, _Cli.ctype, _Cli.clen, _Cli.streamed = 200, b"x" * 100_000, "application/zip", None, 0
+    out = _payload(await gw._rest_call({"site": "locked", "path": "/big.zip"}))
+    assert "넘는다" in out["error"] and out["content_type"] == "application/zip"
+    # 100KB 를 다 읽지 않았다 — 4KB 청크로 상한(10KB)을 넘긴 직후 끊었다
+    assert _Cli.streamed <= 4, _Cli.streamed
+
+
+@pytest.mark.anyio
+async def test_rest_call_trusts_content_length_and_reads_nothing(_rest, monkeypatch):
+    """상류가 크기를 미리 말하면 한 바이트도 안 읽는다."""
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    monkeypatch.setattr(gw, "REST_CALL_MAX_BYTES", 10_000)
+    _Cli.status, _Cli.raw, _Cli.ctype, _Cli.clen, _Cli.streamed = 200, b"x" * 20, "application/zip", 5_000_000, 0
+    out = _payload(await gw._rest_call({"site": "locked", "path": "/big.zip"}))
+    assert "넘는다" in out["error"] and _Cli.streamed == 0
+
+
+@pytest.mark.anyio
+async def test_rest_call_small_text_still_passes(_rest, monkeypatch):
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    _Cli.status, _Cli.raw, _Cli.ctype, _Cli.clen = 200, b"hello", "text/plain", 5
+    out = _payload(await gw._rest_call({"site": "locked", "path": "/t"}))
+    assert out["status"] == 200 and out["body"] == "hello" and "error" not in out

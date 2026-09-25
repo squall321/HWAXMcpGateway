@@ -837,7 +837,16 @@ def _backend_allowed(backend_key: str, groups: list[str]) -> bool:
         return False
     need = _ACCESS_POLICY.get(backend_key)
     # 내부 서비스(GW_TOKEN 으로 그룹 헤더 없이 부름)는 사람이 아니다 — 사람 권한 정책을 받지 않는다.
-    return (not need) or SERVICE_GROUP in gs or bool(gs & set(need))
+    if SERVICE_GROUP in gs:
+        return True
+    # ⚠ 정책을 **아직 못 받은** 상태는 "제한 없음" 이 아니다. 전면 fail-closed 는 가용성을 위해
+    #   일부러 안 한 자리라(위 fail-open 주석), 사용자 위임으로 **계정을 만들 수 있는** 백엔드만 닫는다.
+    #   새 클론(캐시 없음)·옛 포털(404)·포털 미기동 부팅에서 생기고, 60초마다 재시도해 곧 풀린다.
+    #   ⚠ `_delegation_app_id` 는 heax- 접두 키면 위임 여부와 무관하게 id 를 돌려준다 — 실제 위임
+    #   백엔드인지는 PER_USER_SSO 에 있는지까지 봐야 한다(처음에 이걸 빼먹어 step_forge 가 닫혔다).
+    if not _ACCESS_POLICY_READY and _delegation_app_id(backend_key) in PER_USER_SSO:
+        return False
+    return (not need) or bool(gs & set(need))
 
 
 # ── 포털 권한 정책(HWAXPortal docs/access-control) ─────────────────────────────
@@ -851,6 +860,10 @@ _ACCESS_CACHE_FILE = Path(__file__).resolve().parent / ".access_policy_cache.jso
 # 표시 그룹을 붙인다. 에이전트서버는 사용자 호출에 늘 그룹 헤더를 싣는다(빈 값이라도 싣는다).
 SERVICE_GROUP = "gateway:service"
 _ACCESS_POLICY: dict[str, list[str]] = {}
+# 정책을 **한 번이라도 받았는가**(캐시 파일 또는 포털). 비어 있음(=아무 백엔드에도 제한 없음)과
+# 못 받음(=아직 모름)은 다르다 — 못 받은 상태에서 per_user 백엔드를 열면 시크릿을 쥔 게이트웨이가
+# 임의 이메일로 그 앱 계정을 JIT 생성한다(2026-09-24 적대 검토). 그래서 그 백엔드만 닫는다.
+_ACCESS_POLICY_READY = False
 # {(email, 로그인 그룹): (권한 키 | None, 만료)} — PAT 호출자의 **지금** 권한.
 _ENT_CACHE: dict[tuple[str, str], tuple[dict | None, float]] = {}
 _ENT_LAST: dict[tuple[str, str], dict] = {}          # 포털이 죽었을 때 쓸 직전 값(만료 없음)
@@ -866,6 +879,8 @@ def _load_access_cache() -> None:
         if isinstance(data, dict):
             _ACCESS_POLICY.clear()
             _ACCESS_POLICY.update({str(k): [str(x) for x in v] for k, v in data.items() if isinstance(v, list)})
+            global _ACCESS_POLICY_READY
+            _ACCESS_POLICY_READY = True
             log.info("권한 정책 캐시 적재 — 백엔드 %d개", len(_ACCESS_POLICY))
     except FileNotFoundError:
         pass
@@ -890,6 +905,8 @@ async def _refresh_access_policy() -> bool:
     except Exception as exc:  # noqa: BLE001 — 직전 정책 유지(가용성) + 경고
         log.warning("포털 권한 정책 조회 실패 — 직전 정책 유지(백엔드 %d개): %r", len(_ACCESS_POLICY), exc)
         return False
+    global _ACCESS_POLICY_READY
+    _ACCESS_POLICY_READY = True                 # 값이 같아도 "받았다" 는 사실은 남긴다
     if new != _ACCESS_POLICY:
         _ACCESS_POLICY.clear()
         _ACCESS_POLICY.update(new)
@@ -2609,6 +2626,7 @@ def _bearer_gate(app, pat_verifier=None):
                 # 정책이 **실려 있는지**는 무인증으로도 봐야 한다 — 비어 있으면 권한이
                 # 통째로 풀린 채 도는 것이고, 그건 프로브가 잡아야 할 사고다. 내용은 가린다.
                 "access_policy_loaded": len(_ACCESS_POLICY),
+                "access_policy_ready": _ACCESS_POLICY_READY,
                 **({"policy": POLICY, "access_policy": _ACCESS_POLICY} if _detail else {}),
             }).encode()
             await send({"type": "http.response.start", "status": 200,

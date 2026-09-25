@@ -910,6 +910,7 @@ def _per_user_kit(monkeypatch, aff_payload, base_headers=None):
     monkeypatch.setattr(gw, "alias_route", {})
     monkeypatch.setattr(gw, "POLICY", {})
     monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)   # 이 시험의 관심사는 위임 헤더다 — 정책은 '받았고 비었다'
     monkeypatch.setattr(gw, "PER_USER_SSO", {"kooremapper_mcp": {"sso_url": "http://x",
                                                                  "secret": "app-secret"}})
     monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
@@ -1346,3 +1347,55 @@ async def test_rest_call_forwards_and_marks_failure(_rest, monkeypatch):
     _Cli.status = 404
     bad = _payload(await gw._rest_call({"site": "locked", "path": "/nope"}))
     assert bad["status"] == 404 and bad["error"].endswith("404 로 답했다")
+
+
+
+# ── 정책을 못 받은 상태 — per_user 백엔드만 닫는다 ─────────────────────────────
+# 정책 dict 가 비어 있으면 `_backend_allowed` 는 "제한 없음" 으로 허용한다. 그런데 **못 받음**(새 클론에
+# 캐시 없음·옛 포털 404·포털 미기동 부팅)도 같은 빈 dict 다. 그 상태에서 ste·kooremapper 를 부르면
+# 시크릿을 쥔 게이트웨이가 임의 이메일로 그 앱 계정을 JIT 생성한다(2026-09-24 적대 검토).
+def test_per_user_backend_is_denied_until_policy_is_received(monkeypatch):
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"ste": {"sso_url": "http://x", "secret": "s"},
+                                             "kooremapper_mcp": {"sso_url": "http://y", "secret": "s"}})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", False)
+    assert gw._backend_allowed("ste", ["plat:smarttwin"]) is False           # 위임 백엔드 — 닫힘
+    assert gw._backend_allowed("heax-kooremapper_mcp", ["plat:dynaforge"]) is False  # heax 접두 위임도
+    assert gw._backend_allowed("heax-step_forge", ["plat:stepforge"]) is True  # heax 접두지만 위임 아님 — 열림
+    assert gw._backend_allowed("ai-data-hub", ["plat:aidatahub"]) is True     # 위임 아님 — 종전대로(가용성)
+    assert gw._backend_allowed("ste", [gw.SERVICE_GROUP]) is True             # 내부 서비스는 사람이 아니다
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    assert gw._backend_allowed("ste", ["plat:smarttwin"]) is True             # 받았고 비었다 = 제한 없음
+
+
+def test_receiving_an_unchanged_policy_still_marks_ready(monkeypatch, tmp_path):
+    """값이 같아도 '받았다' 는 사실은 남아야 한다 — 안 남기면 재기동마다 위임이 60초 동안 닫힌다."""
+    import httpx as _h
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {"sf": ["plat:stepforge"]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", False)
+    monkeypatch.setattr(gw, "_ACCESS_CACHE_FILE", tmp_path / "c.json")
+    monkeypatch.setattr(gw, "_portal_api_base", lambda: "http://portal")
+
+    class _R:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"backends": {"sf": ["plat:stepforge"]}}
+
+    class _C:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **k): return _R()
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _C)
+    asyncio.run(gw._refresh_access_policy())
+    assert gw._ACCESS_POLICY_READY is True and gw._ACCESS_POLICY == {"sf": ["plat:stepforge"]}
+
+
+def test_loading_the_disk_cache_marks_ready(monkeypatch, tmp_path):
+    f = tmp_path / "c.json"; f.write_text(json.dumps({"ste": ["plat:smarttwin"]}), encoding="utf-8")
+    monkeypatch.setattr(gw, "_ACCESS_CACHE_FILE", f)
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", False)
+    gw._load_access_cache()
+    assert gw._ACCESS_POLICY_READY is True and gw._ACCESS_POLICY == {"ste": ["plat:smarttwin"]}

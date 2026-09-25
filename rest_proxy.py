@@ -111,10 +111,13 @@ class PortalPatVerifier:
 
 
 class RestProxy:
-    def __init__(self, rest_conf: dict, portal_conf: dict, audit, allow=None, mint=None):
+    def __init__(self, rest_conf: dict, portal_conf: dict, audit, allow=None, mint=None, deny_text=None):
         # ⚠ `allow(site, groups)` 는 **MCP 경로와 같은 규칙**이다(`gateway._backend_allowed`).
         # 없이 두면 이 프록시는 자격 체계를 통째로 우회한다 — 아래 handle() 참조.
         self.allow = allow
+        # `deny_text(site, groups, email)` — 403 본문의 사유. MCP 경로(gateway._deny_text)와 같은 말을 해야
+        # 정책 미수신의 일시 거부가 이 경로에서만 "포털에서 청하라" 로 남지 않는다(3라운드 검토).
+        self.deny_text = deny_text
         # `mint(app_id, email) -> token` — per_user 사이트를 **호출자 본인 명의로** 부를 때 쓴다.
         # 게이트웨이가 쥔 기계(`_user_pat`)를 주입받는다. 없으면 per_user 사이트는 막는다.
         self.mint = mint
@@ -210,10 +213,13 @@ class RestProxy:
             if not await self.allow(site, groups, str(claims.get("email") or "")):
                 self.audit(f"{request.method} /{path}", site, False, "forbidden", 0,
                            caller=claims.get("sub"))
-                return JSONResponse(
-                    {"error": f"forbidden: {site}",
-                     "detail": "이 백엔드를 쓸 권한이 없습니다 — 포털 '내 권한' 에서 요청하세요."},
-                    status_code=403)
+                detail = "이 백엔드를 쓸 권한이 없습니다 — 포털 '내 권한' 에서 요청하세요."
+                if self.deny_text is not None:
+                    try:
+                        detail = await self.deny_text(site, groups, str(claims.get("email") or ""))
+                    except Exception:  # noqa: BLE001 — 사유 조회가 죽어도 403 자체는 낸다
+                        pass
+                return JSONResponse({"error": f"forbidden: {site}", "detail": detail}, status_code=403)
 
         url = conf["base"].rstrip("/") + "/" + path.lstrip("/")
         headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP}

@@ -2913,11 +2913,19 @@ async def _rest_allowed(site: str, pat_groups: list[str], email: str) -> bool:
     권한은 PAT 에 박힌 발급 때 값이 아니라 포털의 **지금** 값으로 본다(2183행과 같은 자세) —
     거둔 권한이 PAT 수명(최대 100년) 동안 남으면 안 된다. 포털이 모르면 PAT 값 그대로 쓴다.
     """
+    return _backend_allowed(site, await _rest_groups(pat_groups, email))
+
+
+async def _rest_groups(pat_groups: list[str], email: str) -> list[str]:
+    """REST 호출자의 **지금** 그룹 — PAT 의 발급 때 값이 아니라 포털의 현재 권한으로(_rest_allowed 와 같다)."""
     base = [g for g in pat_groups if g != SERVICE_GROUP and not _is_synthetic(g)]
     now_keys = await _portal_entitlements(email.strip().lower(), base) if email else None
-    groups = base + (now_keys if now_keys is not None else
-                     [g for g in pat_groups if _is_synthetic(g)])
-    return _backend_allowed(site, groups)
+    return base + (now_keys if now_keys is not None else [g for g in pat_groups if _is_synthetic(g)])
+
+
+async def _rest_deny_text(site: str, pat_groups: list[str], email: str) -> str:
+    """REST 프록시 403 의 사유 — MCP 쪽 forbidden 과 같은 문장(_deny_text). 3라운드 검토가 잡은 다섯 번째 소비처."""
+    return _deny_text(site, await _rest_groups(pat_groups, email))
 
 
 def main():
@@ -2925,7 +2933,7 @@ def main():
     # REST 프록시 라우트(/api/<site>/<path>) 를 MCP 마운트보다 먼저 매칭되게 삽입.
     if REST:
         from rest_proxy import RestProxy
-        proxy = RestProxy(REST, PORTAL, _audit, allow=_rest_allowed, mint=_rest_mint)
+        proxy = RestProxy(REST, PORTAL, _audit, allow=_rest_allowed, mint=_rest_mint, deny_text=_rest_deny_text)
         star.router.routes[:0] = proxy.routes()
         log.info("REST proxy enabled: %d sites (%s)", len(REST), ", ".join(REST))
     # streamable_http_app 의 lifespan 은 세션매니저 run() 만 돈다. 백엔드 집계 lifespan 을 함께 묶는다.

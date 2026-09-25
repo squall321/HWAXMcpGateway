@@ -499,6 +499,12 @@ def test_list_tool_apps_거부_안내는_포털_권한키와_요청_경로를_�
     assert "denied_apps" in gw._INSTRUCTIONS and "/access?need=" in gw._INSTRUCTIONS
 
 
+def _noop_async(value):
+    async def _f(*_a, **_k):
+        return value
+    return _f
+
+
 def test_거부_사유가_다르면_안내도_다르다(monkeypatch):
     """적대 검토(2026-09-25)에서 잡힌 둘 — 게이트웨이 그룹으로 막힌 사람에게 이미 가진 포털 권한을
     청하라 했고, 정책 미수신의 일시 닫힘을 '그룹 제한' 영구 상태처럼 말했다."""
@@ -540,6 +546,15 @@ def test_거부_사유가_다르면_안내도_다르다(monkeypatch):
     # 3) _backend_allowed 는 사유만 버린 같은 판정이다.
     monkeypatch.setattr(gw, "_ACCESS_POLICY", {"ste": ["plat:smarttwin"]})
     assert gw._backend_allowed("ste", ["plat:smarttwin"]) and not gw._backend_allowed("ste", ["feat:chat"])
+
+    # 4) REST 프록시 403 도 같은 사유 문장을 낸다(다섯 번째 소비처).
+    monkeypatch.setattr(gw, "_portal_entitlements", _noop_async(None))
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", False)
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    txt = asyncio.run(gw._rest_deny_text("ste", ["feat:chat"], "u@x.test"))
+    assert "일시" in txt and "잠시 뒤" in txt
+    from rest_proxy import RestProxy
+    assert "deny_text" in RestProxy.__init__.__code__.co_varnames
 
 
 def test_조직도_도구가_라벨없이도_돈다(monkeypatch):

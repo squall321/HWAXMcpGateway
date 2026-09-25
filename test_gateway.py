@@ -467,12 +467,34 @@ def test_list_tool_apps_는_권한없는_앱을_아예_안_보여준다(monkeypa
     one = json.loads(asyncio.run(gw._list_tool_apps({"app": "secret"})).content[0].text)
     assert one["apps"] == [] and one["error"].startswith("no_access")
     assert "s_tool" not in json.dumps(one)
+    # 라벨·필요 권한·요청 경로는 준다 — "권한 없음" 과 "그런 앱 없음" 을 모델이 가르게(S3 권한 안내).
+    assert [d["app"] for d in body["denied_apps"]] == ["secret"] and body["denied_apps"][0]["label"]
+    assert body["denied_apps"][0]["request"] is None, "게이트웨이 그룹 제한은 포털에서 청할 수 없다"
+    assert one["denied"]["app"] == "secret"
 
     # 권한이 있으면 종전대로 보인다.
     monkeypatch.setattr(gw, "_request_groups", lambda: ["admin"])
     body2 = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
     assert {a["app"] for a in body2["apps"]} >= {"open_app", "secret"}
     assert body2["hidden_no_access"] == 0
+
+
+def test_list_tool_apps_거부_안내는_포털_권한키와_요청_경로를_준다(monkeypatch):
+    class _S:
+        session = object()
+    monkeypatch.setattr(gw, "backends", {"ste": _S()})
+    monkeypatch.setattr(gw, "exposed_tools", [_tool("ste_submit_job")])
+    monkeypatch.setattr(gw, "route", {"ste_submit_job": ("ste", "submit_job")})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {"ste": ["plat:smarttwin"]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["feat:chat"])
+
+    body = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    d = body["denied_apps"][0]
+    assert d["app"] == "ste" and d["needs"] == ["plat:smarttwin"] and d["request"] == "/access?need=plat:smarttwin"
+    assert "ste_submit_job" not in json.dumps(body), "거부 안내에 도구 이름이 새면 모델이 계획에 넣는다"
+    assert "denied_apps" in gw._INSTRUCTIONS and "/access?need=" in gw._INSTRUCTIONS
 
 
 def test_조직도_도구가_라벨없이도_돈다(monkeypatch):

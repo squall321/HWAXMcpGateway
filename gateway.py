@@ -794,6 +794,9 @@ _INSTRUCTIONS = """HWAX 엔지니어링 허브 — 사내 설계·해석·품질
    `use_experts(keys=[...])` 로 역할·도구를 받아 그 전문가로서 답하라(첫 명이 주 전문가).
 8. 도구가 실패하면 인자만 바꿔 반복하지 마라. 응답이 '인자 문제가 아니다' 라고 말하면
    연결·시간초과이므로 다른 방법을 찾거나 사용자에게 알려라.
+9. 권한 없는 앱은 `list_tool_apps` 목록에 없고 `denied_apps` 에 라벨·필요 권한·요청 경로만 있다.
+   그 앱의 도구 이름을 지어내거나 `invoke_tool` 로 우회하지 말고, 사용자에게 포털 '내 권한'
+   (`/access?need=<권한>`)에서 요청하라고 안내하라 — 승인은 관리자가 한다.
 """
 
 fm = FastMCP("hwax-mcp-gateway", instructions=_INSTRUCTIONS)
@@ -1512,6 +1515,18 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
     )
 
 
+def _denied_entry(key: str, meta: dict) -> dict:
+    """권한 없는 앱의 안내 — 라벨·필요 권한·요청 경로만. 도구 이름은 싣지 않는다(모델이 계획에 넣는다).
+    필요 권한은 포털 정책(_ACCESS_POLICY)의 feat:/plat: 키다. 게이트웨이 그룹 제한(POLICY)뿐이면 요청
+    경로가 없다 — 그건 사용자가 포털에서 청할 수 있는 것이 아니다."""
+    needs = sorted(_ACCESS_POLICY.get(key) or [])
+    first = next((n for n in needs if n.startswith(("plat:", "feat:"))), None)
+    return {"app": key, "label": meta["label"], "needs": needs,
+            "request": f"/access?need={first}" if first else None,
+            "how": ("포털 '내 권한' 페이지에서 요청하면 관리자가 승인한다" if first
+                    else "게이트웨이 그룹 제한 — 포털 관리자에게 문의")}
+
+
 async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     groups = _request_groups()
     want_app = str((arguments or {}).get("app") or "").strip()
@@ -1535,6 +1550,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
 
     apps = []
     denied = 0
+    denied_apps: list[dict] = []
     for key in sorted(by_app, key=lambda k: -len(by_app[k])):
         tools = by_app[key]
         local = key == "_gateway"
@@ -1546,10 +1562,11 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         # 권한 없는 앱은 **목록에서 뺀다** — 예전엔 accessible:false 딱지만 붙여 도구 이름까지
         # 보여 줬고, 모델은 못 부를 도구를 계획에 넣었다(호출은 막히니 실패로만 끝난다).
         # 이름으로 콕 집어 물어도 도구는 안 준다 — 권한 없음만 알린다(되물음을 끊는다).
+        meta = _app_meta(key)
         if not accessible:
             denied += 1
+            denied_apps.append(_denied_entry(key, meta))
             continue
-        meta = _app_meta(key)
         entry = {
             "app": key,
             "label": meta["label"],
@@ -1571,13 +1588,19 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         "app_count": len(apps),
         "total_tools": sum(a["tool_count"] for a in apps),
         "hidden_no_access": denied,
+        # 라벨·필요 권한·요청 경로만 — 도구 이름은 없다. 모델이 "그 앱이 있긴 한데 내 권한이
+        # 아니다" 를 사용자에게 말할 수 있게 하는 것이 목적이다(권한 없음 ≠ 앱 없음).
+        "denied_apps": denied_apps,
         "note": "여기 있는 앱은 모두 내 권한으로 호출 가능하다(reachable=백엔드 연결 정상). "
-                "권한 없는 앱은 목록에 없다 — 필요하면 포털 '내 권한'에서 요청하라. "
+                "권한 없는 앱은 목록에 없고 denied_apps 에 라벨·필요 권한·요청 경로만 있다 — "
+                "포털 '내 권한'(request 경로)에서 요청하면 관리자가 승인한다. "
                 "특정 앱의 도구 설명은 list_tool_apps(app='<키>') 로 조회.",
     }
     if want_app and not apps:
         payload["error"] = (f"no_access: {want_app} — 이 계정에는 권한이 없는 앱이다"
                             if denied else f"unknown app: {want_app}")
+        if denied:
+            payload["denied"] = denied_apps[0]
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
     )

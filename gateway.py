@@ -142,7 +142,8 @@ USER_PAT_TTL_S = int(os.environ.get("GATEWAY_USER_PAT_TTL", "43200"))
 # ── 포털 등록 연결 토큰으로 위임하는 백엔드(사용자 발안 2026-09-03) ──────────────
 # 사용자가 해당 서비스(RA)에서 직접 발급받은 PAT 를 포털 API 토큰 페이지에 등록하면,
 # 게이트웨이가 호출 시 포털 /internal/connections 에서 그 토큰을 읽어 그 사람 명의로
-# 부른다. 미등록 사용자는 종전대로 서비스 계정(폴백 유지 — 등록은 점진 전환).
+# 부른다. 신원이 있는데 미등록이면 **거부하고 등록을 안내한다**(2026-09-29 사용자 결정 — 종전의
+# 서비스 계정 폴백은 실제 사람의 RA 토큰 행세였다). 서비스 계정은 신원 없는 내부 호출에만 쓴다.
 # {backend_key: 포털 service 이름}. 인증은 GW_TOKEN 공유 시크릿(포털 쪽 동일 값 필요).
 PORTAL_CONN_BACKENDS: dict[str, str] = {"reportarchive": "reportarchive"}
 PORTAL_CONN_TTL_S = int(os.environ.get("GATEWAY_CONN_TTL", "300"))
@@ -248,12 +249,6 @@ def _tools_fp(tools) -> dict:
         raw = (getattr(t, "description", "") or "") + "\x00" + sch
         out[t.name] = hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
     return out
-
-
-def _is_read_tool(tool: str) -> bool:
-    """읽기 도구인가 — 캐시 화이트리스트(`_CACHEABLE`)와 같은 판정. 그 접두사에 섞인 쓰기
-    (`_CACHE_DENY`)는 쓰기로 본다. 모르면 쓰기(닫힌 쪽)."""
-    return tool.startswith(_CACHEABLE) and tool not in _CACHE_DENY
 
 
 def _cache_key(backend_key: str, tool: str, arguments, aff: str = "") -> tuple | None:
@@ -2622,56 +2617,57 @@ async def _call_tool(name: str, arguments: dict):
                        caller=email, mode="as-user-pat", corr=_request_corr())
                 return _cache_put(ckey, _evid_keep(name, res))
     elif backend_key in PORTAL_CONN_BACKENDS:
-        # 포털 등록 연결 토큰 위임(RA 등) — 등록한 사용자만 본인 명의, 나머지는 서비스 계정.
+        # 포털 등록 연결 토큰 위임(RA 등). 신원이 있는 호출은 **본인 토큰으로만** 간다. 서비스 계정(cae00 에선
+        # 실제 사람의 RA 토큰)으로 대신 보내면 그 사람 개인 공간에 글이 쌓이고 그 사람의 '내 글' 이 남에게
+        # 보였다(2026-09-29 VOC — "mine 이 personal-5(다른 사람 공간)로 연결된다"). 등록이 없거나 확인이 안 되면
+        # 읽기·쓰기 모두 거부하고 등록을 안내한다(사용자 결정). 서비스 계정은 신원 없는 내부 호출에만 쓴다.
         email = _request_user()
         if not email:
             note = "no-identity"
         else:
+            why = ""
             try:
                 conn = await _portal_connection(PORTAL_CONN_BACKENDS[backend_key], email)
             except _ConnLookupError as exc:
-                conn = None
-                note = "conn-lookup-error"   # 모름 — '미등록'(no-connection)과 가른다
-                if not _is_read_tool(original):
-                    # 쓰기는 서비스 계정으로 보내지 않는다 — 등록한 사람의 글이 서비스 토큰 주인
-                    # 명의로 올라간다(위 _ConnLookupError 설명의 사고). 읽기는 종전대로 폴백한다.
-                    _audit(name, backend_key, False, f"conn-lookup: {exc}",
-                           round((time.monotonic() - t0) * 1000),
-                           caller=email, mode="refused", corr=_request_corr())
-                    return types.CallToolResult(
-                        content=[types.TextContent(type="text", text=(
-                            f"{backend_key}: {email} 의 등록 토큰을 포털에서 확인하지 못해 쓰기를 "
-                            f"멈췄습니다({exc}). 서비스 계정으로 쓰면 글쓴이가 다른 사람으로 "
-                            "기록됩니다. 관리자에게 알리세요(게이트웨이 portal 설정·포털 "
-                            "GATEWAY_SHARED_TOKEN)."))],
-                        isError=True,
-                    )
-            if conn is None:
-                if note != "conn-lookup-error":
-                    note = "no-connection"   # 미등록 — 종전 서비스 계정 경로로 폴백
+                conn, note = None, "conn-lookup-error"
+                why = (f"포털에서 등록 토큰을 확인하지 못했습니다({exc}). 관리자에게 알리세요"
+                       "(게이트웨이 portal 설정·포털 GATEWAY_SHARED_TOKEN).")
             else:
-                # 사용자 부서가 비어 있으면 헤더를 **지운다**(None) — 서비스 계정의
-                # X-Workspace-Slug 가 남으면 그 부서 명의 오류가 사용자에게 뒤집어씌워진다.
-                extra = {"X-Workspace-Slug": conn.get("workspace") or None}
-                try:
-                    res = await _call_as_user(b, original, arguments, conn["token"],
-                                              CALL_TIMEOUT_S, extra_headers=extra)
-                except Exception as exc:  # noqa: BLE001
-                    _audit(name, backend_key, False, f"conn-user: {exc!r}",
-                           round((time.monotonic() - t0) * 1000))
-                    # 서비스 계정으로 조용히 강등하지 않는다 — 강등하면 보고서가 다시
-                    # 서비스 계정 명의로 쌓여 오귀속이 재발한다. 재등록을 안내한다.
-                    return types.CallToolResult(
-                        content=[types.TextContent(type="text", text=(
-                            f"{backend_key}: {email} 의 등록 토큰으로 호출하지 못했습니다 "
-                            f"({exc!r}). 포털 API 토큰 페이지에서 Report Archive 토큰을 "
-                            "다시 등록하세요(만료·폐기 가능성)."))],
-                        isError=True,
-                    )
-                _audit(name, backend_key, not getattr(res, "isError", False), None,
-                       round((time.monotonic() - t0) * 1000),
-                       caller=email, mode="as-conn", corr=_request_corr())
-                return _cache_put(ckey, _evid_keep(name, res))
+                if conn is None:
+                    note = "no-connection"
+                    why = ("Report Archive 토큰이 포털에 등록되어 있지 않습니다. 포털 'API 토큰' 페이지에서 "
+                           "Report Archive 토큰(rat_…)을 등록한 뒤 다시 시도하세요.")
+            if conn is None:
+                _audit(name, backend_key, False, f"refused: {note}", round((time.monotonic() - t0) * 1000),
+                       caller=email, mode="refused", note=note, corr=_request_corr())
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=(
+                        f"{backend_key}: {email} — {why} 공용 계정으로 대신 부르면 다른 사람 명의로 쓰고 "
+                        "남의 비공개 글을 보게 되어 막아 두었습니다."))],
+                    isError=True,
+                )
+            # 사용자 부서가 비어 있으면 헤더를 **지운다**(None) — 서비스 계정의
+            # X-Workspace-Slug 가 남으면 그 부서 명의 오류가 사용자에게 뒤집어씌워진다.
+            extra = {"X-Workspace-Slug": conn.get("workspace") or None}
+            try:
+                res = await _call_as_user(b, original, arguments, conn["token"],
+                                          CALL_TIMEOUT_S, extra_headers=extra)
+            except Exception as exc:  # noqa: BLE001
+                _audit(name, backend_key, False, f"conn-user: {exc!r}",
+                       round((time.monotonic() - t0) * 1000))
+                # 서비스 계정으로 조용히 강등하지 않는다 — 강등하면 보고서가 다시
+                # 서비스 계정 명의로 쌓여 오귀속이 재발한다. 재등록을 안내한다.
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=(
+                        f"{backend_key}: {email} 의 등록 토큰으로 호출하지 못했습니다 "
+                        f"({exc!r}). 포털 API 토큰 페이지에서 Report Archive 토큰을 "
+                        "다시 등록하세요(만료·폐기 가능성)."))],
+                    isError=True,
+                )
+            _audit(name, backend_key, not getattr(res, "isError", False), None,
+                   round((time.monotonic() - t0) * 1000),
+                   caller=email, mode="as-conn", corr=_request_corr())
+            return _cache_put(ckey, _evid_keep(name, res))
 
     # 이 호출이 쓰는 세션의 세대. 실패했을 때 "내가 죽었다고 본 그 세션" 을 가리키므로,
     # 그 사이 다른 호출이 이미 갈아 끼웠다면 새 세션을 또 부수지 않는다. try 밖에서 잡는다 —

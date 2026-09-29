@@ -1633,28 +1633,40 @@ def test_등록한_사람의_RA_쓰기는_api_base_없이도_본인_명의다(mo
     assert row["mode"] == "as-conn" and row["caller"] == "u@corp.com"
 
 
-def test_포털을_못_물으면_RA_쓰기는_서비스_계정으로_가지_않는다(monkeypatch):
-    for kw in ({"status": 403}, {"status": 503}, {"exc": OSError("refused")}, {"portal_cfg": {}}):
-        res, svc, user, row = _ra_kit(monkeypatch, "create_report_draft", **kw)
-        assert res.isError and svc == [] and user == {}, kw
-        assert "글쓴이" in res.content[0].text
-        assert row["mode"] == "refused" and row["ok"] is False and row["caller"] == "u@corp.com"
+def test_포털을_못_물으면_RA_를_서비스_계정으로_부르지_않는다(monkeypatch):
+    for tool in ("create_report_draft", "get_report"):
+        for kw in ({"status": 403}, {"status": 503}, {"exc": OSError("refused")}, {"portal_cfg": {}}):
+            res, svc, user, row = _ra_kit(monkeypatch, tool, **kw)
+            assert res.isError and svc == [] and user == {}, (tool, kw)
+            assert "관리자" in res.content[0].text
+            assert row["mode"] == "refused" and row["note"] == "conn-lookup-error" and row["ok"] is False
+            assert row["caller"] == "u@corp.com"
 
 
-def test_포털을_못_물어도_RA_읽기는_폴백하고_사유를_남긴다(monkeypatch):
-    res, svc, user, row = _ra_kit(monkeypatch, "get_report", status=403)
-    assert not res.isError and svc == ["get_report"] and user == {}
-    assert row["mode"] == "service" and row["note"] == "conn-lookup-error"
+def test_미등록_사람의_RA_호출은_읽기든_쓰기든_거부하고_등록을_안내한다(monkeypatch):
+    """VOC(2026-09-29): 본인 PAT 로 붙었는데 'mine' 이 personal-5(서비스 토큰 주인 공간)로 풀리고 보고서도 그리로
+    갔다. 서비스 계정 폴백이 실제 사람의 RA 토큰 행세였다 — 사용자 결정으로 거부한다."""
+    for tool in ("create_report_draft", "list_reports", "get_report"):
+        res, svc, user, row = _ra_kit(monkeypatch, tool, status=404)
+        assert res.isError and svc == [] and user == {}, tool
+        assert "API 토큰" in res.content[0].text and "등록" in res.content[0].text
+        assert row["mode"] == "refused" and row["note"] == "no-connection" and row["caller"] == "u@corp.com"
 
 
-def test_미등록_사람의_RA_쓰기는_종전대로_서비스_계정이고_그렇게_적힌다(monkeypatch):
-    res, svc, user, row = _ra_kit(monkeypatch, "create_report_draft", status=404)
-    assert not res.isError and svc == ["create_report_draft"]
-    assert row["mode"] == "service" and row["note"] == "no-connection"
-
-
-def test_읽기_판정은_캐시_목록을_따르되_섞인_쓰기는_쓰기다():
-    assert gw._is_read_tool("get_report") and gw._is_read_tool("search_reports")
-    for w in ("create_report_draft", "publish_report", "preview_publish", "trash_report",
-              "add_report_tags", "report_ingest", "report_fragmentize"):
-        assert not gw._is_read_tool(w), w
+def test_신원_없는_내부_호출만_서비스_계정으로_간다(monkeypatch):
+    import asyncio
+    b = _CallB(["list_templates"])
+    monkeypatch.setattr(gw, "backends", {"reportarchive": b})
+    monkeypatch.setattr(gw, "route", {"list_templates": ("reportarchive", "list_templates")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    _portal(monkeypatch, 404)
+    gw._RESP_CACHE.clear()
+    res = asyncio.run(gw._call_tool("list_templates", {}))
+    row = [json.loads(ln) for ln in open(gw.AUDIT_PATH, encoding="utf-8")][-1]
+    assert not res.isError and b.session.calls == ["list_templates"] and _Portal.seen == []
+    assert row["mode"] == "service" and row["note"] == "no-identity"

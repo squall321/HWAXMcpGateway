@@ -2975,8 +2975,11 @@ def _bearer_gate(app, pat_verifier=None):
             # 사용자가 포털에서 끈 앱 — 개인 MCP 클라이언트(개인 PAT)에서만 숨긴다. 웹 챗 PAT(에이전트서버가 이름으로
             # 찾아 코드로 부르는 도구가 있다)와 절차 PAT(tools/list 로 카탈로그를 만든다)는 면제(docs/mcp-app-toggle D-2).
             _muted = [str(a) for a in ((_ent or {}).get("muted_apps") or []) if str(a)]
-            if (_muted and str(claims.get("pat_name") or "") != CHAT_PAT_NAME
-                    and str(claims.get("purpose") or "") != PROCEDURE_PURPOSE):
+            # 챗 PAT 판별은 pat_name 만으로 하지 않는다 — 개인 토큰 이름은 사용자가 정하므로 'chat-session' 으로 지으면
+            # 끄기를 피해 간다(검토 2026-09-29). jti 는 서버가 정하고 챗 PAT 만 'chat-' 로 시작한다(포털 _chat_user_pat).
+            _is_chat = (str(claims.get("pat_name") or "") == CHAT_PAT_NAME
+                        and str(claims.get("jti") or "").startswith("chat-"))
+            if _muted and not _is_chat and str(claims.get("purpose") or "") != PROCEDURE_PURPOSE:
                 fresh.append((MUTED_HEADER.encode(), quote(",".join(_muted), safe=",").encode("latin-1")))
             await app({**scope, "headers": fresh}, receive, send)
             return

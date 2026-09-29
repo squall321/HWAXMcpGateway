@@ -1705,8 +1705,10 @@ def test_끈_앱은_개인_PAT_에만_실리고_챗_절차_PAT_와_서비스_경
     run = _gate(monkeypatch, {"keys": [], "muted_apps": ["signalforge", "heax-step_forge"]})
     h = run(b"Bearer me", {"email": "u@x.io", "groups": []})
     assert h[gw.MUTED_HEADER] == "signalforge,heax-step_forge", "포털 값이 그대로(클라이언트 값이 아니라)"
-    h = run(b"Bearer chat", {"email": "u@x.io", "groups": [], "pat_name": gw.CHAT_PAT_NAME})
+    h = run(b"Bearer chat", {"email": "u@x.io", "groups": [], "pat_name": gw.CHAT_PAT_NAME, "jti": "chat-u-1790000000"})
     assert gw.MUTED_HEADER not in h, "웹 챗 PAT 까지 거르면 /보고서·띵킹이 코드로 부르는 도구가 사라진다"
+    h = run(b"Bearer mine", {"email": "u@x.io", "groups": [], "pat_name": gw.CHAT_PAT_NAME, "jti": "k3Jd9…random"})
+    assert h[gw.MUTED_HEADER], "개인 토큰 이름을 chat-session 으로 지어도 챗 PAT 가 아니다(이름은 사용자가 정한다)"
     h = run(b"Bearer proc", {"email": "u@x.io", "groups": [], "purpose": gw.PROCEDURE_PURPOSE})
     assert gw.MUTED_HEADER not in h, "절차는 tools/list 로 카탈로그를 만든다"
     h = run(b"Bearer gw-secret", None)
@@ -1799,3 +1801,14 @@ def test_포털이_앱_설정을_바꾸면_권한_캐시도_비워_바로_반영
 def test_지침이_끈_앱을_권한_문제와_구분하라고_말한다():
     assert "muted_apps" in gw._INSTRUCTIONS and "요청하라고 하지 마라" in gw._INSTRUCTIONS
     assert len(gw._INSTRUCTIONS) < 2048, "Claude Code 는 서버 지침을 2048자에서 자른다"
+
+
+def test_포털이_찍는_챗_PAT_표지와_게이트웨이가_보는_값이_같다():
+    """한쪽만 바꾸면 웹 챗 PAT 에도 끄기가 걸려 /보고서·띵킹이 코드로 부르는 도구가 사라진다. 형제 리포가 있을 때만 본다."""
+    from pathlib import Path
+    src = Path(gw.__file__).resolve().parent.parent / "HWAXPortal" / "backend" / "app" / "agent" / "routes.py"
+    if not src.exists():
+        pytest.skip("형제 HWAXPortal 리포가 없다")
+    text = src.read_text(encoding="utf-8")
+    assert f'"pat_name": "{gw.CHAT_PAT_NAME}"' in text
+    assert '"jti": f"chat-' in text, "게이트웨이는 챗 PAT 를 jti 의 'chat-' 머리로도 가린다"

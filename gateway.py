@@ -102,6 +102,12 @@ AFF_PROOF_HEADER = "X-Heax-Aff-Proof"
 # 쓰임은 하나다 — `invoke_tool` 의 **정확이름 차단 면제**(_INVOKE_DENY_EXACT). 절차는 늘 별칭으로
 # 부르고, 그 도구들은 포털이 이미 `gate: human` 으로 사람 승인을 받은 것이다.
 PURPOSE_HEADER = "x-hwax-purpose"
+# 사용자가 포털에서 끈 앱(게이트웨이 앱 키, 콤마) — **게이트웨이가 PAT 분기에서만** 싣는다. 두 인증 분기 모두 클라이언트가
+# 실어 보낸 사본은 버린다. 권한(x-hwax-groups)에 섞지 않는다 — 섞으면 응답 캐시 키가 사람마다 쪼개지고 심의 백엔드로
+# 전달되며 '권한 없음' 과 구분이 안 된다(HWAXPortal docs/mcp-app-toggle D-5·D-6).
+MUTED_HEADER = "x-hwax-muted-apps"
+# 끄기를 적용하지 않는 PAT — 포털 웹 챗(에이전트서버가 tools/list 에서 이름으로 찾아 코드로 부르는 도구가 있다)
+CHAT_PAT_NAME = "chat-session"
 PROCEDURE_PURPOSE = "procedure"
 AFF_PROOF_TTL_S = int(os.environ.get("GATEWAY_AFF_PROOF_TTL", "120"))
 
@@ -815,6 +821,8 @@ _INSTRUCTIONS = """HWAX 엔지니어링 허브 — 사내 설계·해석·품질
    `portal_access`: 포털 '내 권한'(`request` = `/access?need=<권한>`)에서 요청하라, 승인은 관리자가 한다 ·
    `gateway_group`: 포털에서 청할 수 있는 것이 아니다, 포털 관리자에게 문의 · `policy_not_ready`(`retry:true`):
    게이트웨이가 정책을 아직 못 받은 일시 상태다, 잠시 뒤 같은 호출을 다시 하라(요청하라고 하지 마라).
+10. `list_tool_apps` 의 `muted_apps` 는 사용자가 포털에서 **꺼 둔** 앱이다(권한 문제가 아니다 — 요청하라고 하지 마라).
+   사용자가 그 앱을 쓰라고 할 때만 `list_tool_apps(app='<키>')` 로 도구를 보고 `invoke_tool` 로 부른다.
 """
 
 fm = FastMCP("hwax-mcp-gateway", instructions=_INSTRUCTIONS)
@@ -1599,6 +1607,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     apps = []
     denied = 0
     denied_apps: list[dict] = []
+    muted = _request_muted()
+    muted_apps: list[dict] = []
     for key in sorted(by_app, key=lambda k: -len(by_app[k])):
         tools = by_app[key]
         local = key == "_gateway"
@@ -1616,6 +1626,11 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             denied += 1
             denied_apps.append(_denied_entry(key, meta, deny))
             continue
+        # 사용자가 포털에서 끈 앱 — 권한 없음(denied_apps)과 다른 칸이다(권한을 요청하라고 안내하면 안 된다).
+        # 앱을 콕 집어 물으면(app=) 도구를 보여 준다 — 사용자가 이 앱을 쓰라고 한 경우다.
+        if not local and key in muted and not want_app:
+            muted_apps.append({"app": key, "label": meta["label"], "tool_count": len(tools)})
+            continue
         entry = {
             "app": key,
             "label": meta["label"],
@@ -1626,6 +1641,10 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             "status": "ok" if (accessible and reachable) else
                       ("no_access" if not accessible else "backend_down"),
         }
+        if not local and key in muted:
+            entry["muted"] = True
+            entry["muted_note"] = ("사용자가 포털에서 꺼 둔 앱이다 — 사용자가 이 앱을 쓰라고 한 경우에만 부른다. "
+                                   "계속 쓰려면 포털 'API 토큰' 페이지의 '허브에 보일 앱' 에서 켜면 된다.")
         if want_app:
             entry["tools"] = [{"name": t.name, "description": (t.description or "")[:300]} for t in tools]
         elif include:
@@ -1640,6 +1659,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         # 라벨·필요 권한·요청 경로만 — 도구 이름은 없다. 모델이 "그 앱이 있긴 한데 내 권한이
         # 아니다" 를 사용자에게 말할 수 있게 하는 것이 목적이다(권한 없음 ≠ 앱 없음).
         "denied_apps": denied_apps,
+        # 사용자가 포털에서 끈 앱 — 권한 문제가 아니다. 사용자가 그 앱을 원할 때만 list_tool_apps(app='<키>') 로 연다.
+        "muted_apps": muted_apps,
         "note": "여기 있는 앱은 모두 내 권한으로 호출 가능하다(reachable=백엔드 연결 정상). "
                 "권한 없는 앱은 목록에 없고 denied_apps 에 라벨·사유·필요 권한·요청 경로만 있다 — 각 항목의 "
                 "reason/how 를 따른다(portal_access 만 포털 '내 권한' 요청, policy_not_ready 는 잠시 뒤 재시도). "
@@ -1664,11 +1685,16 @@ def _list_by_area(by_app: dict, groups: list[str], want_area: str) -> types.Call
     meta = {m["area"]: m for m in _area_meta()}
     buckets: dict[str, list] = {k: [] for k in meta}
     hidden = 0
+    muted = _request_muted()
+    hidden_muted = 0
     for app, tools in by_app.items():
         local = app == "_gateway"
         if not local and not (_backend_allowed(app, groups) and app in backends
                               and backends[app].session is not None):
             hidden += len(tools)
+            continue
+        if not local and app in muted:          # 사용자가 포털에서 끈 앱
+            hidden_muted += len(tools)
             continue
         for t in tools:
             buckets.setdefault(_area_of(t.name, app), []).append((t, app))
@@ -1686,6 +1712,7 @@ def _list_by_area(by_app: dict, groups: list[str], want_area: str) -> types.Call
             areas.append(entry)
     payload = {"areas": areas, "area_count": len(areas), "total_tools": sum(a["tool_count"] for a in areas),
                "hidden_no_access_or_down": hidden,
+               "hidden_muted": hidden_muted,
                "note": "영역 = 하는 일. 특정 영역의 도구 설명은 list_tool_apps(by='area', area='<키>')."}
     if want_area and not areas:
         payload["error"] = f"unknown area: {want_area} — 가능한 키: {', '.join(meta)}"
@@ -1887,8 +1914,15 @@ async def _use_experts(arguments: dict) -> types.CallToolResult:
                 kind = "operator"
                 apps = [str(a) for a in (rc.get("mcp_apps") or [])][:3]
                 key_tools = [str(t) for t in (rc.get("key_tools") or [])][:12]
-        out.append({"key": k, "role": "lead" if i == 0 else "helper", "kind": kind,
-                    "role_doc": role, "apps": apps, "entry_tools": key_tools})
+        entry = {"key": k, "role": "lead" if i == 0 else "helper", "kind": kind,
+                 "role_doc": role, "apps": apps, "entry_tools": key_tools}
+        _m = [a for a in apps if a in _request_muted()]
+        if _m:
+            # 운영자가 묶인 앱을 사용자가 꺼 뒀다 — 도구가 search_tools 에 안 나오므로 계획에 넣기 전에 알린다
+            entry["muted_apps"] = _m
+            entry["muted_note"] = ("이 전문가의 운영 앱을 사용자가 포털에서 꺼 두었다 — 먼저 알리고, 사용자가 원하면 "
+                                   "list_tool_apps(app='<키>') 로 도구를 보고 invoke_tool 로 부른다.")
+        out.append(entry)
     payload = {
         "lead": keys[0], "helpers": keys[1:], "experts": out,
         "how": ("첫 명의 목소리로 한 사람처럼 답하라. 보조는 이름으로 따로 말하지 말고 그들의 "
@@ -2279,7 +2313,10 @@ def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
         local += [REST_CATALOG_TOOL, REST_CALL_TOOL]
-    return [t for t in exposed_tools if _backend_allowed(route[t.name][0], groups)] + local
+    # 사용자가 포털에서 끈 앱은 개인 PAT 의 tools/list·search_tools 에서 뺀다(숨김만 — 호출은 막지 않는다)
+    muted = _request_muted()
+    return [t for t in exposed_tools
+            if _backend_allowed(route[t.name][0], groups) and route[t.name][0] not in muted] + local
 
 
 def _request_groups() -> list[str]:
@@ -2291,6 +2328,16 @@ def _request_groups() -> list[str]:
         return []
     raw = req.headers.get(GROUPS_HEADER) if req is not None else None
     return _parse_groups(raw)
+
+
+def _request_muted() -> set[str]:
+    """이 요청의 호출자가 포털에서 끈 앱(게이트웨이 앱 키). 헤더는 게이트웨이가 PAT 분기에서만 싣는다."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return set()
+    raw = req.headers.get(MUTED_HEADER) if req is not None else None
+    return {a for a in unquote(raw or "").split(",") if a}
 
 
 def _request_purpose() -> str:
@@ -2827,6 +2874,10 @@ def _bearer_gate(app, pat_verifier=None):
             _rgone = [k for k in _RESP_CACHE if (not _email or (len(k) > 3 and k[3] == _email))]
             for k in _rgone:
                 _RESP_CACHE.pop(k, None)
+            # 권한 캐시도 비운다 — 포털이 '허브에 보일 앱' 을 바꾼 뒤에도 이것을 부른다. 안 비우면 끈 앱이 최대
+            # ACCESS_ENT_TTL_S(60초) 동안 search_tools 에 남는다(HWAXPortal docs/mcp-app-toggle).
+            for k in [k for k in _ENT_CACHE if (not _email or k[0] == _email)]:
+                _ENT_CACHE.pop(k, None)
             # 그 사람 명의 PAT 캐시도 비운다 — 연결이 바뀌었으면 위임 토큰도 다시 받는다.
             _pgone = [k for k in _USER_PATS if (not _email or (isinstance(k, tuple) and _email in k)
                                                or k == _email)]
@@ -2887,7 +2938,7 @@ def _bearer_gate(app, pat_verifier=None):
             # 목적 헤더는 **검증된 PAT 에서만** 나온다 — 이 경로(GW_TOKEN)는 PAT 검증을 안 하므로
             # 클라이언트가 실어 보낸 값을 버린다. 안 버리면 GW_TOKEN 을 쥔 쪽이 차단을 면제받는다.
             _kept = [(k, v) for (k, v) in (scope.get("headers") or [])
-                     if k.lower() != PURPOSE_HEADER.encode()]
+                     if k.lower() not in (PURPOSE_HEADER.encode(), MUTED_HEADER.encode())]
             if GROUPS_HEADER.encode() not in headers:
                 _kept.append((GROUPS_HEADER.encode(), SERVICE_GROUP.encode()))
             await app({**scope, "headers": _kept}, receive, send)
@@ -2900,7 +2951,8 @@ def _bearer_gate(app, pat_verifier=None):
             # 거둔 권한이 PAT 수명(최대 100년) 동안 남지 않게. 포털이 모르면(None) PAT 값 그대로.
             _pat_groups = [str(g) for g in (claims.get("groups") or []) if str(g) != SERVICE_GROUP]
             _base = [g for g in _pat_groups if not _is_synthetic(g)]
-            _now_keys = await _portal_entitlements(str(claims.get("email") or "").strip().lower(), _base)
+            _ent = await _portal_access(str(claims.get("email") or "").strip().lower(), _base)
+            _now_keys = None if _ent is None else [str(k) for k in _ent.get("keys") or []]
             if _now_keys is not None:
                 _pat_groups = _base + _now_keys
             groups = ",".join(_pat_groups)
@@ -2910,7 +2962,7 @@ def _bearer_gate(app, pat_verifier=None):
             # 얻는 경로가 생기면 안 되므로, 신원 없음 쪽으로 닫는다).
             fresh = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (GROUPS_HEADER.encode(), USER_HEADER.encode(),
-                                          PURPOSE_HEADER.encode())]
+                                          PURPOSE_HEADER.encode(), MUTED_HEADER.encode())]
             # PAT 의 groups 에도 한글이 올 수 있다 — 같은 규칙으로 인코딩해 실어야 헤더가 안 깨진다.
             fresh.append((GROUPS_HEADER.encode(), quote(groups, safe=",").encode("latin-1")))
             _email = str(claims.get("email") or "").strip().lower()
@@ -2920,6 +2972,12 @@ def _bearer_gate(app, pat_verifier=None):
             # 이 클레임을 넣는 자리가 없다(포털 `app/procedures/pat.py` 하나뿐, 시험이 건다).
             if str(claims.get("purpose") or "") == PROCEDURE_PURPOSE:
                 fresh.append((PURPOSE_HEADER.encode(), PROCEDURE_PURPOSE.encode()))
+            # 사용자가 포털에서 끈 앱 — 개인 MCP 클라이언트(개인 PAT)에서만 숨긴다. 웹 챗 PAT(에이전트서버가 이름으로
+            # 찾아 코드로 부르는 도구가 있다)와 절차 PAT(tools/list 로 카탈로그를 만든다)는 면제(docs/mcp-app-toggle D-2).
+            _muted = [str(a) for a in ((_ent or {}).get("muted_apps") or []) if str(a)]
+            if (_muted and str(claims.get("pat_name") or "") != CHAT_PAT_NAME
+                    and str(claims.get("purpose") or "") != PROCEDURE_PURPOSE):
+                fresh.append((MUTED_HEADER.encode(), quote(",".join(_muted), safe=",").encode("latin-1")))
             await app({**scope, "headers": fresh}, receive, send)
             return
         await send({

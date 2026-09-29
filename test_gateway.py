@@ -1184,9 +1184,10 @@ def test_목적_헤더는_검증된_PAT_에서만_나온다(monkeypatch):
     async def app(scope, receive, send):
         seen["headers"] = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
 
-    async def no_portal(email, base):
+    async def no_portal(email, base, **_kw):
         return None
     monkeypatch.setattr(gw, "_portal_entitlements", no_portal)
+    monkeypatch.setattr(gw, "_portal_access", no_portal)      # PAT 분기가 부르는 쪽 — 안 막으면 dev 포털로 실제 요청이 간다
     monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
 
     class _V:
@@ -1670,3 +1671,131 @@ def test_신원_없는_내부_호출만_서비스_계정으로_간다(monkeypatc
     row = [json.loads(ln) for ln in open(gw.AUDIT_PATH, encoding="utf-8")][-1]
     assert not res.isError and b.session.calls == ["list_templates"] and _Portal.seen == []
     assert row["mode"] == "service" and row["note"] == "no-identity"
+
+
+
+# ── 허브에서 끈 앱(개인 MCP 시야에서 숨김 — HWAXPortal docs/mcp-app-toggle) ─────────────────────────
+def _gate(monkeypatch, portal_resp):
+    """인증 미들웨어를 실제로 태워 **앱이 받는 헤더**를 돌려준다. 포털 응답만 가짜."""
+    import asyncio
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["headers"] = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+
+    async def fake_access(email, base, **_kw):
+        return portal_resp
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        def __init__(self, claims): self.claims = claims
+        async def verify(self, token, aud): return self.claims
+
+    def run(auth, claims, forged=b"heax-step_forge"):
+        seen.clear()
+        mw = gw._bearer_gate(app, _V(claims))
+        hdrs = [(b"authorization", auth), (gw.MUTED_HEADER.encode(), forged)]
+        asyncio.run(mw({"type": "http", "path": "/mcp", "headers": hdrs}, None, None))
+        return seen.get("headers", {})
+    return run
+
+
+def test_끈_앱은_개인_PAT_에만_실리고_챗_절차_PAT_와_서비스_경로는_면제다(monkeypatch):
+    run = _gate(monkeypatch, {"keys": [], "muted_apps": ["signalforge", "heax-step_forge"]})
+    h = run(b"Bearer me", {"email": "u@x.io", "groups": []})
+    assert h[gw.MUTED_HEADER] == "signalforge,heax-step_forge", "포털 값이 그대로(클라이언트 값이 아니라)"
+    h = run(b"Bearer chat", {"email": "u@x.io", "groups": [], "pat_name": gw.CHAT_PAT_NAME})
+    assert gw.MUTED_HEADER not in h, "웹 챗 PAT 까지 거르면 /보고서·띵킹이 코드로 부르는 도구가 사라진다"
+    h = run(b"Bearer proc", {"email": "u@x.io", "groups": [], "purpose": gw.PROCEDURE_PURPOSE})
+    assert gw.MUTED_HEADER not in h, "절차는 tools/list 로 카탈로그를 만든다"
+    h = run(b"Bearer gw-secret", None)
+    assert gw.MUTED_HEADER not in h, "GW_TOKEN(에이전트서버·심의)에는 싣지 않고 클라이언트 사본도 버린다"
+    run2 = _gate(monkeypatch, {"keys": []})                       # 끈 앱이 없으면
+    assert gw.MUTED_HEADER not in run2(b"Bearer me", {"email": "u@x.io", "groups": []}), "위조 사본이 살아남으면 안 된다"
+
+
+def _muted_ctx(monkeypatch, muted: str, groups: str = ""):
+    _set_request_headers(monkeypatch, {gw.MUTED_HEADER: muted, gw.GROUPS_HEADER: groups})
+    monkeypatch.setattr(gw, "exposed_tools", [_tool("sf_q"), _tool("step_x"), _tool("ra_get")])
+    monkeypatch.setattr(gw, "route", {"sf_q": ("signalforge", "sf_q"), "step_x": ("heax-step_forge", "step_x"),
+                                      "ra_get": ("reportarchive", "get_report")})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+
+
+def test_끈_앱은_도구_목록과_검색에서_빠진다(monkeypatch):
+    import asyncio
+    _muted_ctx(monkeypatch, "heax-step_forge,signalforge")
+    names = {t.name for t in gw._visible_tools([])}
+    assert "step_x" not in names and "sf_q" not in names and "ra_get" in names
+    assert "search_tools" in names and "invoke_tool" in names, "허브 자체 도구는 끌 수 없다"
+    for q, want in (("ra_get", True), ("step_x", False), ("sf_q", False)):
+        out = json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)
+        got = {r["tool"] for r in out["matches"]}
+        assert (q in got) is want, (q, got)                         # 켠 앱은 찾고(대조군) 끈 앱은 못 찾는다
+
+
+def test_끈_앱은_권한없음과_다른_칸에_나오고_콕_집으면_도구를_보인다(monkeypatch):
+    import asyncio
+    _muted_ctx(monkeypatch, "heax-step_forge")
+    monkeypatch.setattr(gw, "backends", {k: _CallB([]) for k in ("signalforge", "heax-step_forge", "reportarchive")})
+    body = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    assert "heax-step_forge" not in {a["app"] for a in body["apps"]}
+    assert [m["app"] for m in body["muted_apps"]] == ["heax-step_forge"]
+    assert not body["denied_apps"], "끈 앱을 권한 없음으로 적으면 모델이 권한을 요청하라고 안내한다"
+    one = json.loads(asyncio.run(gw._list_tool_apps({"app": "heax-step_forge"})).content[0].text)
+    assert one["apps"][0]["muted"] is True and one["apps"][0]["tools"][0]["name"] == "step_x"
+    area = json.loads(asyncio.run(gw._list_tool_apps({"by": "area"})).content[0].text)
+    assert area["hidden_muted"] == 1 and all("step_x" not in a["tools"] for a in area["areas"])
+
+
+def test_끈_앱도_이름을_주면_호출된다(monkeypatch):
+    """숨김만 한다(D-3) — 끄기는 권한이 아니라 선호다."""
+    import asyncio
+    b = _CallB(["step_x"])
+    _muted_ctx(monkeypatch, "heax-step_forge")
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": b})
+    monkeypatch.setattr(gw, "route", {"step_x": ("heax-step_forge", "step_x")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    gw._RESP_CACHE.clear()
+    r = asyncio.run(gw._call_tool("invoke_tool", {"name": "step_x", "arguments": {}}))
+    assert not r.isError and b.session.calls == ["step_x"]
+
+
+def test_운영자_전문가의_앱을_끈_사람에게는_먼저_알리라고_표시한다(monkeypatch):
+    import asyncio
+    _muted_ctx(monkeypatch, "heax-step_forge")
+    sess = {"data": {"system_prompt": "역할", "response_config": {
+        "persona_kind": "mcp_operator", "mcp_apps": ["heax-step_forge"], "key_tools": ["step_x"]}}}
+
+    async def fake_call(name, args):
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(sess))])
+    monkeypatch.setattr(gw, "_call_tool", fake_call)
+    out = json.loads(asyncio.run(gw._use_experts({"keys": ["op.step"]})).content[0].text)
+    e = out["experts"][0]
+    assert e["muted_apps"] == ["heax-step_forge"] and "먼저 알리" in e["muted_note"]
+
+
+def test_포털이_앱_설정을_바꾸면_권한_캐시도_비워_바로_반영된다(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    gw._ENT_CACHE.clear()
+    gw._ENT_CACHE[("u@x.io", "")] = ({"keys": [], "muted_apps": []}, 1e12)
+    gw._ENT_CACHE[("other@x.io", "")] = ({"keys": []}, 1e12)
+    sent = []
+
+    async def send(m): sent.append(m)
+    mw = gw._bearer_gate(None, None)
+    asyncio.run(mw({"type": "http", "path": "/conn-invalidate", "method": "POST", "query_string": b"email=u@x.io",
+                    "headers": [(b"authorization", b"Bearer gw-secret")]}, None, send))
+    assert sent[0]["status"] == 200
+    assert ("u@x.io", "") not in gw._ENT_CACHE and ("other@x.io", "") in gw._ENT_CACHE
+    gw._ENT_CACHE.clear()
+
+
+def test_지침이_끈_앱을_권한_문제와_구분하라고_말한다():
+    assert "muted_apps" in gw._INSTRUCTIONS and "요청하라고 하지 마라" in gw._INSTRUCTIONS
+    assert len(gw._INSTRUCTIONS) < 2048, "Claude Code 는 서버 지침을 2048자에서 자른다"

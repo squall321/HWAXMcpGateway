@@ -1527,3 +1527,134 @@ async def test_rest_call_small_text_still_passes(_rest, monkeypatch):
     _Cli.status, _Cli.raw, _Cli.ctype, _Cli.clen = 200, b"hello", "text/plain", 5
     out = _payload(await gw._rest_call({"site": "locked", "path": "/t"}))
     assert out["status"] == 200 and out["body"] == "hello" and "error" not in out
+
+
+# ── RA 위임이 조용히 꺼지던 것(2026-09-29) ───────────────────────────────────
+# 프로비저너 --force 가 portal 블록을 api_base 없이 다시 쓰자 `_portal_connection` 이 포털에 묻지도
+# 않고 전원을 '미등록' 으로 돌려, 연결을 등록한 사람의 RA 글까지 서비스 토큰 주인 명의로 올라갔다.
+class _Portal:
+    """httpx.AsyncClient 자리 — /internal/connections 응답을 정한다. 받은 요청을 기록한다."""
+    status, payload, exc = 200, None, None
+    seen: list = []
+
+    def __init__(self, *a, **k): pass
+
+    async def __aenter__(self): return self
+
+    async def __aexit__(self, *a): return False
+
+    async def get(self, url, params=None, headers=None):
+        _Portal.seen.append((url, dict(params or {}), dict(headers or {})))
+        if _Portal.exc is not None:
+            raise _Portal.exc
+        from types import SimpleNamespace as NS
+        return NS(status_code=_Portal.status, json=lambda: _Portal.payload)
+
+
+def _portal(monkeypatch, status=200, payload=None, exc=None, portal_cfg=None):
+    _Portal.status, _Portal.payload, _Portal.exc, _Portal.seen = status, payload, exc, []
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Portal)
+    monkeypatch.setattr(gw, "PORTAL", portal_cfg if portal_cfg is not None
+                        else {"jwks_url": "http://127.0.0.1:8723/.well-known/jwks.json"})
+    gw._CONN_CACHE.clear()
+
+
+def test_연결조회는_api_base_없이도_jwks_주소로_포털에_묻는다(monkeypatch):
+    import asyncio
+    _portal(monkeypatch, 200, {"token": "rat_u", "workspace": "dept"})     # 프로비저너가 쓰는 모양 그대로
+    conn = asyncio.run(gw._portal_connection("reportarchive", "u@corp.com"))
+    assert conn == {"token": "rat_u", "workspace": "dept"}
+    url, params, headers = _Portal.seen[0]
+    assert url == "http://127.0.0.1:8723/internal/connections/reportarchive"
+    assert params == {"email": "u@corp.com"} and headers["Authorization"] == f"Bearer {gw.GW_TOKEN}"
+
+
+def test_연결조회_없음과_모름을_가른다(monkeypatch):
+    import asyncio
+    _portal(monkeypatch, 404)
+    assert asyncio.run(gw._portal_connection("reportarchive", "u@corp.com")) is None
+    for status in (403, 503, 500):
+        _portal(monkeypatch, status)
+        with pytest.raises(gw._ConnLookupError, match=str(status)):
+            asyncio.run(gw._portal_connection("reportarchive", "u@corp.com"))
+    _portal(monkeypatch, exc=OSError("refused"))
+    with pytest.raises(gw._ConnLookupError):
+        asyncio.run(gw._portal_connection("reportarchive", "u@corp.com"))
+    _Portal.exc = None                                   # 포털이 살아나도 짧은 캐시 동안은 모름이다
+    with pytest.raises(gw._ConnLookupError):
+        asyncio.run(gw._portal_connection("reportarchive", "u@corp.com"))
+    assert len(_Portal.seen) == 1
+    _portal(monkeypatch, portal_cfg={})                  # 주소를 아예 모른다 — 묻지도 못한다
+    with pytest.raises(gw._ConnLookupError, match="주소"):
+        asyncio.run(gw._portal_connection("reportarchive", "u@corp.com"))
+    assert _Portal.seen == []
+
+
+def _ra_kit(monkeypatch, tool, **portal):
+    """RA 백엔드 하나로 `_call_tool` 을 실제로 태운다. 사용자 세션은 전송 계층만 막는다(`_call_as_user` 는 진짜)."""
+    import asyncio
+    b = _CallB([tool])
+    b.headers = {"Authorization": "Bearer rat_service", "X-Workspace-Slug": "svc"}
+    user = {}
+
+    class _Sess:
+        async def initialize(self): return None
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            user["tool"] = original
+            return types.CallToolResult(content=[types.TextContent(type="text", text="{}")], isError=False)
+
+    def fake_stream(url, headers=None):
+        user["headers"] = dict(headers or {})
+        return _StubCM((None, None, "sid"))
+
+    monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {"reportarchive": b})
+    monkeypatch.setattr(gw, "route", {tool: ("reportarchive", tool)})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    _portal(monkeypatch, **portal)
+    res = asyncio.run(gw._call_tool(tool, {}))
+    rows = [json.loads(ln) for ln in open(gw.AUDIT_PATH, encoding="utf-8")]
+    return res, b.session.calls, user, rows[-1]
+
+
+def test_등록한_사람의_RA_쓰기는_api_base_없이도_본인_명의다(monkeypatch):
+    res, svc, user, row = _ra_kit(monkeypatch, "create_report_draft",
+                                  status=200, payload={"token": "rat_u", "workspace": "dept"})
+    assert not res.isError and svc == [], "서비스 세션으로 가면 서비스 토큰 주인이 글쓴이가 된다"
+    assert user["headers"]["Authorization"] == "Bearer rat_u" and user["headers"]["X-Workspace-Slug"] == "dept"
+    assert row["mode"] == "as-conn" and row["caller"] == "u@corp.com"
+
+
+def test_포털을_못_물으면_RA_쓰기는_서비스_계정으로_가지_않는다(monkeypatch):
+    for kw in ({"status": 403}, {"status": 503}, {"exc": OSError("refused")}, {"portal_cfg": {}}):
+        res, svc, user, row = _ra_kit(monkeypatch, "create_report_draft", **kw)
+        assert res.isError and svc == [] and user == {}, kw
+        assert "글쓴이" in res.content[0].text
+        assert row["mode"] == "refused" and row["ok"] is False and row["caller"] == "u@corp.com"
+
+
+def test_포털을_못_물어도_RA_읽기는_폴백하고_사유를_남긴다(monkeypatch):
+    res, svc, user, row = _ra_kit(monkeypatch, "get_report", status=403)
+    assert not res.isError and svc == ["get_report"] and user == {}
+    assert row["mode"] == "service" and row["note"] == "conn-lookup-error"
+
+
+def test_미등록_사람의_RA_쓰기는_종전대로_서비스_계정이고_그렇게_적힌다(monkeypatch):
+    res, svc, user, row = _ra_kit(monkeypatch, "create_report_draft", status=404)
+    assert not res.isError and svc == ["create_report_draft"]
+    assert row["mode"] == "service" and row["note"] == "no-connection"
+
+
+def test_읽기_판정은_캐시_목록을_따르되_섞인_쓰기는_쓰기다():
+    assert gw._is_read_tool("get_report") and gw._is_read_tool("search_reports")
+    for w in ("create_report_draft", "publish_report", "preview_publish", "trash_report",
+              "add_report_tags", "report_ingest", "report_fragmentize"):
+        assert not gw._is_read_tool(w), w

@@ -146,36 +146,51 @@ USER_PAT_TTL_S = int(os.environ.get("GATEWAY_USER_PAT_TTL", "43200"))
 # {backend_key: 포털 service 이름}. 인증은 GW_TOKEN 공유 시크릿(포털 쪽 동일 값 필요).
 PORTAL_CONN_BACKENDS: dict[str, str] = {"reportarchive": "reportarchive"}
 PORTAL_CONN_TTL_S = int(os.environ.get("GATEWAY_CONN_TTL", "300"))
-# {(service,email): (conn|None, 만료 monotonic)} — None 은 '등록 없음' 부정 캐시.
-_CONN_CACHE: dict[tuple[str, str], tuple[dict | None, float]] = {}
+# {(service,email): (conn|None|_ConnLookupError, 만료 monotonic)} — None 은 '등록 없음' 부정 캐시.
+_CONN_CACHE: dict[tuple[str, str], tuple[object, float]] = {}
+
+
+class _ConnLookupError(Exception):
+    """포털에 연결을 **물을 수 없었다** — '등록 없음'(None)과 다르다.
+
+    둘을 None 하나로 돌려주던 때, 게이트웨이 config 에서 portal.api_base 가 빠지자(프로비저너
+    --force 가 portal 블록을 그 키 없이 다시 쓴다) 요청도 로그도 없이 전원이 '미등록' 이 되어
+    등록한 사람까지 서비스 계정 명의로 RA 에 글을 썼다(cae00 에서 남의 글이 서비스 토큰 주인
+    이름으로 올라간 사고, 2026-09-29). 호출부가 '모름' 을 '없음' 과 달리 다루게 한다."""
 
 
 async def _portal_connection(service: str, email: str) -> dict | None:
-    """포털에 등록된 사용자 연결 토큰 {token, workspace} — 없거나 실패면 None(서비스 계정 폴백)."""
+    """포털에 등록된 사용자 연결 토큰 {token, workspace}. 등록 없음(404)이면 None.
+    포털 주소를 모르거나 포털이 거부·무응답이면 `_ConnLookupError`(짧게 캐시)."""
     key = (service, email)
     hit = _CONN_CACHE.get(key)
     if hit and hit[1] > time.monotonic():
+        if isinstance(hit[0], _ConnLookupError):
+            raise hit[0]
         return hit[0]
-    base = (PORTAL.get("api_base") or "").rstrip("/")
+    # 다른 포털 조회와 같은 주소 규칙 — api_base 가 없으면 jwks_url 에서 유도한다.
+    base = _portal_api_base()
+    if not base:
+        raise _ConnLookupError("포털 주소를 모른다(portal.api_base·jwks_url 둘 다 없음)")
     conn: dict | None = None
-    if base:
-        try:
-            async with httpx.AsyncClient(timeout=8) as cli:
-                resp = await cli.get(f"{base}/internal/connections/{service}",
-                                     params={"email": email},
-                                     headers={"Authorization": f"Bearer {GW_TOKEN}"})
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict) and data.get("token"):
-                    conn = {"token": data["token"], "workspace": data.get("workspace") or ""}
-            elif resp.status_code not in (404,):
-                log.warning("portal connection lookup %s/%s → HTTP %s", service, email,
-                            resp.status_code)
-        except Exception as exc:  # noqa: BLE001 — 조회 실패는 서비스 계정 폴백(가용성 우선)
-            log.warning("portal connection lookup failed (%r) — 서비스 계정 폴백", exc)
-            # 실패는 짧게만 캐시해 포털 복구가 빨리 반영되게 한다.
-            _CONN_CACHE[key] = (None, time.monotonic() + 30)
-            return None
+    try:
+        async with httpx.AsyncClient(timeout=8) as cli:
+            resp = await cli.get(f"{base}/internal/connections/{service}",
+                                 params={"email": email},
+                                 headers={"Authorization": f"Bearer {GW_TOKEN}"})
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict) and data.get("token"):
+                conn = {"token": data["token"], "workspace": data.get("workspace") or ""}
+        elif resp.status_code != 404:
+            # 403 = 포털 GATEWAY_SHARED_TOKEN ≠ GW_TOKEN, 503 = 포털에 그 값이 없다
+            raise _ConnLookupError(f"포털 /internal/connections → HTTP {resp.status_code}")
+    except Exception as exc:  # noqa: BLE001
+        err = exc if isinstance(exc, _ConnLookupError) else _ConnLookupError(f"포털 조회 실패 {exc!r}")
+        log.warning("portal connection lookup %s/%s: %s", service, email, err)
+        # 실패는 짧게만 캐시해 포털 복구가 빨리 반영되게 한다.
+        _CONN_CACHE[key] = (err, time.monotonic() + 30)
+        raise err from None
     # '등록 없음'(404)도 30초만 — 방금 등록한 사용자가 5분을 기다리게 하지 않는다.
     ttl = PORTAL_CONN_TTL_S if conn else 30
     _CONN_CACHE[key] = (conn, time.monotonic() + ttl)
@@ -233,6 +248,12 @@ def _tools_fp(tools) -> dict:
         raw = (getattr(t, "description", "") or "") + "\x00" + sch
         out[t.name] = hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
     return out
+
+
+def _is_read_tool(tool: str) -> bool:
+    """읽기 도구인가 — 캐시 화이트리스트(`_CACHEABLE`)와 같은 판정. 그 접두사에 섞인 쓰기
+    (`_CACHE_DENY`)는 쓰기로 본다. 모르면 쓰기(닫힌 쪽)."""
+    return tool.startswith(_CACHEABLE) and tool not in _CACHE_DENY
 
 
 def _cache_key(backend_key: str, tool: str, arguments, aff: str = "") -> tuple | None:
@@ -2606,9 +2627,28 @@ async def _call_tool(name: str, arguments: dict):
         if not email:
             note = "no-identity"
         else:
-            conn = await _portal_connection(PORTAL_CONN_BACKENDS[backend_key], email)
+            try:
+                conn = await _portal_connection(PORTAL_CONN_BACKENDS[backend_key], email)
+            except _ConnLookupError as exc:
+                conn = None
+                note = "conn-lookup-error"   # 모름 — '미등록'(no-connection)과 가른다
+                if not _is_read_tool(original):
+                    # 쓰기는 서비스 계정으로 보내지 않는다 — 등록한 사람의 글이 서비스 토큰 주인
+                    # 명의로 올라간다(위 _ConnLookupError 설명의 사고). 읽기는 종전대로 폴백한다.
+                    _audit(name, backend_key, False, f"conn-lookup: {exc}",
+                           round((time.monotonic() - t0) * 1000),
+                           caller=email, mode="refused", corr=_request_corr())
+                    return types.CallToolResult(
+                        content=[types.TextContent(type="text", text=(
+                            f"{backend_key}: {email} 의 등록 토큰을 포털에서 확인하지 못해 쓰기를 "
+                            f"멈췄습니다({exc}). 서비스 계정으로 쓰면 글쓴이가 다른 사람으로 "
+                            "기록됩니다. 관리자에게 알리세요(게이트웨이 portal 설정·포털 "
+                            "GATEWAY_SHARED_TOKEN)."))],
+                        isError=True,
+                    )
             if conn is None:
-                note = "no-connection"   # 미등록 — 종전 서비스 계정 경로로 폴백
+                if note != "conn-lookup-error":
+                    note = "no-connection"   # 미등록 — 종전 서비스 계정 경로로 폴백
             else:
                 # 사용자 부서가 비어 있으면 헤더를 **지운다**(None) — 서비스 계정의
                 # X-Workspace-Slug 가 남으면 그 부서 명의 오류가 사용자에게 뒤집어씌워진다.

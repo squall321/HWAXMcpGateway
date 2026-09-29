@@ -1845,6 +1845,9 @@ def test_감사가_호출_주소와_자격과_계정을_스스로_남긴다(monk
     ("", None),
     ("2001:DB8::1", "2001:db8::1"),
     (" 203.0.113.9 ", "203.0.113.9"),
+    ('fe80::1%attacker said "hi" <b>', None),   # IPv6 영역 표기 — ip_address 는 % 뒤를 아무 글자나 받는다(검토 1차)
+    ("::1%203.0.113.9", None),
+    ("::ffff:203.0.113.4", "203.0.113.4"),     # IPv4 로 풀어 적어야 주소로 찾을 때 안 빠진다
 ])
 def test_주소가_아닌_값은_칸만_빼고_줄은_남긴다(monkeypatch, host, want):
     _set_request(monkeypatch, {}, host)
@@ -1912,7 +1915,7 @@ def test_인증_실패는_주소와_사유를_남기고_계정은_적지_않는�
 
     class _V:
         async def verify(self, token, aud):
-            return None
+            return {"email": "a@x.io", "groups": []} if token == "valid" else None
 
     async def app(scope, receive, send):
         raise AssertionError("인증 없이 앱까지 가면 안 된다")
@@ -1922,19 +1925,23 @@ def test_인증_실패는_주소와_사유를_남기고_계정은_적지_않는�
         sent.append(m)
     mw = gw._bearer_gate(app, _V())
 
-    def hit(path, auth=None):
-        hdrs = [(b"authorization", auth)] if auth else []
-        asyncio.run(mw({"type": "http", "method": "POST", "path": path, "headers": hdrs,
+    def hit(path, *auth, method="POST"):
+        hdrs = [(b"authorization", a) for a in auth]
+        asyncio.run(mw({"type": "http", "method": method, "path": path, "headers": hdrs,
                         "client": ("198.51.100.9", 0)}, None, send))
     hit("/mcp")
     hit("/mcp", b"Bearer forged.jwt.value")
     hit("/mcp/.well-known/openid-configuration")
+    # 두 번 실린 Authorization 은 **둘 다 유효해도** 거절한다 — 검증은 마지막, 대화 저장·검색은 첫 것을 쓴다(검토 1차)
+    hit("/mcp", b"Bearer other", b"Bearer valid")
+    hit("/mcp", method="A" * 7000)                               # 토큰 없이 보낸 긴 메서드가 원장에 그대로 실리면 안 된다
     rows = _rows()
-    assert [r["error"] for r in rows] == ["unauthorized: no-bearer", "unauthorized: invalid-token"], \
+    assert [r["error"] for r in rows] == ["unauthorized: no-bearer", "unauthorized: unverified-token",
+                                          "unauthorized: duplicate-authorization", "unauthorized: no-bearer"], \
         "클라이언트의 OAuth 메타데이터 조회(.well-known)는 정상 동작 중에도 401 이라 적지 않는다"
-    assert all(r["ip"] == "198.51.100.9" and r["tool"] == "POST /mcp" and not r["ok"] and "caller" not in r
-               for r in rows)
-    assert sum(1 for m in sent if m.get("status") == 401) == 3
+    assert [r["tool"] for r in rows] == ["POST /mcp"] * 3 + ["OTHER /mcp"]
+    assert all(r["ip"] == "198.51.100.9" and not r["ok"] and "caller" not in r for r in rows)
+    assert sum(1 for m in sent if m.get("status") == 401) == 5
 
 
 def test_REST_다리도_주소와_이메일_계정을_남긴다(monkeypatch):
@@ -1953,14 +1960,16 @@ def test_REST_다리도_주소와_이메일_계정을_남긴다(monkeypatch):
     p._verify = lambda token, site: {"sub": "S-123", "email": "U@X.io", "jti": "j", "groups": []}
     p._revoked_set = no_revoked
 
-    def call(auth):
+    def call(auth, path="x"):
         hdrs = [(b"authorization", auth)] if auth else []
         return asyncio.run(p.handle(Request({
-            "type": "http", "method": "GET", "path": "/api/s/x", "headers": hdrs, "query_string": b"",
-            "path_params": {"site": "s", "path": "x"}, "client": ("203.0.113.5", 0)})))
+            "type": "http", "method": "GET", "path": f"/api/s/{path}", "headers": hdrs, "query_string": b"",
+            "path_params": {"site": "s", "path": path}, "client": ("203.0.113.5", 0)})))
     assert call(b"Bearer t").status_code == 403                  # 권한 없음 — 상류는 안 부른다
     assert call(None).status_code == 401
     rows = _rows()
     assert (rows[0]["error"], rows[0]["caller"], rows[0]["ip"], rows[0]["via"]) == \
         ("forbidden", "u@x.io", "203.0.113.5", "pat")
     assert rows[1]["error"] == "pat: missing bearer" and rows[1]["ip"] == "203.0.113.5" and "caller" not in rows[1]
+    call(None, "p" * 8000)                                        # 토큰 없이 보낸 긴 경로 — 원장 한 줄이 8KB 가 되면 안 된다
+    assert len(_rows()[-1]["tool"]) <= 220

@@ -2404,11 +2404,18 @@ def _request_user() -> str:
 
 def _clean_ip(host) -> str:
     """주소 형식이면 정규화한 문자열, 아니면 ''. uvicorn 은 X-Forwarded-For 의 토큰을 **그대로** client 로 쓴다 —
-    주소가 아닌 글자도 들어온다(검증 2026-09-29). 그런 값은 감사 원장에 안 싣는다."""
+    주소가 아닌 글자도 들어온다(검증 2026-09-29). 그런 값은 감사 원장에 안 싣는다.
+    ⚠ IPv6 **영역 표기**(`fe80::1%…`)는 버린다 — `ip_address` 는 `%` 뒤를 아무 글자나(길이 제한 없이) 받아 그대로
+    돌려준다(검토 1차 D-9). nginx 가 넘기는 주소에는 영역이 붙지 않는다. `::ffff:a.b.c.d` 는 IPv4 로 풀어 적는다."""
     try:
-        return str(ipaddress.ip_address(str(host).strip())) if host else ""
+        a = ipaddress.ip_address(str(host).strip()) if host else None
     except ValueError:
         return ""
+    if a is None or getattr(a, "scope_id", None):
+        return ""
+    if a.version == 6 and a.ipv4_mapped:
+        a = a.ipv4_mapped
+    return str(a)
 
 
 def _request_ip() -> str:
@@ -2979,6 +2986,11 @@ def _bearer_gate(app, pat_verifier=None):
             return
         headers = dict(scope.get("headers") or [])
         auth = headers.get(b"authorization", b"").decode("latin-1")
+        # Authorization 이 두 번 실리면 거절한다 — 여기서는 **마지막** 것을 검증하는데(dict), 대화 저장·검색은 **첫** 것을
+        # 포털로 넘긴다(Starlette). 둘이 다르면 검증한 사람과 포털이 받은 사람이 갈리고 감사의 계정이 틀린다(검토 1차 D-9).
+        _dup_auth = sum(1 for (k, _v) in (scope.get("headers") or []) if k.lower() == b"authorization") > 1
+        if _dup_auth:
+            auth = ""
         if _secret_eq(auth, expected):
             # 내부 에이전트 서버: GW_TOKEN. groups 는 에이전트가 x-hwax-groups 로 실어 보냄(신뢰).
             # 그룹 헤더가 아예 없으면 사용자를 대리하지 않는 내부 서비스 호출이다 — 표시 그룹을 붙여
@@ -3036,9 +3048,14 @@ def _bearer_gate(app, pat_verifier=None):
             return
         # 인증 실패도 어디서 왔는지 남긴다 — `/mcp` 만. 클라이언트가 OAuth 메타데이터를 찾는 `/mcp/.well-known/*` 는
         # 정상 동작 중에도 401 을 받으므로 실패로 적으면 잡음이다. 검증 안 된 토큰의 신원은 적지 않는다(주장일 뿐, D-7).
+        # 메서드는 정해진 것만 적는다 — 토큰 없이 누구나 보낼 수 있는 줄에 요청이 정한 긴 글자를 싣지 않는다(검토 1차).
+        # `unverified-token` 은 토큰이 틀렸거나 **포털 키를 못 받아 검증을 못 한** 것이다(둘을 못 가른다, D-9).
         if scope.get("path") in ("/mcp", "/mcp/"):
-            _audit(f"{scope.get('method', '')} {scope.get('path')}", None, False,
-                   "unauthorized: " + ("invalid-token" if token else "no-bearer"), 0,
+            _m = scope.get("method", "")
+            _m = _m if _m in ("GET", "POST", "DELETE", "PUT", "PATCH", "HEAD", "OPTIONS") else "OTHER"
+            _audit(f"{_m} {scope.get('path')}", None, False,
+                   "unauthorized: " + ("duplicate-authorization" if _dup_auth else
+                                       "unverified-token" if token else "no-bearer"), 0,
                    ip=(scope.get("client") or (None,))[0])
         await send({
             "type": "http.response.start",

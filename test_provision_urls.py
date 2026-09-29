@@ -194,3 +194,15 @@ def test_ste_sso_url_은_env_가_없으면_직전_config_를_보존한다(tmp_pa
     (tmp_path / "gateway_config.json").unlink(missing_ok=True)
     out = _run_provision(tmp_path, {"HEAX_MCP_TOKEN": "heax-svc", "STE_SSO_SECRET": "s2"})
     assert out["heax_registry"]["per_user_sso"]["ste"]["sso_url"] == "http://127.0.0.1:15810/api/auth/sso"
+
+
+def test_포털_api_base_는_재생성에서_사라지지_않는다(tmp_path):
+    """--force 가 portal 블록을 api_base 없이 다시 써서 사용자별 RA 위임이 조용히 꺼졌다(2026-09-29).
+    기본값이 있고, 손으로 바꾼 값은 이어받는다."""
+    out = _run_provision(tmp_path, {})
+    assert out["portal"]["api_base"] == "http://127.0.0.1:8723"
+    assert out["portal"]["jwks_url"].startswith(out["portal"]["api_base"] + "/")
+    (tmp_path / "gateway_config.json.bak").write_text(
+        json.dumps({"portal": {"api_base": "http://10.0.0.7:8723"}}), encoding="utf-8")
+    (tmp_path / "gateway_config.json").unlink()
+    assert _run_provision(tmp_path, {})["portal"]["api_base"] == "http://10.0.0.7:8723"

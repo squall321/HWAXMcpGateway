@@ -487,6 +487,10 @@ if e.get("SF_API_KEY"):
 cfg["rest"] = rest
 cfg["portal"] = {"jwks_url": "http://127.0.0.1:8723/.well-known/jwks.json",
                  "revoked_url": "http://127.0.0.1:8723/auth/pat/revoked.json",
+                 # 사용자별 RA 위임(포털 /internal/connections)의 주소. 종전엔 이 줄이 없어 --force 한 번에
+                 # 사라졌고(손으로 넣는 wire 스크립트만 썼다), 게이트웨이가 포털에 묻지도 않고 전원을
+                 # 서비스 계정으로 RA 에 보냈다 — 남의 글이 서비스 토큰 주인 명의로 올라갔다(2026-09-29).
+                 "api_base": _prev("portal", "api_base") or "http://127.0.0.1:8723",
                  "audience_ok": []}          # rest 사이트가 정해진 뒤 아래에서 채운다
 # ODB 자동화 허브 — cae00 에서만 도달하는 사내 MCP 서버. dev 에서는 닿지 않는다(실측: 포트 차단).
 # 반드시 url 형식이어야 한다 — 게이트웨이는 `"url" in v` 인 항목만 백엔드로 읽는다(gateway.py:42).

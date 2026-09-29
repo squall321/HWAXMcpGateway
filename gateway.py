@@ -1,6 +1,7 @@
 # 3개 백엔드 MCP를 집계해 단일 streamable-http 엔드포인트로 재노출하는 게이트웨이
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -109,6 +110,10 @@ MUTED_HEADER = "x-hwax-muted-apps"
 # 끄기를 적용하지 않는 PAT — 포털 웹 챗(에이전트서버가 tools/list 에서 이름으로 찾아 코드로 부르는 도구가 있다)
 CHAT_PAT_NAME = "chat-session"
 PROCEDURE_PURPOSE = "procedure"
+# 이 요청이 **어느 자격으로** 들어왔나(gw-token·chat·procedure·pat) — 감사 `via` 칸. 게이트웨이가 인증 분기에서 싣고
+# 클라이언트가 보낸 사본은 두 분기 모두 버린다. 박스 안 호출은 IP 가 전부 127.0.0.1 이라 이게 없으면 '웹 챗 경유' 와
+# '박스 안 Claude Code' 를 못 가른다(HWAXPortal docs/gateway-audit-ip D-5).
+VIA_HEADER = "x-hwax-via"
 AFF_PROOF_TTL_S = int(os.environ.get("GATEWAY_AFF_PROOF_TTL", "120"))
 
 
@@ -347,7 +352,7 @@ def _cache_flush_backend(backend_key: str):
         _CACHE_STAT["flush"] += len(doomed)
 
 
-def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=None):
+def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=None, ip=None, via=None):
     """호출 1건을 JSONL 감사 로그에 append (감사 실패가 호출을 막지 않게).
 
     ⚠ **`error` 는 실패에만 쓴다.** 종전에는 위임 신원(`as:someone@…`)과 메모(`cache-hit`·
@@ -361,10 +366,17 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
       purpose: 포털 **절차 실행기**가 부른 호출이면 `procedure`. 절차는 정확이름 차단을 면제받으므로,
                이 칸이 없으면 "면제로 지나간 파괴 호출" 이 직접 호출과 글자 하나 다르지 않았다
                (2026-09-18 검토). `purpose=procedure` 이고 도구가 `_INVOKE_DENY_EXACT` 면 면제 건이다.
+      ip     : 어디서 불렀나. 개인 Claude(nginx `/mcp-gw/`)는 사용자 PC 주소, 박스 안 호출은 127.0.0.1 이다.
+               주소 형식일 때만 남긴다. ⚠ 박스 안에서 게이트웨이로 직접 붙는 프로세스는 X-Forwarded-For 로
+               아무 주소나 주장할 수 있다 — 127.0.0.1 을 믿는 uvicorn 기본값이다(docs/gateway-audit-ip).
+      via    : 어느 자격으로 들어왔나(gw-token · chat · procedure · pat). 127.0.0.1 을 읽는 열쇠다.
+    `caller`·`ip`·`via` 를 안 주면 요청 컨텍스트에서 읽는다 — 호출부마다 넘기게 하면 빠뜨린 자리가 빈 칸이 된다
+    (대화 저장·검색 줄이 그래서 계정이 비어 있었다). REST 다리처럼 MCP 컨텍스트가 없는 곳은 직접 넘긴다.
     """
     try:
         rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                "tool": tool, "backend": backend, "ok": ok, "ms": ms}
+        caller = caller or _request_user()
         if caller:
             rec["caller"] = caller
         if mode:
@@ -378,6 +390,12 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
         purpose = _request_purpose()
         if purpose:
             rec["purpose"] = purpose
+        ip = _clean_ip(ip) if ip is not None else _request_ip()
+        if ip:
+            rec["ip"] = ip
+        via = via or _request_via()
+        if via:
+            rec["via"] = via
         with open(AUDIT_PATH, "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001
@@ -2384,6 +2402,36 @@ def _request_user() -> str:
         return ""
 
 
+def _clean_ip(host) -> str:
+    """주소 형식이면 정규화한 문자열, 아니면 ''. uvicorn 은 X-Forwarded-For 의 토큰을 **그대로** client 로 쓴다 —
+    주소가 아닌 글자도 들어온다(검증 2026-09-29). 그런 값은 감사 원장에 안 싣는다."""
+    try:
+        return str(ipaddress.ip_address(str(host).strip())) if host else ""
+    except ValueError:
+        return ""
+
+
+def _request_ip() -> str:
+    """이 호출이 온 주소. nginx 를 거친 요청은 uvicorn 이 이미 nginx 의 `$remote_addr` 로 바꿔 두었다(D-2).
+    ⚠ ContextVar 로 옮기지 마라 — 핸들러는 세션 태스크에서 돌아 첫 요청(initialize) 값으로 굳는다(D-3).
+    어떤 이유로든 못 읽으면 '' — 여기서 터지면 `_audit` 의 except 가 **줄 전체**를 삼킨다(D-4)."""
+    try:
+        req = _low.request_context.request
+        return _clean_ip(getattr(getattr(req, "client", None), "host", None))
+    except Exception:  # noqa: BLE001 — LookupError(컨텍스트 없음) 포함
+        return ""
+
+
+def _request_via() -> str:
+    """이 호출이 들어온 자격(게이트웨이가 인증 분기에서 싣는다). 없으면 ''."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return ""
+    raw = req.headers.get(VIA_HEADER) if req is not None else None
+    return (raw or "").strip()[:20]
+
+
 # ── 사용자별 백엔드 자격증명 ────────────────────────────────────────────────
 # {(app_id, email): (token, 만료 monotonic)}. 발급이 '같은 이름의 직전 토큰'을 회수하므로
 # 같은 사용자에 대한 동시 발급은 서로를 무효화한다 — 사용자 단위 락으로 직렬화한다.
@@ -2938,9 +2986,10 @@ def _bearer_gate(app, pat_verifier=None):
             # 목적 헤더는 **검증된 PAT 에서만** 나온다 — 이 경로(GW_TOKEN)는 PAT 검증을 안 하므로
             # 클라이언트가 실어 보낸 값을 버린다. 안 버리면 GW_TOKEN 을 쥔 쪽이 차단을 면제받는다.
             _kept = [(k, v) for (k, v) in (scope.get("headers") or [])
-                     if k.lower() not in (PURPOSE_HEADER.encode(), MUTED_HEADER.encode())]
+                     if k.lower() not in (PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode())]
             if GROUPS_HEADER.encode() not in headers:
                 _kept.append((GROUPS_HEADER.encode(), SERVICE_GROUP.encode()))
+            _kept.append((VIA_HEADER.encode(), b"gw-token"))
             await app({**scope, "headers": _kept}, receive, send)
             return
         # GW_TOKEN 이 아니면 포털 PAT(개인 Claude 등) 로 검증 시도 → 성공 시 PAT 의 groups 로 도구 필터.
@@ -2962,7 +3011,7 @@ def _bearer_gate(app, pat_verifier=None):
             # 얻는 경로가 생기면 안 되므로, 신원 없음 쪽으로 닫는다).
             fresh = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (GROUPS_HEADER.encode(), USER_HEADER.encode(),
-                                          PURPOSE_HEADER.encode(), MUTED_HEADER.encode())]
+                                          PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode())]
             # PAT 의 groups 에도 한글이 올 수 있다 — 같은 규칙으로 인코딩해 실어야 헤더가 안 깨진다.
             fresh.append((GROUPS_HEADER.encode(), quote(groups, safe=",").encode("latin-1")))
             _email = str(claims.get("email") or "").strip().lower()
@@ -2981,8 +3030,16 @@ def _bearer_gate(app, pat_verifier=None):
                         and str(claims.get("jti") or "").startswith("chat-"))
             if _muted and not _is_chat and str(claims.get("purpose") or "") != PROCEDURE_PURPOSE:
                 fresh.append((MUTED_HEADER.encode(), quote(",".join(_muted), safe=",").encode("latin-1")))
+            fresh.append((VIA_HEADER.encode(), b"chat" if _is_chat else
+                          b"procedure" if str(claims.get("purpose") or "") == PROCEDURE_PURPOSE else b"pat"))
             await app({**scope, "headers": fresh}, receive, send)
             return
+        # 인증 실패도 어디서 왔는지 남긴다 — `/mcp` 만. 클라이언트가 OAuth 메타데이터를 찾는 `/mcp/.well-known/*` 는
+        # 정상 동작 중에도 401 을 받으므로 실패로 적으면 잡음이다. 검증 안 된 토큰의 신원은 적지 않는다(주장일 뿐, D-7).
+        if scope.get("path") in ("/mcp", "/mcp/"):
+            _audit(f"{scope.get('method', '')} {scope.get('path')}", None, False,
+                   "unauthorized: " + ("invalid-token" if token else "no-bearer"), 0,
+                   ip=(scope.get("client") or (None,))[0])
         await send({
             "type": "http.response.start",
             "status": 401,

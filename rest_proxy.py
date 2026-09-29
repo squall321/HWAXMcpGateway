@@ -171,17 +171,23 @@ class RestProxy:
         t0 = time.monotonic()
         if not conf or site not in self.audience_ok:
             return JSONResponse({"error": f"unknown site: {site}"}, status_code=404)
+        # 이 경로는 MCP 요청 컨텍스트 밖이라 감사가 스스로 주소를 못 읽는다 — 직접 넘긴다. nginx 를 거친 요청이면
+        # uvicorn 이 이미 nginx 의 $remote_addr 로 바꿔 두었다(HWAXPortal docs/gateway-audit-ip D-2). 형식 검사는 감사가 한다.
+        ip = getattr(request.client, "host", None)
         auth = request.headers.get("authorization", "")
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         if not token:
+            self.audit(f"{request.method} /{path}", site, False, "pat: missing bearer", 0, ip=ip)
             return JSONResponse({"error": "missing bearer PAT"}, status_code=401)
         try:
             claims = self._verify(token, site)
             if claims["jti"] in await self._revoked_set():
                 raise ValueError("token revoked")
         except Exception as e:  # noqa: BLE001
-            self.audit(f"{request.method} /{path}", site, False, f"pat: {e!r}", 0)
+            self.audit(f"{request.method} /{path}", site, False, f"pat: {e!r}", 0, ip=ip)
             return JSONResponse({"error": "invalid PAT", "detail": str(e)}, status_code=401)
+        # 계정은 MCP 줄과 같게 이메일로 적는다 — `sub` 는 SSO 사용자면 이메일이 아닐 수 있다(D-6).
+        who = str(claims.get("email") or "").strip().lower() or claims.get("sub")
 
         # ⚠ 서비스 자격증명을 주입하는 사이트는 기본적으로 읽기만 허용한다.
         # 아래 inject 는 "그 사이트의 마스터 키" 다. PAT 검증은 서명·aud·scope=="api"·폐기목록
@@ -195,7 +201,7 @@ class RestProxy:
         allowed = allowed_methods(conf)
         if allowed is not None and request.method.upper() not in {m.upper() for m in allowed}:
             self.audit(f"{request.method} /{path}", site, False, "method not allowed", 0,
-                       caller=claims.get("sub"))
+                       caller=who, ip=ip, via="pat")
             return JSONResponse(
                 {"error": "method not allowed for this site",
                  "detail": f"{site} 는 {'/'.join(allowed)} 만 허용한다. 쓰기가 필요하면 "
@@ -212,7 +218,7 @@ class RestProxy:
             groups = [str(g) for g in (claims.get("groups") or [])]
             if not await self.allow(site, groups, str(claims.get("email") or "")):
                 self.audit(f"{request.method} /{path}", site, False, "forbidden", 0,
-                           caller=claims.get("sub"))
+                           caller=who, ip=ip, via="pat")
                 detail = "이 백엔드를 쓸 권한이 없습니다 — 포털 '내 권한' 에서 요청하세요."
                 if self.deny_text is not None:
                     try:
@@ -238,7 +244,7 @@ class RestProxy:
                 tok, tok_header = await self.mint(str(conf["per_user"]), email)
             except Exception as e:  # noqa: BLE001
                 self.audit(f"{request.method} /{path}", site, False, f"per-user: {e!r}", 0,
-                           caller=claims.get("sub"))
+                           caller=who, ip=ip, via="pat")
                 return JSONResponse({"error": f"{email} 자격증명을 받지 못했다",
                                      "detail": str(e)[:300]}, status_code=502)
             if tok_header:
@@ -262,10 +268,10 @@ class RestProxy:
             up = await self._client.send(req, stream=True)
         except Exception as e:  # noqa: BLE001
             self.audit(f"{request.method} /{path}", site, False, f"upstream: {e!r}",
-                       round((time.monotonic() - t0) * 1000), caller=claims.get("sub"))
+                       round((time.monotonic() - t0) * 1000), caller=who, ip=ip, via="pat")
             return JSONResponse({"error": "upstream unreachable", "detail": str(e)}, status_code=502)
         self.audit(f"{request.method} /{path}", site, up.status_code < 400, None,
-                   round((time.monotonic() - t0) * 1000), caller=claims.get("sub"))
+                   round((time.monotonic() - t0) * 1000), caller=who, ip=ip, via="pat")
         out_headers = {k: v for k, v in up.headers.items() if k.lower() not in _HOP}
 
         async def _out():

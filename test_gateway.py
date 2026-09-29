@@ -1812,3 +1812,155 @@ def test_포털이_찍는_챗_PAT_표지와_게이트웨이가_보는_값이_같
     text = src.read_text(encoding="utf-8")
     assert f'"pat_name": "{gw.CHAT_PAT_NAME}"' in text
     assert '"jti": f"chat-' in text, "게이트웨이는 챗 PAT 를 jti 의 'chat-' 머리로도 가린다"
+
+
+# ── 감사에 호출 주소·자격(HWAXPortal docs/gateway-audit-ip) ─────────────────
+# 주소는 문서용 예약 대역(TEST-NET)만 쓴다 — 이 리포는 GitHub 에 있다.
+def _set_request(monkeypatch, headers: dict, host):
+    """`_set_request_headers` 에 **주소**를 더한다 — 실제 요청은 Starlette Request 라 `.client.host` 가 있다."""
+    from types import SimpleNamespace as NS
+    client = NS(host=host) if host is not None else None
+    monkeypatch.setattr(gw, "_low", NS(request_context=NS(request=NS(headers=headers, client=client))))
+
+
+def _rows():
+    return [json.loads(ln) for ln in open(gw.AUDIT_PATH, encoding="utf-8")]
+
+
+def test_감사가_호출_주소와_자격과_계정을_스스로_남긴다(monkeypatch):
+    """호출부 23곳은 그대로 두고 `_audit` 이 요청에서 읽는다 — 넘기게 하면 빠뜨린 자리가 빈 칸이 된다
+    (대화 저장·검색 줄이 그래서 계정이 비어 있었다, D-6)."""
+    _set_request(monkeypatch, {gw.VIA_HEADER: "pat", gw.USER_HEADER: "u%40x.io"}, "203.0.113.7")
+    gw._audit("save_conversation", "portal", True, None, 3)            # caller 를 안 넘기던 자리
+    r = _rows()[-1]
+    assert (r["ip"], r["via"], r["caller"]) == ("203.0.113.7", "pat", "u@x.io")
+    gw._audit("t", "b", True, None, 1, caller="given@x.io", ip="198.51.100.2", via="gw-token")
+    r = _rows()[-1]
+    assert (r["ip"], r["via"], r["caller"]) == ("198.51.100.2", "gw-token", "given@x.io"), "넘긴 값이 우선"
+
+
+@pytest.mark.parametrize("host,want", [
+    ('evil"}{ x', None),            # uvicorn 은 X-Forwarded-For 토큰을 그대로 client 로 쓴다(검증 2026-09-29)
+    ("testclient", None),
+    ("", None),
+    ("2001:DB8::1", "2001:db8::1"),
+    (" 203.0.113.9 ", "203.0.113.9"),
+])
+def test_주소가_아닌_값은_칸만_빼고_줄은_남긴다(monkeypatch, host, want):
+    _set_request(monkeypatch, {}, host)
+    gw._audit("t", "b", True, None, 1)
+    r = _rows()[-1]
+    assert r["tool"] == "t" and r.get("ip") == want
+
+
+def test_주소를_못_읽어도_줄이_사라지지_않는다(monkeypatch):
+    """`_audit` 은 통째로 except 로 감싼다 — 주소 읽기가 터지면 **줄 전체**가 사라진다(D-4)."""
+    from types import SimpleNamespace as NS
+    _set_request_headers(monkeypatch, {gw.PURPOSE_HEADER: "procedure"})      # .client 가 없는 가짜
+    gw._audit("t1", "b", True, None, 1)
+    assert _rows()[-1]["tool"] == "t1" and _rows()[-1]["purpose"] == "procedure" and "ip" not in _rows()[-1]
+
+    class _Boom:
+        headers: dict = {}
+
+        @property
+        def client(self):
+            raise RuntimeError("boom")
+    monkeypatch.setattr(gw, "_low", NS(request_context=NS(request=_Boom())))
+    gw._audit("t2", "b", True, None, 1)
+    assert _rows()[-1]["tool"] == "t2", "주소 읽기가 터져도 줄은 남는다"
+
+
+def _via_seen(monkeypatch, auth, claims, extra=()):
+    """인증 미들웨어를 태워 앱이 받는 `x-hwax-via` 를 **전부**(중복 포함) 돌려준다."""
+    import asyncio
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["h"] = list(scope["headers"])
+
+    async def fake_access(email, base, **_kw):
+        return {"keys": []}
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        async def verify(self, token, aud):
+            return claims
+    mw = gw._bearer_gate(app, _V())
+    asyncio.run(mw({"type": "http", "path": "/mcp", "headers": [(b"authorization", auth), *extra]}, None, None))
+    return [v.decode() for k, v in seen.get("h", []) if k.lower() == gw.VIA_HEADER.encode()]
+
+
+def test_들어온_자격은_게이트웨이가_정하고_보낸_사본은_버린다(monkeypatch):
+    """127.0.0.1 만으로는 '웹 챗 경유' 와 '박스 안 Claude Code' 를 못 가른다 — 자격을 게이트웨이가 적는다(D-5)."""
+    forged = ((gw.VIA_HEADER.encode(), b"gw-token"),)
+    me = {"email": "u@x.io", "groups": []}
+    assert _via_seen(monkeypatch, b"Bearer me", me, forged) == ["pat"]
+    assert _via_seen(monkeypatch, b"Bearer c", {**me, "pat_name": gw.CHAT_PAT_NAME, "jti": "chat-u-1"},
+                     forged) == ["chat"]
+    assert _via_seen(monkeypatch, b"Bearer c", {**me, "pat_name": gw.CHAT_PAT_NAME, "jti": "random"}) == ["pat"], \
+        "이름만 chat-session 인 개인 토큰은 챗이 아니다(이름은 사용자가 정한다)"
+    assert _via_seen(monkeypatch, b"Bearer p", {**me, "purpose": gw.PROCEDURE_PURPOSE}, forged) == ["procedure"]
+    assert _via_seen(monkeypatch, b"Bearer gw-secret", None, ((gw.VIA_HEADER.encode(), b"pat"),)) == ["gw-token"]
+
+
+def test_인증_실패는_주소와_사유를_남기고_계정은_적지_않는다(monkeypatch):
+    """누가 틀린 토큰으로 두드렸는지 — 계정은 모르므로(검증 안 된 토큰의 주장) 주소와 사유만(D-7)."""
+    import asyncio
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        async def verify(self, token, aud):
+            return None
+
+    async def app(scope, receive, send):
+        raise AssertionError("인증 없이 앱까지 가면 안 된다")
+    sent = []
+
+    async def send(m):
+        sent.append(m)
+    mw = gw._bearer_gate(app, _V())
+
+    def hit(path, auth=None):
+        hdrs = [(b"authorization", auth)] if auth else []
+        asyncio.run(mw({"type": "http", "method": "POST", "path": path, "headers": hdrs,
+                        "client": ("198.51.100.9", 0)}, None, send))
+    hit("/mcp")
+    hit("/mcp", b"Bearer forged.jwt.value")
+    hit("/mcp/.well-known/openid-configuration")
+    rows = _rows()
+    assert [r["error"] for r in rows] == ["unauthorized: no-bearer", "unauthorized: invalid-token"], \
+        "클라이언트의 OAuth 메타데이터 조회(.well-known)는 정상 동작 중에도 401 이라 적지 않는다"
+    assert all(r["ip"] == "198.51.100.9" and r["tool"] == "POST /mcp" and not r["ok"] and "caller" not in r
+               for r in rows)
+    assert sum(1 for m in sent if m.get("status") == 401) == 3
+
+
+def test_REST_다리도_주소와_이메일_계정을_남긴다(monkeypatch):
+    """REST 다리(/api/)는 MCP 컨텍스트 밖이라 `_audit` 이 스스로 못 읽는다 — 직접 넘긴다. 계정은 `sub` 가 아니라
+    이메일(MCP 줄과 같게, D-6)."""
+    import asyncio
+    from starlette.requests import Request
+    from rest_proxy import RestProxy
+
+    async def deny(site, groups, email):
+        return False
+
+    async def no_revoked():
+        return set()
+    p = RestProxy({"s": {"base": "http://upstream.invalid"}}, {"audience_ok": ["s"]}, gw._audit, allow=deny)
+    p._verify = lambda token, site: {"sub": "S-123", "email": "U@X.io", "jti": "j", "groups": []}
+    p._revoked_set = no_revoked
+
+    def call(auth):
+        hdrs = [(b"authorization", auth)] if auth else []
+        return asyncio.run(p.handle(Request({
+            "type": "http", "method": "GET", "path": "/api/s/x", "headers": hdrs, "query_string": b"",
+            "path_params": {"site": "s", "path": "x"}, "client": ("203.0.113.5", 0)})))
+    assert call(b"Bearer t").status_code == 403                  # 권한 없음 — 상류는 안 부른다
+    assert call(None).status_code == 401
+    rows = _rows()
+    assert (rows[0]["error"], rows[0]["caller"], rows[0]["ip"], rows[0]["via"]) == \
+        ("forbidden", "u@x.io", "203.0.113.5", "pat")
+    assert rows[1]["error"] == "pat: missing bearer" and rows[1]["ip"] == "203.0.113.5" and "caller" not in rows[1]

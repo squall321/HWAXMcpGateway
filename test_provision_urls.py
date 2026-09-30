@@ -206,3 +206,14 @@ def test_포털_api_base_는_재생성에서_사라지지_않는다(tmp_path):
         json.dumps({"portal": {"api_base": "http://10.0.0.7:8723"}}), encoding="utf-8")
     (tmp_path / "gateway_config.json").unlink()
     assert _run_provision(tmp_path, {})["portal"]["api_base"] == "http://10.0.0.7:8723"
+
+
+def test_ste_위임은_heax_토큰이_없어도_생긴다(tmp_path):
+    """heax 토큰 자동 발급이 실패한 박스에서 ste 위임까지 사라져 게이트웨이가 ste 를 토큰 없이(서비스 신분) 불렀다 —
+    REST 가 401 → "Error executing tool …"(HWAXPortal docs/ste-cae00 D-30). 위임은 heax 앱 탐지와 무관하다."""
+    out = _run_provision(tmp_path, {"STE_SSO_SECRET": "s2", "STE_SSO_URL": "http://127.0.0.1:15810/api/auth/sso"})
+    reg = out["heax_registry"]
+    assert reg["per_user_sso"]["ste"] == {"sso_url": "http://127.0.0.1:15810/api/auth/sso", "secret": "s2",
+                                         "client": "gateway"}
+    assert "servers_url" not in reg and "token" not in reg, "heax 앱 자동탐지는 토큰이 있을 때만 켠다"
+    assert out["rest"]["ste"]["per_user"] == "ste", "REST 다리도 같은 위임으로 산다"

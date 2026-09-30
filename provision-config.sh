@@ -535,40 +535,43 @@ if e.get("HEAX_MCP_TOKEN"):
         "token": e["HEAX_MCP_TOKEN"]}
     if app_tokens:
         cfg["heax_registry"]["app_tokens"] = app_tokens
-    # per_user_sso: 호출자별 자격증명을 게이트웨이가 직접 발급할 앱. 이번 실행이 시크릿을
-    # 못 읽었다고 기존 설정을 지우면(레포 미체크아웃 등) 멀쩡하던 위임이 조용히 꺼진다.
-    per_user = dict(_prev("heax_registry", "per_user_sso") or {})
-    if e.get("KOORM_SSO_SECRET"):
-        per_user["kooremapper_mcp"] = {
-            "sso_url": e.get("KOORM_SSO_URL") or "http://127.0.0.1:8700/api/v1/auth/sso",
-            "secret": e["KOORM_SSO_SECRET"],
-            "client": "deliberation"}
-    if e.get("HWAXRISK_SSO_SECRET"):
-        per_user["hwax_risk"] = {
-            "sso_url": e.get("HWAXRISK_SSO_URL") or (
-                (e.get("HEAX_MCP_BASE") or "http://127.0.0.1:4180").rstrip("/")
-                + "/apps/hwax_risk/api/auth/sso"),
-            "secret": e["HWAXRISK_SSO_SECRET"],
-            "client": "deliberation",
-            # 발급 요청은 서비스 토큰으로 Caddy 를 통과하고(auth), 실제 호출에서는 사용자 자격을
-            # Authorization 이 아니라 이 헤더로 싣는다(token_header) — 둘 다 forward_auth 때문이다.
-            "auth": "heax",
-            "token_header": "X-Heax-Sso-Assertion"}
-    if e.get("STE_SSO_SECRET"):
-        # ste 는 heax-hub 앱이 아니라 설정에 직접 적은 백엔드다 — 키가 곧 위임 식별자다.
-        # Caddy forward_auth 뒤가 아니므로 auth/token_header 는 쓰지 않는다(그 둘은 Caddy 전용
-        # 손잡이다). ste MCP 가 호출자 Authorization 을 REST 로 그대로 넘기므로 잡 소유권이 산다.
-        # ⚠ MCP url 은 `_url()` 이 직전 config 값을 보존하는데 sso_url 만 env → 기본값이었다.
-        #   그래서 STE_SSO_URL 없이 --force 를 돌리면 멀쩡하던 VM 주소가 127.0.0.1 로 **덮였다**.
-        #   같은 규칙으로 맞춘다: env > 직전 config > 기본값.
-        per_user["ste"] = {
-            "sso_url": e.get("STE_SSO_URL")
-                       or (per_user.get("ste") or {}).get("sso_url")
-                       or "http://127.0.0.1:15810/api/auth/sso",
-            "secret": e["STE_SSO_SECRET"],
-            "client": "gateway"}
-    if per_user:
-        cfg["heax_registry"]["per_user_sso"] = per_user
+# per_user_sso 는 HEAX 토큰과 **따로** 쓴다 — 이 블록이 `if HEAX_MCP_TOKEN` 안에 있어서 heax 토큰 자동 발급이 실패한
+# 박스에서는 ste 위임까지 통째로 사라지고, 게이트웨이가 ste 를 토큰 없이(서비스 신분) 불러 REST 가 401 이었다
+# (HWAXPortal docs/ste-cae00 D-30). 게이트웨이는 servers_url 없는 heax_registry 를 '앱 자동탐지 없음' 으로 읽는다.
+# per_user_sso: 호출자별 자격증명을 게이트웨이가 직접 발급할 앱. 이번 실행이 시크릿을
+# 못 읽었다고 기존 설정을 지우면(레포 미체크아웃 등) 멀쩡하던 위임이 조용히 꺼진다.
+per_user = dict(_prev("heax_registry", "per_user_sso") or {})
+if e.get("KOORM_SSO_SECRET"):
+    per_user["kooremapper_mcp"] = {
+        "sso_url": e.get("KOORM_SSO_URL") or "http://127.0.0.1:8700/api/v1/auth/sso",
+        "secret": e["KOORM_SSO_SECRET"],
+        "client": "deliberation"}
+if e.get("HWAXRISK_SSO_SECRET"):
+    per_user["hwax_risk"] = {
+        "sso_url": e.get("HWAXRISK_SSO_URL") or (
+            (e.get("HEAX_MCP_BASE") or "http://127.0.0.1:4180").rstrip("/")
+            + "/apps/hwax_risk/api/auth/sso"),
+        "secret": e["HWAXRISK_SSO_SECRET"],
+        "client": "deliberation",
+        # 발급 요청은 서비스 토큰으로 Caddy 를 통과하고(auth), 실제 호출에서는 사용자 자격을
+        # Authorization 이 아니라 이 헤더로 싣는다(token_header) — 둘 다 forward_auth 때문이다.
+        "auth": "heax",
+        "token_header": "X-Heax-Sso-Assertion"}
+if e.get("STE_SSO_SECRET"):
+    # ste 는 heax-hub 앱이 아니라 설정에 직접 적은 백엔드다 — 키가 곧 위임 식별자다.
+    # Caddy forward_auth 뒤가 아니므로 auth/token_header 는 쓰지 않는다(그 둘은 Caddy 전용
+    # 손잡이다). ste MCP 가 호출자 Authorization 을 REST 로 그대로 넘기므로 잡 소유권이 산다.
+    # ⚠ MCP url 은 `_url()` 이 직전 config 값을 보존하는데 sso_url 만 env → 기본값이었다.
+    #   그래서 STE_SSO_URL 없이 --force 를 돌리면 멀쩡하던 VM 주소가 127.0.0.1 로 **덮였다**.
+    #   같은 규칙으로 맞춘다: env > 직전 config > 기본값.
+    per_user["ste"] = {
+        "sso_url": e.get("STE_SSO_URL")
+                   or (per_user.get("ste") or {}).get("sso_url")
+                   or "http://127.0.0.1:15810/api/auth/sso",
+        "secret": e["STE_SSO_SECRET"],
+        "client": "gateway"}
+if per_user:
+    cfg.setdefault("heax_registry", {})["per_user_sso"] = per_user
 
 # ── REST 다리 사이트 확장 ────────────────────────────────────────────────────
 # per_user 블록 **뒤에** 둔다 — ste 의 REST base 는 그 sso_url 이 가리키는 곳이 정본이라

@@ -1973,3 +1973,82 @@ def test_REST_다리도_주소와_이메일_계정을_남긴다(monkeypatch):
     assert rows[1]["error"] == "pat: missing bearer" and rows[1]["ip"] == "203.0.113.5" and "caller" not in rows[1]
     call(None, "p" * 8000)                                        # 토큰 없이 보낸 긴 경로 — 원장 한 줄이 8KB 가 되면 안 된다
     assert len(_rows()[-1]["tool"]) <= 220
+
+
+# ── ste 가 사용자 토큰을 거절한 결과면 1회 재발급(HWAXPortal docs/ste-cae00 D-30) ─────────────────
+def _remint_kit(monkeypatch, replies: list[str | None]):
+    """위임 경로를 실제로 태운다(전송 계층만 막는다). `replies` 는 호출마다 백엔드가 돌려줄 결과 — None 이면 성공,
+    문자열이면 그 문구의 isError 결과다. 호출마다 **어느 토큰을 실었는지**와 발급 때의 force 를 돌려준다."""
+    import asyncio
+
+    b = _CallB(["cluster_info"])
+    seen = {"tokens": [], "force": [], "calls": 0}
+    queue = list(replies)
+
+    class _Sess:
+        async def initialize(self): return None
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            seen["calls"] += 1
+            err = queue.pop(0)
+            return types.CallToolResult(content=[types.TextContent(type="text", text=err or '{"nodes": []}')],
+                                        isError=err is not None)
+
+    def fake_stream(url, headers=None):
+        seen["tokens"].append((headers or {}).get("Authorization"))
+        return _StubCM((None, None, "sid"))
+
+    async def fake_pat(app_id, email, *, force=False):
+        seen["force"].append(force)
+        return "new-tok" if force else "old-tok"
+
+    async def fake_access(email, base_groups, **_kw):
+        return {"keys": [], "affiliation": ""}
+    monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {"ste": b})
+    monkeypatch.setattr(gw, "route", {"cluster_info": ("ste", "cluster_info")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"ste": {"sso_url": "http://x", "secret": "s"}})
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_user_pat", fake_pat)
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    res = asyncio.run(gw._call_tool("cluster_info", {}))
+    seen["result"] = res
+    return seen
+
+
+_STE_401 = ('Error executing tool cluster_info: GET /api/cluster → HTTP 401: {"detail":"토큰이 폐기됐다"}'
+            ' — 신원이 없거나 토큰이 죽었다.')
+
+
+def test_ste_가_토큰을_거절하면_한_번_다시_받아_부른다(monkeypatch):
+    """401 은 예외가 아니라 isError 결과로 온다 — 예외에만 재발급하던 탓에 폐기된 캐시 토큰을 12시간 계속 썼다."""
+    seen = _remint_kit(monkeypatch, [_STE_401, None])
+    assert seen["calls"] == 2 and seen["force"] == [False, True]
+    assert seen["tokens"] == ["Bearer old-tok", "Bearer new-tok"], "두 번째는 새로 받은 토큰이어야 한다"
+    assert not seen["result"].isError
+    row = _rows()[-1]
+    assert (row["mode"], row["ok"], row.get("note")) == ("as-user-pat", True, "re-minted")
+
+
+def test_다시_받아도_거절되면_두_번에서_멈추고_그대로_알린다(monkeypatch):
+    seen = _remint_kit(monkeypatch, [_STE_401, _STE_401])
+    assert seen["calls"] == 2 and seen["result"].isError
+    assert "HTTP 401" in seen["result"].content[0].text, "무엇이 실패했는지 그대로 전한다"
+
+
+@pytest.mark.parametrize("err", [
+    "Error executing tool cluster_info: GET /api/cluster → HTTP 503: 클러스터 조회 실패",   # 토큰 문제가 아니다(slurm)
+    "Error executing tool fetch_url: 원격 서버가 HTTP 401 을 냈다",                        # 도구가 바깥에서 받은 401
+    "GET /api/cluster → HTTP 401: x",                                                    # FastMCP 가 감싼 모양이 아니다
+])
+def test_토큰_거절이_아니면_다시_부르지_않는다(monkeypatch, err):
+    """쓰기 도구를 두 번 부를 수 있으니 모양을 좁게 본다."""
+    seen = _remint_kit(monkeypatch, [err, None])
+    assert seen["calls"] == 1 and seen["force"] == [False] and seen["result"].isError

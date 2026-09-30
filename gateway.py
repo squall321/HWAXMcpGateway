@@ -2494,6 +2494,21 @@ async def _user_pat(app_id: str, email: str, *, force: bool = False) -> str:
         return tok
 
 
+# 백엔드가 **우리가 실은 사용자 토큰을 거절했다**는 결과. 예외가 아니라 isError 결과로 온다 — ste MCP 는 REST 의 401 을
+# "GET /api/… → HTTP 401: …" 로 올리고 FastMCP 가 "Error executing tool X: …" 로 감싼다. 발급·호출 예외에만 재발급하던 탓에
+# 폐기된 캐시 토큰을 캐시 수명(12시간) 동안 계속 썼다(HWAXPortal docs/ste-cae00 D-30). 401 은 인증에서 끊긴 것이라 도구가
+# 아무것도 안 했다 — 다시 불러도 두 번 실행되지 않는다. 모양은 좁게 본다: 도구가 **바깥에서** 받은 401 을 옮기는 결과와 섞이면
+# 쓰기 도구를 두 번 부를 수 있다.
+_TOKEN_REJECTED = re.compile(r"^Error executing tool \S+: (?:GET|POST|PUT|PATCH|DELETE) \S+ → HTTP 401\b")
+
+
+def _token_rejected(res) -> bool:
+    if not getattr(res, "isError", False):
+        return False
+    text = "".join(getattr(c, "text", "") or "" for c in (getattr(res, "content", None) or []))
+    return bool(_TOKEN_REJECTED.match(text.strip()))
+
+
 async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: str, timeout_s: float,
                         extra_headers: dict | None = None, token_header: str | None = None):
     """이 호출만을 위한 단발 세션으로 백엔드를 부른다.
@@ -2714,9 +2729,13 @@ async def _call_tool(name: str, arguments: dict):
                             "이 앱은 사용자별 데이터라 서비스 계정 결과로 대체하지 않습니다."))],
                         isError=True,
                     )
+                if attempt == 0 and _token_rejected(res):
+                    log.warning("per-user call %s: 백엔드가 토큰을 거절했다(401) — 토큰 재발급 후 1회 재시도", name)
+                    continue
                 _audit(name, backend_key, not getattr(res, "isError", False), None,
                        round((time.monotonic() - t0) * 1000),
-                       caller=email, mode="as-user-pat", corr=_request_corr())
+                       caller=email, mode="as-user-pat", corr=_request_corr(),
+                       note="re-minted" if attempt else None)
                 return _cache_put(ckey, _evid_keep(name, res))
     elif backend_key in PORTAL_CONN_BACKENDS:
         # 포털 등록 연결 토큰 위임(RA 등). 신원이 있는 호출은 **본인 토큰으로만** 간다. 서비스 계정(cae00 에선

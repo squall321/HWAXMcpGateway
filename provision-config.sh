@@ -514,7 +514,7 @@ if _ODB:
 # 게이트웨이는 "url" 키가 없는 항목을 백엔드로 읽지 않아 에러 없이 조용히 무시한다(odb-hub 와 같은 함정).
 # mcp-remote 는 HTTP MCP 로 가는 stdio 브리지일 뿐이라, HTTP 를 직접 말하는 여기엔 불필요하다.
 # env 가 없으면 직전 config 의 주소를 이어받는다 — 한 번 붙여 두면 --force 재생성에서 안 사라진다.
-_ARP_PREV = _prev("arp")                      # 예: http://10.252.38.97:3001/mcp
+_ARP_PREV = _prev("arp")                      # 예: http://<ARP 서버>:3001/mcp
 _ARP_BASE = e.get("ARP_BASE") or (_ARP_PREV.split("/mcp")[0] if _ARP_PREV else None)
 if _ARP_BASE:
     cfg["arp"] = {"url": f'{_ARP_BASE.rstrip("/")}/mcp', "transport": "streamable_http"}

@@ -55,7 +55,16 @@ MCP fan-out과 같은 패턴("호출자 토큰 1개 → 백엔드별 네이티�
 |---|---|
 | `STE_SSO_SECRET` · `STE_SSO_URL` | `per_user_sso.ste` |
 | `RA_SSO_SECRET` · `RA_SSO_URL`(기본 `http://127.0.0.1:3000/api/auth/sso`) | `per_user_sso.reportarchive` + `strip_headers: ["X-Workspace-Slug"]`. 서비스 백엔드(`RAT_TOKEN`)는 그대로 — 도구 목록은 그 세션으로 모은다 |
-| `TESTSCOPE_SSO_SECRET` · `TESTSCOPE_SSO_URL` · `TESTSCOPE_MCP_URL` | `per_user_sso.testscope` + 백엔드 `testscope`(서비스 토큰 없음). 기본 호스트가 없어 주소를 모르면 만들지 않고, 위임 없이 백엔드만 만들지도 않는다(토큰 없이 부르면 401) |
+
+## 등록 토큰 방식 — `PORTAL_CONN_BACKENDS`(RA·TestScope)
+사람이 그 서비스에서 직접 받은 개인 토큰을 포털 '개인 토큰 › 외부 연결'(`/tokens?tab=connect`)에 등록하면, 게이트웨이가 호출 때 포털 `GET /internal/connections/<service>?email=`(GW_TOKEN)로 그 토큰을 읽어 그 사람 명의로 부른다. 신원이 있는데 등록이 없거나 포털에 묻지 못하면 **거부**하고 등록을 안내한다(서비스 계정으로 대신 부르지 않는다). 신원 없는 내부 호출만 서비스 세션으로 간다.
+
+| 백엔드 | 토큰 | 부서 헤더 |
+|---|---|---|
+| `reportarchive` | `rat_…` | 등록한 워크스페이스를 `X-Workspace-Slug` 로(비면 서비스 값을 지운다) |
+| `testscope` | `tsc_pat_…`(TestScope 에서 발급, `/api/auth/me` 를 부르려면 `read` 범위) | 싣지 않는다 |
+
+TestScope 는 다른 조직의 포털(제 주소로 노출)이라 ste 방식(우리가 발급)이 아니라 이 길로 붙인다 — TestScope 코드는 손대지 않는다. 백엔드는 `provision-config.sh` 가 `TESTSCOPE_MCP_URL`(> 직전 config 주소)로 만든다(`streamable_http`, 서비스 `Authorization` 없음 — tools/list 는 토큰 없이 된다). 기본 호스트가 없어 주소를 모르면 만들지 않는다. `per_user_sso.testscope` 는 만들지 않는다 — 있으면 위 우선순위대로 그쪽이 먼저 탄다.
 
 ## 실행
 ```bash

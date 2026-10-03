@@ -159,7 +159,14 @@ USER_PAT_TTL_S = int(os.environ.get("GATEWAY_USER_PAT_TTL", "43200"))
 # 부른다. 신원이 있는데 미등록이면 **거부하고 등록을 안내한다**(2026-09-29 사용자 결정 — 종전의
 # 서비스 계정 폴백은 실제 사람의 RA 토큰 행세였다). 서비스 계정은 신원 없는 내부 호출에만 쓴다.
 # {backend_key: 포털 service 이름}. 인증은 GW_TOKEN 공유 시크릿(포털 쪽 동일 값 필요).
-PORTAL_CONN_BACKENDS: dict[str, str] = {"reportarchive": "reportarchive"}
+# TestScope 는 다른 조직의 포털이라 ste 방식(우리가 발급) 대신 이 길로 붙인다 — 그쪽 코드는 손대지 않는다(2026-10-03).
+PORTAL_CONN_BACKENDS: dict[str, str] = {"reportarchive": "reportarchive", "testscope": "testscope"}
+# 거부·실패 안내에 쓰는 이름과 토큰 모양, 사용자 부서를 실을 헤더(None 이면 싣지 않고 서비스 헤더도 건드리지 않는다).
+# TestScope 에는 부서 개념이 없다 — RA 의 X-Workspace-Slug 를 보내면 모르는 헤더를 남의 서비스에 흘린다.
+PORTAL_CONN_META: dict[str, dict] = {
+    "reportarchive": {"label": "Report Archive", "hint": "rat_…", "workspace_header": "X-Workspace-Slug"},
+    "testscope": {"label": "TestScope", "hint": "tsc_pat_…", "workspace_header": None},
+}
 PORTAL_CONN_TTL_S = int(os.environ.get("GATEWAY_CONN_TTL", "300"))
 # {(service,email): (conn|None|_ConnLookupError, 만료 monotonic)} — None 은 '등록 없음' 부정 캐시.
 _CONN_CACHE: dict[tuple[str, str], tuple[object, float]] = {}
@@ -2760,6 +2767,8 @@ async def _call_tool(name: str, arguments: dict):
             note = "no-identity"
         else:
             why = ""
+            _cm = PORTAL_CONN_META.get(backend_key) or {}
+            _label, _hint = _cm.get("label") or backend_key, _cm.get("hint") or "…"
             try:
                 conn = await _portal_connection(PORTAL_CONN_BACKENDS[backend_key], email)
             except _ConnLookupError as exc:
@@ -2769,8 +2778,8 @@ async def _call_tool(name: str, arguments: dict):
             else:
                 if conn is None:
                     note = "no-connection"
-                    why = ("Report Archive 토큰이 포털에 등록되어 있지 않습니다. 포털 '개인 토큰 › 외부 연결'"
-                           "(/tokens?tab=connect)에서 Report Archive 토큰(rat_…)을 등록한 뒤 다시 시도하세요.")
+                    why = (f"{_label} 토큰이 포털에 등록되어 있지 않습니다. 포털 '개인 토큰 › 외부 연결'"
+                           f"(/tokens?tab=connect)에서 {_label} 토큰({_hint})을 등록한 뒤 다시 시도하세요.")
             if conn is None:
                 _audit(name, backend_key, False, f"refused: {note}", round((time.monotonic() - t0) * 1000),
                        caller=email, mode="refused", note=note, corr=_request_corr())
@@ -2782,7 +2791,8 @@ async def _call_tool(name: str, arguments: dict):
                 )
             # 사용자 부서가 비어 있으면 헤더를 **지운다**(None) — 서비스 계정의
             # X-Workspace-Slug 가 남으면 그 부서 명의 오류가 사용자에게 뒤집어씌워진다.
-            extra = {"X-Workspace-Slug": conn.get("workspace") or None}
+            _wh = _cm.get("workspace_header")
+            extra = {_wh: conn.get("workspace") or None} if _wh else None
             try:
                 res = await _call_as_user(b, original, arguments, conn["token"],
                                           CALL_TIMEOUT_S, extra_headers=extra)
@@ -2794,7 +2804,7 @@ async def _call_tool(name: str, arguments: dict):
                 return types.CallToolResult(
                     content=[types.TextContent(type="text", text=(
                         f"{backend_key}: {email} 의 등록 토큰으로 호출하지 못했습니다 "
-                        f"({exc!r}). 포털 '개인 토큰 › 외부 연결'(/tokens?tab=connect)에서 Report Archive "
+                        f"({exc!r}). 포털 '개인 토큰 › 외부 연결'(/tokens?tab=connect)에서 {_label} "
                         "토큰을 다시 등록하세요(만료·폐기 가능성)."))],
                     isError=True,
                 )

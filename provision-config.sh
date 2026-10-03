@@ -28,8 +28,11 @@
 #      값을 두지 않아 가짜 DOWN 이 뜨지 않는다(ODB_HUB_TOKEN 이 하는 역할과 같다).
 #      주의 — 게이트웨이는 "url" 키가 있는 항목만 백엔드로 읽는다(gateway.py:42). mcp-remote 의
 #      {"command":"npx","args":[...]} 형식을 넣으면 에러 없이 조용히 무시되므로 url 형식으로 쓴다.
-#   8) 사람별 위임(ste 방식, heax_registry.per_user_sso): STE_SSO_SECRET · RA_SSO_SECRET(+RA_SSO_URL) ·
-#      TESTSCOPE_SSO_SECRET(+TESTSCOPE_SSO_URL, 백엔드는 TESTSCOPE_MCP_URL). 비밀이 없는 실행은 직전 값을 이어받는다.
+#   8) 사람별 위임(ste 방식, heax_registry.per_user_sso): STE_SSO_SECRET · RA_SSO_SECRET(+RA_SSO_URL).
+#      비밀이 없는 실행은 직전 값을 이어받는다.
+#   9) TestScope: TESTSCOPE_MCP_URL(> 직전 config 주소)이 있으면 testscope 백엔드(서비스 토큰 없음).
+#      다른 조직의 포털이라 ste 방식이 아니라 RA 처럼 사람이 포털 '개인 토큰 › 외부 연결' 에 등록한
+#      TestScope 토큰으로 부른다(게이트웨이 PORTAL_CONN_BACKENDS). 기본 호스트가 없어 주소를 모르면 만들지 않는다.
 #
 # 사용:  bash provision-config.sh            # 이미 config 있으면 건드리지 않음
 #        bash provision-config.sh --force    # 재생성(기존은 .bak 백업)
@@ -582,7 +585,7 @@ if e.get("STE_SSO_SECRET"):
                    or "http://127.0.0.1:15810/api/auth/sso",
         "secret": e["STE_SSO_SECRET"],
         "client": "gateway"}
-# RA·TestScope 도 ste 방식이다(HWAXPortal docs/sso-delegation) — 규칙도 ste 와 같다(env > 직전 config > 기본값,
+# RA 도 ste 방식이다(HWAXPortal docs/sso-delegation) — 규칙도 ste 와 같다(env > 직전 config > 기본값,
 # 이번 실행에 비밀이 없다고 있던 항목을 지우지 않는다 — 위 per_user 가 직전 값에서 시작한다).
 if e.get("RA_SSO_SECRET"):
     # 서비스 백엔드(RAT_TOKEN)는 그대로 둔다 — 도구 목록은 그 서비스 세션으로 모은다. 사람별 호출만 이 길로 가고,
@@ -596,28 +599,23 @@ if e.get("RA_SSO_SECRET"):
         "client": "gateway",
         "strip_headers": ["X-Workspace-Slug"]}
     print(f"  ✓ RA 사람별 위임 — {per_user['reportarchive']['sso_url']}")
-if e.get("TESTSCOPE_SSO_SECRET"):
-    # TestScope 는 기본 호스트가 없다(박스마다 다르고 같은 박스라는 보장도 없다) — 주소를 모르면 만들지 않는다.
-    _ts_sso = e.get("TESTSCOPE_SSO_URL") or (per_user.get("testscope") or {}).get("sso_url")
-    if _ts_sso:
-        per_user["testscope"] = {"sso_url": _ts_sso, "secret": e["TESTSCOPE_SSO_SECRET"], "client": "gateway"}
-        print(f"  ✓ TestScope 사람별 위임 — {_ts_sso}")
-    else:
-        print("  ⚠ TESTSCOPE_SSO_SECRET 은 있는데 주소가 없다(TESTSCOPE_SSO_URL·직전 config 둘 다 없음) — TestScope 위임 생략")
+if "testscope" in per_user:
+    # 만들지는 않지만 지우지도 않는다(사람이 넣었을 수 있다). 남아 있으면 게이트웨이에서 등록 토큰보다 먼저 탄다.
+    print("  ⚠ per_user_sso.testscope 가 직전 config 에 있다 — TestScope 는 이제 포털 등록 토큰 방식이라 "
+          "이 항목이 있으면 그쪽이 먼저 쓰인다. 의도가 아니면 손으로 지우라")
 if per_user:
     cfg.setdefault("heax_registry", {})["per_user_sso"] = per_user
 
-# TestScope MCP 백엔드 — 위임이 있을 때만 만든다. 위임 없이 붙이면 사람별 호출이 토큰 없이 나가 '있는데 401' 이 된다.
-# 손으로 붙여 둔 항목(헤더·allowed_groups 등)은 env 가 없어도 지우지 않고 이어받는다.
+# TestScope MCP 백엔드 — 다른 조직의 포털(제 주소로 노출)이라 ste 방식으로 우리가 토큰을 발급하지 않는다.
+# RA 처럼 사람이 그쪽에서 받은 tsc_pat_ 를 포털 '개인 토큰 › 외부 연결' 에 등록하고, 게이트웨이가 그 토큰으로
+# 부른다(PORTAL_CONN_BACKENDS). 서비스 Authorization 은 없다 — tools/list 는 토큰 없이 된다.
+# 기본 호스트가 없다 — env > 직전 config 주소, 둘 다 없으면 만들지 않는다(127.0.0.1 로 지어내면 없는 서비스를 가리킨다).
+# 손으로 붙여 둔 필드(allowed_groups 등)는 이어받는다.
 _ts_prev = _prev_entry("testscope")
 _ts_url = e.get("TESTSCOPE_MCP_URL") or (_ts_prev or {}).get("url")
-if _ts_url and "testscope" in per_user:
+if _ts_url:
     cfg["testscope"] = {**(_ts_prev or {}), "url": _ts_url, "transport": "streamable_http"}
-elif _ts_prev:
-    cfg["testscope"] = _ts_prev
-    print("  · testscope: 위임 없음 → 직전 config 항목을 그대로 이어받는다(사라지지 않게)")
-elif e.get("TESTSCOPE_MCP_URL"):
-    print("  ⚠ TESTSCOPE_MCP_URL 은 있는데 TestScope 위임이 없다 — 백엔드를 만들지 않는다(토큰 없이 부르면 401)")
+    print(f"  ✓ testscope — {_ts_url}(사람별 호출은 포털에 등록한 TestScope 토큰으로)")
 
 # ── REST 다리 사이트 확장 ────────────────────────────────────────────────────
 # per_user 블록 **뒤에** 둔다 — ste 의 REST base 는 그 sso_url 이 가리키는 곳이 정본이라

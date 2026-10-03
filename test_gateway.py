@@ -1605,11 +1605,13 @@ def test_연결조회_없음과_모름을_가른다(monkeypatch):
     assert _Portal.seen == []
 
 
-def _ra_kit(monkeypatch, tool, **portal):
-    """RA 백엔드 하나로 `_call_tool` 을 실제로 태운다. 사용자 세션은 전송 계층만 막는다(`_call_as_user` 는 진짜)."""
+def _ra_kit(monkeypatch, tool, *, backend="reportarchive", svc_headers=None, **portal):
+    """RA 백엔드 하나로 `_call_tool` 을 실제로 태운다. 사용자 세션은 전송 계층만 막는다(`_call_as_user` 는 진짜).
+    `backend`·`svc_headers` 로 같은 등록 토큰 길의 다른 백엔드(TestScope)를 태운다."""
     import asyncio
     b = _CallB([tool])
-    b.headers = {"Authorization": "Bearer rat_service", "X-Workspace-Slug": "svc"}
+    b.headers = (dict(svc_headers) if svc_headers is not None
+                 else {"Authorization": "Bearer rat_service", "X-Workspace-Slug": "svc"})
     user = {}
 
     class _Sess:
@@ -1626,8 +1628,8 @@ def _ra_kit(monkeypatch, tool, **portal):
     monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
     monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
     gw._RESP_CACHE.clear()
-    monkeypatch.setattr(gw, "backends", {"reportarchive": b})
-    monkeypatch.setattr(gw, "route", {tool: ("reportarchive", tool)})
+    monkeypatch.setattr(gw, "backends", {backend: b})
+    monkeypatch.setattr(gw, "route", {tool: (backend, tool)})
     monkeypatch.setattr(gw, "alias_route", {})
     monkeypatch.setattr(gw, "POLICY", {})
     monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
@@ -1684,6 +1686,52 @@ def test_신원_없는_내부_호출만_서비스_계정으로_간다(monkeypatc
     res = asyncio.run(gw._call_tool("list_templates", {}))
     row = [json.loads(ln) for ln in open(gw.AUDIT_PATH, encoding="utf-8")][-1]
     assert not res.isError and b.session.calls == ["list_templates"] and _Portal.seen == []
+    assert row["mode"] == "service" and row["note"] == "no-identity"
+
+
+# ── TestScope 도 등록 토큰 방식(다른 조직의 포털이라 ste 방식 위임 대신 — 2026-10-03 사용자 결정) ─────────
+def test_TestScope_는_본인이_등록한_토큰으로만_가고_부서_헤더를_싣지_않는다(monkeypatch):
+    """포털이 workspace 를 돌려줘도 X-Workspace-Slug 는 RA 의 것이다 — TestScope 에는 싣지 않는다.
+    손으로 붙인 다른 헤더는 건드리지 않는다."""
+    assert gw.PORTAL_CONN_BACKENDS["testscope"] == "testscope"
+    res, svc, user, row = _ra_kit(monkeypatch, "list_equipment", backend="testscope",
+                                  svc_headers={"X-Keep": "1"},
+                                  status=200, payload={"token": "tsc_pat_u", "workspace": "dept"})
+    assert not res.isError and svc == []
+    assert _Portal.seen[0][0].endswith("/internal/connections/testscope")
+    assert user["headers"]["Authorization"] == "Bearer tsc_pat_u" and user["headers"]["X-Keep"] == "1"
+    assert not any(k.lower() == "x-workspace-slug" for k in user["headers"])
+    assert row["mode"] == "as-conn" and row["caller"] == "u@corp.com"
+
+
+def test_미등록_사람의_TestScope_호출은_거부하고_TestScope_토큰_등록을_안내한다(monkeypatch):
+    res, svc, user, row = _ra_kit(monkeypatch, "list_equipment", backend="testscope", svc_headers={}, status=404)
+    text = res.content[0].text
+    assert res.isError and svc == [] and user == {}, "토큰 없이 부르면 남의 포털에 익명으로 간다"
+    assert "TestScope" in text and "tsc_pat_" in text and "외부 연결" in text and "등록" in text
+    assert "Report Archive" not in text and "rat_" not in text
+    assert row["mode"] == "refused" and row["note"] == "no-connection"
+    res, svc, user, row = _ra_kit(monkeypatch, "list_equipment", backend="testscope", svc_headers={}, status=503)
+    assert res.isError and svc == [] and user == {} and "관리자" in res.content[0].text
+    assert row["note"] == "conn-lookup-error"
+
+
+def test_신원_없는_TestScope_호출은_서비스_세션으로_간다(monkeypatch):
+    import asyncio
+    b = _CallB(["list_equipment"])
+    monkeypatch.setattr(gw, "backends", {"testscope": b})
+    monkeypatch.setattr(gw, "route", {"list_equipment": ("testscope", "list_equipment")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    _portal(monkeypatch, 404)
+    gw._RESP_CACHE.clear()
+    res = asyncio.run(gw._call_tool("list_equipment", {}))
+    row = [json.loads(ln) for ln in open(gw.AUDIT_PATH, encoding="utf-8")][-1]
+    assert not res.isError and b.session.calls == ["list_equipment"] and _Portal.seen == []
     assert row["mode"] == "service" and row["note"] == "no-identity"
 
 

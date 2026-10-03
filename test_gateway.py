@@ -955,7 +955,7 @@ class _StubCM:
     async def __aexit__(self, *a): return False
 
 
-def _per_user_kit(monkeypatch, aff_payload, base_headers=None):
+def _per_user_kit(monkeypatch, aff_payload, base_headers=None, sso_extra=None):
     """사용자 위임 경로를 실제로 태우고 **백엔드에 닿은 헤더**를 돌려준다.
 
     ⚠ `_call_as_user` 를 가짜로 갈아끼우면 안 된다 — 처음에 그렇게 짰다가 검토에서 잡혔다.
@@ -994,7 +994,8 @@ def _per_user_kit(monkeypatch, aff_payload, base_headers=None):
     monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
     monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)   # 이 시험의 관심사는 위임 헤더다 — 정책은 '받았고 비었다'
     monkeypatch.setattr(gw, "PER_USER_SSO", {"kooremapper_mcp": {"sso_url": "http://x",
-                                                                 "secret": "app-secret"}})
+                                                                 "secret": "app-secret",
+                                                                 **(sso_extra or {})}})
     monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
     monkeypatch.setattr(gw, "_request_groups", lambda: ["mes-user", "plat:dynaforge"])
 
@@ -1032,6 +1033,19 @@ def test_사용자_위임_호출에_소속이_증명과_함께_실린다(monkeyp
     assert ver == "v1" and int(exp) > 0
     want = hmac.new(b"app-secret", f"v1|u@corp.com|CAEG|{exp}".encode(), hashlib.sha256).hexdigest()
     assert hmac.compare_digest(sig, want), "서명이 이메일·소속·만료에 결속돼야 한다"
+
+
+def test_사람별_호출에서는_strip_headers_의_서비스_헤더를_뺀다(monkeypatch):
+    """RA 를 ste 방식(per_user_sso)으로 부를 때 서비스 설정의 X-Workspace-Slug(서비스 부서)가 사람별 호출에 남으면
+    그 부서로 읽고 쓴다 — 포털 연결 경로가 이미 막던 것과 같은 사고다(docs/sso-delegation). 손잡이가 없으면 종전대로 둔다."""
+    svc = {"X-Workspace-Slug": "svc", "X-Keep": "1"}
+    seen = _per_user_kit(monkeypatch, None, base_headers=svc, sso_extra={"strip_headers": ["X-Workspace-Slug"]})
+    assert "X-Workspace-Slug" not in seen["headers"] and seen["headers"]["X-Keep"] == "1"
+    assert seen["headers"]["Authorization"] == "Bearer kr_tok"
+    seen = _per_user_kit(monkeypatch, None, base_headers=svc)
+    assert seen["headers"]["X-Workspace-Slug"] == "svc", "손잡이가 없는 앱(ste·DynaForge)은 그대로"
+    seen = _per_user_kit(monkeypatch, None, base_headers=svc, sso_extra={"strip_headers": "X-Workspace-Slug"})
+    assert seen["headers"]["X-Workspace-Slug"] == "svc", "목록이 아니면 글자 단위로 쪼개 엉뚱한 헤더를 지우지 않는다"
 
 
 def test_증명은_다른_사람의_호출에는_못_쓴다(monkeypatch):
@@ -1650,7 +1664,7 @@ def test_미등록_사람의_RA_호출은_읽기든_쓰기든_거부하고_등�
     for tool in ("create_report_draft", "list_reports", "get_report"):
         res, svc, user, row = _ra_kit(monkeypatch, tool, status=404)
         assert res.isError and svc == [] and user == {}, tool
-        assert "API 토큰" in res.content[0].text and "등록" in res.content[0].text
+        assert "외부 연결" in res.content[0].text and "등록" in res.content[0].text
         assert row["mode"] == "refused" and row["note"] == "no-connection" and row["caller"] == "u@corp.com"
 
 
@@ -2052,3 +2066,79 @@ def test_토큰_거절이_아니면_다시_부르지_않는다(monkeypatch, err)
     """쓰기 도구를 두 번 부를 수 있으니 모양을 좁게 본다."""
     seen = _remint_kit(monkeypatch, [err, None])
     assert seen["calls"] == 1 and seen["force"] == [False] and seen["result"].isError
+
+
+# ── 위임 토큰 캐시는 토큰 제 수명을 넘기지 않는다(RA 위임 JWT 12시간 = 캐시 12시간, docs/sso-delegation) ──
+class _Clock:
+    """gateway 가 보는 `time` 만 갈아끼운다 — 전역 time.monotonic 을 바꾸면 이벤트 루프까지 흔들린다."""
+    def __init__(self):
+        import time as _t
+        self._t, self.now = _t, 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def __getattr__(self, n):
+        return getattr(self._t, n)
+
+
+def _mint_kit(monkeypatch, body_for):
+    """실제 `_user_pat`·`_mint_user_pat` 을 태우고 SSO 엔드포인트만 가짜로 둔다. 발급 횟수를 센다."""
+    n = {"mints": 0}
+
+    def handler(req):
+        n["mints"] += 1
+        return httpx.Response(200, json=body_for(n["mints"]))
+    _mock_http(monkeypatch, handler)
+    clk = _Clock()
+    monkeypatch.setattr(gw, "time", clk)
+    monkeypatch.setattr(gw, "_USER_PATS", {})
+    monkeypatch.setattr(gw, "_USER_PAT_LOCKS", {})
+    monkeypatch.setattr(gw, "USER_PAT_TTL_S", 43200)
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"reportarchive": {"sso_url": "http://ra/api/auth/sso", "secret": "s"}})
+    return n, clk
+
+
+def _pat_at(clk, t):
+    clk.now = 1000.0 + t
+    return gw._user_pat("reportarchive", "u@corp.com")
+
+
+def test_사용자_토큰_캐시는_expires_in_보다_먼저_버린다(monkeypatch):
+    # RA 봉투 모양 그대로 — expires_in 은 토큰과 같은 객체에 있다.
+    n, clk = _mint_kit(monkeypatch, lambda i: {"success": True, "data": {"access_token": f"t{i}", "expires_in": 600}})
+
+    async def run():
+        return [await _pat_at(clk, 0), await _pat_at(clk, 479), await _pat_at(clk, 481)]
+    assert asyncio.run(run()) == ["t1", "t1", "t2"], "만료 2분 전(600-120=480초)에 다시 받아야 한다"
+    assert n["mints"] == 2
+
+
+@pytest.mark.parametrize("body", [{"access_token": "t"}, {"access_token": "t", "expires_in": "600"},
+                                  {"access_token": "t", "expires_in": True}, {"access_token": "t", "expires_in": 0}])
+def test_expires_in_이_없거나_이상하면_캐시_수명대로(monkeypatch, body):
+    n, clk = _mint_kit(monkeypatch, lambda i: body)
+
+    async def run():
+        await _pat_at(clk, 0)
+        await _pat_at(clk, 43199)
+        await _pat_at(clk, 43201)
+    asyncio.run(run())
+    assert n["mints"] == 2
+
+
+def test_expires_in_이_캐시보다_길면_캐시_수명이_이긴다(monkeypatch):
+    """TestScope 위임 PAT 는 1일 — 권한 회수 반영은 캐시 수명(12시간)이 정한다."""
+    n, clk = _mint_kit(monkeypatch, lambda i: {"access_token": f"t{i}", "expires_in": 86400})
+
+    async def run():
+        return [await _pat_at(clk, 0), await _pat_at(clk, 43199), await _pat_at(clk, 43201)]
+    assert asyncio.run(run()) == ["t1", "t1", "t2"]
+
+
+def test_expires_in_이_2분도_안_남으면_캐시하지_않는다(monkeypatch):
+    n, clk = _mint_kit(monkeypatch, lambda i: {"access_token": f"t{i}", "expires_in": 60})
+
+    async def run():
+        return [await _pat_at(clk, 0), await _pat_at(clk, 0)]
+    assert asyncio.run(run()) == ["t1", "t2"]

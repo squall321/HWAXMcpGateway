@@ -127,7 +127,9 @@ def _aff_proof(secret: str, email: str, aff: str, now: float | None = None) -> s
     msg = f"v1|{email}|{aff}|{exp}"
     sig = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"v1.{exp}.{sig}"
-# 백엔드별 사용자 위임 설정 — {app_id: {sso_url, secret, client, base?}}.
+# 백엔드별 사용자 위임 설정 — {app_id: {sso_url, secret, client, base?, token_header?, strip_headers?}}.
+# strip_headers — 서비스 계정 설정에만 맞는 헤더를 사람별 호출에서 뺀다(RA 의 X-Workspace-Slug: 서비스 부서가 남으면
+# 남의 부서로 읽고 쓴다. 사람별 부서는 앱이 그 사람 기준으로 정한다 — docs/sso-delegation).
 # 값이 있는 백엔드만 사용자별 자격증명으로 호출한다(나머지는 종전대로 서비스 계정).
 PER_USER_SSO: dict[str, dict] = {k: v for k, v in (HEAX.get("per_user_sso") or {}).items()
                                  if isinstance(v, dict) and v.get("sso_url") and v.get("secret")}
@@ -148,10 +150,11 @@ def _delegation_app_id(backend_key: str) -> str:
 
 # 사용자 PAT 캐시 수명(초). PAT 자체는 장수명이라 만료 때문이 아니라 '권한 회수 반영'을 위한 값이다.
 # 짧게 잡으면 재발급이 잦아 백엔드에 폐기 토큰 행이 쌓인다(발급이 직전 것을 회수하는 구조).
+# 수명이 있는 토큰(RA 위임 JWT)은 응답의 expires_in 이 이 값보다 앞서면 그것을 따른다(_user_pat).
 USER_PAT_TTL_S = int(os.environ.get("GATEWAY_USER_PAT_TTL", "43200"))
 
 # ── 포털 등록 연결 토큰으로 위임하는 백엔드(사용자 발안 2026-09-03) ──────────────
-# 사용자가 해당 서비스(RA)에서 직접 발급받은 PAT 를 포털 API 토큰 페이지에 등록하면,
+# 사용자가 해당 서비스(RA)에서 직접 발급받은 PAT 를 포털 '개인 토큰 › 외부 연결' 에 등록하면,
 # 게이트웨이가 호출 시 포털 /internal/connections 에서 그 토큰을 읽어 그 사람 명의로
 # 부른다. 신원이 있는데 미등록이면 **거부하고 등록을 안내한다**(2026-09-29 사용자 결정 — 종전의
 # 서비스 계정 폴백은 실제 사람의 RA 토큰 행세였다). 서비스 계정은 신원 없는 내부 호출에만 쓴다.
@@ -1662,7 +1665,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         if not local and key in muted:
             entry["muted"] = True
             entry["muted_note"] = ("사용자가 포털에서 꺼 둔 앱이다 — 사용자가 이 앱을 쓰라고 한 경우에만 부른다. "
-                                   "계속 쓰려면 포털 'API 토큰' 페이지의 '허브에 보일 앱' 에서 켜면 된다.")
+                                   "계속 쓰려면 포털 '개인 토큰 › 허브에 보일 앱'(/tokens?tab=apps)에서 켜면 된다.")
         if want_app:
             entry["tools"] = [{"name": t.name, "description": (t.description or "")[:300]} for t in tools]
         elif include:
@@ -2446,8 +2449,8 @@ _USER_PATS: dict[tuple[str, str], tuple[str, float]] = {}
 _USER_PAT_LOCKS: dict[tuple[str, str], anyio.Lock] = {}
 
 
-async def _mint_user_pat(conf: dict, email: str) -> str:
-    """백엔드의 게이트웨이 SSO 로 이 사용자의 PAT 를 발급받는다. 실패 시 예외."""
+async def _mint_user_pat(conf: dict, email: str) -> tuple[str, object]:
+    """백엔드의 게이트웨이 SSO 로 이 사용자의 PAT 를 발급받는다 → (토큰, 토큰 옆의 expires_in). 실패 시 예외."""
     headers = {
         "X-Heax-Gateway-Secret": conf["secret"],
         "X-Heax-User-Email": email,
@@ -2464,20 +2467,21 @@ async def _mint_user_pat(conf: dict, email: str) -> str:
         raise RuntimeError(f"SSO {resp.status_code}: {resp.text[:200]}")
     data = resp.json()
 
+    # expires_in 은 토큰과 **같은 객체**에서 읽는다 — RA 는 {success, data:{access_token, expires_in}} 봉투다.
     def _find(o):
         if isinstance(o, dict):
             for k, v in o.items():
-                if k in ("access_token", "token") and isinstance(v, str):
-                    return v
+                if k in ("access_token", "token") and isinstance(v, str) and v:
+                    return v, o.get("expires_in")
                 got = _find(v)
                 if got:
                     return got
         return None
 
-    tok = _find(data)
-    if not tok:
+    got = _find(data)
+    if not got:
         raise RuntimeError(f"SSO 응답에 토큰 없음: {json.dumps(data, ensure_ascii=False)[:200]}")
-    return tok
+    return got
 
 
 async def _user_pat(app_id: str, email: str, *, force: bool = False) -> str:
@@ -2488,8 +2492,13 @@ async def _user_pat(app_id: str, email: str, *, force: bool = False) -> str:
         hit = _USER_PATS.get(key)
         if hit and not force and hit[1] > time.monotonic():
             return hit[0]
-        tok = await _mint_user_pat(PER_USER_SSO[app_id], email)
-        _USER_PATS[key] = (tok, time.monotonic() + USER_PAT_TTL_S)
+        tok, exp = await _mint_user_pat(PER_USER_SSO[app_id], email)
+        # 토큰 제 수명을 넘겨 쓰지 않는다 — RA 위임 JWT 는 12시간이라 캐시와 같다. 2분 먼저 버린다.
+        # 값이 없거나 이상하면(bool·문자열·0 이하) 종전대로 캐시 수명만 쓴다.
+        ttl = USER_PAT_TTL_S
+        if isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp > 0:
+            ttl = max(0, min(USER_PAT_TTL_S, exp - 120))
+        _USER_PATS[key] = (tok, time.monotonic() + ttl)
         log.info("user PAT minted for %s on %s", email, app_id)
         return tok
 
@@ -2708,6 +2717,10 @@ async def _call_tool(name: str, arguments: dict):
                 extra = {AFF_HEADER: quote(_aff, safe=""),
                          AFF_PROOF_HEADER: _aff_proof(PER_USER_SSO[app_id]["secret"],
                                                       email, _aff)}
+            _strip = PER_USER_SSO[app_id].get("strip_headers")
+            for h in _strip if isinstance(_strip, list) else []:   # 문자열이면 글자로 쪼개지 않는다
+                if isinstance(h, str) and h:
+                    extra[h] = None   # None 이면 _call_as_user 가 서비스 헤더를 지운다
             for attempt in (0, 1):   # 폐기된 캐시 토큰은 1회 재발급 후 재시도
                 try:
                     tok = await _user_pat(app_id, email, force=bool(attempt))
@@ -2756,8 +2769,8 @@ async def _call_tool(name: str, arguments: dict):
             else:
                 if conn is None:
                     note = "no-connection"
-                    why = ("Report Archive 토큰이 포털에 등록되어 있지 않습니다. 포털 'API 토큰' 페이지에서 "
-                           "Report Archive 토큰(rat_…)을 등록한 뒤 다시 시도하세요.")
+                    why = ("Report Archive 토큰이 포털에 등록되어 있지 않습니다. 포털 '개인 토큰 › 외부 연결'"
+                           "(/tokens?tab=connect)에서 Report Archive 토큰(rat_…)을 등록한 뒤 다시 시도하세요.")
             if conn is None:
                 _audit(name, backend_key, False, f"refused: {note}", round((time.monotonic() - t0) * 1000),
                        caller=email, mode="refused", note=note, corr=_request_corr())
@@ -2781,8 +2794,8 @@ async def _call_tool(name: str, arguments: dict):
                 return types.CallToolResult(
                     content=[types.TextContent(type="text", text=(
                         f"{backend_key}: {email} 의 등록 토큰으로 호출하지 못했습니다 "
-                        f"({exc!r}). 포털 API 토큰 페이지에서 Report Archive 토큰을 "
-                        "다시 등록하세요(만료·폐기 가능성)."))],
+                        f"({exc!r}). 포털 '개인 토큰 › 외부 연결'(/tokens?tab=connect)에서 Report Archive "
+                        "토큰을 다시 등록하세요(만료·폐기 가능성)."))],
                     isError=True,
                 )
             _audit(name, backend_key, not getattr(res, "isError", False), None,

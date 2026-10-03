@@ -159,7 +159,8 @@ USER_PAT_TTL_S = int(os.environ.get("GATEWAY_USER_PAT_TTL", "43200"))
 # 부른다. 신원이 있는데 미등록이면 **거부하고 등록을 안내한다**(2026-09-29 사용자 결정 — 종전의
 # 서비스 계정 폴백은 실제 사람의 RA 토큰 행세였다). 서비스 계정은 신원 없는 내부 호출에만 쓴다.
 # {backend_key: 포털 service 이름}. 인증은 GW_TOKEN 공유 시크릿(포털 쪽 동일 값 필요).
-# TestScope 는 다른 조직의 포털이라 ste 방식(우리가 발급) 대신 이 길로 붙인다 — 그쪽 코드는 손대지 않는다(2026-10-03).
+# TestScope 는 다른 조직의 포털이라 기본은 이 길이다 — 그쪽 코드는 손대지 않는다(2026-10-03). RA 처럼 per_user_sso 에 항목이
+# 있으면(provision 의 TESTSCOPE_SSO_SECRET) 그 위임이 먼저 탄다(HWAXPortal docs/sso-delegation D-16).
 PORTAL_CONN_BACKENDS: dict[str, str] = {"reportarchive": "reportarchive", "testscope": "testscope"}
 # 거부·실패 안내에 쓰는 이름과 토큰 모양, 사용자 부서를 실을 헤더(None 이면 싣지 않고 서비스 헤더도 건드리지 않는다).
 # TestScope 에는 부서 개념이 없다 — RA 의 X-Workspace-Slug 를 보내면 모르는 헤더를 남의 서비스에 흘린다.

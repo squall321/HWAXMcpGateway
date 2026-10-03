@@ -118,7 +118,8 @@ def test_프로비저너가_signalforge_주소를_이_판정으로_정한다():
 # ── REST 다리 사이트 확장 ────────────────────────────────────────────────────
 # provision-config.sh 의 파이썬 블록을 **그대로 떼어 돌린다.** 로직을 시험 안에 베껴 쓰면
 # 스크립트가 바뀌어도 시험은 계속 통과한다 — 그러면 시험이 아니라 사본이다.
-def _run_provision(tmp_path, env: dict) -> dict:
+def _run_provision(tmp_path, env: dict, log: list | None = None) -> dict:
+    """`log` 를 주면 그 실행의 표준출력(운영 로그에 남는 줄)을 덧붙인다."""
     body = re.search(r"python3 - <<'PYEOF'\n(.*?)\nPYEOF\n",
                      (HERE / "provision-config.sh").read_text(encoding="utf-8"), re.S).group(1)
     script = tmp_path / "block.py"
@@ -128,6 +129,8 @@ def _run_provision(tmp_path, env: dict) -> dict:
             "SIBLING_ROOT": str(tmp_path / "siblings"), "GW_TOKEN": "gw", **env}
     r = subprocess.run([sys.executable, str(script)], env=full, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+    if log is not None:
+        log.append(r.stdout)
     return json.loads(cfg.read_text(encoding="utf-8"))
 
 
@@ -219,7 +222,7 @@ def test_ste_위임은_heax_토큰이_없어도_생긴다(tmp_path):
     assert out["rest"]["ste"]["per_user"] == "ste", "REST 다리도 같은 위임으로 산다"
 
 
-# ── RA 사람별 위임(ste 방식) · TestScope 등록 토큰 방식(HWAXPortal docs/sso-delegation) ──────────
+# ── RA·TestScope 두 방식 — 비밀이 있으면 ste 방식 위임, 없으면 등록 토큰(HWAXPortal docs/sso-delegation) ──────────
 def test_RA_위임은_env_로_생기고_부서_헤더를_뺀다(tmp_path):
     out = _run_provision(tmp_path, {"RA_SSO_SECRET": "ra-s", "RA_SSO_URL": "http://10.0.0.3:3000/api/auth/sso"})
     assert out["heax_registry"]["per_user_sso"]["reportarchive"] == {
@@ -254,19 +257,40 @@ def test_RA_위임이_서비스_백엔드를_바꾸지_않는다(tmp_path):
     assert out["reportarchive"]["headers"] == {"Authorization": "Bearer rat_svc", "X-Workspace-Slug": "dev"}
 
 
-def test_TestScope_백엔드는_MCP_주소만으로_생기고_위임은_만들지_않는다(tmp_path):
-    """다른 조직의 포털이라 RA 처럼 사람이 등록한 토큰으로 부른다(2026-10-03) — 우리가 발급하는 위임은 없다."""
-    out = _run_provision(tmp_path, {"TESTSCOPE_MCP_URL": "http://testscope.example:8022/mcp"})
+def test_TestScope_백엔드는_MCP_주소만으로_생기고_비밀이_없으면_등록_토큰_방식이다(tmp_path):
+    """기본은 사람이 포털에 등록한 TestScope 토큰(PORTAL_CONN) — 위임 항목이 없어야 게이트웨이가 그 길로 간다."""
+    log: list = []
+    out = _run_provision(tmp_path, {"TESTSCOPE_MCP_URL": "http://testscope.example:8022/mcp"}, log)
     # 서비스 Authorization 이 없다 — TestScope tools/list 는 토큰 없이 되고, 사람별 호출은 등록 토큰을 싣는다.
     assert out["testscope"] == {"url": "http://testscope.example:8022/mcp", "transport": "streamable_http"}
     assert "testscope" not in (out.get("heax_registry") or {}).get("per_user_sso", {})
-    # 옛 손잡이가 env 에 남아 있어도 위임을 만들지 않는다 — 만들면 게이트웨이에서 등록 토큰보다 먼저 탄다.
+    assert "포털에 등록한 TestScope 토큰으로" in log[0]
+
+
+def test_TestScope_위임은_비밀과_주소로_생기고_백엔드_모양은_같다(tmp_path):
+    """RA 와 같은 ste 방식(2026-10-03) — 다만 부서 헤더가 없어 strip_headers 가 없다. 비밀은 로그에 안 나온다."""
+    base = _run_provision(tmp_path, {"TESTSCOPE_MCP_URL": "http://testscope.example:8022/mcp"})["testscope"]
     (tmp_path / "gateway_config.json").unlink()
+    log: list = []
     out = _run_provision(tmp_path, {"TESTSCOPE_MCP_URL": "http://testscope.example:8022/mcp",
-                                    "TESTSCOPE_SSO_SECRET": "ts-s",
-                                    "TESTSCOPE_SSO_URL": "http://testscope.example:8020/api/auth/sso"})
+                                    "TESTSCOPE_SSO_SECRET": "ts-secret-xyz",
+                                    "TESTSCOPE_SSO_URL": "http://testscope.example:8020/api/auth/sso"}, log)
+    assert out["heax_registry"]["per_user_sso"]["testscope"] == {
+        "sso_url": "http://testscope.example:8020/api/auth/sso", "secret": "ts-secret-xyz", "client": "gateway"}
+    assert out["testscope"] == base, "백엔드는 방식과 무관하다 — 사람별 자격만 바뀐다"
+    assert "testscope" not in out["rest"], "REST 다리는 이번 범위가 아니다"
+    assert "TestScope 사람별 위임 — http://testscope.example:8020/api/auth/sso" in log[0]
+    assert "위임 토큰으로" in log[0] and "ts-secret-xyz" not in log[0]
+
+
+def test_TestScope_위임은_주소를_모르면_만들지_않고_그렇다고_말한다(tmp_path):
+    """기본 호스트가 없다 — 지어내면 없는 서비스에 비밀을 보낸다. 생략은 로그에 남긴다(조용히 빠지지 않게)."""
+    log: list = []
+    out = _run_provision(tmp_path, {"TESTSCOPE_SSO_SECRET": "ts-secret-xyz",
+                                    "TESTSCOPE_MCP_URL": "http://testscope.example:8022/mcp"}, log)
     assert "testscope" not in (out.get("heax_registry") or {}).get("per_user_sso", {})
-    assert out["testscope"]["url"] == "http://testscope.example:8022/mcp"
+    assert "TESTSCOPE_SSO_SECRET 은 있는데 주소가 없다" in log[0] and "ts-secret-xyz" not in log[0]
+    assert out["testscope"]["url"] == "http://testscope.example:8022/mcp", "백엔드는 등록 토큰 방식으로 그대로 선다"
 
 
 def test_TestScope_는_주소를_모르면_만들지_않는다(tmp_path):
@@ -293,12 +317,45 @@ def test_TestScope_는_env_가_없는_실행에도_이어받는다(tmp_path):
     assert out["testscope"]["allowed_groups"] == ["plat:testscope"]
 
 
-def test_직전_config_의_TestScope_위임은_조용히_지우지_않는다(tmp_path):
-    """만들지는 않지만 사람이 넣어 둔 것일 수 있다 — 지우는 대신 실행 로그에 경고한다."""
+def test_TestScope_위임은_비밀이_없는_실행에도_지워지지_않는다(tmp_path):
+    """RA 와 같은 규칙 — 비밀을 못 읽은 실행이 멀쩡하던 위임을 끄면 TestScope 호출이 조용히 등록 토큰 방식으로 돌아간다."""
     prev = {"sso_url": "http://testscope.example:8020/api/auth/sso", "secret": "old", "client": "gateway"}
     (tmp_path / "gateway_config.json.bak").write_text(json.dumps({
         "heax_registry": {"per_user_sso": {"testscope": prev}}}), encoding="utf-8")
     assert _run_provision(tmp_path, {})["heax_registry"]["per_user_sso"]["testscope"] == prev
+    # 비밀만 새로 주면 주소는 직전 값을 지킨다
+    got = _run_provision(tmp_path, {"TESTSCOPE_SSO_SECRET": "new"})["heax_registry"]["per_user_sso"]["testscope"]
+    assert got == {**prev, "secret": "new"}
+
+
+def test_update_all_이_끄라고_하면_그_위임만_지운다(tmp_path):
+    """되돌리기 — infra/.env 에서 비밀을 비우면 update-all 이 PER_USER_SSO_OFF 로 넘긴다. 이어받기는 비밀을 못 읽은 실행용이라
+    이 신호 없이는 위임이 남아 포털은 '토큰 등록' 인데 게이트웨이만 위임으로 부르고 거부했다."""
+    ste = {"sso_url": "http://127.0.0.1:15810/api/auth/sso", "secret": "s2", "client": "gateway"}
+    ra = {"sso_url": "http://ra.example:3000/api/auth/sso", "secret": "ra-old", "client": "gateway",
+          "strip_headers": ["X-Workspace-Slug"]}
+    ts = {"sso_url": "http://testscope.example:8020/api/auth/sso", "secret": "ts-old", "client": "gateway"}
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({
+        "heax_registry": {"per_user_sso": {"ste": ste, "reportarchive": ra, "testscope": ts}}}), encoding="utf-8")
+    log: list = []
+    pu_ = _run_provision(tmp_path, {"PER_USER_SSO_OFF": "testscope"}, log)["heax_registry"]["per_user_sso"]
+    assert pu_ == {"ste": ste, "reportarchive": ra}
+    assert "TestScope 사람별 위임 끔" in log[0] and "ts-old" not in log[0]
+    # 둘 다 끄면 둘 다 — 다른 서비스(ste)는 이 손잡이로 지워지지 않는다
+    pu_ = _run_provision(tmp_path, {"PER_USER_SSO_OFF": "reportarchive testscope ste"})["heax_registry"]["per_user_sso"]
+    assert pu_ == {"ste": ste}
+    # 비밀이 같이 오면 끄지 않는다(켜는 쪽이 이긴다)
+    pu_ = _run_provision(tmp_path, {"PER_USER_SSO_OFF": "reportarchive", "RA_SSO_SECRET": "ra-new"}
+                         )["heax_registry"]["per_user_sso"]
+    assert pu_["reportarchive"] == {**ra, "secret": "ra-new"}
+
+
+def test_마지막_위임을_끄면_per_user_sso_가_비어_남지_않는다(tmp_path):
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({"heax_registry": {"per_user_sso": {
+        "reportarchive": {"sso_url": "http://ra.example:3000/api/auth/sso", "secret": "x", "client": "gateway"}}}}),
+        encoding="utf-8")
+    out = _run_provision(tmp_path, {"PER_USER_SSO_OFF": "reportarchive"})
+    assert "reportarchive" not in ((out.get("heax_registry") or {}).get("per_user_sso") or {})
 
 
 def test_RA_위임과_TestScope_가_ste_hwax_risk_를_건드리지_않는다(tmp_path):
@@ -306,10 +363,11 @@ def test_RA_위임과_TestScope_가_ste_hwax_risk_를_건드리지_않는다(tmp
            "HWAXRISK_SSO_SECRET": "hr", "HEAX_MCP_TOKEN": "heax-svc"}
     base = _run_provision(tmp_path, env)["heax_registry"]["per_user_sso"]
     (tmp_path / "gateway_config.json").unlink()
-    out = _run_provision(tmp_path, {**env, "RA_SSO_SECRET": "ra-s",
+    out = _run_provision(tmp_path, {**env, "RA_SSO_SECRET": "ra-s", "TESTSCOPE_SSO_SECRET": "ts-s",
+                                    "TESTSCOPE_SSO_URL": "http://testscope.example:8020/api/auth/sso",
                                     "TESTSCOPE_MCP_URL": "http://testscope.example:8022/mcp"})
     pu_ = out["heax_registry"]["per_user_sso"]
     assert pu_["ste"] == base["ste"] and pu_["hwax_risk"] == base["hwax_risk"]
-    assert set(pu_) == {"ste", "hwax_risk", "reportarchive"}
+    assert set(pu_) == {"ste", "hwax_risk", "reportarchive", "testscope"}
     assert out["rest"]["ste"]["per_user"] == "ste"
     assert "reportarchive" not in out["rest"] and "testscope" not in out["rest"], "REST 다리는 이번 범위가 아니다"

@@ -1735,6 +1735,88 @@ def test_신원_없는_TestScope_호출은_서비스_세션으로_간다(monkeyp
     assert row["mode"] == "service" and row["note"] == "no-identity"
 
 
+# ── TestScope 도 RA 처럼 두 방식 — per_user_sso.testscope 가 있으면 ste 방식 위임이 등록 토큰보다 먼저(2026-10-03) ──
+_TS_SSO = {"sso_url": "http://testscope.example/api/auth/sso", "secret": "ts-s", "client": "gateway"}
+
+
+def _ts_kit(monkeypatch, per_user_sso, sso_status=200):
+    """testscope 백엔드 하나로 `_call_tool` 을 태운다. 발급(`_user_pat`·`_mint_user_pat`)과 포털 연결 조회
+    (`_portal_connection`)는 진짜이고 둘이 같은 가짜 HTTP 를 지나므로, 어느 길을 탔는지 요청 기록으로 본다."""
+    import asyncio
+    http = []
+
+    def handler(req):
+        http.append((req.method, str(req.url), dict(req.headers)))
+        if req.url.path == "/api/auth/sso":
+            return httpx.Response(sso_status, json={"access_token": "tsc_pat_minted", "expires_in": 86400})
+        return httpx.Response(200, json={"token": "tsc_pat_registered", "workspace": "dept"})
+    _mock_http(monkeypatch, handler)
+    b = _CallB(["list_equipment"])
+    b.headers = {"X-Keep": "1"}
+    user = {}
+
+    class _Sess:
+        async def initialize(self): return None
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            return types.CallToolResult(content=[types.TextContent(type="text", text="{}")], isError=False)
+
+    def fake_stream(url, headers=None):
+        user["headers"] = dict(headers or {})
+        return _StubCM((None, None, "sid"))
+
+    async def fake_access(email, base_groups, **_kw):
+        return {"keys": [], "affiliation": ""}
+    monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    monkeypatch.setattr(gw, "PER_USER_SSO", per_user_sso)
+    monkeypatch.setattr(gw, "_USER_PATS", {})
+    monkeypatch.setattr(gw, "_USER_PAT_LOCKS", {})
+    gw._RESP_CACHE.clear()
+    gw._CONN_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {"testscope": b})
+    monkeypatch.setattr(gw, "route", {"list_equipment": ("testscope", "list_equipment")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    res = asyncio.run(gw._call_tool("list_equipment", {}))
+    return res, b.session.calls, user, http, _rows()[-1]
+
+
+def test_TestScope_위임이_있으면_발급한_토큰으로_가고_등록_토큰은_묻지_않는다(monkeypatch):
+    res, svc, user, http, row = _ts_kit(monkeypatch, {"testscope": dict(_TS_SSO)})
+    assert not res.isError and svc == []
+    assert user["headers"]["Authorization"] == "Bearer tsc_pat_minted"
+    assert user["headers"]["X-Keep"] == "1", "strip_headers 가 없으니 서비스 헤더는 그대로"
+    assert not any(k.lower() == "x-workspace-slug" for k in user["headers"])
+    assert [(m, u) for m, u, _h in http] == [("POST", "http://testscope.example/api/auth/sso")], \
+        "포털 /internal/connections 를 묻지 않는다 — 위임이 먼저다"
+    h = http[0][2]
+    assert (h["x-heax-gateway-secret"], h["x-heax-user-email"], h["x-heax-client"]) == ("ts-s", "u@corp.com", "gateway")
+    assert row["mode"] == "as-user-pat" and row["caller"] == "u@corp.com"
+
+
+def test_TestScope_위임이_없으면_같은_백엔드가_등록_토큰으로_간다(monkeypatch):
+    """위 시험과 같은 장치에서 항목만 뺀다 — 방식을 가르는 것은 설정 한 줄이다."""
+    res, svc, user, http, row = _ts_kit(monkeypatch, {})
+    assert not res.isError and svc == [] and user["headers"]["Authorization"] == "Bearer tsc_pat_registered"
+    assert [(m, u) for m, u, _h in http] == [("GET", "http://portal/internal/connections/testscope?email=u%40corp.com")]
+    assert row["mode"] == "as-conn"
+
+
+def test_TestScope_가_발급을_못_하면_거부하고_등록_토큰으로_돌아가지_않는다(monkeypatch):
+    """비밀을 자동으로 만들지 않는 이유다 — TestScope 에 /api/auth/sso 가 생기기 전에 위임이 켜지면 사람별 호출이 전부 이렇게 된다."""
+    res, svc, user, http, row = _ts_kit(monkeypatch, {"testscope": dict(_TS_SSO)}, sso_status=404)
+    assert res.isError and svc == [] and user == {}
+    assert "자격증명으로 호출하지 못했습니다" in res.content[0].text
+    assert [u for _m, u, _h in http] == ["http://testscope.example/api/auth/sso"] * 2, "1회 재발급 뒤 멈추고 포털은 묻지 않는다"
+    assert row["ok"] is False
+
+
 
 # ── 허브에서 끈 앱(개인 MCP 시야에서 숨김 — HWAXPortal docs/mcp-app-toggle) ─────────────────────────
 def _gate(monkeypatch, portal_resp):

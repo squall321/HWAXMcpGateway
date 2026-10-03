@@ -28,11 +28,13 @@
 #      값을 두지 않아 가짜 DOWN 이 뜨지 않는다(ODB_HUB_TOKEN 이 하는 역할과 같다).
 #      주의 — 게이트웨이는 "url" 키가 있는 항목만 백엔드로 읽는다(gateway.py:42). mcp-remote 의
 #      {"command":"npx","args":[...]} 형식을 넣으면 에러 없이 조용히 무시되므로 url 형식으로 쓴다.
-#   8) 사람별 위임(ste 방식, heax_registry.per_user_sso): STE_SSO_SECRET · RA_SSO_SECRET(+RA_SSO_URL).
-#      비밀이 없는 실행은 직전 값을 이어받는다.
+#   8) 사람별 위임(ste 방식, heax_registry.per_user_sso): STE_SSO_SECRET · RA_SSO_SECRET(+RA_SSO_URL) ·
+#      TESTSCOPE_SSO_SECRET(+TESTSCOPE_SSO_URL, 기본 주소 없음). 비밀이 없는 실행은 직전 값을 이어받는다 —
+#      끄는 것은 PER_USER_SSO_OFF(update-all 이 infra/.env 의 빈 RA·TestScope 비밀을 보고 넘긴다)로만.
 #   9) TestScope: TESTSCOPE_MCP_URL(> 직전 config 주소)이 있으면 testscope 백엔드(서비스 토큰 없음).
-#      다른 조직의 포털이라 ste 방식이 아니라 RA 처럼 사람이 포털 '개인 토큰 › 외부 연결' 에 등록한
-#      TestScope 토큰으로 부른다(게이트웨이 PORTAL_CONN_BACKENDS). 기본 호스트가 없어 주소를 모르면 만들지 않는다.
+#      사람별 호출은 RA 처럼 두 방식 중 하나다 — 기본은 사람이 포털 '개인 토큰 › 외부 연결' 에 등록한
+#      TestScope 토큰(게이트웨이 PORTAL_CONN_BACKENDS), TESTSCOPE_SSO_SECRET 이 있으면 8)의 위임(게이트웨이에서 먼저 탄다).
+#      기본 호스트가 없어 주소를 모르면 만들지 않는다.
 #
 # 사용:  bash provision-config.sh            # 이미 config 있으면 건드리지 않음
 #        bash provision-config.sh --force    # 재생성(기존은 .bak 백업)
@@ -599,23 +601,40 @@ if e.get("RA_SSO_SECRET"):
         "client": "gateway",
         "strip_headers": ["X-Workspace-Slug"]}
     print(f"  ✓ RA 사람별 위임 — {per_user['reportarchive']['sso_url']}")
-if "testscope" in per_user:
-    # 만들지는 않지만 지우지도 않는다(사람이 넣었을 수 있다). 남아 있으면 게이트웨이에서 등록 토큰보다 먼저 탄다.
-    print("  ⚠ per_user_sso.testscope 가 직전 config 에 있다 — TestScope 는 이제 포털 등록 토큰 방식이라 "
-          "이 항목이 있으면 그쪽이 먼저 쓰인다. 의도가 아니면 손으로 지우라")
+# TestScope 도 RA 처럼 두 방식을 고른다 — 비밀이 없으면 등록 토큰(PORTAL_CONN), 있으면 이 위임이 먼저 탄다.
+# 비밀은 사람이 넣는다 — TestScope 가 /api/auth/sso 를 갖추기 전에 생기면 그 순간 사람별 TestScope 호출이 전부 거부된다.
+# 기본 호스트는 없다(다른 조직의 서버라 박스마다 다르다) — env > 직전 config, 둘 다 없으면 만들지 않는다.
+# 부서 헤더가 없어 strip_headers 는 쓰지 않는다. 비밀이 없는 실행이 있던 항목을 지우지 않는 것은 RA 와 같다.
+if e.get("TESTSCOPE_SSO_SECRET"):
+    _ts_sso = e.get("TESTSCOPE_SSO_URL") or (per_user.get("testscope") or {}).get("sso_url")
+    if _ts_sso:
+        per_user["testscope"] = {"sso_url": _ts_sso, "secret": e["TESTSCOPE_SSO_SECRET"], "client": "gateway"}
+        print(f"  ✓ TestScope 사람별 위임 — {_ts_sso}")
+    else:
+        print("  ⚠ TESTSCOPE_SSO_SECRET 은 있는데 주소가 없다(TESTSCOPE_SSO_URL·직전 config 둘 다 없음) — "
+              "TestScope 위임 생략, 사람별 호출은 등록 토큰 방식 그대로")
+# 끄기 — 위의 '비밀이 없는 실행은 이어받는다' 는 비밀을 **못 읽은** 실행(손으로 돌린 --force 등)을 위한 것이다. 그래서
+# infra/.env 에서 비밀을 비워도 위임이 남아, 포털 화면은 '토큰 등록' 인데 게이트웨이만 위임으로 부르고 거부했다(되돌리기가 안 됐다).
+# update-all 이 infra/.env 를 읽어 비밀이 빈 서비스를 PER_USER_SSO_OFF 로 넘기면 그 항목만 지운다. 비밀이 같이 왔으면 끄지 않고,
+# 받는 이름은 이 둘뿐이다(ste·hwax_risk 등은 비밀 출처가 다른 리포라 이 손잡이로 끄지 않는다).
+_SSO_OFF_KEYS = {"reportarchive": ("RA_SSO_SECRET", "RA"), "testscope": ("TESTSCOPE_SSO_SECRET", "TestScope")}
+for _k in (e.get("PER_USER_SSO_OFF") or "").split():
+    if _k in _SSO_OFF_KEYS and not e.get(_SSO_OFF_KEYS[_k][0]) and per_user.pop(_k, None):
+        print(f"  · {_SSO_OFF_KEYS[_k][1]} 사람별 위임 끔({_SSO_OFF_KEYS[_k][0]} 비어 있음) — 등록 토큰 방식으로")
 if per_user:
     cfg.setdefault("heax_registry", {})["per_user_sso"] = per_user
 
-# TestScope MCP 백엔드 — 다른 조직의 포털(제 주소로 노출)이라 ste 방식으로 우리가 토큰을 발급하지 않는다.
-# RA 처럼 사람이 그쪽에서 받은 tsc_pat_ 를 포털 '개인 토큰 › 외부 연결' 에 등록하고, 게이트웨이가 그 토큰으로
-# 부른다(PORTAL_CONN_BACKENDS). 서비스 Authorization 은 없다 — tools/list 는 토큰 없이 된다.
+# TestScope MCP 백엔드 — 모양은 두 방식이 같다. 사람별 호출의 자격만 다르다 — 기본은 사람이 그쪽에서 받은 tsc_pat_ 를
+# 포털 '개인 토큰 › 외부 연결' 에 등록한 것(PORTAL_CONN_BACKENDS), 위 per_user_sso.testscope 가 있으면 그 위임 토큰.
+# 서비스 Authorization 은 없다 — tools/list 는 토큰 없이 된다.
 # 기본 호스트가 없다 — env > 직전 config 주소, 둘 다 없으면 만들지 않는다(127.0.0.1 로 지어내면 없는 서비스를 가리킨다).
 # 손으로 붙여 둔 필드(allowed_groups 등)는 이어받는다.
 _ts_prev = _prev_entry("testscope")
 _ts_url = e.get("TESTSCOPE_MCP_URL") or (_ts_prev or {}).get("url")
 if _ts_url:
     cfg["testscope"] = {**(_ts_prev or {}), "url": _ts_url, "transport": "streamable_http"}
-    print(f"  ✓ testscope — {_ts_url}(사람별 호출은 포털에 등록한 TestScope 토큰으로)")
+    _ts_how = "위임 토큰으로(per_user_sso)" if "testscope" in per_user else "포털에 등록한 TestScope 토큰으로"
+    print(f"  ✓ testscope — {_ts_url}(사람별 호출은 {_ts_how})")
 
 # ── REST 다리 사이트 확장 ────────────────────────────────────────────────────
 # per_user 블록 **뒤에** 둔다 — ste 의 REST base 는 그 sso_url 이 가리키는 곳이 정본이라

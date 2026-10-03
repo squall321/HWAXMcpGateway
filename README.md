@@ -48,13 +48,15 @@ MCP fan-out과 같은 패턴("호출자 토큰 1개 → 백엔드별 네이티�
 게이트웨이가 서비스의 `POST /api/auth/sso` 에 공유 비밀(`X-Heax-Gateway-Secret`)과 호출자 이메일을 보내 **그 사람 토큰**을 받아 그 명의로 부른다. 토큰은 12시간 캐시하되 응답의 `expires_in` 이 더 짧으면 그보다 2분 먼저 버린다. 백엔드가 401 이면 한 번 다시 받고, 받지 못하면 거부한다(서비스 계정으로 강등하지 않는다). 포털은 토큰을 쥐지 않는다.
 
 - 항목 `{sso_url, secret, client, strip_headers?}` — `strip_headers` 는 서비스 계정 설정에만 맞는 헤더를 사람별 호출에서 뺀다(RA 의 `X-Workspace-Slug`: 서비스 부서가 남으면 남의 부서로 읽고 쓴다).
-- `per_user_sso` 가 포털 등록 연결(`PORTAL_CONN_BACKENDS`, 포털 '개인 토큰 › 외부 연결' 의 RA 토큰)보다 **먼저**다 — RA 에 위임이 켜지면 등록 토큰은 쓰지 않는다.
+- `per_user_sso` 가 포털 등록 연결(`PORTAL_CONN_BACKENDS`, 포털 '개인 토큰 › 외부 연결' 의 RA·TestScope 토큰)보다 **먼저**다 — 위임이 켜진 서비스는 등록 토큰을 쓰지 않는다.
 - `provision-config.sh` 가 env 로 만든다. 순서는 env > 직전 config > 기본값이고, 비밀이 없는 실행은 직전 항목을 지우지 않고 이어받는다. 운영에서는 update-all 이 포털 `infra/.env` 에서 읽어 넘긴다(HWAXPortal `docs/sso-delegation`).
 
 | env | 만드는 것 |
 |---|---|
 | `STE_SSO_SECRET` · `STE_SSO_URL` | `per_user_sso.ste` |
 | `RA_SSO_SECRET` · `RA_SSO_URL`(기본 `http://127.0.0.1:3000/api/auth/sso`) | `per_user_sso.reportarchive` + `strip_headers: ["X-Workspace-Slug"]`. 서비스 백엔드(`RAT_TOKEN`)는 그대로 — 도구 목록은 그 세션으로 모은다 |
+| `TESTSCOPE_SSO_SECRET` · `TESTSCOPE_SSO_URL`(기본 없음 — 운영에서는 포털이 `TESTSCOPE_BASE_URL` 에서 유도해 넘긴다) | `per_user_sso.testscope`(부서 헤더가 없어 `strip_headers` 없음). 주소를 모르면 만들지 않고 생략을 로그에 남긴다 |
+| `PER_USER_SSO_OFF`(공백 구분 `reportarchive`·`testscope` — HWAXPortal update-all 이 infra/.env 의 빈 비밀을 보고 넘긴다) | 그 위임 항목을 지운다(토큰 등록으로 되돌리기). 비밀 없는 손 실행은 직전 값을 이어받으므로 끄는 길은 이것뿐이다. 비밀이 같이 오면 끄지 않는다 |
 
 ## 등록 토큰 방식 — `PORTAL_CONN_BACKENDS`(RA·TestScope)
 사람이 그 서비스에서 직접 받은 개인 토큰을 포털 '개인 토큰 › 외부 연결'(`/tokens?tab=connect`)에 등록하면, 게이트웨이가 호출 때 포털 `GET /internal/connections/<service>?email=`(GW_TOKEN)로 그 토큰을 읽어 그 사람 명의로 부른다. 신원이 있는데 등록이 없거나 포털에 묻지 못하면 **거부**하고 등록을 안내한다(서비스 계정으로 대신 부르지 않는다). 신원 없는 내부 호출만 서비스 세션으로 간다.
@@ -64,7 +66,7 @@ MCP fan-out과 같은 패턴("호출자 토큰 1개 → 백엔드별 네이티�
 | `reportarchive` | `rat_…` | 등록한 워크스페이스를 `X-Workspace-Slug` 로(비면 서비스 값을 지운다) |
 | `testscope` | `tsc_pat_…`(TestScope 에서 발급, `/api/auth/me` 를 부르려면 `read` 범위) | 싣지 않는다 |
 
-TestScope 는 다른 조직의 포털(제 주소로 노출)이라 ste 방식(우리가 발급)이 아니라 이 길로 붙인다 — TestScope 코드는 손대지 않는다. 백엔드는 `provision-config.sh` 가 `TESTSCOPE_MCP_URL`(> 직전 config 주소)로 만든다(`streamable_http`, 서비스 `Authorization` 없음 — tools/list 는 토큰 없이 된다). 기본 호스트가 없어 주소를 모르면 만들지 않는다. `per_user_sso.testscope` 는 만들지 않는다 — 있으면 위 우선순위대로 그쪽이 먼저 탄다.
+TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 방식 중 하나로 붙는다 — TestScope 코드는 여기서 손대지 않는다. **기본(`TESTSCOPE_SSO_SECRET` 없음)** 은 이 등록 토큰 길이고, **비밀이 있으면** `per_user_sso.testscope` 가 생겨 위 우선순위대로 그쪽이 먼저 탄다(등록할 것 없음). 위임은 TestScope 가 `POST /api/auth/sso`(위 계약)를 갖춘 뒤에만 켠다 — 그 전에 비밀이 생기면 발급이 실패해 신원 있는 TestScope 호출이 전부 거부되고 등록 토큰으로 돌아가지 않는다. 그래서 비밀은 자동으로 만들지 않고 사람이 넣는다. 백엔드는 두 방식이 같다 — `provision-config.sh` 가 `TESTSCOPE_MCP_URL`(> 직전 config 주소)로 만든다(`streamable_http`, 서비스 `Authorization` 없음 — tools/list 는 토큰 없이 된다). 기본 호스트가 없어 주소를 모르면 만들지 않는다.
 
 ## 실행
 ```bash

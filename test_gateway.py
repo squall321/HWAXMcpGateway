@@ -447,18 +447,18 @@ def test_PAT_호출자는_포털의_지금_권한을_쓴다(monkeypatch):
         calls.append(dict(req.url.params))
         return httpx.Response(200, json={"keys": ["feat:chat"]})
     _mock_http(monkeypatch, ok)
-    assert asyncio.run(gw._portal_entitlements("u@corp.com", ["mes-user"])) == ["feat:chat"]
-    assert asyncio.run(gw._portal_entitlements("u@corp.com", ["mes-user"])) == ["feat:chat"]
+    assert asyncio.run(gw._portal_access("u@corp.com", ["mes-user"]))["keys"] == ["feat:chat"]
+    assert asyncio.run(gw._portal_access("u@corp.com", ["mes-user"]))["keys"] == ["feat:chat"]
     assert len(calls) == 1 and calls[0] == {"email": "u@corp.com", "groups": "mes-user"}, "캐시"
 
     gw._ENT_CACHE.clear()
     def boom(req):
         raise httpx.ConnectError("portal down")
     _mock_http(monkeypatch, boom)
-    assert asyncio.run(gw._portal_entitlements("u@corp.com", ["mes-user"])) == ["feat:chat"], \
+    assert asyncio.run(gw._portal_access("u@corp.com", ["mes-user"]))["keys"] == ["feat:chat"], \
         "포털이 죽으면 직전 값"
     _mock_http(monkeypatch, lambda req: httpx.Response(404))
-    assert asyncio.run(gw._portal_entitlements("new@corp.com", [])) is None, \
+    assert asyncio.run(gw._portal_access("new@corp.com", [])) is None, \
         "권한 기능 이전 포털 — PAT 값 그대로 쓰게 None"
     assert gw._is_synthetic("plat:stepforge") and not gw._is_synthetic("portal-admin")
 
@@ -573,7 +573,7 @@ def test_거부_사유가_다르면_안내도_다르다(monkeypatch):
     assert gw._backend_allowed("ste", ["plat:smarttwin"]) and not gw._backend_allowed("ste", ["feat:chat"])
 
     # 4) REST 프록시 403 도 같은 사유 문장을 낸다(다섯 번째 소비처).
-    monkeypatch.setattr(gw, "_portal_entitlements", _noop_async(None))
+    monkeypatch.setattr(gw, "_portal_access", _noop_async(None))
     monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", False)
     monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
     txt = asyncio.run(gw._rest_deny_text("ste", ["feat:chat"], "u@x.test"))
@@ -830,7 +830,7 @@ def test_rest_프록시가_MCP_와_같은_규칙을_본다(monkeypatch):
 
     async def _no_portal(email, base):
         return None
-    monkeypatch.setattr(gw, "_portal_entitlements", _no_portal)
+    monkeypatch.setattr(gw, "_portal_access", _no_portal)
 
     run = asyncio.get_event_loop_policy().new_event_loop().run_until_complete
     assert run(gw._rest_allowed("ai-data-hub", ["plat:aidatahub"], "")) is True
@@ -954,7 +954,7 @@ def test_소속은_권한과_같은_조회에서_온다(monkeypatch):
         return httpx.Response(200, json={"keys": ["feat:chat"], "affiliation": "CAEG",
                                          "affiliation_label": "CAE그룹"})
     _mock_http(monkeypatch, ok)
-    assert asyncio.run(gw._portal_entitlements("u@corp.com", ["mes-user"])) == ["feat:chat"]
+    assert asyncio.run(gw._portal_access("u@corp.com", ["mes-user"]))["keys"] == ["feat:chat"]
     assert asyncio.run(gw._portal_affiliation("u@corp.com", ["mes-user"])) == "CAEG"
     assert len(calls) == 1, f"같은 조회를 두 번 했다: {calls}"
 
@@ -962,7 +962,7 @@ def test_소속은_권한과_같은_조회에서_온다(monkeypatch):
     gw._ENT_CACHE.clear(); gw._ENT_LAST.clear()
     _mock_http(monkeypatch, lambda req: httpx.Response(404))
     assert asyncio.run(gw._portal_affiliation("new@corp.com", [])) == ""
-    assert asyncio.run(gw._portal_entitlements("new@corp.com", [])) is None
+    assert asyncio.run(gw._portal_access("new@corp.com", [])) is None
 
     # 소속 칸이 없는 응답(구 포털)도 빈 값이지 예외가 아니다
     gw._ENT_CACHE.clear(); gw._ENT_LAST.clear()
@@ -1226,7 +1226,6 @@ def test_목적_헤더는_검증된_PAT_에서만_나온다(monkeypatch):
 
     async def no_portal(email, base, **_kw):
         return None
-    monkeypatch.setattr(gw, "_portal_entitlements", no_portal)
     monkeypatch.setattr(gw, "_portal_access", no_portal)      # PAT 분기가 부르는 쪽 — 안 막으면 dev 포털로 실제 요청이 간다
     monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
 
@@ -2722,3 +2721,76 @@ def test_소속_조회는_게이트웨이가_붙인_관리자_표지를_로그�
     seen = _per_user_kit(monkeypatch, {"keys": ["plat:dynaforge"], "affiliation": "CAEG", "is_admin": True},
                          groups=("mes-user", "plat:dynaforge", "portal-admin"))
     assert seen["lookups"] == [(["mes-user"], False)]
+
+
+# ── REST 프록시(/api/<site>/…)도 같은 규칙이다 — 두 경로가 그룹을 따로 계산한다(검토 2026-10-07) ─────────────
+def _rest_gate(monkeypatch, portal_resp, token_groups, site="sec"):
+    """REST 프록시 라우트를 실제로 태운다 — `main()` 과 같은 배선이고 가짜는 서명 검증·폐기 목록·상류 전송·포털 응답뿐이다.
+    돌려주는 것 — 응답 · 상류에 닿은 주소 · 포털에 물은 로그인 그룹."""
+    from starlette.requests import Request
+    from rest_proxy import RestProxy
+    shots, asked = [], []
+
+    async def fake_access(email, base, **_kw):
+        asked.append(list(base))
+        return portal_resp
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    p = RestProxy({site: {"base": "http://upstream.invalid"}}, {"audience_ok": [site]}, gw._audit,
+                  allow=gw._rest_allowed, mint=gw._rest_mint, deny_text=gw._rest_deny_text)
+    p._verify = lambda token, s: {"sub": "S-1", "email": "u@corp.com", "jti": "j", "groups": list(token_groups)}
+    p._revoked_set = _noop_async(set())
+
+    async def fake_send(req, stream=False):
+        shots.append(str(req.url))
+        return httpx.Response(200, content=b"ok", request=req)
+    monkeypatch.setattr(p._client, "send", fake_send)
+    resp = asyncio.run(p.handle(Request({
+        "type": "http", "method": "GET", "path": f"/api/{site}/x", "headers": [(b"authorization", b"Bearer me")],
+        "query_string": b"", "path_params": {"site": site, "path": "x"}, "client": ("203.0.113.5", 0)})))
+    return resp, shots, asked
+
+
+def _admin_only_site(monkeypatch):
+    monkeypatch.setattr(gw, "POLICY", {"sec": [gw.ADMIN_GROUP]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+
+
+@pytest.mark.parametrize("resp", [{"keys": ["feat:chat"], "is_admin": False}, {"keys": ["feat:chat"]}, None,
+                                  {"keys": ["feat:chat"], "is_admin": "true"}, {"keys": ["feat:chat"], "is_admin": 1},
+                                  {"keys": ["feat:chat"], "is_admin": None}])
+def test_REST_프록시는_토큰에_박힌_관리자_표지로_열리지_않는다(monkeypatch, resp):
+    """`/api/<site>/` 는 인증 미들웨어의 PAT 분기를 타지 않고 `_rest_groups` 로 따로 계산한다. 거기서는 표지를 떼지 않아,
+    관리자에서 내려온 사람의 옛 PAT 가 `/mcp` 에서는 막히는 백엔드를 이 길로는 200 으로 읽었다(사본 재현)."""
+    _admin_only_site(monkeypatch)
+    got, shots, asked = _rest_gate(monkeypatch, resp, _OLD_ADMIN_TOKEN)
+    assert got.status_code == 403 and shots == [], "해제된 관리자의 옛 토큰으로 상류까지 갔다"
+    assert "그룹 제한" in json.loads(got.body)["detail"], "403 의 사유도 같은 그룹으로 말해야 한다(_rest_deny_text)"
+    assert asked[0] == ["mes-user", "portal-admin"], \
+        "포털에는 토큰의 로그인 그룹을 그대로 묻는다 — 떼고 물으면 `/mcp` 와 캐시 키가 갈리고 D-10 #6 을 어긴다"
+
+
+def test_REST_프록시도_포털이_지금_관리자라고_답하면_연다(monkeypatch):
+    """반대쪽 어긋남 — 표지 없이 발급된 토큰의 지금 관리자가 `/mcp` 로는 들어가는데 이 길로는 403 이었다."""
+    _admin_only_site(monkeypatch)
+    for token in (["mes-user"], _OLD_ADMIN_TOKEN):
+        got, shots, _asked = _rest_gate(monkeypatch, {"keys": ["feat:chat"], "is_admin": True}, token)
+        assert got.status_code == 200 and shots == ["http://upstream.invalid/x"], token
+
+
+@pytest.mark.parametrize("token", [_OLD_ADMIN_TOKEN, ["mes-user"]])
+@pytest.mark.parametrize("resp", [{"keys": ["feat:chat"], "is_admin": False}, {"keys": ["feat:chat"], "is_admin": True},
+                                  {"keys": ["feat:chat"]}, None, {"keys": ["feat:chat"], "is_admin": "true"},
+                                  {"keys": ["feat:chat"], "is_admin": 1}, {"keys": ["feat:chat"], "is_admin": None}])
+def test_REST_경로의_그룹은_인증_미들웨어가_앱에_넘기는_그룹과_같다(monkeypatch, resp, token):
+    """정본은 미들웨어다 — 한쪽만 고치면 같은 토큰이 `/mcp` 에서는 막히고 `/api` 에서는 통한다. 순서는 보지 않는다
+    (포털이 모를 때 두 경로가 토큰의 그룹을 늘어놓는 순서가 다르다)."""
+    _h, mcp, mcp_asked = _admin_gate(monkeypatch, resp)(token)
+    asked = []
+
+    async def fake_access(email, base, **_kw):
+        asked.append(list(base))
+        return resp
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    assert sorted(asyncio.run(gw._rest_groups(list(token), "u@corp.com"))) == sorted(mcp)
+    assert asked == [mcp_asked], "포털에 묻는 그룹도 같아야 캐시가 한 항목이다"

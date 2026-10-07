@@ -1007,7 +1007,8 @@ _ACCESS_CACHE_FILE = Path(__file__).resolve().parent / ".access_policy_cache.jso
 # GW_TOKEN 으로 그룹 헤더 **없이** 오는 호출 = 사용자 대리가 아닌 내부 서비스 자신. 미들웨어가 이
 # 표시 그룹을 붙인다. 에이전트서버는 사용자 호출에 늘 그룹 헤더를 싣는다(빈 값이라도 싣는다).
 SERVICE_GROUP = "gateway:service"
-# 포털 관리자 표지. **PAT 에 박힌 것은 믿지 않는다** — 인증 미들웨어가 떼고, 포털이 지금 관리자라고 답할 때만 다시 붙인다.
+# 포털 관리자 표지. **PAT 에 박힌 것은 믿지 않는다** — 인증 미들웨어(`/mcp`)와 `_rest_groups`(`/api/`) 가 **둘 다** 떼고,
+# 포털이 지금 관리자라고 답할 때만 다시 붙인다. PAT 의 그룹을 읽는 길이 둘이라 한쪽만 고치면 다른 길로 옛 표지가 통한다.
 ADMIN_GROUP = "portal-admin"
 _ACCESS_POLICY: dict[str, list[str]] = {}
 # 정책을 **한 번이라도 받았는가**(캐시 파일 또는 포털). 비어 있음(=아무 백엔드에도 제한 없음)과
@@ -1110,12 +1111,6 @@ async def _portal_access(email: str, base_groups: list[str], *,
     _ENT_CACHE[key] = (got, time.monotonic() + ACCESS_ENT_TTL_S)
     _ENT_LAST[key] = got
     return got
-
-
-async def _portal_entitlements(email: str, base_groups: list[str]) -> list[str] | None:
-    """이 사람의 지금 권한 키 — PAT 에 박힌 발급 때 값 대신 쓴다. 포털이 모르면 None."""
-    got = await _portal_access(email, base_groups)
-    return None if got is None else [str(k) for k in got.get("keys") or []]
 
 
 async def _portal_affiliation(email: str, base_groups: list[str]) -> str:
@@ -3145,6 +3140,8 @@ def _bearer_gate(app, pat_verifier=None):
             # ⚠ 칸이 없으면(옛 포털) 붙이지 않는다. 이 표지를 읽는 곳이 없어 아무도 막히지 않는다(2026-10-07 대조 — 포털 권한
             #   정책은 feat:·plat: 키만 쓰고, 심의 서버에 관리자 검사가 없고, dev 설정과 heax 매니페스트의 allowed_groups 에
             #   이 값을 건 규칙이 없다). 칸이 없다고 토큰 값을 넘기면 포털이 보증하지 못하는 바로 그 구성에서 옛 표지가 계속 샌다.
+            #   `/api/<site>/` 는 이 분기를 타지 않는다 — 같은 규칙을 `_rest_groups` 가 따로 적용한다. 그 길은 heax 매니페스트의
+            #   allowed_groups 를 아예 보지 않는다(매니페스트 규칙은 `POLICY["heax-<id>"]` 에 서는데 REST 사이트 키는 `heax-` 가 아니다).
             # ⚠ 포털에 **물을 때는** 토큰의 그룹을 그대로 준다(위 `_base`). 누가 관리자인지는 포털이 제 규칙으로 정한다 —
             #   여기서 빼고 물으면 관리자를 IdP 그룹으로 받는 박스(mock·oidc-mock)가 옛 포털과 만나는 동안 권한 키를 잃는다.
             _pat_groups = [g for g in _pat_groups if g != ADMIN_GROUP]
@@ -3222,10 +3219,21 @@ async def _rest_allowed(site: str, pat_groups: list[str], email: str) -> bool:
 
 
 async def _rest_groups(pat_groups: list[str], email: str) -> list[str]:
-    """REST 호출자의 **지금** 그룹 — PAT 의 발급 때 값이 아니라 포털의 현재 권한으로(_rest_allowed 와 같다)."""
+    """REST 호출자의 **지금** 그룹 — PAT 의 발급 때 값이 아니라 포털의 현재 권한으로(_rest_allowed 와 같다).
+
+    ⚠ 관리자 표지도 인증 미들웨어(`_bearer_gate` 의 PAT 분기)와 **같게** 다룬다 — 토큰의 것은 떼고 포털이 지금 관리자라고
+    답할 때만 붙인다. `/api/` 는 그 분기를 타지 않아 여기서 따로 계산하는데, 권한 키만 바꾸고 표지는 그대로 두었다. 그래서
+    관리자에서 내려온 사람의 옛 PAT 가 `/mcp` 에서는 막히는 `allowed_groups: [portal-admin]` 백엔드를 이 길로는 통과했고,
+    표지 없이 발급된 토큰의 지금 관리자는 거꾸로 이 길에서만 막혔다(사본 재현, HWAXPortal docs/change-request-8-10 D-3).
+    포털에 **물을 때는** 토큰의 로그인 그룹을 그대로 준다(D-10 #6) — 떼고 물으면 미들웨어와 캐시 키가 갈려 포털을 한 번 더 부른다.
+    """
     base = [g for g in pat_groups if g != SERVICE_GROUP and not _is_synthetic(g)]
-    now_keys = await _portal_entitlements(email.strip().lower(), base) if email else None
-    return base + (now_keys if now_keys is not None else [g for g in pat_groups if _is_synthetic(g)])
+    ent = await _portal_access(email.strip().lower(), base) if email else None
+    keys = [g for g in pat_groups if _is_synthetic(g)] if ent is None else [str(k) for k in ent.get("keys") or []]
+    out = [g for g in base if g != ADMIN_GROUP] + keys
+    if ent is not None and ent.get("is_admin") is True:
+        out.append(ADMIN_GROUP)
+    return out
 
 
 async def _rest_deny_text(site: str, pat_groups: list[str], email: str) -> str:

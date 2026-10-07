@@ -25,7 +25,8 @@
 #   6) ODB 자동화 허브: ODB_HUB_TOKEN 이 있으면 odb-hub 백엔드 포함(cae00 에서만 도달하는 사내 서버).
 #   7) AI Ready Portal(ARP): ARP_BASE 와 ARP_TOKEN 이 둘 다 있으면 arp 백엔드 포함(cae00 전용 사내 서버).
 #      ARP 는 2026-10-01 인증을 켰다(/api/auth/me enabled:true) — 토큰이 없으면 이 백엔드만 빠진다(ODB_HUB_TOKEN 과 같다).
-#      둘 다 env > 직전 config 다. 주소만 있고 토큰이 없으면 '켜려면' 과 함께 생략을 찍는다.
+#      둘 다 env > 직전 config 다. 한쪽만 있으면 '켜려면' 과 함께 생략을 찍는다 — 주소만 있을 때도, 토큰만 있을 때도.
+#      ⚠ 주소가 직전 config 에만 있던 박스는 항목이 빠지면서 주소도 사라진다(그때 찍어 준다). ARP_BASE 도 provision.env 에 둔다.
 #      주의 — 게이트웨이는 "url" 키가 있는 항목만 백엔드로 읽는다(gateway.py:42). mcp-remote 의
 #      {"command":"npx","args":[...]} 형식을 넣으면 에러 없이 조용히 무시되므로 url 형식으로 쓴다.
 #   8) 사람별 위임(ste 방식, heax_registry.per_user_sso): STE_SSO_SECRET · RA_SSO_SECRET(+RA_SSO_URL) ·
@@ -569,8 +570,21 @@ if _ARP_BASE and _ARP:
                   "headers": {"Authorization": f"Bearer {_ARP}"}}
 elif _ARP_BASE:
     # 옛 무토큰 항목은 MANAGED 키라 아래 '보존' 으로 되살아나지 않는다 — 조용히 빠지지 않게 켜는 법과 함께 말한다.
+    # ⚠ 주소를 env 로 받지 못한 실행이면 **주소도 이 항목과 함께 사라진다** — 직전 config 가 그 주소를 아는 유일한 곳이고,
+    # 다음 --force 는 arp 없는 config 로 .bak 을 덮는다. 'ARP_TOKEN 을 적어라' 만 말하던 때는 그대로 따른 다음 실행이 주소를
+    # 몰라 arp 를 만들지 않으면서 아무 말도 없었다(사본 재현). 그래서 주소를 찍어 주고 함께 적으라고 한다. 한 줄로 낸다.
+    _arp_addr = "" if e.get("ARP_BASE") else (
+        f" ⚠ 이번 실행은 ARP_BASE 를 받지 못해 주소를 직전 config 에서 읽었다 — 이 항목이 빠지면 주소도 함께 사라지니 "
+        f"ARP_BASE={_ARP_BASE} 도 함께 적는다(포털 infra/.env 에 ARP_HOST 가 있으면 update-all 1f 가 채운다)")
     print("  ⚠ arp 생략 — ARP 주소는 있는데 ARP_TOKEN 이 없다(env·직전 config 둘 다 없음, ARP 는 2026-10-01 부터 인증). "
-          "켜려면 provision.env 에 ARP_TOKEN=<ARP MCP 서비스 토큰> 을 적고 update-all 재실행(손으로 돌릴 때는 env 로 주고 --force)")
+          "켜려면 provision.env 에 ARP_TOKEN=<ARP MCP 서비스 토큰> 을 적고 update-all 재실행(손으로 돌릴 때는 env 로 주고 --force)"
+          + _arp_addr)
+elif _ARP:
+    # 토큰만 있고 주소를 모른다 — 지어내지 않는다(없는 서버에 토큰을 보내게 된다). 위에서 빠진 박스가 토큰만 적으면 여기로 온다.
+    # 토큰은 찍지 않는다. 주소도 토큰도 없는 박스(dev)는 예전처럼 조용하다 — 쓰지 않는 박스에 매번 '생략' 을 찍지 않는다.
+    print("  ⚠ arp 생략 — ARP_TOKEN 은 있는데 ARP 주소를 모른다(ARP_BASE·직전 config 둘 다 없음). "
+          "켜려면 provision.env 에 ARP_BASE=http://<ARP 서버>:3001 을 적거나 포털 infra/.env 에 ARP_HOST 를 적고 update-all 재실행"
+          "(손으로 돌릴 때는 env 로 주고 --force)")
 
 # heax-hub MCP 앱 자동탐지(옵션) — heax registry 를 폴링해 mcp:{expose} 앱을 heax-<id> 백엔드로 흡수.
 #   token: HEAX_MCP_TOKEN env(heax 'MCP 토큰' 메뉴/PAT). 없으면 heax_registry 생략(그 기능만 빠짐).

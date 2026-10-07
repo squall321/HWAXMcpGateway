@@ -1,5 +1,6 @@
 # 백엔드 주소 결정 — 형제 서비스의 `.env` 포트가 정본이고, 한 번 박힌 기본값을 물려받지 않는다
 import json
+import os
 import re
 import subprocess
 import sys
@@ -132,6 +133,18 @@ def _run_provision(tmp_path, env: dict, log: list | None = None) -> dict:
     if log is not None:
         log.append(r.stdout)
     return json.loads(cfg.read_text(encoding="utf-8"))
+
+
+def _force_backup(tmp_path) -> None:
+    """`--force` 가 파이썬 블록 **앞에서** 하는 백업을 스크립트에서 그대로 떼어 돌린다 — 라이브 config 가 `.bak` 을 덮는다.
+    `_run_provision` 은 블록만 돌려 이것을 하지 않는다. 그래서 연속 실행을 흉내 낸 시험이 첫 실행 전의 `.bak` 을 계속 읽어,
+    스크립트가 만들 수 없는 순서(항목이 빠진 **다음** 실행에 직전 주소로 선다)를 통과시켰다. 연속 실행을 볼 때만 사이에 부른다 —
+    `.bak` 을 한 번 심어 놓고 독립된 경우를 여럿 돌리는 시험에는 맞지 않는다."""
+    block = re.search(r'\nif \[ -f "\$CFG" \]; then\n  cp -f "\$CFG" "\$CFG\.bak"\n.*?\nfi\n',
+                      (HERE / "provision-config.sh").read_text(encoding="utf-8"), re.S).group(0)
+    r = subprocess.run(["bash", "-c", block], env={"CFG": str(tmp_path / "gateway_config.json"), "PATH": os.environ["PATH"]},
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
 
 
 def test_rest_사이트는_본인_명의로_갈_수_있으면_그렇게_간다(tmp_path):
@@ -513,6 +526,7 @@ def test_arp_는_토큰이_없으면_등재하지_않고_켜는_법을_말한다
     assert "arp" not in out
     line = [l for l in log[0].splitlines() if "arp 생략" in l]
     assert len(line) == 1 and "켜려면" in line[0] and "ARP_TOKEN=" in line[0] and "provision.env" in line[0], log[0]
+    assert "ARP_BASE=" not in line[0], "주소를 env 로 받은 실행이다 — 주소는 사라지지 않으니 적으라고 하지 않는다"
     # 주소도 토큰도 없는 박스(dev)는 예전처럼 조용하다 — 쓰지 않는 박스에 '생략' 을 매번 찍지 않는다
     (tmp_path / "gateway_config.json").unlink()
     log = []
@@ -535,8 +549,35 @@ def test_arp_무토큰_항목이_직전_config_에_남아_있어도_이어받지
     assert "arp" not in out
     assert "knox-bridge" in out, "손으로 붙인 백엔드는 그대로 보존한다"
     assert any("arp 생략" in l and "ARP_TOKEN=" in l for l in log[0].splitlines()), log[0]
-    # 토큰만 주면 직전 config 의 주소로 선다
+    # 무토큰 항목이 **아직 config 에 있는** 실행에 토큰을 주면 그 주소로 선다(빠진 다음 실행은 아래 시험이 본다)
+    (tmp_path / "gateway_config.json").write_text(json.dumps(old), encoding="utf-8")
     out = _run_provision(tmp_path, {"ARP_TOKEN": "arp-secret-xyz"})
+    assert out["arp"] == {"url": ARP_BASE + "/mcp", "transport": "streamable_http",
+                          "headers": {"Authorization": "Bearer arp-secret-xyz"}}
+
+
+def test_arp_가_토큰이_없어_빠질_때_주소도_함께_사라진다고_말하고_다음_실행도_조용하지_않다(tmp_path):
+    """주소가 게이트웨이 config 에만 있던 박스(이 실행이 ARP_BASE 를 받지 못했다) — 항목이 빠지면 주소도 함께 사라진다.
+    안내는 'ARP_TOKEN 을 적어라' 뿐이었고, 그대로 따른 다음 실행은 주소를 몰라 arp 를 만들지 않으면서 **아무 말도 없었다**.
+    `--force` 는 블록 앞에서 라이브 config 로 `.bak` 을 덮으므로 빠진 다음 실행에는 이어받을 주소가 없다."""
+    (tmp_path / "gateway_config.json").write_text(json.dumps({
+        "arp": {"url": ARP_BASE + "/mcp", "transport": "streamable_http"}}), encoding="utf-8")
+    _force_backup(tmp_path)
+    log: list = []
+    assert "arp" not in _run_provision(tmp_path, {}, log)
+    drop = [l for l in log[0].splitlines() if "arp 생략" in l]
+    assert len(drop) == 1 and "ARP_TOKEN=" in drop[0] and f"ARP_BASE={ARP_BASE}" in drop[0], log[0]
+    # 안내의 절반(토큰)만 따른 다음 실행 — 주소를 지어내지 않고, 왜 서지 않는지와 켜는 법을 말한다
+    _force_backup(tmp_path)
+    log = []
+    assert "arp" not in _run_provision(tmp_path, {"ARP_TOKEN": "arp-secret-xyz"}, log)
+    drop = [l for l in log[0].splitlines() if "arp 생략" in l]
+    assert len(drop) == 1 and "켜려면" in drop[0] and "ARP_BASE=" in drop[0] and "ARP_HOST" in drop[0], log[0]
+    assert ARP_BASE not in log[0], "모르는 주소를 지어내 찍으면 안 된다"
+    assert "arp-secret-xyz" not in log[0], "토큰이 운영 로그에 남는다"
+    # 둘 다 주면 선다
+    _force_backup(tmp_path)
+    out = _run_provision(tmp_path, {"ARP_TOKEN": "arp-secret-xyz", "ARP_BASE": ARP_BASE})
     assert out["arp"] == {"url": ARP_BASE + "/mcp", "transport": "streamable_http",
                           "headers": {"Authorization": "Bearer arp-secret-xyz"}}
 

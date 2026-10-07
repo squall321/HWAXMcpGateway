@@ -1007,6 +1007,8 @@ _ACCESS_CACHE_FILE = Path(__file__).resolve().parent / ".access_policy_cache.jso
 # GW_TOKEN 으로 그룹 헤더 **없이** 오는 호출 = 사용자 대리가 아닌 내부 서비스 자신. 미들웨어가 이
 # 표시 그룹을 붙인다. 에이전트서버는 사용자 호출에 늘 그룹 헤더를 싣는다(빈 값이라도 싣는다).
 SERVICE_GROUP = "gateway:service"
+# 포털 관리자 표지. **PAT 에 박힌 것은 믿지 않는다** — 인증 미들웨어가 떼고, 포털이 지금 관리자라고 답할 때만 다시 붙인다.
+ADMIN_GROUP = "portal-admin"
 _ACCESS_POLICY: dict[str, list[str]] = {}
 # 정책을 **한 번이라도 받았는가**(캐시 파일 또는 포털). 비어 있음(=아무 백엔드에도 제한 없음)과
 # 못 받음(=아직 모름)은 다르다 — 못 받은 상태에서 per_user 백엔드를 열면 시크릿을 쥔 게이트웨이가
@@ -2749,8 +2751,9 @@ async def _call_tool(name: str, arguments: dict):
     _aff = ""
     if app_id in PER_USER_SSO and _request_user():
         # 권한 조회와 같은 키라 이미 데워져 있다(추가 HTTP 없음). 실패하면 빈 값 — 모르면 안 싣는다.
+        # 관리자 표지는 뺀다 — 인증 때 게이트웨이가 붙인 포털의 답이지 로그인 그룹이 아니다(넣으면 키가 갈린다).
         _aff = await _portal_affiliation(
-            _request_user(), [g for g in _request_groups() if not _is_synthetic(g)])
+            _request_user(), [g for g in _request_groups() if not _is_synthetic(g) and g != ADMIN_GROUP])
     # ── 읽기 전용 캐시 ── 인가(위)를 통과한 뒤에 본다. 순서가 반대면 권한 없는 호출자가
     #    캐시된 남의 결과를 받는다. 키에도 신원이 들어간다(_cache_key 주석 참조).
     ckey = _cache_key(backend_key, original, arguments, _aff)
@@ -3136,6 +3139,17 @@ def _bearer_gate(app, pat_verifier=None):
             _now_keys = None if _ent is None else [str(k) for k in _ent.get("keys") or []]
             if _now_keys is not None:
                 _pat_groups = _base + _now_keys
+            # 관리자 표지도 발급 때 값을 넘기지 않는다. 관리자이던 때 받은 PAT 에는 `portal-admin` 이 박혀 있고(mock 시절
+            # 공용 계정 PAT 도 그렇다), 이 그룹은 신원 전달 백엔드까지 그대로 내려간다 — 해제가 하위에서 먹지 않았다
+            # (HWAXPortal docs/change-request-8-10 #6 · D-3). 포털이 **지금** 관리자라고 답할 때만(`is_admin: true`) 붙인다.
+            # ⚠ 칸이 없으면(옛 포털) 붙이지 않는다. 이 표지를 읽는 곳이 없어 아무도 막히지 않는다(2026-10-07 대조 — 포털 권한
+            #   정책은 feat:·plat: 키만 쓰고, 심의 서버에 관리자 검사가 없고, dev 설정과 heax 매니페스트의 allowed_groups 에
+            #   이 값을 건 규칙이 없다). 칸이 없다고 토큰 값을 넘기면 포털이 보증하지 못하는 바로 그 구성에서 옛 표지가 계속 샌다.
+            # ⚠ 포털에 **물을 때는** 토큰의 그룹을 그대로 준다(위 `_base`). 누가 관리자인지는 포털이 제 규칙으로 정한다 —
+            #   여기서 빼고 물으면 관리자를 IdP 그룹으로 받는 박스(mock·oidc-mock)가 옛 포털과 만나는 동안 권한 키를 잃는다.
+            _pat_groups = [g for g in _pat_groups if g != ADMIN_GROUP]
+            if _ent is not None and _ent.get("is_admin") is True:
+                _pat_groups.append(ADMIN_GROUP)
             groups = ",".join(_pat_groups)
             # 클라이언트가 위조로 넣었을 x-hwax-groups 는 버리고, 검증된 PAT 의 groups 로 강제한다.
             # 신원 헤더도 groups 와 똑같이 다룬다 — 클라이언트가 실어 보낸 값은 버리고 검증된

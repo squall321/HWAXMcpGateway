@@ -13,6 +13,8 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
 - **`tools/list`** 를 필터 — 백엔드 `allowed_groups`가 caller groups와 교집합이 있는 도구만 노출(보이지 않는 도구는 LLM이 존재조차 모름).
 - **`tools/call`** 을 가드 — list에서 숨겼어도 직접 호출을 시도하면 `forbidden`(이중 방어).
 
+포털 PAT 로 들어온 호출은 PAT 에 박힌 발급 때 값이 아니라 포털의 **지금** 답(`GET /internal/access/entitlements`)을 쓴다 — 권한 키(`feat:`·`plat:`)는 응답의 `keys` 로 바꾸고, 관리자 표지(`portal-admin`)는 PAT 에 박힌 것을 떼고 응답이 `"is_admin": true` 일 때만 붙인다. 이 그룹은 신원 전달 백엔드까지 내려가므로, 떼지 않으면 관리자 해제가 하위에서 먹지 않는다. 칸이 없으면(옛 포털) 붙이지 않는다 — 이 표지를 읽는 백엔드·`allowed_groups` 규칙이 없어 아무도 막히지 않는다(2026-10-07 dev 대조). 포털에 물을 때는 토큰의 로그인 그룹을 그대로 준다(누가 관리자인지는 포털이 정한다).
+
 규칙: 백엔드 `allowed_groups`가 **비었거나 없으면 전체 공개**(기존 동작 보존), 있으면 교집합 필요. 헤더가 없거나 그룹이 비면 제한 백엔드는 숨김(**fail-closed**). 어느 도구가 어느 백엔드인지는 게이트웨이의 `route` 맵만 알기에(에이전트엔 평탄화되어 도착) 필터는 여기서만 가능하다. 헤더는 `_low.request_context.request.headers`로 읽는다(streamable-http가 Starlette Request를 핸들러까지 전달).
 
 ## 설정 — `gateway_config.json` (gitignore, 시크릿)

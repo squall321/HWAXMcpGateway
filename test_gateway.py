@@ -955,7 +955,8 @@ class _StubCM:
     async def __aexit__(self, *a): return False
 
 
-def _per_user_kit(monkeypatch, aff_payload, base_headers=None, sso_extra=None):
+def _per_user_kit(monkeypatch, aff_payload, base_headers=None, sso_extra=None,
+                  groups=("mes-user", "plat:dynaforge")):
     """사용자 위임 경로를 실제로 태우고 **백엔드에 닿은 헤더**를 돌려준다.
 
     ⚠ `_call_as_user` 를 가짜로 갈아끼우면 안 된다 — 처음에 그렇게 짰다가 검토에서 잡혔다.
@@ -997,7 +998,7 @@ def _per_user_kit(monkeypatch, aff_payload, base_headers=None, sso_extra=None):
                                                                  "secret": "app-secret",
                                                                  **(sso_extra or {})}})
     monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
-    monkeypatch.setattr(gw, "_request_groups", lambda: ["mes-user", "plat:dynaforge"])
+    monkeypatch.setattr(gw, "_request_groups", lambda: list(groups))
 
     async def fake_pat(app_id, email, *, force=False):
         return "kr_tok"
@@ -2294,9 +2295,10 @@ class _ReconB(_CallB):
 
 
 def _recon_kit(monkeypatch, backend, *, session="up", oneshot_fails=0, user="u@corp.com",
-               groups=("mes-user", "feat:chat")):
+               groups=("mes-user", "feat:chat"), headers=None):
     """재연결 분기를 실제로 태운다(전송 계층만 막는다). 단발 세션(신원 호출)의 연결은 `oneshot_fails` 번까지 터진다.
-    돌려주는 것 — 결과 · 백엔드(상주 세션이 받은 호출·재연결 횟수) · 단발 세션이 연결마다 실은 헤더 · 감사 마지막 줄."""
+    돌려주는 것 — 결과 · 백엔드(상주 세션이 받은 호출·재연결 횟수) · 단발 세션이 연결마다 실은 헤더 · 감사 마지막 줄.
+    `headers` 를 주면 신원을 흉내 내지 않고 그 요청 헤더에서 읽는다(인증 미들웨어가 만든 헤더를 그대로 얹을 때)."""
     b = _ReconB(["deliberate_status"], session)
     shots = []
 
@@ -2325,8 +2327,11 @@ def _recon_kit(monkeypatch, backend, *, session="up", oneshot_fails=0, user="u@c
     monkeypatch.setattr(gw, "IDENTITY_FWD", {"hwax-deliberation"})
     monkeypatch.setattr(gw, "_task_group_holder", {"tg": object()})
     monkeypatch.setattr(gw, "_REAGG", {})
-    monkeypatch.setattr(gw, "_request_user", lambda: user)
-    monkeypatch.setattr(gw, "_request_groups", lambda: list(groups))
+    if headers is None:
+        monkeypatch.setattr(gw, "_request_user", lambda: user)
+        monkeypatch.setattr(gw, "_request_groups", lambda: list(groups))
+    else:
+        _set_request_headers(monkeypatch, headers)
     res = asyncio.run(gw._call_tool("deliberate_status", {"job_id": "j1"}))
     return res, b, shots, _rows()[-1]
 
@@ -2584,3 +2589,81 @@ def test_기동하면_설정의_내부_목적지가_전부_프록시를_벗어�
         assert name in run.stderr, f"기동 로그에 더한 호스트가 남아야 한다: {name}"
     for leak in ("SECRET", "token=", "user:"):
         assert leak not in run.stderr and leak not in "".join(out["env"]), f"주소의 비밀이 샜다: {leak}"
+
+
+# ── 관리자 표지는 PAT 에 박힌 것을 믿지 않는다(HWAXPortal docs/change-request-8-10 #6 · D-3) ─────────────
+_OLD_ADMIN_TOKEN = ["mes-user", "portal-admin", "feat:old"]      # 관리자이던 때 발급된 PAT 의 groups
+
+
+def _admin_gate(monkeypatch, portal_resp):
+    """인증 미들웨어를 실제로 태운다(포털 응답만 가짜). 돌려주는 것 — 앱이 받는 헤더 · 그 안의 그룹 · 포털에 물은 로그인 그룹."""
+    seen, asked = {}, []
+
+    async def app(scope, receive, send):
+        seen["h"] = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+
+    async def fake_access(email, base, **_kw):
+        asked.append(list(base))
+        return portal_resp
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        def __init__(self, claims): self.claims = claims
+        async def verify(self, token, aud): return self.claims
+
+    def run(token_groups):
+        seen.clear(); asked.clear()
+        mw = gw._bearer_gate(app, _V({"email": "u@corp.com", "groups": list(token_groups)}))
+        asyncio.run(mw({"type": "http", "path": "/mcp", "headers": [(b"authorization", b"Bearer me")]}, None, None))
+        return seen["h"], gw._parse_groups(seen["h"][gw.GROUPS_HEADER]), asked[0]
+    return run
+
+
+def test_토큰에_박힌_관리자_표지는_넘기지_않는다(monkeypatch):
+    """관리자에서 내려온 사람의 옛 PAT 에는 `portal-admin` 이 박혀 있다(수명 최대 100년 — mock 시절 공용 계정 PAT 가 아직
+    쓰인다). 게이트웨이가 PAT 의 그룹을 그대로 싣던 때는 해제가 하위까지 먹지 않았다."""
+    _h, groups, asked = _admin_gate(monkeypatch, {"keys": ["feat:chat"], "is_admin": False})(_OLD_ADMIN_TOKEN)
+    assert groups == ["mes-user", "feat:chat"]
+    assert asked == ["mes-user", "portal-admin"], \
+        "포털에는 토큰의 로그인 그룹을 그대로 묻는다 — 누가 관리자인지는 포털이 정한다(옛 포털에서 권한 키가 달라지지 않게)"
+
+
+def test_포털이_지금_관리자라고_답할_때만_표지를_붙인다(monkeypatch):
+    run = _admin_gate(monkeypatch, {"keys": ["feat:chat"], "is_admin": True})
+    assert run(_OLD_ADMIN_TOKEN)[1] == ["mes-user", "feat:chat", "portal-admin"]
+    assert run(["mes-user"])[1] == ["mes-user", "feat:chat", "portal-admin"], \
+        "표지 없이 발급된 토큰이어도 지금 관리자면 붙는다 — 토큰이 아니라 포털의 답이 정본이다"
+
+
+@pytest.mark.parametrize("resp,want", [
+    # 옛 포털 — is_admin 칸이 없다. 붙이지 않는다: 표지를 읽는 하위가 없어 아무도 막히지 않고, 권한 키는 포털이 제 규칙으로
+    # 준 그대로다. 칸이 없다고 토큰 값을 넘기면 포털이 보증할 수 없는 바로 그 구성에서 옛 표지가 계속 샌다.
+    ({"keys": ["feat:chat"]}, ["mes-user", "feat:chat"]),
+    # 포털이 모른다(권한 기능 이전·불통) — 권한 키는 종전대로 PAT 값, 표지는 뺀다
+    (None, ["mes-user", "feat:old"]),
+    # 불리언 참만 인정한다
+    ({"keys": ["feat:chat"], "is_admin": "true"}, ["mes-user", "feat:chat"]),
+    ({"keys": ["feat:chat"], "is_admin": 1}, ["mes-user", "feat:chat"]),
+    ({"keys": ["feat:chat"], "is_admin": None}, ["mes-user", "feat:chat"]),
+])
+def test_포털이_관리자라고_답하지_않으면_표지를_넘기지_않는다(monkeypatch, resp, want):
+    assert _admin_gate(monkeypatch, resp)(_OLD_ADMIN_TOKEN)[1] == want
+
+
+@pytest.mark.parametrize("is_admin,want", [(False, ["mes-user", "feat:chat"]),
+                                           (True, ["mes-user", "feat:chat", "portal-admin"])])
+def test_하위_백엔드가_받는_그룹도_포털의_답을_따른다(monkeypatch, is_admin, want):
+    """미들웨어가 만든 헤더를 그대로 요청에 얹어 신원 전달 호출까지 태운다 — 하위(hwax-deliberation)가 **실제로 받는** 그룹."""
+    headers, _g, _a = _admin_gate(monkeypatch, {"keys": ["feat:chat"], "is_admin": is_admin})(_OLD_ADMIN_TOKEN)
+    res, _b, shots, _row = _recon_kit(monkeypatch, "hwax-deliberation", headers=headers)
+    assert not res.isError and len(shots) == 1
+    assert gw._parse_groups(shots[0][gw.GROUPS_HEADER]) == want and shots[0][gw.USER_HEADER] == "u@corp.com"
+
+
+def test_소속_조회는_게이트웨이가_붙인_관리자_표지를_로그인_그룹으로_되묻지_않는다(monkeypatch):
+    """표지는 이제 로그인 그룹이 아니라 포털의 답이다. 소속 조회가 그것까지 실어 물으면 인증 때의 권한 조회와 키가 갈려
+    관리자 호출마다 포털을 한 번 더 부른다(`_portal_affiliation` — 같은 값을 줘야 캐시가 한 항목이다)."""
+    seen = _per_user_kit(monkeypatch, {"keys": ["plat:dynaforge"], "affiliation": "CAEG", "is_admin": True},
+                         groups=("mes-user", "plat:dynaforge", "portal-admin"))
+    assert seen["lookups"] == [(["mes-user"], False)]

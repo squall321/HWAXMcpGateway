@@ -781,6 +781,19 @@ HEAX_MISS_BEFORE_DROP = int(os.environ.get("GATEWAY_HEAX_MISS_DROP", "3"))
 _HEAX_FAILS = {"n": 0}
 
 
+async def _first_connect(tg, key: str, b: _Backend) -> None:
+    """백엔드의 **첫** 핸드셰이크 — LIVENESS_TIMEOUT_S 안에 못 끝내면 놓고 간다(다음 재활 패스의 재연결 루프가 다시 붙인다).
+
+    여기만 기한이 없었다. 연결은 받는데 답하지 않는 백엔드 하나가 MCP 클라이언트의 read 한도(종전 300초, 지금은 호출 한도 + 60)가
+    찰 때까지 부팅을, 재활 패스에서 합류하는 앱이면 패스 전체를 세웠다 — 그동안 다른 백엔드의 탐침·재연결·카탈로그 갱신이
+    멈추고 로그에도 아무것도 없다. 재연결 경로는 이미 같은 값으로 감싸 두었다(_revive_once, gateway-26).
+    """
+    with anyio.move_on_after(LIVENESS_TIMEOUT_S) as sc:
+        await tg.start(b.run)
+    if sc.cancelled_caught:
+        log.warning("backend %s 첫 연결 %g초 초과 — 다음 패스에서 다시 시도(GATEWAY_LIVENESS_TIMEOUT)", key, LIVENESS_TIMEOUT_S)
+
+
 async def _revive_once(tg) -> bool:
     """재활 1회 — 죽은 백엔드 재연결 + heax 앱 재탐지 + 도구 구성 변경 감지 후 재집계.
 
@@ -813,7 +826,7 @@ async def _revive_once(tg) -> bool:
             b = _Backend(key, spec["url"], spec.get("headers"))
             backends[key] = b
             POLICY[key] = spec.get("allowed_groups") or []   # heax 앱의 그룹 필터 반영
-            await tg.start(b.run)
+            await _first_connect(tg, key, b)
             await b._ready.wait()
             if b.session is not None:
                 log.info("heax MCP %s 합류 (%s)", key, spec["url"])
@@ -921,7 +934,7 @@ async def _backends_lifespan():
         for key, spec in BACKENDS.items():
             b = _Backend(key, spec["url"], spec.get("headers"))
             backends[key] = b
-            await tg.start(b.run)
+            await _first_connect(tg, key, b)
         # heax-hub MCP 앱 자동탐지 → heax-<id> 백엔드로 합류 (heax_registry 있을 때만)
         # _discover_heax 는 '폴링 실패=None, 앱 없음={}' 계약이다(docstring). revive 루프는
         # `if discovered is None:` 으로 지키는데 부팅 경로만 곧바로 .items() 를 불렀다 —
@@ -939,7 +952,7 @@ async def _backends_lifespan():
             b = _Backend(key, spec["url"], spec.get("headers"))
             backends[key] = b
             POLICY[key] = spec.get("allowed_groups") or []   # heax 앱의 그룹 필터 반영
-            await tg.start(b.run)
+            await _first_connect(tg, key, b)
         await _aggregate()
         tg.start_soon(_revive_loop, tg)
         # 포털 권한 정책 — 디스크 캐시로 먼저 막고(포털이 늦게 떠도 권한이 풀린 채 돌지 않게),

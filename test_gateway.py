@@ -3378,3 +3378,93 @@ def test_탐침_횟수_손잡이(tmp_path):
     assert _limits(tmp_path, ["LIVENESS_STRIKES"], GATEWAY_LIVENESS_STRIKES="3")[0] == {"LIVENESS_STRIKES": 3}
     assert _limits(tmp_path, ["LIVENESS_STRIKES"], GATEWAY_LIVENESS_STRIKES="0")[0] == {"LIVENESS_STRIKES": 1}, \
         "0 이하는 1 로 읽는다(한 번 놓치면 간다 — 종전 동작)"
+
+
+# ── 첫 핸드셰이크 — 매달린 백엔드 하나가 부팅과 재활 패스를 세우지 않는다(결정표 gateway-26) ─────────────────────
+class _HangCM:
+    """연결은 받는데 한 글자도 답하지 않는 백엔드 — 세션을 여는 데서 매달린다."""
+    async def __aenter__(self):
+        await asyncio.sleep(3600)
+
+    async def __aexit__(self, *a): return False
+
+
+def _boot_kit(monkeypatch, hung: set):
+    """실제 `_Backend`·`_backends_lifespan`·`_revive_once` 를 돌릴 판 — 전송 계층만 막는다. `hung` 에 든 주소는 핸드셰이크가
+    매달린다(시험 중에 비우면 그때부터 붙는다). 포털 권한 정책·주기 루프는 이 시험의 관심사가 아니라 끈다."""
+    class _Sess:
+        async def initialize(self): return None
+
+        async def list_tools(self): return _Res([_tool("ok_tool")])
+
+    def fake_stream(url, headers=None, **_kw):
+        return _HangCM() if url in hung else _StubCM((None, None, "sid"))
+
+    async def _noop(*a, **k):
+        return None
+    monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+    monkeypatch.setattr(gw, "LIVENESS_TIMEOUT_S", 0.05)
+    for name in ("backends", "route", "alias_route", "_task_group_holder", "_REAGG", "_FP", "_LAST_TOOLS",
+                 "_LIVENESS_MISS", "_HEAX_MISS", "DISCOVERED_META", "POLICY"):
+        monkeypatch.setattr(gw, name, {})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "_load_access_cache", lambda: None)
+    monkeypatch.setattr(gw, "_refresh_access_policy", _noop)
+    monkeypatch.setattr(gw, "_access_policy_loop", _noop)
+    monkeypatch.setattr(gw, "_revive_loop", _noop)
+
+
+@pytest.mark.parametrize("where", ["설정에 적은 백엔드", "레지스트리로 찾은 앱"])
+def test_부팅은_첫_핸드셰이크가_매달린_백엔드를_놓고_간다(monkeypatch, caplog, where):
+    """기한이 없어서 매달린 백엔드 하나가 MCP 클라이언트의 read 한도(종전 300초)가 찰 때까지 부팅을 세웠다 — start.sh 의
+    헬스 대기 60초를 넘겨 '기동 실패' 로 보이고 로그에는 아무것도 없다."""
+    import time as _time
+    _boot_kit(monkeypatch, {"http://hung/mcp"})
+    static = where == "설정에 적은 백엔드"
+    hung_key = "hung" if static else "heax-hung"
+    monkeypatch.setattr(gw, "BACKENDS", {**({"hung": {"url": "http://hung/mcp"}} if static else {}),
+                                         "ok": {"url": "http://ok/mcp"}})
+    monkeypatch.setattr(gw, "HEAX", {} if static else {"servers_url": "http://hub/servers"})
+
+    async def found():
+        return {} if static else {"heax-hung": {"url": "http://hung/mcp", "headers": {}, "allowed_groups": [],
+                                                "label": "", "description": ""}}
+    monkeypatch.setattr(gw, "_discover_heax", found)
+
+    async def go():
+        t0 = _time.monotonic()
+        async with gw._backends_lifespan():
+            return _time.monotonic() - t0, {k: b.session is not None for k, b in gw.backends.items()}, sorted(gw.route)
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        took, up, tools = asyncio.run(asyncio.wait_for(go(), 5))
+    assert took < 2 and up == {hung_key: False, "ok": True} and tools == ["ok_tool"], "멀쩡한 백엔드까지 못 붙었다"
+    said = [r.getMessage() for r in caplog.records if "첫 연결" in r.getMessage()]
+    assert len(said) == 1 and hung_key in said[0] and "GATEWAY_LIVENESS_TIMEOUT" in said[0], caplog.text
+
+
+def test_재활_패스에서_합류하는_앱이_매달려도_패스가_서지_않고_다음_패스에_붙는다(monkeypatch):
+    """패스가 서면 그동안 다른 백엔드의 탐침·재연결·카탈로그 갱신이 전부 멈춘다."""
+    import anyio
+    hung = {"http://hub/new/mcp"}
+    _boot_kit(monkeypatch, hung)
+    monkeypatch.setattr(gw, "HEAX", {"servers_url": "http://hub/servers"})
+
+    async def found():
+        return {"heax-new": {"url": "http://hub/new/mcp", "headers": {}, "allowed_groups": [], "label": "", "description": ""}}
+    monkeypatch.setattr(gw, "_discover_heax", found)
+
+    async def go():
+        async with anyio.create_task_group() as tg:
+            first = await gw._revive_once(tg)               # 합류를 시도하다 놓고 간다(같은 패스의 재연결도 기한 안에 놓는다)
+            b = gw.backends["heax-new"]
+            mid = (b.session is None, sorted(gw.route))
+            hung.clear()                                    # 백엔드가 답하기 시작했다
+            second = await gw._revive_once(tg)
+            out = first, mid, second, b.session is not None, sorted(gw.route)
+            b._stop.set()
+            tg.cancel_scope.cancel()
+        return out
+    first, mid, second, up, tools = asyncio.run(asyncio.wait_for(go(), 5))
+    assert first is False and mid == (True, [])
+    assert second is True and up and tools == ["ok_tool"], "놓고 간 백엔드를 다음 패스가 다시 붙여야 한다"

@@ -24,7 +24,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 # 메서드 허용 규칙의 정본. REST 프록시 라우트와 MCP 다리가 **같은 함수**를 봐야 한다.
 # (rest_proxy 는 gateway 를 import 하지 않으므로 이 방향은 순환이 아니다.)
-from rest_proxy import EXPIRED_BODY, PatExpired, allowed_methods, credential_mode
+from rest_proxy import EXPIRED_BODY, JWKS_TIMEOUT_S, PatExpired, allowed_methods, credential_mode
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("hwax-mcp-gateway")
@@ -3482,6 +3482,20 @@ async def _rest_deny_text(site: str, pat_groups: list[str], email: str) -> str:
     return _deny_text(site, await _rest_groups(pat_groups, email))
 
 
+def _limits_line() -> str:
+    """이 프로세스에 **실제로 걸린** 시간 한도 한 줄 — 기동 로그에 남긴다.
+
+    게이트웨이는 `.env` 를 읽지 않고 포털 services.yaml 도 env 를 넘기지 않는다. 손잡이를 적었는데 닿지 않았는지, 재기동 뒤에
+    옛 코드가 돌고 있는지를 볼 자리가 이 줄뿐이다(값이 조용히 안 먹는 것이 이 스택에서 되풀이된 고장이다)."""
+    return ("시간 한도(초) — GATEWAY_CALL_TIMEOUT=%g · GATEWAY_RECONNECT_TIMEOUT=%g · GATEWAY_BACKEND_READ_TIMEOUT=%g · "
+            "GATEWAY_BACKEND_HTTP_TIMEOUT=%g · GATEWAY_LIVENESS_TIMEOUT=%g × GATEWAY_LIVENESS_STRIKES=%d(주기 %d) · "
+            "GATEWAY_AGG_STALE_ROUNDS=%d · GATEWAY_HEAX_MISS_DROP=%d · GATEWAY_REST_CALL_TIMEOUT=%g · "
+            "GATEWAY_PORTAL_SAVE_TIMEOUT=%g · GATEWAY_JWKS_TIMEOUT=%g" % (
+                CALL_TIMEOUT_S, RECONNECT_TIMEOUT_S, BACKEND_READ_TIMEOUT_S, BACKEND_HTTP_TIMEOUT_S, LIVENESS_TIMEOUT_S,
+                LIVENESS_STRIKES, REVIVE_INTERVAL_S, AGG_STALE_ROUNDS, HEAX_MISS_BEFORE_DROP, REST_CALL_TIMEOUT_S,
+                PORTAL_SAVE_TIMEOUT_S, JWKS_TIMEOUT_S))
+
+
 def main():
     star = fm.streamable_http_app()
     # REST 프록시 라우트(/api/<site>/<path>) 를 MCP 마운트보다 먼저 매칭되게 삽입.
@@ -3508,6 +3522,7 @@ def main():
         log.info("MCP PAT auth enabled (audience=%s)", MCP_AUDIENCE)
     app = _bearer_gate(star, pat_verifier)
     log.info("starting hwax-mcp-gateway on %s:%d (path /mcp), %d backends", HOST, PORT, len(BACKENDS))
+    log.info("%s", _limits_line())
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
 

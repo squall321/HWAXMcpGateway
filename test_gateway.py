@@ -3847,3 +3847,40 @@ def test_응답_스트림의_15초_ping_전제가_그대로다():
     assert EventSourceResponse.DEFAULT_PING_INTERVAL == 15
     made = re.findall(r"EventSourceResponse\((.*?)\)", inspect.getsource(sh), re.S)
     assert made and not any("ping" in args for args in made), "MCP SDK 가 ping 을 따로 준다 — 실제 간격을 확인하라"
+
+
+# ── 기동 로그 — 손잡이가 닿았는지 볼 자리 ─────────────────────────────────────────────────────────────
+_LIMITS_LINE_PROBE = r'''
+import gateway as gw
+print(gw._limits_line())
+'''
+
+
+def test_기동_로그의_시간_한도_줄은_이_프로세스에_실제로_걸린_값을_말한다(tmp_path):
+    """게이트웨이는 `.env` 를 읽지 않는다 — 적었는데 닿지 않은 손잡이와 재기동 뒤의 옛 코드를 볼 자리가 이 줄뿐이다.
+    손잡이 이름을 그대로 적어 로그에서 찾을 수 있게 하고, 바꿔 준 값이 그대로 나오는지 본다."""
+    (tmp_path / "cfg.json").write_text(json.dumps({"_gateway": {"token": "gw-test-token"}}), encoding="utf-8")
+
+    def line(**env):
+        full = {k: v for k, v in os.environ.items() if not k.startswith("GATEWAY_")}
+        full.update(GATEWAY_CONFIG=str(tmp_path / "cfg.json"), GATEWAY_AUDIT=str(tmp_path / "audit.jsonl"),
+                    PYTHONDONTWRITEBYTECODE="1", **env)
+        run = subprocess.run([sys.executable, "-c", _LIMITS_LINE_PROBE], cwd=os.path.dirname(os.path.abspath(gw.__file__)),
+                             env=full, capture_output=True, text=True, timeout=120)
+        assert run.returncode == 0, run.stderr[-2000:]
+        return run.stdout.strip()
+    said = line()
+    for want in ("GATEWAY_CALL_TIMEOUT=600 ", "GATEWAY_RECONNECT_TIMEOUT=30 ", "GATEWAY_BACKEND_READ_TIMEOUT=660 ",
+                 "GATEWAY_BACKEND_HTTP_TIMEOUT=30 ", "GATEWAY_LIVENESS_TIMEOUT=10 × GATEWAY_LIVENESS_STRIKES=2(주기 60)",
+                 "GATEWAY_AGG_STALE_ROUNDS=10 ", "GATEWAY_HEAX_MISS_DROP=10 ", "GATEWAY_REST_CALL_TIMEOUT=600 ",
+                 "GATEWAY_PORTAL_SAVE_TIMEOUT=120 ", "GATEWAY_JWKS_TIMEOUT=5"):
+        assert want in said, f"{want!r} 가 없다: {said}"
+    said = line(GATEWAY_CALL_TIMEOUT="900", GATEWAY_LIVENESS_STRIKES="3", GATEWAY_JWKS_TIMEOUT="2")
+    assert "GATEWAY_CALL_TIMEOUT=900 " in said and "GATEWAY_BACKEND_READ_TIMEOUT=960 " in said
+    assert "GATEWAY_REST_CALL_TIMEOUT=900 " in said and "GATEWAY_LIVENESS_STRIKES=3(" in said and said.endswith("GATEWAY_JWKS_TIMEOUT=2")
+
+
+def test_기동할_때_그_줄을_남긴다():
+    src = open(gw.__file__, encoding="utf-8").read()
+    main = src[src.index("\ndef main():"):]
+    assert 'log.info("%s", _limits_line())' in main[:main.index("uvicorn.run(")], "main() 이 기동 전에 시간 한도 줄을 남겨야 한다"

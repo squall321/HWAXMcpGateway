@@ -80,8 +80,8 @@ MCP fan-out과 같은 패턴("호출자 토큰 1개 → 백엔드별 네이티�
 
 TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 방식 중 하나로 붙는다 — TestScope 코드는 여기서 손대지 않는다. **기본(`TESTSCOPE_SSO_SECRET` 없음)** 은 이 등록 토큰 길이고, **비밀이 있으면** `per_user_sso.testscope` 가 생겨 위 우선순위대로 그쪽이 먼저 탄다(등록할 것 없음). 위임은 TestScope 가 `POST /api/auth/sso`(위 계약)를 갖춘 뒤에만 켠다 — 그 전에 비밀이 생기면 발급이 실패해 신원 있는 TestScope 호출이 전부 거부되고 등록 토큰으로 돌아가지 않는다. 그래서 비밀은 자동으로 만들지 않고 사람이 넣는다. 백엔드는 두 방식이 같다 — `provision-config.sh` 가 `TESTSCOPE_MCP_URL`(> 직전 config 주소)로 만든다(`streamable_http`, 서비스 `Authorization` 없음 — tools/list 는 토큰 없이 된다). 기본 호스트가 없어 주소를 모르면 만들지 않는다.
 
-## 시간 한도 — 손잡이는 전부 프로세스 env, 기본값은 코드
-게이트웨이는 `.env` 를 읽지 않고 HWAXPortal `infra/services.yaml` 의 `mcp-gateway` 항목도 env 를 넘기지 않는다 — **`gateway.py` 의 기본값이 곧 운영값**이다. 바꾸려면 `start.sh` 를 부르는 환경에 export 한다(값은 초).
+## 시간 한도 — 손잡이는 프로세스 env, 기본값은 코드
+게이트웨이는 `.env` 를 읽지 않고 HWAXPortal `infra/services.yaml` 의 `mcp-gateway` 항목도 env 를 넘기지 않는다 — **`gateway.py` 의 기본값이 곧 운영값**이다. 바꾸려면 `start.sh` 를 부르는 환경에 export 한다(값은 초). 닿았는지는 기동 로그의 한 줄(`시간 한도(초) — GATEWAY_CALL_TIMEOUT=600 · …`)로 본다 — 이 프로세스에 실제로 걸린 값이다.
 
 원칙은 셋이다. ① 안쪽 한도가 그것을 감싸는 한도보다 작다. ② 느린 도구(시간 초과)와 죽은 상대(연결 실패)를 가른다 — 시간 초과는 **한 번으로 끝내고**(재시도·세션 교체·토큰 재발급 없음) 연결 실패만 한 번 다시 건다. ③ 만료 문구는 몇 초였고 어느 손잡이인지 말한다.
 
@@ -99,6 +99,21 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 | `GATEWAY_JWKS_TIMEOUT` | 5 | 호출자 토큰(포털 PAT)을 검증할 때의 포털 서명 키 조회 — `/mcp` 와 `/api/<site>/` 둘 다. 스레드에서 돈다(동기 urllib 가 이벤트 루프를 붙잡지 않게) | 검증 실패로 다뤄져 401 `unauthorized`(감사 `unverified-token`). 포털이 매달려도 진행 중인 호출과 ping 은 멈추지 않는다 |
 
 층 — 핸드셰이크·재연결 30 < 호출 600 < 전송 read·단발 세션 바깥 기한 660(= 30 + 600 + 30) < 엔진 `MCP_CALL_TIMEOUT_S` 900 < nginx `/mcp-gw/` 3600. 포털 절차 워밍업(690)도 660 바깥이다. **`GATEWAY_CALL_TIMEOUT` 을 올리면 엔진·포털 워밍업·nginx 셋을 같은 폭으로 올린다**(전송 read 와 단발 세션 바깥 기한은 스스로 따라 오른다). 안쪽(백엔드 자신의 한도 — KooRemapper MCP→REST 240, AIDataHub 풀 60 + 검색 90 등)은 600 보다 작아야 한다. HWAXPortal 절차 시험(`test_procedures_census`)이 `gateway.py` 의 기본값을 읽어 30~600 으로 묶으므로 600 을 넘기려면 그 상한부터 고친다. 600 으로도 모자란 도구는 한도를 올리지 말고 잡 도구(제출 + 상태 조회)로 돌린다 — 이 값이 호출 중 죽은 무상태 백엔드에서 호출자를 풀어 주는 마지막 값이다.
+
+그대로 둔 값 — 느린 일을 재지 않고 죽은 상대·신선도를 재는 값이라 짧게 둔다.
+
+| env | 기본 | 무엇 |
+|---|---|---|
+| `GATEWAY_REVIVE_INTERVAL` | 60 | 재활 패스 주기(탐침·재연결·레지스트리 폴·카탈로그 갱신) |
+| `GATEWAY_USER_PAT_TTL` | 43200 | 사람별 위임 토큰 캐시. 응답의 `expires_in` − 120초가 더 짧으면 그것 |
+| `GATEWAY_AFF_PROOF_TTL` | 120 | 소속 증명의 재전송 창(앱은 요청이 도착할 때 본다) |
+| `GATEWAY_CONN_TTL` | 300 | 포털 등록 토큰 캐시(조회 실패·미등록은 30초) |
+| `GATEWAY_ACCESS_POLICY_TTL` · `GATEWAY_ACCESS_ENT_TTL` | 60 · 60 | 포털 권한 정책 갱신 주기 · 사람별 권한 캐시(포털이 불통이면 직전 값) |
+| `GATEWAY_CACHE_TTL` | 300 | 읽기 전용 응답 캐시. 상태·잡·`deliberate_*`·`risk_*` 는 캐시하지 않아 폴링이 실제 상태를 본다 |
+| `EVID_TTL_S` | 1800 | `verify_answer` 의 조회 기록. 지나면 `조회 기록이 만료됐다 … (EVID_TTL_S)` |
+| `ORG_TAX_TTL_S` | 600 | 조직도 라벨 캐시 |
+
+손잡이 없이 리터럴로 남은 것도 있다 — 죽은 상대를 재는 포털 조회 8초(등록 토큰·권한·정책·조직도) · REST 사이트의 OpenAPI 조회 8초 · 사람별 토큰 발급 15초 · 레지스트리 폴 10초 · 폐기 목록 5초, 그리고 심의가 쓰지 않는 길의 `search_conversations` 120초 · REST 스트리밍 프록시(`/api/<site>/`) 30초.
 
 **만료된 호출자 토큰**은 틀린 토큰과 다르게 답한다 — 401 본문 `{"error": "expired", "detail": "토큰 수명이 끝났다(포털 CHAT_PAT_TTL_S 또는 PAT 만료)"}`, 감사 줄은 `/mcp` 가 `unauthorized: expired`, `/api/` 가 `pat: expired` 다. 서명이 틀린 토큰은 `exp` 가 지났어도 만료로 치지 않는다(주장일 뿐이다). 수 시간짜리 심의에서 시작할 때 받은 챗 토큰이 도중에 끝나면 여기서 거절되고, 엔진은 그것을 보고 서비스 계정으로 넘긴다.
 

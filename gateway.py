@@ -11,6 +11,7 @@ from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import anyio
 import httpx
@@ -50,7 +51,71 @@ def _load_config():
     return gw, backends, rest, portal, heax
 
 
+# 설정에 없어도 늘 프록시를 거치지 않는 주소 — 백엔드 대부분이 이 박스 안에서 돈다.
+_NO_PROXY_ALWAYS = ("127.0.0.1", "localhost", "::1")
+
+
+def _bypass_proxy_for(urls) -> list[str]:
+    """이 주소들의 **호스트**를 `NO_PROXY`·`no_proxy` 에 더하고, 새로 더한 호스트를 돌려준다.
+
+    httpx 는 `trust_env` 기본값(True)으로 환경의 프록시를 따른다. 그래서 내부 백엔드 호출이 사내 프록시로 나갔고, RA 가
+    IP 허용목록으로 거절해 사람별 위임이 403 이 됐다(실측 2026-10-03). 운영자 `~/.bashrc` 의 임시 블록으로 막고 있었는데
+    systemd·cron 으로 띄우거나 박스를 새로 세우면 다시 뚫린다. 클라이언트를 만드는 자리가 열 곳이고 MCP SDK 가 안에서
+    만드는 것은 손이 닿지 않아, 자리마다 고치지 않고 **환경을 세운다** — httpx 는 클라이언트를 만드는 순간의 환경을
+    읽으므로 이 뒤에 만들어지는 것은 전부 따른다(HWAXPortal docs/change-request-8-10 D-8).
+
+    - **호스트만** 적는다(포트·계정·쿼리는 버린다 — 주소에 `?token=` 이 실린 백엔드가 있다). httpx 는 IP 를 그 주소 하나로,
+      이름을 그 이름과 하위 도메인으로 맞춘다. CIDR 은 대역으로 읽지 않고 `.example.com` 은 하위 도메인만 덮으므로,
+      그런 항목이 이미 있어도 주소를 따로 더한다.
+    - **있던 값은 지우지 않는다.** 한쪽 철자에만 있으면(다른 쪽이 없거나 비었으면) 그 값을 다른 쪽이 이어받는다 —
+      파이썬은 소문자를 먼저 보므로, 소문자를 우리 호스트만으로 새로 만들면 대문자에 적어 둔 것이 통째로 무시된다.
+      둘 다 있으면 서로 섞지 않고 각자 제 값 뒤에 붙인다.
+    - 값이 `*` 하나면 그대로 둔다(이미 전부 우회). 뒤에 덧붙이면 urllib 은 그것을 더는 '전부' 로 읽지 않는다.
+    - IP(영역 표기 없는 것)와 평범한 DNS 이름만 적는다. httpx 는 `NO_PROXY` 의 항목 하나를 못 읽으면 **클라이언트를 만드는
+      자리마다** 던진다(`[::1]` 한 항목으로 재현) — 주소 하나의 오타가 전 호출을 죽이면 안 된다. 못 적은 것은 경고로 남긴다.
+    """
+    hosts: list[str] = []
+    for u in urls:
+        try:
+            h = urlsplit(str(u or "")).hostname or ""
+        except ValueError:                   # 깨진 IPv6 표기 — 어차피 부를 수 없는 주소다
+            continue
+        if not h or h in hosts:
+            continue
+        try:
+            ok = not getattr(ipaddress.ip_address(h), "scope_id", None)
+        except ValueError:
+            ok = bool(re.fullmatch(r"[a-z0-9._-]+", h))
+        if ok:
+            hosts.append(h)
+        else:
+            log.warning("NO_PROXY 에 적을 수 없는 호스트라 건너뛴다 — 이 주소는 프록시 설정을 그대로 따른다: %s", h)
+    added: list[str] = []
+    cur = {k: (os.environ.get(k) or "").strip() for k in ("NO_PROXY", "no_proxy")}
+    for key, other in (("NO_PROXY", "no_proxy"), ("no_proxy", "NO_PROXY")):
+        have = [e.strip() for e in (cur[key] or cur[other]).split(",") if e.strip()]
+        if have != ["*"]:
+            seen = {e.lower() for e in have}
+            new = [h for h in dict.fromkeys((*_NO_PROXY_ALWAYS, *hosts)) if h not in seen]
+            have += new
+            added += [h for h in new if h not in added]
+        if ",".join(have) != os.environ.get(key):
+            os.environ[key] = ",".join(have)
+    if added:
+        log.info("NO_PROXY 에 내부 목적지 %d곳을 더했다(사내 프록시를 거치지 않는다): %s", len(added), ", ".join(added))
+    return added
+
+
 GW, BACKENDS, REST, PORTAL, HEAX = _load_config()
+# 클라이언트를 하나라도 만들기 **전에** 환경을 세운다. 게이트웨이가 직접 부르는 주소 전부다 — 백엔드 · 사람별 위임(sso_url) ·
+# REST 사이트 · 포털 · heax 레지스트리(앱 주소는 base + 경로라 base 하나로 덮인다. 뒤늦게 발견되는 앱은 _discover_heax 가 더한다).
+if not _bypass_proxy_for(
+        [v.get("url") for v in BACKENDS.values()]
+        + [v.get("sso_url") for v in (HEAX.get("per_user_sso") or {}).values() if isinstance(v, dict)]
+        + [v.get("base") for v in REST.values() if isinstance(v, dict)]
+        + [PORTAL.get(k) for k in ("api_base", "jwks_url", "revoked_url")]
+        + [HEAX.get(k) for k in ("servers_url", "base")]):
+    log.info("NO_PROXY — 더할 내부 목적지가 없다(이미 들어 있거나 `*`)")
 GW_TOKEN = GW["token"]
 HOST = GW.get("host", "127.0.0.1")
 # GATEWAY_PORT 로 config 를 덮어쓸 수 있다 — 임시/재현 실행이 운영 포트(9110)를 뺏지 않도록
@@ -611,6 +676,8 @@ async def _discover_heax() -> dict[str, dict] | None:
                                       "allowed_groups": list(s.get("allowed_groups") or []),
                                       "label": (s.get("name") or "").strip()[:80],
                                       "description": (s.get("description") or "").strip()[:300]}
+    # 발견한 앱의 세션을 열기 **전에** 그 호스트도 프록시에서 뺀다(기동 때와 같은 함수 — 이미 있으면 아무것도 안 한다).
+    _bypass_proxy_for(spec["url"] for spec in out.values())
     return out
 
 

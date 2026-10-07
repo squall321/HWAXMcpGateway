@@ -2381,3 +2381,206 @@ def test_신원_전달_대상이_아니면_재시도는_종전대로_서비스_�
     assert not res.isError, res.content[0].text
     assert b.reconnects == 1 and b.session.calls == ["deliberate_status"] and shots == []
     assert (row["mode"], row["note"], row.get("caller")) == ("service", "reconnected", user or None)
+
+
+# ── 내부 목적지는 사내 프록시를 거치지 않는다(HWAXPortal docs/change-request-8-10 #2 · D-8) ───────────
+#
+# httpx 는 **클라이언트를 만드는 순간**의 환경으로 프록시를 정한다(trust_env 기본값). 그래서 판정은 "이 환경에서 새로 만든
+# 클라이언트가 이 주소를 어디로 보내는가" 로 한다 — 연결은 하지 않는다(프록시 주소도 가짜다).
+import logging  # noqa: E402
+import os  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+_PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy")
+_REAL_ASYNC_CLIENT = httpx.AsyncClient      # `_mock_http` 류가 모듈 속성을 갈아 끼우므로 진짜를 잡아 둔다
+_LOOPBACK = "127.0.0.1,localhost,::1"
+_INSIDE = ["http://ra.corp.test:3002/mcp", "https://ra.corp.test/api/auth/sso", "http://192.0.2.10:8000/mcp"]
+_OUTSIDE = "https://example.com/"
+
+
+def _proxy_env(monkeypatch, upper=None, lower=None):
+    """사내 프록시가 걸린 환경. `NO_PROXY` 두 철자는 준 대로 둔다(None = 변수 없음)."""
+    for k in _PROXY_VARS:
+        monkeypatch.setenv(k, "")       # 먼저 한 번 적어야 시험 뒤에 원래대로 돌아간다 — 없던 변수의 delenv 는 기록이 안 남는다
+        monkeypatch.delenv(k)
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    if upper is not None:
+        monkeypatch.setenv("NO_PROXY", upper)
+    if lower is not None:
+        monkeypatch.setenv("no_proxy", lower)
+
+
+def _route(url: str) -> str:
+    """지금 환경에서 **새로 만든** httpx 클라이언트가 이 주소를 보내는 곳 — 'direct' | 'proxy'."""
+    c = _REAL_ASYNC_CLIENT(timeout=8)
+    try:
+        return "direct" if c._transport_for_url(httpx.URL(url)) is c._transport else "proxy"
+    finally:
+        asyncio.run(c.aclose())
+
+
+@pytest.mark.parametrize("upper,lower,want_upper,want_lower", [
+    (None, None, f"{_LOOPBACK},ra.corp.test,192.0.2.10", f"{_LOOPBACK},ra.corp.test,192.0.2.10"),
+    # 한쪽 철자에만 있던 값은 다른 쪽이 이어받는다 — 파이썬은 소문자를 먼저 보므로, 소문자를 우리 호스트만으로 새로
+    # 만들면 대문자에 적어 둔 것이 통째로 무시된다(있던 우회가 사라진다).
+    ("a.test", None, f"a.test,{_LOOPBACK},ra.corp.test,192.0.2.10", f"a.test,{_LOOPBACK},ra.corp.test,192.0.2.10"),
+    (None, "a.test", f"a.test,{_LOOPBACK},ra.corp.test,192.0.2.10", f"a.test,{_LOOPBACK},ra.corp.test,192.0.2.10"),
+    ("a.test", "", f"a.test,{_LOOPBACK},ra.corp.test,192.0.2.10", f"a.test,{_LOOPBACK},ra.corp.test,192.0.2.10"),
+    # 둘 다 있으면 서로 섞지 않는다 — 각자 제 값 뒤에 붙인다
+    ("a.test", "b.test, c.test", f"a.test,{_LOOPBACK},ra.corp.test,192.0.2.10",
+     f"b.test,c.test,{_LOOPBACK},ra.corp.test,192.0.2.10"),
+    # 이미 있는 것은 다시 적지 않는다(대소문자 무관). 포트가 붙은 항목은 그 포트만 덮으므로 호스트를 따로 더한다
+    ("localhost,RA.Corp.Test,192.0.2.10:9", None, f"localhost,RA.Corp.Test,192.0.2.10:9,127.0.0.1,::1,192.0.2.10",
+     f"localhost,RA.Corp.Test,192.0.2.10:9,127.0.0.1,::1,192.0.2.10"),
+])
+def test_NO_PROXY_에_더하되_있던_값은_지우지_않는다(monkeypatch, upper, lower, want_upper, want_lower):
+    _proxy_env(monkeypatch, upper, lower)
+    gw._bypass_proxy_for(_INSIDE)
+    assert (os.environ["NO_PROXY"], os.environ["no_proxy"]) == (want_upper, want_lower)
+    assert [_route(u) for u in _INSIDE + ["http://127.0.0.1:9009/mcp", "http://localhost:8723/", "http://[::1]:3002/mcp"]] \
+        == ["direct"] * 6
+    assert _route(_OUTSIDE) == "proxy", "바깥 주소까지 우회시키면 안 된다"
+    assert gw._bypass_proxy_for(_INSIDE) == [], "두 번 불러도 같은 값이다"
+    assert (os.environ["NO_PROXY"], os.environ["no_proxy"]) == (want_upper, want_lower)
+
+
+@pytest.mark.parametrize("upper,lower,want,outside", [
+    ("*", None, ("*", "*"), "direct"),            # 이미 전부 우회 — 뒤에 덧붙이면 urllib 은 더는 '전부' 로 읽지 않는다
+    (None, "*", ("*", "*"), "direct"),
+    # 파이썬이 실제로 보는 것은 소문자다 — 대문자의 `*` 를 소문자로 끌어오지 않는다(바깥 호출까지 프록시를 벗어난다)
+    ("*", "a.test", ("*", f"a.test,{_LOOPBACK},ra.corp.test,192.0.2.10"), "proxy"),
+])
+def test_NO_PROXY_가_별표면_그대로_둔다(monkeypatch, upper, lower, want, outside):
+    _proxy_env(monkeypatch, upper, lower)
+    gw._bypass_proxy_for(_INSIDE)
+    assert (os.environ["NO_PROXY"], os.environ["no_proxy"]) == want
+    assert [_route(u) for u in _INSIDE] == ["direct"] * 3 and _route(_OUTSIDE) == outside
+
+
+def test_대역과_점_표기가_이미_있어도_주소를_따로_더한다(monkeypatch):
+    """httpx 는 `NO_PROXY` 의 CIDR 을 대역으로 읽지 않고(네트워크 주소 하나로만 맞춘다) `.corp.test` 는 하위 도메인만 덮는다.
+    '이미 덮여 있겠지' 하고 건너뛰면 그 주소만 계속 프록시로 간다."""
+    _proxy_env(monkeypatch, "192.0.2.0/24,.corp.test", "192.0.2.0/24,.corp.test")
+    urls = ["http://192.0.2.10:8000/mcp", "https://corp.test/mcp"]
+    assert [_route(u) for u in urls] == ["proxy", "proxy"], "이 시험의 전제 — httpx 가 달리 읽게 되면 여기서 알린다"
+    assert gw._bypass_proxy_for(urls) == ["127.0.0.1", "localhost", "::1", "192.0.2.10", "corp.test"]
+    assert [_route(u) for u in urls] == ["direct", "direct"]
+    assert os.environ["NO_PROXY"].startswith("192.0.2.0/24,.corp.test,")
+
+
+def test_NO_PROXY_에는_호스트만_적고_로그에도_호스트만_남긴다(monkeypatch, caplog):
+    """주소에 계정·`?token=` 이 실린 백엔드가 있다 — 환경변수와 기동 로그에 새면 안 된다. 그리고 못 읽는 항목 하나가
+    `NO_PROXY` 에 들어가면 httpx 는 **클라이언트를 만드는 자리마다** 던진다(`[::1]` 로 재현) — 이상한 호스트는 적지 않는다."""
+    _proxy_env(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="hwax-mcp-gateway"):
+        added = gw._bypass_proxy_for([
+            "http://user:PW-SECRET@ra.corp.test:3002/mcp?token=QUERY-SECRET", "https://[2001:db8::7]:8443/mcp",
+            None, "", "nohost", "http://*/x", "http://[fe80::1%25eth0]:9/x", "http://exa mple/x", "http://[::1/x"])
+    assert added == ["127.0.0.1", "localhost", "::1", "ra.corp.test", "2001:db8::7"]
+    assert os.environ["NO_PROXY"] == os.environ["no_proxy"] == f"{_LOOPBACK},ra.corp.test,2001:db8::7"
+    said = "\n".join(r.getMessage() for r in caplog.records)
+    assert "ra.corp.test" in said and "2001:db8::7" in said
+    for leak in ("SECRET", "token=", "user:", "3002"):
+        assert leak not in said, f"로그에 주소의 다른 부분이 샜다: {leak}"
+    assert _route("https://[2001:db8::7]:8443/mcp") == "direct", "클라이언트가 만들어지고 IPv6 도 맞는다"
+    assert any(r.levelno == logging.WARNING and "*" in r.getMessage() for r in caplog.records), \
+        "못 적은 호스트는 조용히 넘기지 않는다 — 그 주소는 여전히 프록시를 탄다"
+
+
+def test_레지스트리로_뒤늦게_발견된_앱의_호스트도_더한다(monkeypatch):
+    _proxy_env(monkeypatch, "a.test")
+    monkeypatch.setattr(gw, "HEAX", {"servers_url": "http://hub.corp.test:4040/servers", "base": "http://late.corp.test:4180"})
+    monkeypatch.setattr(gw.httpx, "AsyncClient", lambda **kw: _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json={"servers": [{"id": "app1", "path": "/app1/mcp"}]})), **kw))
+    assert _route("http://late.corp.test:4180/app1/mcp") == "proxy"
+    found = asyncio.run(gw._discover_heax())
+    assert found["heax-app1"]["url"] == "http://late.corp.test:4180/app1/mcp"
+    assert _route("http://late.corp.test:4180/app1/mcp") == "direct", "이 뒤에 여는 세션이 프록시를 타면 안 된다"
+    assert os.environ["NO_PROXY"].split(",")[0] == "a.test" and _route(_OUTSIDE) == "proxy"
+
+
+_PROXY_PROBE = r'''
+import asyncio, json, os, sys, urllib.request
+import httpx
+made, sent = [], []
+def _spy(cls):
+    init = cls.__init__
+    def spied(self, *a, **kw):
+        made.append(self)
+        init(self, *a, **kw)
+    cls.__init__ = spied
+_spy(httpx.AsyncClient); _spy(httpx.Client)
+async def _no_send(self, request, **kw):
+    sent.append(str(request.url))
+    raise httpx.ConnectError("이 탐침은 연결하지 않는다")
+httpx.AsyncClient.send = _no_send
+import gateway as gw
+import rest_proxy
+at_import = len(made)
+urls = json.loads(sys.argv[1])
+def routes(c):
+    return {u: "direct" if c._transport_for_url(httpx.URL(u)) is c._transport else "proxy" for u in urls}
+async def main():
+    out = {}
+    async with gw.httpx.AsyncClient(timeout=8) as cli:               # gateway.py 의 호출별 클라이언트 모양
+        out["per_call"] = routes(cli)
+    n = len(made)
+    async with gw.streamablehttp_client(urls[0], headers={}):        # MCP SDK 가 안에서 만드는 클라이언트
+        pass
+    out["sdk_made"] = len(made) - n
+    out["sdk"] = routes(made[n]) if len(made) > n else {}
+    out["rest_proxy"] = routes(rest_proxy.RestProxy(gw.REST, gw.PORTAL, lambda *a, **k: None)._client)   # main() 이 만드는 상주 둘
+    out["pat_verifier"] = routes(rest_proxy.PortalPatVerifier(gw.PORTAL)._client)
+    return out
+out = asyncio.run(main())
+out.update(at_import=at_import, sent=sent, env=[os.environ.get("NO_PROXY"), os.environ.get("no_proxy")],
+           urllib=[bool(urllib.request.proxy_bypass(h)) for h in ("jwks.corp.test:8723", "example.com:443")])   # PyJWKClient 는 urllib 이다
+print(json.dumps(out))
+'''
+
+
+def test_기동하면_설정의_내부_목적지가_전부_프록시를_벗어난다(tmp_path):
+    """게이트웨이를 **실제로 import** 해(설정은 임시 파일) 그 뒤에 만들어지는 클라이언트 넷을 본다 — gateway.py 의 호출별
+    클라이언트 · MCP SDK 가 안에서 만드는 것 · main() 이 만드는 상주 둘(REST 프록시 · PAT 검증기). 고치기 전에는
+    루프백까지 전부 프록시로 갔다 — RA 가 IP 허용목록으로 거절해 사람별 위임이 403 이었다(실측 2026-10-03).
+    import 시점에 만들어지는 클라이언트가 없다는 것도 본다 — 있으면 환경을 세우기 전의 프록시 설정으로 굳는다."""
+    cfg = {
+        "_gateway": {"host": "127.0.0.1", "port": 9110, "token": "gw-test-token"},
+        "ra": {"url": "http://ra.corp.test:3002/mcp"},
+        "odb": {"url": "http://192.0.2.10:8000/mcp?token=QUERY-SECRET"},
+        "rest": {"site": {"base": "https://rest.corp.test:8443"}},
+        "portal": {"api_base": "http://portal.corp.test:8723",
+                   "jwks_url": "http://jwks.corp.test:8723/.well-known/jwks.json",
+                   "revoked_url": "http://revoked.corp.test:8723/auth/pat/revoked.json"},
+        "heax_registry": {"servers_url": "http://hub.corp.test:4040/api/v1/mcp/servers",
+                          "base": "http://caddy.corp.test:4180",
+                          "per_user_sso": {"ste": {"sso_url": "http://user:PW-SECRET@198.51.100.7:5012/api/auth/sso",
+                                                   "secret": "s"}}},
+    }
+    (tmp_path / "cfg.json").write_text(json.dumps(cfg), encoding="utf-8")
+    inside = ["http://ra.corp.test:3002/mcp", "http://192.0.2.10:8000/mcp", "https://rest.corp.test:8443/api/x",
+              "http://portal.corp.test:8723/internal/access/policy", "http://jwks.corp.test:8723/.well-known/jwks.json",
+              "http://revoked.corp.test:8723/auth/pat/revoked.json", "http://hub.corp.test:4040/api/v1/mcp/servers",
+              "http://caddy.corp.test:4180/app/mcp", "http://198.51.100.7:5012/api/auth/sso", "http://127.0.0.1:9009/mcp"]
+    env = {k: v for k, v in os.environ.items() if k not in _PROXY_VARS}
+    env.update(HTTP_PROXY="http://proxy.invalid:3128", HTTPS_PROXY="http://proxy.invalid:3128",
+               NO_PROXY="keep.test",                               # 대문자에만 있던 값 — 지워지면 안 된다
+               GATEWAY_CONFIG=str(tmp_path / "cfg.json"), GATEWAY_AUDIT=str(tmp_path / "audit.jsonl"),
+               PYTHONDONTWRITEBYTECODE="1")
+    run = subprocess.run([sys.executable, "-c", _PROXY_PROBE, json.dumps(inside + [_OUTSIDE])],
+                         cwd=os.path.dirname(os.path.abspath(gw.__file__)), env=env,
+                         capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    out = json.loads(run.stdout)
+    assert out["at_import"] == 0 and out["sent"] == [] and out["sdk_made"] == 1
+    for kind in ("per_call", "sdk", "rest_proxy", "pat_verifier"):
+        assert {u: out[kind][u] for u in inside} == dict.fromkeys(inside, "direct"), kind
+        assert out[kind][_OUTSIDE] == "proxy", f"{kind}: 바깥 주소까지 우회시키면 안 된다"
+    assert out["urllib"] == [True, False], "JWKS 는 httpx 가 아니라 urllib 로 받는다 — 같은 환경을 따라야 한다"
+    assert out["env"][0] == out["env"][1] and out["env"][0].startswith(f"keep.test,{_LOOPBACK},")
+    for name in ("ra.corp.test", "192.0.2.10", "rest.corp.test", "portal.corp.test", "hub.corp.test", "198.51.100.7"):
+        assert name in run.stderr, f"기동 로그에 더한 호스트가 남아야 한다: {name}"
+    for leak in ("SECRET", "token=", "user:"):
+        assert leak not in run.stderr and leak not in "".join(out["env"]), f"주소의 비밀이 샜다: {leak}"

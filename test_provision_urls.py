@@ -565,3 +565,59 @@ def test_arp_env_토큰과_주소가_직전_config_를_이긴다(tmp_path):
     out = _run_provision(tmp_path, {"ARP_TOKEN": "arp-new-token", "ARP_BASE": "http://arp2.example:3001"})
     assert out["arp"]["url"] == "http://arp2.example:3001/mcp"
     assert "arp-old-token" not in json.dumps(out)
+
+
+# ── smart-twin-mcp — 주소가 설정된 박스에서만 등재한다(change-request-8-10 #11 · D-4) ───────────────────────
+# 예전엔 기본값(같은 박스 :5013)으로 무조건 등재했다 — 띄운 적 없는 cae00 에서 가짜 DOWN 이 영구히 남았다.
+# 없어진 서비스는 아니다(dev 는 그 주소에서 듣고 도구 18종을 낸다) — 그래서 지우지 않고 조건부로 바꿨다.
+ST_DEFAULT = "http://127.0.0.1:5013/mcp"
+
+
+def _st_skip(log: list) -> list:
+    return [l for l in log[0].splitlines() if "smart-twin-mcp 생략" in l]
+
+
+def test_smart_twin_mcp_는_주소를_적은_박스에서만_등재한다(tmp_path):
+    log: list = []
+    out = _run_provision(tmp_path, {}, log)
+    assert "smart-twin-mcp" not in out, "기본값으로 지어내면 서비스가 없는 박스에 가짜 DOWN 이 선다"
+    skip = _st_skip(log)
+    assert len(skip) == 1 and "켜려면" in skip[0] and "provision.env" in skip[0] and "SMARTTWIN_MCP_URL=" in skip[0], log[0]
+    # dev 의 모양 — 같은 박스 기본 주소에서 듣고 있고, 그 주소를 env 로 적었다
+    (tmp_path / "gateway_config.json").unlink()
+    log = []
+    out = _run_provision(tmp_path, {"SMARTTWIN_MCP_URL": ST_DEFAULT}, log)
+    assert out["smart-twin-mcp"] == {"url": ST_DEFAULT, "transport": "streamable_http"}
+    assert _st_skip(log) == []
+
+
+def test_smart_twin_mcp_직전_config_의_옛_기본값은_이어받지_않는다(tmp_path):
+    """cae00 의 모양 — 예전 프로비저너가 박은 기본 주소가 라이브 config 와 .bak 에 남아 있다. 이어받으면 반영 뒤에도
+    가짜 DOWN 이 그대로다. 관리 키라 '보존' 으로 되살아나지도 않아야 한다 — 빠진 사실은 켜는 법과 함께 말한다."""
+    old = {"smart-twin-mcp": {"url": ST_DEFAULT, "transport": "streamable_http"},
+           "smart-twin-cluster": {"url": "http://127.0.0.1:5012/mcp", "transport": "streamable_http"}}
+    (tmp_path / "gateway_config.json").write_text(json.dumps(old), encoding="utf-8")
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps(old), encoding="utf-8")
+    log: list = []
+    out = _run_provision(tmp_path, {}, log)
+    assert "smart-twin-mcp" not in out
+    assert out["smart-twin-cluster"] == old["smart-twin-cluster"], "손으로 붙인 별개 서버는 그대로 보존한다"
+    skip = _st_skip(log)
+    assert len(skip) == 1 and "옛 기본값" in skip[0] and "켜려면" in skip[0] and "SMARTTWIN_MCP_URL=" in skip[0], log[0]
+    # 그 박스가 실제로 쓰는 곳이면(dev) env 한 줄로 그 주소 그대로 선다
+    out = _run_provision(tmp_path, {"SMARTTWIN_MCP_URL": ST_DEFAULT})
+    assert out["smart-twin-mcp"] == {"url": ST_DEFAULT, "transport": "streamable_http"}
+
+
+def test_smart_twin_mcp_사람이_옮겨_적은_주소는_이어받는다(tmp_path):
+    """기본값이 아닌 주소는 '설정' 이다 — env 가 없는 실행(손으로 돌린 --force)이 그것을 지우면 도구가 통째로 사라진다."""
+    moved = "http://smarttwin.example:5013/mcp"
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({
+        "smart-twin-mcp": {"url": moved, "transport": "streamable_http"}}), encoding="utf-8")
+    log: list = []
+    out = _run_provision(tmp_path, {}, log)
+    assert out["smart-twin-mcp"] == {"url": moved, "transport": "streamable_http"}
+    assert _st_skip(log) == []
+    # env 가 직전 값을 이긴다
+    out = _run_provision(tmp_path, {"SMARTTWIN_MCP_URL": "http://smarttwin2.example:5013/mcp"})
+    assert out["smart-twin-mcp"]["url"] == "http://smarttwin2.example:5013/mcp"

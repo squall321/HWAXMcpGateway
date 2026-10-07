@@ -37,6 +37,9 @@
 #      사람별 호출은 RA 처럼 두 방식 중 하나다 — 기본은 사람이 포털 '개인 토큰 › 외부 연결' 에 등록한
 #      TestScope 토큰(게이트웨이 PORTAL_CONN_BACKENDS), TESTSCOPE_SSO_SECRET 이 있으면 8)의 위임(게이트웨이에서 먼저 탄다).
 #      기본 호스트가 없어 주소를 모르면 만들지 않는다.
+#  10) SmartTwinMCP: SMARTTWIN_MCP_URL(> 직전 config 의 **기본값이 아닌** 주소)이 있으면 smart-twin-mcp 백엔드.
+#      예전처럼 같은 박스 기본 주소로 무조건 등재하지 않는다 — 띄운 적 없는 박스에서 가짜 DOWN 이 남았다.
+#      같은 박스에서 쓰는 곳(dev)도 provision.env 에 SMARTTWIN_MCP_URL=http://127.0.0.1:5013/mcp 를 적는다.
 #
 # 사용:  bash provision-config.sh            # 이미 config 있으면 건드리지 않음
 #        bash provision-config.sh --force    # 재생성(기존은 .bak 백업)
@@ -484,8 +487,24 @@ cfg["ai-data-hub"] = {"url": _url("AIDH_MCP_URL", "ai-data-hub", "http://127.0.0
                       "transport": "streamable_http"}
 # SmartTwinMCP(:5013) — 해석 잡 제출·후처리·수집. smart-twin-cluster(:5012, 대시보드 slurm 조회)와
 # 별개 서버다. 이게 없으면 잡을 던질 수는 있어도 후처리·결과 수집 도구가 통째로 안 보인다.
-cfg["smart-twin-mcp"] = {"url": _url("SMARTTWIN_MCP_URL", "smart-twin-mcp", "http://127.0.0.1:5013/mcp"),
-                         "transport": "streamable_http"}
+# ⚠ 예전엔 기본값(같은 박스 :5013)으로 무조건 등재했다 — 띄운 적 없는 박스에도 서서 가짜 DOWN 이 영구히 남았다
+#   (cae00 2026-10-01·10-08 실측: :5013 수신 없음). 없어진 서비스는 아니다 — dev 는 그 주소에서 듣고 도구 18종을 낸다.
+#   그래서 주소가 **설정된** 박스에서만 등재한다(HWAXPortal docs/change-request-8-10 D-4) — env, 또는 직전 config 의
+#   기본값이 아닌 주소(사람이 옮겨 적은 것). 직전 config 의 기본값은 설정이 아니라 예전 프로비저너가 박은 값이라
+#   이어받지 않는다 — 이어받으면 반영 뒤에도 가짜 DOWN 이 그대로다. 그 대가로 같은 박스에서 쓰는 곳(dev)은
+#   provision.env 에 SMARTTWIN_MCP_URL 을 적어야 한다. update-all 의 기대 조건이 이 조건·이 기본값과 글자까지 같아야 한다.
+_ST_DEFAULT = "http://127.0.0.1:5013/mcp"
+_ST_PREV = _prev("smart-twin-mcp")
+_ST_URL = e.get("SMARTTWIN_MCP_URL") or (_ST_PREV if _ST_PREV != _ST_DEFAULT else None)
+if _ST_URL:
+    cfg["smart-twin-mcp"] = {"url": _ST_URL, "transport": "streamable_http"}
+else:
+    # 조용히 빠지지 않게 켜는 법과 함께 말한다 — 관리 키라 아래 '보존' 으로 되살아나지 않는다.
+    _st_why = (f"직전 config 의 주소가 옛 기본값({_ST_DEFAULT})뿐이다(설정한 주소가 아니라 이어받지 않는다)"
+               if _ST_PREV else "SMARTTWIN_MCP_URL 이 없다")
+    print(f"  {'⚠' if _ST_PREV else '·'} smart-twin-mcp 생략 — {_st_why}. 해석 잡 제출·후처리 도구가 붙지 않는다. "
+          f"켜려면 provision.env 에 SMARTTWIN_MCP_URL=<SmartTwinMCP 주소>(같은 박스면 {_ST_DEFAULT}) 를 적고 "
+          "update-all 재실행(손으로 돌릴 때는 env 로 주고 --force)")
 # ste(SmartTwinExplorer 웹) MCP — REST 의 얇은 래퍼(:15812). 잡 제출·상태·결과를 낸다.
 # 별도 프로세스인 이유는 starlette 버전 충돌이고, 그 덕에 인증·쿼터가 REST 한 곳에서만
 # 강제된다. **ste 는 stcx 와 다른 클러스터다**(ste 24대 / stcx 356대).
@@ -726,8 +745,9 @@ cfg["portal"]["audience_ok"] = sorted(rest)
 # smart-twin-cluster(slurm 도구 19개)가 조용히 사라진다. update-all 의 기대 목록에도
 # 없어서 사라진 사실조차 안 잡힌다(실측). 관리 키는 여기서 보존하지 않는다 —
 # 관리 키 중 토큰이 필요한 것(reportarchive·odb-hub·arp)은 env 가 없어도 직전 config 에서
-# 이어받으므로(_carry) 여기까지 와서 사라지는 일은 없다. 일부러 빼는 것은 하나다 — 토큰 없이
-# 등재돼 있던 옛 arp 항목(가짜 DOWN). 관리 키라서 빠지고, 빠질 때 위에서 '켜려면' 과 함께 말한다.
+# 이어받으므로(_carry) 여기까지 와서 사라지는 일은 없다. 일부러 빼는 것은 둘이다 — 토큰 없이
+# 등재돼 있던 옛 arp 항목과 옛 기본 주소로만 남은 smart-twin-mcp(가짜 DOWN 을 내던 모양). 관리 키라서
+# 빠지고, 빠질 때 위에서 '켜려면' 과 함께 말한다.
 MANAGED = {"_gateway", "reportarchive", "signalforge", "mx-white-paper",
            "ai-data-hub", "hwax-deliberation", "smart-twin-mcp", "ste",
            "rest", "portal", "heax_registry", "odb-hub", "arp", "testscope"}

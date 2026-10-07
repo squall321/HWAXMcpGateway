@@ -1079,7 +1079,7 @@ async def _portal_access(email: str, base_groups: list[str], *,
                          allow_stale: bool = True) -> dict | None:
     """포털의 **지금** 권한·소속 응답 전체(`{keys, affiliation, affiliation_label}`).
 
-    포털이 모르면(권한 기능 이전) None. 조회가 실패하면 직전에 받은 값, 그것도 없으면 None.
+    포털이 모르면(권한 기능 이전) None. 조회가 실패하면 직전에 받은 값(`is_admin` 은 거짓으로 바꿔서), 그것도 없으면 None.
     권한과 소속이 **같은 조회**에서 온다 — 포털은 정지된 계정에 둘 다 빈 값을 주므로,
     따로 물으면 한쪽만 거둬진 순간이 생긴다."""
     key = (email, ",".join(sorted(base_groups)))
@@ -1106,8 +1106,13 @@ async def _portal_access(email: str, base_groups: list[str], *,
         # 낫지만(포털이 죽었다고 도구가 다 사라지면 안 된다), **소속은 아니다** — 소속을
         # 벗어난 사람이 포털이 돌아올 때까지 **몇 시간이든** 남의 문서를 계속 읽는다.
         # 소속은 "모르면 안 싣는다" 가 규율이라 이 경로에서만 뒤집히면 안 된다.
-        log.warning("포털 권한 조회 실패(%s) — 권한만 직전 값으로(소속은 버린다): %r", email, exc)
-        return _ENT_LAST.get(key) if allow_stale else None
+        # ⚠ **관리자 표지도 소속 쪽 규율을 따른다** — 직전 값의 `is_admin` 은 싣지 않는다. 표지는 포털이 **지금** 관리자라고
+        # 답할 때만 붙는 것인데(HWAXPortal docs/change-request-8-10 D-3) 직전 값은 그 답이 아니다. 그대로 돌려주던 때는
+        # 해제된 관리자의 다음 호출이 포털 불통과 겹치면 표지가 다시 붙어 내려갔다(사본 재현 — 60초 캐시가 지난 뒤면
+        # 무효화 호출이 있었든 없었든 같다). 이 표지를 읽는 곳이 없어(2026-10-07 dev 대조) 불통 동안 떼어도 막히는 사람이 없다.
+        log.warning("포털 권한 조회 실패(%s) — 권한 키만 직전 값으로(소속·관리자 표지는 버린다): %r", email, exc)
+        last = _ENT_LAST.get(key) if allow_stale else None
+        return None if last is None else {**last, "is_admin": False}
     _ENT_CACHE[key] = (got, time.monotonic() + ACCESS_ENT_TTL_S)
     _ENT_LAST[key] = got
     return got
@@ -3049,8 +3054,14 @@ def _bearer_gate(app, pat_verifier=None):
                 _RESP_CACHE.pop(k, None)
             # 권한 캐시도 비운다 — 포털이 '허브에 보일 앱' 을 바꾼 뒤에도 이것을 부른다. 안 비우면 끈 앱이 최대
             # ACCESS_ENT_TTL_S(60초) 동안 search_tools 에 남는다(HWAXPortal docs/mcp-app-toggle).
-            for k in [k for k in _ENT_CACHE if (not _email or k[0] == _email)]:
-                _ENT_CACHE.pop(k, None)
+            # ⚠ **불통 때 쓰는 직전 값(`_ENT_LAST`)도 함께 버린다.** 포털은 관리자 해제·소속·허가 변경·계정 정지 뒤에도 이것을
+            # 부른다 — 알렸다는 것은 쥐고 있는 답이 **틀렸다**는 뜻이다. 60초 캐시만 비우던 때는 그 사람의 다음 호출이 포털
+            # 재기동과 겹치면 만료 없는 직전 값이 회수 전 권한 키를 그대로 돌려줘, 거둔 `plat:` 백엔드가 불통 내내 열렸다.
+            # 그 대가 — 알린 직후의 첫 호출이 불통과 겹친 **그 한 사람**은 포털이 답할 때까지 토큰의 값만 갖는다(로그인 그룹만
+            # 굽는 지금의 PAT 면 권한 키가 없다). 닫히는 쪽이고 포털이 돌아온 첫 호출에 풀린다. 남의 직전 값은 건드리지 않는다.
+            for _c in (_ENT_CACHE, _ENT_LAST):
+                for k in [k for k in _c if (not _email or k[0] == _email)]:
+                    _c.pop(k, None)
             # 그 사람 명의 PAT 캐시도 비운다 — 연결이 바뀌었으면 위임 토큰도 다시 받는다.
             _pgone = [k for k in _USER_PATS if (not _email or (isinstance(k, tuple) and _email in k)
                                                or k == _email)]

@@ -1984,6 +1984,7 @@ def test_계정을_정지하면_그_사람의_위임_토큰_연결_응답_캐시
     monkeypatch.setattr(gw, "_RESP_CACHE", OrderedDict([(("ste", "list_x", "{}", "u@x.io", (), ""), ("r-u", 1e12)),
                                                         (("ste", "list_x", "{}", "other@x.io", (), ""), ("r-o", 1e12))]))
     monkeypatch.setattr(gw, "_ENT_CACHE", {})
+    monkeypatch.setattr(gw, "_ENT_LAST", {})
     sent = []
 
     async def send(m): sent.append(m)
@@ -1995,6 +1996,30 @@ def test_계정을_정지하면_그_사람의_위임_토큰_연결_응답_캐시
     assert set(gw._USER_PATS) == {("ste", "other@x.io")}, "정지된 사람의 ste·RA 위임 토큰이 게이트웨이에 남았다"
     assert set(gw._CONN_CACHE) == {("reportarchive", "other@x.io")}
     assert list(gw._RESP_CACHE) == [("ste", "list_x", "{}", "other@x.io", (), "")]
+
+
+def test_포털이_알리면_불통_때_쓰는_직전_권한도_그_사람_것만_버린다(monkeypatch):
+    """`_ENT_CACHE`(60초)만 비우고 만료 없는 `_ENT_LAST` 를 두면, 그 사람의 다음 호출이 포털 불통과 겹칠 때 회수 전 답이
+    되살아난다. 포털이 알렸다는 것은 **쥐고 있는 답이 틀렸다**는 뜻이다."""
+    import asyncio
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    monkeypatch.setattr(gw, "_ENT_CACHE", {})
+    monkeypatch.setattr(gw, "_ENT_LAST", {("u@x.io", "mes-user"): {"keys": ["plat:risk"], "is_admin": True},
+                                          ("u@x.io", ""): {"keys": ["plat:risk"]},
+                                          ("other@x.io", "mes-user"): {"keys": ["feat:chat"]}})
+
+    def post(query):
+        sent = []
+
+        async def send(m): sent.append(m)
+        asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/conn-invalidate", "method": "POST",
+                                                 "query_string": query,
+                                                 "headers": [(b"authorization", b"Bearer gw-secret")]}, None, send))
+        return sent[0]["status"]
+    assert post(b"email=U@x.io") == 200
+    assert set(gw._ENT_LAST) == {("other@x.io", "mes-user")}, \
+        "그 사람 것은 로그인 그룹이 달라도 전부, 남의 것은 그대로 — 남의 것까지 버리면 불통 때 그 사람의 도구가 사라진다"
+    assert post(b"") == 200 and gw._ENT_LAST == {}, "이메일 없이 부르면 전부 비운다(다른 캐시와 같다)"
 
 
 def test_지침이_끈_앱을_권한_문제와_구분하라고_말한다():
@@ -2794,3 +2819,77 @@ def test_REST_경로의_그룹은_인증_미들웨어가_앱에_넘기는_그룹
     monkeypatch.setattr(gw, "_portal_access", fake_access)
     assert sorted(asyncio.run(gw._rest_groups(list(token), "u@corp.com"))) == sorted(mcp)
     assert asked == [mcp_asked], "포털에 묻는 그룹도 같아야 캐시가 한 항목이다"
+
+
+# ── 포털 불통 때 쓰는 직전 값(`_ENT_LAST`)이 거둔 것을 되살리지 않는다(검토 2026-10-07) ─────────────────────
+def _stale_kit(monkeypatch):
+    """인증 미들웨어·`_portal_access`·`/conn-invalidate` 는 실제 코드다 — 가짜는 포털의 HTTP 응답 하나뿐이다.
+    `_admin_gate` 는 `_portal_access` 를 통째로 갈아 끼워, 그 표의 '불통' 줄이 직전 값 분기를 한 번도 타지 않았다.
+    돌려주는 것 — 포털 상태(`down`·`answer`) · PAT 호출(앱이 받는 그룹) · 포털이 부르는 무효화."""
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    monkeypatch.setattr(gw, "_ENT_CACHE", {})
+    monkeypatch.setattr(gw, "_ENT_LAST", {})
+    portal = {"down": False, "answer": {"keys": ["feat:chat", "plat:risk"], "is_admin": True}}
+
+    def handler(req):
+        if portal["down"]:
+            raise httpx.ConnectError("portal down", request=req)
+        return httpx.Response(200, json=portal["answer"])
+    _mock_http(monkeypatch, handler)
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["h"] = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+
+    class _V:
+        async def verify(self, token, aud): return {"email": "u@corp.com", "groups": ["mes-user"]}
+
+    def call():
+        seen.clear()
+        asyncio.run(gw._bearer_gate(app, _V())({"type": "http", "path": "/mcp",
+                                                "headers": [(b"authorization", b"Bearer me")]}, None, None))
+        return gw._parse_groups(seen["h"][gw.GROUPS_HEADER])
+
+    def invalidate():
+        sent = []
+
+        async def send(m): sent.append(m)
+        asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/conn-invalidate", "method": "POST",
+                                                 "query_string": b"email=u@corp.com",
+                                                 "headers": [(b"authorization", b"Bearer gw-secret")]}, None, send))
+        return sent[0]["status"]
+    return portal, call, invalidate
+
+
+def test_포털이_불통이면_권한_키는_직전_값으로_버티고_관리자_표지는_싣지_않는다(monkeypatch):
+    """직전 값에는 만료가 없다. 권한 키는 그것으로 버티지만(포털이 죽었다고 도구가 다 사라지면 안 된다) 관리자 표지는
+    "포털이 **지금** 관리자라고 답할 때만" 붙는 것이다(D-3) — 직전 값은 그 답이 아니다. 무효화가 없어도 60초 뒤의 불통이면
+    해제된 관리자에게 표지가 다시 붙었다(고정 목록 `PORTAL_ADMIN_EMAILS` 에서 뺀 사람은 무효화 호출조차 없다)."""
+    portal, call, _invalidate = _stale_kit(monkeypatch)
+    assert call() == ["mes-user", "feat:chat", "plat:risk", "portal-admin"]
+    gw._ENT_CACHE.clear()                                   # 60초가 지난 것과 같다
+    portal["down"] = True
+    assert call() == ["mes-user", "feat:chat", "plat:risk"]
+    assert asyncio.run(gw._rest_groups(["mes-user"], "u@corp.com")) == ["mes-user", "feat:chat", "plat:risk"], \
+        "REST 프록시도 같은 조회를 쓴다"
+    portal["down"] = False
+    assert call() == ["mes-user", "feat:chat", "plat:risk", "portal-admin"], "포털이 돌아오면 첫 호출에 다시 붙는다"
+
+
+def test_포털이_거두었다고_알린_뒤의_불통은_거두기_전_권한으로_돌아가지_않는다(monkeypatch):
+    """관리자 해제·허가 회수·정지 뒤 포털이 `/conn-invalidate` 를 부른다(HWAXPortal 479d767). 그 사람의 다음 호출이 포털
+    재기동과 겹치면 직전 값이 회수 전 답(`plat:risk`·관리자)을 그대로 돌려줘, 정책이 건 백엔드가 불통 내내 열렸다."""
+    portal, call, invalidate = _stale_kit(monkeypatch)
+    monkeypatch.setattr(gw, "POLICY", {"risk": []})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {"risk": ["plat:risk"]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    assert gw._backend_allowed("risk", call())
+    portal["answer"] = {"keys": ["feat:chat"], "is_admin": False}      # 포털에서 해제하고 허가를 거뒀다
+    assert invalidate() == 200
+    portal["down"] = True
+    during = call()
+    assert during == ["mes-user"], "포털이 모른다 — 토큰의 값만 남는다(로그인 그룹만 굽는 지금의 PAT 에는 권한 키가 없다)"
+    assert not gw._backend_allowed("risk", during)
+    assert call() == during, "실패는 캐시되지 않는다 — 불통이 이어지는 동안 매 호출이 같아야 한다"
+    portal["down"] = False
+    assert call() == ["mes-user", "feat:chat"]

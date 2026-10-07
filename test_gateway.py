@@ -723,22 +723,32 @@ def test_a_backend_that_never_answers_does_not_freeze_the_catalogue(monkeypatch)
     monkeypatch.setattr(gw, "_REAGG", {})
     monkeypatch.setattr(gw, "LIVENESS_STRIKES", 2)
 
+    monkeypatch.setattr(gw, "HEAX", {})
+    monkeypatch.setattr(gw, "_FP", {})
+    monkeypatch.setattr(gw, "_LAST_TOOLS", {})
+
     async def go():
         # 데드라인이 없으면 여기서 매달린다 — 그게 실제로 일어난 일이다
         await asyncio.wait_for(gw._aggregate(), timeout=5)
         first = ({t.name for t in gw.exposed_tools}, stuck_answer.session is not None, gw._REAGG.get("pending"))
         await asyncio.wait_for(gw._aggregate(), timeout=5)
-        return first
+        second = stuck_answer.session is not None
+        await asyncio.wait_for(gw._revive_once(object()), timeout=5)
+        third = stuck_answer.session is not None
+        await asyncio.wait_for(gw._revive_once(object()), timeout=5)
+        return first, second, third
 
-    got, kept, again = asyncio.run(go())
+    (got, kept, again), kept2, kept3 = asyncio.run(go())
 
     assert got == {"before", "after"}, f"막힌 백엔드가 나머지를 데려갔다: {got}"
-    # 한 번 놓친 것으로는 세션을 갈지 않는다(잠깐 바쁜 건강한 백엔드의 진행 중 답을 버린다, gateway-06). 대신 다음 회차에
-    # 목록을 다시 받게 예약한다 — 안 그러면 이 백엔드의 도구가 그 구성이 바뀔 때까지 카탈로그에 안 올라온다.
-    assert kept and again is True
-    # 연속으로 놓친 백엔드는 **죽은 것으로 표시**돼 다음 회차 재연결 루프가 집어 간다
+    # 재집계의 무응답으로는 세션을 갈지 않는다(잠깐 바쁜 건강한 백엔드의 진행 중 답을 버린다, gateway-06) — 몇 번을 놓쳐도
+    # 같다. 대신 다음 회차에 목록을 다시 받게 예약한다 — 안 그러면 이 백엔드의 도구가 그 구성이 바뀔 때까지 카탈로그에
+    # 안 올라온다.
+    assert kept and again is True and kept2
+    # 생사는 재활 패스의 탐침이 가린다 — 연속으로 놓친 백엔드는 **죽은 것으로 표시**돼 재연결 루프가 집어 간다
+    assert kept3, "탐침 한 번으로는 아직 둔다"
     assert stuck_answer.session is None, "재연결 예약이 안 됐다 — 영영 안 돌아온다"
-    assert {t.name for t in gw.exposed_tools} == {"before", "after"}
+    assert {"before", "after"} <= {t.name for t in gw.exposed_tools}
 
 
 def test_the_stuck_backend_is_reported_not_swallowed(monkeypatch, caplog):
@@ -3292,6 +3302,22 @@ def test_재집계에서_목록을_받았으면_놓친_횟수가_끊긴다(monke
     assert b.session is sess and b.reconnects == 0 and gw._LIVENESS_MISS == {"signalforge": 1}
 
 
+def test_같은_패스_안에서_탐침과_재집계가_연달아_놓쳐도_한_번이다(monkeypatch):
+    """재집계는 탐침 바로 뒤에 같은 세션으로 list_tools 를 또 보낸다. 그것까지 세면 20초 남짓 바빴던 백엔드가 한 패스 안에서
+    '연속 2회' 가 되어 갈린다 — 횟수는 패스마다 한 번(재활 주기 간격)이어야 한다."""
+    sess = _ProbeSess(["hang"])
+    b = _probe_kit(monkeypatch, sess)
+    monkeypatch.setattr(gw, "_REAGG", {"pending": True})            # 다른 앱이 바뀌어 이번 패스에 재집계가 돈다
+
+    async def go():
+        await gw._revive_once(object())
+        return sess.probed
+    probed = asyncio.run(asyncio.wait_for(go(), 5))
+    assert probed == 2, "탐침과 재집계가 둘 다 돌았어야 이 시험이 뜻이 있다"
+    assert b.session is sess and b.reconnects == 0 and gw._LIVENESS_MISS == {"signalforge": 1}
+    assert gw._REAGG.get("pending") is True, "목록을 못 받았으니 다음 패스에 다시 받는다"
+
+
 def test_탐침을_연속으로_놓치면_세션을_갈고_그_세션의_진행_중_호출을_곧바로_풀어_준다(monkeypatch):
     """갈린 세션의 답은 어차피 버려진다. 알리지 않으면 호출자는 호출 한도(여기서는 30초, 운영 600초)까지 기다렸다."""
     import time as _time
@@ -3737,6 +3763,8 @@ def test_만료된_토큰은_틀린_토큰과_다르게_답하고_감사에도_�
     bodies = [json.loads(m["body"]) for m in sent if m["type"] == "http.response.body"]
     assert statuses == [401, 401]
     assert bodies[0] == {"error": "expired", "detail": "토큰 수명이 끝났다(포털 CHAT_PAT_TTL_S 또는 PAT 만료)"}
+    raw = [m["body"] for m in sent if m["type"] == "http.response.body"][0].decode("utf-8")
+    assert "토큰 수명이 끝났다" in raw, "curl·로그에서 읽히게 /api/ 와 같은 UTF-8 로 낸다(\\uXXXX 로 풀어 쓰지 않는다)"
     assert bodies[1] == {"error": "unauthorized"}, "서명이 틀린 토큰은 exp 가 지났어도 만료가 아니다(주장일 뿐이다)"
     assert [r["error"] for r in _rows()] == ["unauthorized: expired", "unauthorized: unverified-token"]
     assert all("caller" not in r for r in _rows())

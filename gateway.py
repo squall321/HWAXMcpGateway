@@ -619,12 +619,16 @@ async def _aggregate():
                 res = await b.session.list_tools()
         except Exception as exc:  # noqa: BLE001 — 하나가 전체 재집계를 막으면 안 된다
             log.error("backend %s list_tools 실패·초과 (%r)", key, exc)
-            # 재활 패스의 탐침과 **같은 판정**이다(_probe_missed) — 여기만 한 번에 갈면, 무관한 앱의 재배포로 재집계가 돌 때
-            # 잠깐 바쁜 백엔드의 세션이 갈려 좌석들의 진행 중 조회가 한꺼번에 죽는다. 죽은 것으로 표시되면 다음 회차 재연결
-            # 루프가 집어 간다. 세션을 남겼으면 다음 회차에 목록을 다시 받게 예약한다 — 안 그러면 부팅 때 한 번 늦은 백엔드의
-            # 도구가 그 구성이 바뀔 때까지 카탈로그에 안 올라온다(재집계는 '바뀐 것이 있을 때' 만 돈다).
-            if not _probe_missed(key, b, exc):
+            # 여기서 **무응답**으로는 세션을 갈지 않는다 — 생사는 재활 패스의 탐침이 연속 횟수로 가린다(_probe_missed). 한 번에
+            # 갈던 때는 무관한 앱의 재배포로 재집계가 돌 때마다 잠깐 바쁜 백엔드의 세션이 갈려 좌석들의 진행 중 조회가 한꺼번에
+            # 죽었다. 횟수에 보태지도 않는다 — 같은 패스 안에서 탐침 바로 뒤에 도는 조회라, 보태면 20초 남짓 바빴던 백엔드가
+            # '연속 2회' 로 갈린다. 대신 다음 회차에 목록을 다시 받게 예약한다: 안 그러면 부팅 때 한 번 늦은 백엔드의 도구가 그
+            # 구성이 바뀔 때까지 카탈로그에 안 올라온다(재집계는 '바뀐 것이 있을 때' 만 돈다).
+            # 예외로 실패한 것(세션 종료·연결 거부)은 종전대로 곧바로 죽은 것으로 표시해 다음 회차 재연결 루프가 집어 가게 한다.
+            if isinstance(exc, TimeoutError):
                 _REAGG["pending"] = True
+            else:
+                _probe_missed(key, b, exc)
             _keep_last(key, collected, "list_tools 실패")
             continue
         _LIVENESS_MISS.pop(key, None)
@@ -750,7 +754,7 @@ def _keep_last(key: str, collected: list, why: str) -> None:
                 key, why, len(tools), misses + 1, AGG_STALE_ROUNDS)
 
 
-# 탐침(list_tools)을 **연속으로** 놓친 횟수 — 시간 초과만 센다(_probe_missed).
+# 재활 패스의 탐침(list_tools)을 **연속으로** 놓친 횟수 — 시간 초과만, 패스마다 한 번만 센다(_probe_missed).
 _LIVENESS_MISS: dict[str, int] = {}
 
 
@@ -3436,7 +3440,8 @@ def _bearer_gate(app, pat_verifier=None):
         })
         await send({
             "type": "http.response.body",
-            "body": json.dumps(EXPIRED_BODY).encode() if _expired else b'{"error":"unauthorized"}',
+            "body": (json.dumps(EXPIRED_BODY, ensure_ascii=False).encode() if _expired     # /api/ 와 같은 UTF-8
+                     else b'{"error":"unauthorized"}'),
         })
         return
 

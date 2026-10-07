@@ -23,9 +23,9 @@
 #   SF_REST_BASE MXWP_REST_BASE AIDH_REST_BASE                 (REST 베이스)
 #   HEAX_MCP_SERVERS_URL / HEAX_MCP_BASE                       (heax registry — 기존부터 있던 손잡이)
 #   6) ODB 자동화 허브: ODB_HUB_TOKEN 이 있으면 odb-hub 백엔드 포함(cae00 에서만 도달하는 사내 서버).
-#   7) AI Ready Portal(ARP): ARP_BASE 가 있으면 arp 백엔드 포함(역시 cae00 전용 사내 서버).
-#      토큰이 없는 서버라 '주소가 설정돼 있다'가 곧 '이 박스에서 쓴다'는 신호다 — dev 에서는
-#      값을 두지 않아 가짜 DOWN 이 뜨지 않는다(ODB_HUB_TOKEN 이 하는 역할과 같다).
+#   7) AI Ready Portal(ARP): ARP_BASE 와 ARP_TOKEN 이 둘 다 있으면 arp 백엔드 포함(cae00 전용 사내 서버).
+#      ARP 는 2026-10-01 인증을 켰다(/api/auth/me enabled:true) — 토큰이 없으면 이 백엔드만 빠진다(ODB_HUB_TOKEN 과 같다).
+#      둘 다 env > 직전 config 다. 주소만 있고 토큰이 없으면 '켜려면' 과 함께 생략을 찍는다.
 #      주의 — 게이트웨이는 "url" 키가 있는 항목만 백엔드로 읽는다(gateway.py:42). mcp-remote 의
 #      {"command":"npx","args":[...]} 형식을 넣으면 에러 없이 조용히 무시되므로 url 형식으로 쓴다.
 #   8) 사람별 위임(ste 방식, heax_registry.per_user_sso): STE_SSO_SECRET · RA_SSO_SECRET(+RA_SSO_URL) ·
@@ -336,8 +336,11 @@ else
 fi
 unset HR_DATA HR_SECRETS HR_SSO_SECRET
 
-if [ -n "${ARP_BASE:-}" ]; then
-  echo "  ✓ ARP(AI Ready Portal) — ${ARP_BASE}/mcp 로 등록"
+if [ -n "${ARP_BASE:-}" ] && [ -n "${ARP_TOKEN:-}" ]; then
+  echo "  ✓ ARP(AI Ready Portal) 주소·토큰 확인 — ${ARP_BASE}/mcp 로 등록"
+elif [ -n "${ARP_BASE:-}" ]; then
+  # 여기서 '생략'을 단정하면 안 된다 — 직전 config 에 토큰이 있으면 아래 _carry 가 이어받는다. 실제로 빠질 때는 4) 가 말한다.
+  echo "  · ARP_TOKEN 미설정 — 직전 config 에 있으면 그 값을 이어받고, 없으면 이 백엔드만 빠진다(ARP 는 2026-10-01 부터 인증)"
 else
   echo "  · ARP_BASE 미설정 — 직전 config 에 있으면 그 값을 이어받고, 없으면 이 백엔드만 빠진다"
 fi
@@ -356,7 +359,7 @@ HEAX_MCP_TOKEN="${HEAX_MCP_TOKEN:-}" HEAX_MCP_SERVERS_URL="${HEAX_MCP_SERVERS_UR
 KOORM_MCP_TOKEN="${KOORM_MCP_TOKEN:-}" \
 KOORM_SSO_SECRET="${KOORM_SSO_SECRET:-}" KOORM_SSO_URL="${KOORM_SSO_URL:-}" \
 ODB_HUB_TOKEN="${ODB_HUB_TOKEN:-}" ODB_HUB_BASE="${ODB_HUB_BASE:-}" \
-ARP_BASE="${ARP_BASE:-}" \
+ARP_BASE="${ARP_BASE:-}" ARP_TOKEN="${ARP_TOKEN:-}" \
 RA_WORKSPACE_SLUG="${RA_WORKSPACE_SLUG:-}" \
 RA_MCP_URL="${RA_MCP_URL:-}" SF_MCP_URL="${SF_MCP_URL:-}" MXWP_MCP_URL="${MXWP_MCP_URL:-}" \
 AIDH_MCP_URL="${AIDH_MCP_URL:-}" AIDH_REST_BASE="${AIDH_REST_BASE:-}" \
@@ -528,15 +531,27 @@ if _ODB:
         "url": f'{_odb_base}/mcp?token={_ODB}',
         "transport": "streamable_http"}
 
-# AI Ready Portal(ARP) — cae00 에서만 도달하는 사내 포탈. 토큰 없이 열려 있어 URL 만 있으면 된다.
+# AI Ready Portal(ARP) — cae00 에서만 도달하는 사내 포탈. 2026-10-01 부터 인증이 켜져 토큰 없이 등재하면 401 → 가짜 DOWN.
+# 그래서 주소와 토큰이 **둘 다** 있을 때만 등재한다. HWAXPortal update-all 의 기대 조건도 같다 — 한쪽만 주소로 판정하면
+# 토큰 없는 박스가 매 실행 arp 를 '빠짐' 으로 보고 재프로비저닝을 헛돌린다(docs/change-request-8-10 D-5).
+# 토큰 모양은 ARP 회신 전이라 Authorization: Bearer 로 둔다 — 쿼리(?token=) 방식이면 위 odb-hub 분기를 따라 바꾼다.
 # ⚠ 클라이언트가 주는 mcp-remote 형식({"command":"npx","args":[...]})을 그대로 넣으면
 # 게이트웨이는 "url" 키가 없는 항목을 백엔드로 읽지 않아 에러 없이 조용히 무시한다(odb-hub 와 같은 함정).
 # mcp-remote 는 HTTP MCP 로 가는 stdio 브리지일 뿐이라, HTTP 를 직접 말하는 여기엔 불필요하다.
-# env 가 없으면 직전 config 의 주소를 이어받는다 — 한 번 붙여 두면 --force 재생성에서 안 사라진다.
+# env 가 없으면 직전 config 의 주소·토큰을 이어받는다 — 한 번 붙여 두면 --force 재생성에서 안 사라진다.
+_ARP = _carry("ARP_TOKEN",
+              lambda: ((_prev("arp", "headers") or {}).get("Authorization") or "")
+                      .replace("Bearer ", "").strip() or None,
+              "ARP_TOKEN")
 _ARP_PREV = _prev("arp")                      # 예: http://<ARP 서버>:3001/mcp
 _ARP_BASE = e.get("ARP_BASE") or (_ARP_PREV.split("/mcp")[0] if _ARP_PREV else None)
-if _ARP_BASE:
-    cfg["arp"] = {"url": f'{_ARP_BASE.rstrip("/")}/mcp', "transport": "streamable_http"}
+if _ARP_BASE and _ARP:
+    cfg["arp"] = {"url": f'{_ARP_BASE.rstrip("/")}/mcp', "transport": "streamable_http",
+                  "headers": {"Authorization": f"Bearer {_ARP}"}}
+elif _ARP_BASE:
+    # 옛 무토큰 항목은 MANAGED 키라 아래 '보존' 으로 되살아나지 않는다 — 조용히 빠지지 않게 켜는 법과 함께 말한다.
+    print("  ⚠ arp 생략 — ARP 주소는 있는데 ARP_TOKEN 이 없다(env·직전 config 둘 다 없음, ARP 는 2026-10-01 부터 인증). "
+          "켜려면 provision.env 에 ARP_TOKEN=<ARP MCP 서비스 토큰> 을 적고 update-all 재실행(손으로 돌릴 때는 env 로 주고 --force)")
 
 # heax-hub MCP 앱 자동탐지(옵션) — heax registry 를 폴링해 mcp:{expose} 앱을 heax-<id> 백엔드로 흡수.
 #   token: HEAX_MCP_TOKEN env(heax 'MCP 토큰' 메뉴/PAT). 없으면 heax_registry 생략(그 기능만 빠짐).
@@ -710,8 +725,9 @@ cfg["portal"]["audience_ok"] = sorted(rest)
 # 예전엔 cfg 를 빈 dict 에서 시작해 파일을 통째로 덮어썼다 — 그래서 --force 한 번에
 # smart-twin-cluster(slurm 도구 19개)가 조용히 사라진다. update-all 의 기대 목록에도
 # 없어서 사라진 사실조차 안 잡힌다(실측). 관리 키는 여기서 보존하지 않는다 —
-# 관리 키 중 토큰이 필요한 것(reportarchive·odb-hub)은 env 가 없어도 직전 config 에서
-# 이어받으므로(_carry) 여기까지 와서 사라지는 일은 없다.
+# 관리 키 중 토큰이 필요한 것(reportarchive·odb-hub·arp)은 env 가 없어도 직전 config 에서
+# 이어받으므로(_carry) 여기까지 와서 사라지는 일은 없다. 일부러 빼는 것은 하나다 — 토큰 없이
+# 등재돼 있던 옛 arp 항목(가짜 DOWN). 관리 키라서 빠지고, 빠질 때 위에서 '켜려면' 과 함께 말한다.
 MANAGED = {"_gateway", "reportarchive", "signalforge", "mx-white-paper",
            "ai-data-hub", "hwax-deliberation", "smart-twin-mcp", "ste",
            "rest", "portal", "heax_registry", "odb-hub", "arp", "testscope"}

@@ -492,3 +492,76 @@ def test_PER_USER_SSO_APPS_의_못_읽은_쌍은_건너뛰되_말한다(tmp_path
     assert any("1번째 쌍(콜론 없음)" in l for l in bad)
     for leak in ("nocolon", "NOKEY", "NEW-APP", "1APP", "A:B", "g-secret-xyz"):
         assert leak not in log[0], f"{leak} 가 로그에 샜다"
+
+
+# ── arp — 주소와 토큰이 둘 다 있을 때만 등재한다(change-request-8-10 #10 · D-5) ──────────────────────────
+# ARP 는 2026-10-01 부터 인증을 켰다. 토큰 없이 등재하면 401 → /health 의 arp 가 영영 false(가짜 DOWN)였다.
+ARP_BASE = "http://arp.example:3001"
+
+
+def test_arp_는_주소와_토큰이_둘_다_있으면_토큰을_실어_등재한다(tmp_path):
+    log: list = []
+    out = _run_provision(tmp_path, {"ARP_BASE": ARP_BASE + "/", "ARP_TOKEN": "arp-secret-xyz"}, log)
+    assert out["arp"] == {"url": ARP_BASE + "/mcp", "transport": "streamable_http",
+                          "headers": {"Authorization": "Bearer arp-secret-xyz"}}
+    assert "arp-secret-xyz" not in log[0], "토큰이 운영 로그에 남는다"
+
+
+def test_arp_는_토큰이_없으면_등재하지_않고_켜는_법을_말한다(tmp_path):
+    log: list = []
+    out = _run_provision(tmp_path, {"ARP_BASE": ARP_BASE}, log)
+    assert "arp" not in out
+    line = [l for l in log[0].splitlines() if "arp 생략" in l]
+    assert len(line) == 1 and "켜려면" in line[0] and "ARP_TOKEN=" in line[0] and "provision.env" in line[0], log[0]
+    # 주소도 토큰도 없는 박스(dev)는 예전처럼 조용하다 — 쓰지 않는 박스에 '생략' 을 매번 찍지 않는다
+    (tmp_path / "gateway_config.json").unlink()
+    log = []
+    out = _run_provision(tmp_path, {}, log)
+    assert "arp" not in out and "arp 생략" not in log[0]
+    # 토큰만 있고 주소를 모르면 지어내지 않는다
+    (tmp_path / "gateway_config.json").unlink()
+    assert "arp" not in _run_provision(tmp_path, {"ARP_TOKEN": "arp-secret-xyz"})
+
+
+def test_arp_무토큰_항목이_직전_config_에_남아_있어도_이어받지_않는다(tmp_path):
+    """cae00 의 모양 — 옛 프로비저너가 토큰 없이 등재해 둔 항목이 라이브 config 와 .bak 에 있다.
+    주소는 이어받되 토큰이 없으니 빠져야 한다(arp 는 프로비저너가 만드는 키라 '보존' 으로 되살아나지도 않는다)."""
+    old = {"arp": {"url": ARP_BASE + "/mcp", "transport": "streamable_http"},
+           "knox-bridge": {"url": "http://127.0.0.1:9120/mcp", "transport": "streamable_http"}}
+    (tmp_path / "gateway_config.json").write_text(json.dumps(old), encoding="utf-8")
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps(old), encoding="utf-8")
+    log: list = []
+    out = _run_provision(tmp_path, {}, log)
+    assert "arp" not in out
+    assert "knox-bridge" in out, "손으로 붙인 백엔드는 그대로 보존한다"
+    assert any("arp 생략" in l and "ARP_TOKEN=" in l for l in log[0].splitlines()), log[0]
+    # 토큰만 주면 직전 config 의 주소로 선다
+    out = _run_provision(tmp_path, {"ARP_TOKEN": "arp-secret-xyz"})
+    assert out["arp"] == {"url": ARP_BASE + "/mcp", "transport": "streamable_http",
+                          "headers": {"Authorization": "Bearer arp-secret-xyz"}}
+
+
+def test_arp_토큰은_env_가_없는_실행에_직전_config_에서_이어받는다(tmp_path):
+    """다른 토큰(RAT·ODB)과 같다 — env 를 못 읽은 실행(손으로 돌린 --force)이 돌고 있던 백엔드를 지우면 안 된다."""
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({
+        "arp": {"url": ARP_BASE + "/mcp", "transport": "streamable_http",
+                "headers": {"Authorization": "Bearer arp-old-token"}}}), encoding="utf-8")
+    log: list = []
+    out = _run_provision(tmp_path, {}, log)
+    assert out["arp"] == {"url": ARP_BASE + "/mcp", "transport": "streamable_http",
+                          "headers": {"Authorization": "Bearer arp-old-token"}}
+    assert "ARP_TOKEN: env 없음" in log[0] and "arp-old-token" not in log[0]
+    assert "arp 생략" not in log[0]
+
+
+def test_arp_env_토큰과_주소가_직전_config_를_이긴다(tmp_path):
+    """토큰을 바꿔 적었는데 .bak 의 옛 토큰이 되살아나면 재발급이 반영되지 않는다(odb-hub 가 그랬다)."""
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({
+        "arp": {"url": ARP_BASE + "/mcp", "transport": "streamable_http",
+                "headers": {"Authorization": "Bearer arp-old-token"}}}), encoding="utf-8")
+    out = _run_provision(tmp_path, {"ARP_TOKEN": "arp-new-token"})
+    assert out["arp"]["headers"] == {"Authorization": "Bearer arp-new-token"}
+    assert out["arp"]["url"] == ARP_BASE + "/mcp", "주소는 직전 값을 지킨다"
+    out = _run_provision(tmp_path, {"ARP_TOKEN": "arp-new-token", "ARP_BASE": "http://arp2.example:3001"})
+    assert out["arp"]["url"] == "http://arp2.example:3001/mcp"
+    assert "arp-old-token" not in json.dumps(out)

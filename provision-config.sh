@@ -22,7 +22,8 @@
 #   RA_MCP_URL   SF_MCP_URL   MXWP_MCP_URL   AIDH_MCP_URL      (MCP 엔드포인트)
 #   SF_REST_BASE MXWP_REST_BASE AIDH_REST_BASE                 (REST 베이스)
 #   HEAX_MCP_SERVERS_URL / HEAX_MCP_BASE                       (heax registry — 기존부터 있던 손잡이)
-#   6) ODB 자동화 허브: ODB_HUB_TOKEN 이 있으면 odb-hub 백엔드 포함(cae00 에서만 도달하는 사내 서버).
+#   6) ODB 자동화 허브: ODB_HUB_TOKEN 과 주소(ODB_HUB_BASE > 직전 config)가 있으면 odb-hub 백엔드 포함(cae00 에서만 도달하는 사내 서버).
+#      기본 주소는 없다 — 사내 주소를 이 파일에 적지 않는다. 토큰만 있고 주소를 모르면 만들지 않고 켜는 법을 찍는다.
 #   7) AI Ready Portal(ARP): ARP_BASE 와 ARP_TOKEN 이 둘 다 있으면 arp 백엔드 포함(cae00 전용 사내 서버).
 #      ARP 는 2026-10-01 인증을 켰다(/api/auth/me enabled:true) — 토큰이 없으면 이 백엔드만 빠진다(ODB_HUB_TOKEN 과 같다).
 #      둘 다 env > 직전 config 다. 한쪽만 있으면 '켜려면' 과 함께 생략을 찍는다 — 주소만 있을 때도, 토큰만 있을 때도.
@@ -355,7 +356,9 @@ if [ -z "${ODB_HUB_TOKEN:-}" ]; then
   # 여기서 '생략'을 단정하면 안 된다 — 직전 config 에 토큰이 있으면 아래 _carry 가 이어받는다.
   echo "  · ODB_HUB_TOKEN 미설정 — 직전 config 에 있으면 그 값을 이어받고, 없으면 이 백엔드만 빠진다"
 else
-  echo "  ✓ odb-hub 토큰 확인 — ${ODB_HUB_BASE:-http://10.252.38.121:8000}/mcp 로 등록"
+  # 주소는 찍지 않는다 — 사내 주소이고 이 출력은 update-all 로그에 남는다. 예전에는 그 주소가 기본값으로 이 줄과 아래 파이썬
+  # 블록에 박혀 있었다(GitHub 에 있는 추적 파일이다). 주소를 모르면 4) 가 켜는 법과 함께 말한다.
+  echo "  ✓ odb-hub 토큰 확인 — 주소는 ODB_HUB_BASE(없으면 직전 config)에서 읽는다"
 fi
 
 echo "▶ 4) config 파일 작성"
@@ -545,13 +548,20 @@ if _ODB:
     # 호스트는 보존하되 토큰은 항상 env 의 현재 값을 쓴다.
     # URL 통째로 보존하면 .bak 에 박힌 옛 토큰이 되살아나 새 토큰을 덮어쓴다 —
     # 호스트는 '설정'이고 토큰은 '시크릿'이라 수명이 다르다.
-    _odb_prev = _prev("odb-hub")            # 예: http://10.9.9.9:8000/mcp?token=old
-    _odb_base = (e.get("ODB_HUB_BASE")
-                 or (_odb_prev.split("/mcp")[0] if _odb_prev else None)
-                 or "http://10.252.38.121:8000")
-    cfg["odb-hub"] = {
-        "url": f'{_odb_base}/mcp?token={_ODB}',
-        "transport": "streamable_http"}
+    _odb_prev = _prev("odb-hub")            # 예: http://<ODB 서버>:8000/mcp?token=old
+    # 주소: env > 직전 config > **없음.** 예전에는 마지막에 사내 주소가 기본값으로 박혀 있었다 — 추적 파일에 내부 IP 를 적지
+    # 않고(이 리포는 GitHub 에 있다), 그 주소가 맞는 박스는 하나뿐이라 다른 박스에서는 없는 서버에 토큰을 실어 보낸다.
+    # 이미 붙어 있는 박스는 직전 config 가 주소를 알고 있어 아무것도 새로 적지 않아도 그대로 선다.
+    _odb_base = e.get("ODB_HUB_BASE") or (_odb_prev.split("/mcp")[0] if _odb_prev else None)
+    if _odb_base:
+        cfg["odb-hub"] = {
+            "url": f'{_odb_base}/mcp?token={_ODB}',
+            "transport": "streamable_http"}
+    else:
+        # 토큰만 있고 주소를 모른다 — 지어내지 않는다. 조용히 빠지지 않게 켜는 법과 함께 말한다(토큰은 찍지 않는다).
+        print("  ⚠ odb-hub 생략 — ODB_HUB_TOKEN 은 있는데 허브 주소를 모른다(ODB_HUB_BASE·직전 config 둘 다 없음). "
+              "켜려면 provision.env 에 ODB_HUB_BASE=http://<ODB 자동화 허브 서버>:<포트> 를 적고 update-all 재실행"
+              "(손으로 돌릴 때는 env 로 주고 --force)")
 
 # AI Ready Portal(ARP) — cae00 에서만 도달하는 사내 포탈. 2026-10-01 부터 인증이 켜져 토큰 없이 등재하면 401 → 가짜 DOWN.
 # 그래서 주소와 토큰이 **둘 다** 있을 때만 등재한다. HWAXPortal update-all 의 기대 조건도 같다 — 한쪽만 주소로 판정하면

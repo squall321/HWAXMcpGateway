@@ -738,3 +738,86 @@ def test_smart_twin_mcp_사람이_옮겨_적은_주소는_이어받는다(tmp_pa
     # env 가 직전 값을 이긴다
     out = _run_provision(tmp_path, {"SMARTTWIN_MCP_URL": "http://smarttwin2.example:5013/mcp"})
     assert out["smart-twin-mcp"]["url"] == "http://smarttwin2.example:5013/mcp"
+
+
+# ── odb-hub — 주소를 지어내지 않는다(추적 파일에 사내 주소가 기본값으로 박혀 있었다) ──────────────────────────────
+# 이 리포는 GitHub 에 있다. ODB 자동화 허브의 사내 주소가 프로비저너의 기본값으로 두 군데(3단계 안내 줄 · 파이썬 블록의
+# 마지막 폴백) 적혀 있었다. 주소는 env ODB_HUB_BASE > 직전 config > 없음이다 — 모르면 만들지 않고 켜는 법을 말한다.
+ODB_PREV = "http://odb.example:8000/mcp?token=odb-old-token"
+
+
+def _odb_bak(tmp_path) -> None:
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({
+        "odb-hub": {"url": ODB_PREV, "transport": "streamable_http"}}), encoding="utf-8")
+
+
+def test_odb_hub_는_직전_config_가_주소를_알면_새_env_없이_그대로_선다(tmp_path):
+    """이미 붙어 있는 박스(cae00)는 주소가 config 에 있다 — 기본값을 걷어도 아무것도 새로 적지 않고 계속 돌아야 한다."""
+    _odb_bak(tmp_path)
+    log: list = []
+    out = _run_provision(tmp_path, {}, log)
+    assert out["odb-hub"] == {"url": ODB_PREV, "transport": "streamable_http"}
+    assert "odb-hub 생략" not in log[0]
+    # 토큰만 새로 적은 실행 — 주소는 직전 값을 지키고 토큰은 env 의 것으로 바뀐다(옛 토큰이 되살아나지 않는다)
+    out = _run_provision(tmp_path, {"ODB_HUB_TOKEN": "odb-new-token"}, log)
+    assert out["odb-hub"]["url"] == "http://odb.example:8000/mcp?token=odb-new-token"
+    for run in log:
+        for leak in ("odb.example", "odb-old-token", "odb-new-token"):
+            assert leak not in run, f"{leak} 가 로그에 샜다 — 이 출력은 update-all 로그에 남는다"
+
+
+def test_odb_hub_는_env_주소가_직전_config_를_이긴다(tmp_path):
+    _odb_bak(tmp_path)
+    out = _run_provision(tmp_path, {"ODB_HUB_BASE": "http://odb2.example:9000", "ODB_HUB_TOKEN": "odb-new-token"})
+    assert out["odb-hub"]["url"] == "http://odb2.example:9000/mcp?token=odb-new-token"
+
+
+def test_odb_hub_는_토큰만_있고_주소를_모르면_지어내지_않고_켜는_법을_말한다(tmp_path):
+    """예전에는 추적 파일에 박힌 사내 주소로 등재했다. 지어내지 않는다 — 그 주소가 맞는 박스는 하나뿐이고, 틀린 박스에서는
+    없는 서버에 토큰을 실어 보낸다."""
+    log: list = []
+    out = _run_provision(tmp_path, {"ODB_HUB_TOKEN": "odb-new-token"}, log)
+    assert "odb-hub" not in out
+    said = [l for l in log[0].splitlines() if "odb-hub 생략" in l]
+    assert len(said) == 1 and "ODB_HUB_BASE" in said[0] and "provision.env" in said[0], log[0]
+    assert "odb-new-token" not in log[0], "토큰은 찍지 않는다"
+    # 토큰도 주소도 없는 박스(dev)는 조용하다 — 쓰지 않는 박스에 매번 '생략' 을 찍지 않는다
+    log.clear()
+    assert "odb-hub" not in _run_provision(tmp_path, {}, log) and "odb-hub 생략" not in log[0]
+
+
+def test_odb_hub_3단계_안내는_주소를_찍지_않는다():
+    """3단계의 안내 줄이 `${ODB_HUB_BASE:-<사내 주소>}` 를 그대로 찍었다 — 이 출력은 update-all 로그에 남는다."""
+    src = (HERE / "provision-config.sh").read_text(encoding="utf-8")
+    block = re.search(r'\nif \[ -z "\$\{ODB_HUB_TOKEN:-\}" \]; then\n.*?\nfi\n', src, re.S).group(0)
+
+    def say(**env):
+        r = subprocess.run(["bash", "-c", "set -u\n" + block], env={"PATH": os.environ["PATH"], **env},
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        return r.stdout
+    out = say(ODB_HUB_TOKEN="odb-new-token", ODB_HUB_BASE="http://odb.example:8000")
+    assert "odb-hub" in out and "ODB_HUB_BASE" in out
+    assert "odb.example" not in out and "odb-new-token" not in out
+    assert "ODB_HUB_BASE" in say(ODB_HUB_TOKEN="odb-new-token"), "주소를 어디서 읽는지는 말한다"
+    assert "ODB_HUB_TOKEN 미설정" in say()
+
+
+_PRIVATE_V4 = re.compile(r"(?<![\d.])(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}(?![\d.])")
+
+
+def test_추적_파일에_사내_주소가_박혀_있지_않다():
+    """내부 IP 를 추적 파일에 적지 않는다(이 리포는 GitHub 에 있다). 시험 파일의 고정물(10.0.0.x 같은 지어낸 주소)은 뺀다.
+    어긋나면 **파일과 줄 번호만** 말한다 — 주소를 실패 글에 다시 찍지 않는다."""
+    ls = subprocess.run(["git", "ls-files"], cwd=str(HERE), capture_output=True, text=True)
+    if ls.returncode != 0 or not ls.stdout.strip():
+        import pytest
+        pytest.skip("git 작업 트리가 아니다 — 추적 파일 목록을 알 수 없다")
+    hits = []
+    for name in ls.stdout.split():
+        if name.startswith("test_") or not (HERE / name).is_file():
+            continue
+        for n, line in enumerate((HERE / name).read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if _PRIVATE_V4.search(line):
+                hits.append(f"{name}:{n}")
+    assert hits == [], f"사설 대역 주소가 적혀 있다: {hits}"

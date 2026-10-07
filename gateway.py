@@ -727,8 +727,10 @@ async def _discover_heax() -> dict[str, dict] | None:
 # ⚠ 한 회차가 흔들렸다고 그 백엔드를 0종으로 집계하면 카탈로그가 통째로 출렁인다 —
 # 실측 로그에 460→426→460 이 남아 있다. 그 사이 호출은 "그런 도구 없습니다" 를 받는다.
 # 연속으로 실패할 때만 결국 비운다(영영 낡은 목록을 내걸지는 않는다).
+# 기본 10회(종전 3). 수 시간짜리 심의 도중에 앱 재배포가 3분을 넘기면 좌석이 `unknown tool` 을 받았다 — 도구가 없다는 말로
+# 읽힌다. 항목이 남아 있는 동안은 `backend <키> unavailable: … backend session down` 이라는 맞는 말이 나온다(gateway-08).
 _LAST_TOOLS: dict[str, tuple] = {}
-AGG_STALE_ROUNDS = int(os.environ.get("GATEWAY_AGG_STALE_ROUNDS", "3"))
+AGG_STALE_ROUNDS = int(os.environ.get("GATEWAY_AGG_STALE_ROUNDS", "10"))
 
 
 def _keep_last(key: str, collected: list, why: str) -> None:
@@ -776,8 +778,9 @@ def _probe_missed(key: str, b: "_Backend", exc: Exception) -> bool:
     return True
 
 
+# 레지스트리에 안 보인 앱을 몇 패스째에 떼는가 — 위 AGG_STALE_ROUNDS 와 같은 이유로 같은 값이다(종전 3, 약 10분).
 _HEAX_MISS: dict[str, int] = {}
-HEAX_MISS_BEFORE_DROP = int(os.environ.get("GATEWAY_HEAX_MISS_DROP", "3"))
+HEAX_MISS_BEFORE_DROP = int(os.environ.get("GATEWAY_HEAX_MISS_DROP", "10"))
 _HEAX_FAILS = {"n": 0}
 
 

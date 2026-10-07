@@ -3468,3 +3468,57 @@ def test_재활_패스에서_합류하는_앱이_매달려도_패스가_서지_�
     first, mid, second, up, tools = asyncio.run(asyncio.wait_for(go(), 5))
     assert first is False and mid == (True, [])
     assert second is True and up and tools == ["ok_tool"], "놓고 간 백엔드를 다음 패스가 다시 붙여야 한다"
+
+
+# ── 닿지 않는 백엔드의 도구를 카탈로그에서 빼기까지(결정표 gateway-08) ───────────────────────────────────
+# 3패스(약 3분)였다. 수 시간짜리 심의 도중에 앱 재배포가 그보다 길면 좌석이 `unknown tool` 을 받는다 — '도구가 없다' 로 읽힌다.
+# 항목이 남아 있는 동안은 `backend <키> unavailable: … backend session down` 이라는 맞는 말이 나온다.
+def test_카탈로그_보존_횟수의_기본값과_손잡이(tmp_path):
+    names = ["AGG_STALE_ROUNDS", "HEAX_MISS_BEFORE_DROP"]
+    assert _limits(tmp_path, names)[0] == {"AGG_STALE_ROUNDS": 10, "HEAX_MISS_BEFORE_DROP": 10}
+    assert _limits(tmp_path, names, GATEWAY_AGG_STALE_ROUNDS="4", GATEWAY_HEAX_MISS_DROP="6")[0] == {
+        "AGG_STALE_ROUNDS": 4, "HEAX_MISS_BEFORE_DROP": 6}
+
+
+def test_세션이_없는_백엔드의_도구는_재집계_열_번_동안_남는다(monkeypatch):
+    down = _B([])
+    down.session = None
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": down})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "_LAST_TOOLS", {"heax-step_forge": ([_tool("list_parts")], 0)})
+
+    async def go():
+        seen = []
+        for _ in range(gw.AGG_STALE_ROUNDS + 1):
+            await gw._aggregate()
+            seen.append("list_parts" in gw.route)
+        return seen
+    seen = asyncio.run(asyncio.wait_for(go(), 5))
+    assert len(seen) == 11 and seen == [True] * 10 + [False], "기본값(10)대로 — 영영 낡은 목록을 내걸지는 않는다"
+
+
+def test_레지스트리에서_빠진_앱은_열_패스째에_뗀다(monkeypatch):
+    from types import SimpleNamespace as NS
+    b, stopped = _ReconB(["list_parts"]), []
+    b._stop = NS(set=lambda: stopped.append(1))
+    monkeypatch.setattr(gw, "HEAX", {"servers_url": "http://hub/servers"})
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": b})
+    for name in ("route", "alias_route", "_REAGG", "_FP", "_LAST_TOOLS", "_LIVENESS_MISS", "_HEAX_MISS", "DISCOVERED_META",
+                 "POLICY"):
+        monkeypatch.setattr(gw, name, {})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+
+    async def nothing():
+        return {}                                           # 레지스트리는 답했는데(200) 그 앱이 목록에 없다
+    monkeypatch.setattr(gw, "_discover_heax", nothing)
+
+    async def go():
+        seen = []
+        for _ in range(gw.HEAX_MISS_BEFORE_DROP):
+            await gw._revive_once(object())
+            seen.append("heax-step_forge" in gw.backends)
+        return seen
+    seen = asyncio.run(asyncio.wait_for(go(), 5))
+    assert len(seen) == 10 and seen == [True] * 9 + [False] and stopped == [1]

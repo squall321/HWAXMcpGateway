@@ -2920,24 +2920,35 @@ def test_포털이_거두었다고_알린_뒤의_불통은_거두기_전_권한�
 # 실사용 팀의 리스크 심사는 17~22석이 공용 LLM·백엔드를 같이 쓴다. 120초 한도는 이미 걸리고 있었고(dev 감사 15,429건 중 5건이
 # 재시도까지 약 240초에 실패), 시간 초과가 세션을 갈아 같은 백엔드의 멀쩡한 호출까지 끊었다.
 _LIMITS_PROBE = r'''
-import json, sys
+import json
 import gateway as gw
-import rest_proxy
-print(json.dumps({k: getattr(gw, k, None) if hasattr(gw, k) else getattr(rest_proxy, k, None) for k in sys.argv[1:]}))
+out = {n: getattr(gw, n) for n in dir(gw)
+       if n.isupper() and isinstance(getattr(gw, n), (int, float)) and not isinstance(getattr(gw, n), bool)}
+out["_line"] = gw._limits_line()
+print(json.dumps(out))
 '''
+_LIMITS_SEEN: dict = {}
+# 손잡이를 한꺼번에 바꿔 준 환경 — 시험마다 따로 띄우면 import 가 스무 번이다(부하 걸린 박스에서 스위트가 20초 넘게 는다).
+_KNOBS_SET = dict(GATEWAY_CALL_TIMEOUT="900", GATEWAY_RECONNECT_TIMEOUT="12", GATEWAY_BACKEND_HTTP_TIMEOUT="7",
+                  GATEWAY_LIVENESS_STRIKES="3", GATEWAY_AGG_STALE_ROUNDS="4", GATEWAY_HEAX_MISS_DROP="6",
+                  GATEWAY_PORTAL_SAVE_TIMEOUT="300", GATEWAY_JWKS_TIMEOUT="2")
 
 
 def _limits(tmp_path, names, **env):
     """게이트웨이를 **실제로 import** 해(설정은 임시 파일) 손잡이가 닿는지 본다 — 상수를 monkeypatch 하는 시험은 env 를 읽는
-    줄이 사라져도 통과한다. 돌려주는 것 — {이름: 값} · 기동 로그."""
-    (tmp_path / "cfg.json").write_text(json.dumps({"_gateway": {"token": "gw-test-token"}}), encoding="utf-8")
-    full = {k: v for k, v in os.environ.items() if not k.startswith("GATEWAY_")}
-    full.update(GATEWAY_CONFIG=str(tmp_path / "cfg.json"), GATEWAY_AUDIT=str(tmp_path / "audit.jsonl"),
-                PYTHONDONTWRITEBYTECODE="1", **env)
-    run = subprocess.run([sys.executable, "-c", _LIMITS_PROBE, *names], cwd=os.path.dirname(os.path.abspath(gw.__file__)),
-                         env=full, capture_output=True, text=True, timeout=120)
-    assert run.returncode == 0, run.stderr[-2000:]
-    return json.loads(run.stdout), run.stderr
+    줄이 사라져도 통과한다. 돌려주는 것 — {이름: 값} · 기동 로그. 같은 env 는 한 번만 띄운다(`_line` 은 기동 로그의 시간 한도 줄)."""
+    key = tuple(sorted(env.items()))
+    if key not in _LIMITS_SEEN:
+        (tmp_path / "cfg.json").write_text(json.dumps({"_gateway": {"token": "gw-test-token"}}), encoding="utf-8")
+        full = {k: v for k, v in os.environ.items() if not k.startswith("GATEWAY_")}
+        full.update(GATEWAY_CONFIG=str(tmp_path / "cfg.json"), GATEWAY_AUDIT=str(tmp_path / "audit.jsonl"),
+                    PYTHONDONTWRITEBYTECODE="1", **env)
+        run = subprocess.run([sys.executable, "-c", _LIMITS_PROBE], cwd=os.path.dirname(os.path.abspath(gw.__file__)),
+                             env=full, capture_output=True, text=True, timeout=120)
+        assert run.returncode == 0, run.stderr[-2000:]
+        _LIMITS_SEEN[key] = (json.loads(run.stdout), run.stderr)
+    got, log_ = _LIMITS_SEEN[key]
+    return {n: got.get(n) for n in names}, log_
 
 
 _CALL_LIMITS = ["CALL_TIMEOUT_S", "RECONNECT_TIMEOUT_S", "BACKEND_HTTP_TIMEOUT_S", "BACKEND_READ_TIMEOUT_S"]
@@ -2952,8 +2963,7 @@ def test_호출_한도의_기본값은_안쪽이_바깥보다_작다(tmp_path):
 
 
 def test_호출_한도를_올리면_전송_한도가_따라_오르고_뒤집힌_설정은_따르지_않는다(tmp_path):
-    got, log_ = _limits(tmp_path, _CALL_LIMITS, GATEWAY_CALL_TIMEOUT="900", GATEWAY_RECONNECT_TIMEOUT="12",
-                        GATEWAY_BACKEND_HTTP_TIMEOUT="7")
+    got, log_ = _limits(tmp_path, _CALL_LIMITS, **_KNOBS_SET)
     assert got == {"CALL_TIMEOUT_S": 900, "RECONNECT_TIMEOUT_S": 12.0, "BACKEND_HTTP_TIMEOUT_S": 7.0,
                    "BACKEND_READ_TIMEOUT_S": 960.0}, "전송 read 는 호출 한도 + 60 으로 유도된다"
     assert "GATEWAY_BACKEND_READ_TIMEOUT" not in log_, "유도된 값은 경고 없이 맞아야 한다(호출 한도만 올린 운영자에게 거짓 경고)"
@@ -3402,7 +3412,7 @@ def test_재집계의_목록_조회가_예외로_실패하면_종전대로_한_�
 
 def test_탐침_횟수_손잡이(tmp_path):
     assert _limits(tmp_path, ["LIVENESS_STRIKES", "LIVENESS_TIMEOUT_S"])[0] == {"LIVENESS_STRIKES": 2, "LIVENESS_TIMEOUT_S": 10.0}
-    assert _limits(tmp_path, ["LIVENESS_STRIKES"], GATEWAY_LIVENESS_STRIKES="3")[0] == {"LIVENESS_STRIKES": 3}
+    assert _limits(tmp_path, ["LIVENESS_STRIKES"], **_KNOBS_SET)[0] == {"LIVENESS_STRIKES": 3}
     assert _limits(tmp_path, ["LIVENESS_STRIKES"], GATEWAY_LIVENESS_STRIKES="0")[0] == {"LIVENESS_STRIKES": 1}, \
         "0 이하는 1 로 읽는다(한 번 놓치면 간다 — 종전 동작)"
 
@@ -3503,7 +3513,7 @@ def test_재활_패스에서_합류하는_앱이_매달려도_패스가_서지_�
 def test_카탈로그_보존_횟수의_기본값과_손잡이(tmp_path):
     names = ["AGG_STALE_ROUNDS", "HEAX_MISS_BEFORE_DROP"]
     assert _limits(tmp_path, names)[0] == {"AGG_STALE_ROUNDS": 10, "HEAX_MISS_BEFORE_DROP": 10}
-    assert _limits(tmp_path, names, GATEWAY_AGG_STALE_ROUNDS="4", GATEWAY_HEAX_MISS_DROP="6")[0] == {
+    assert _limits(tmp_path, names, **_KNOBS_SET)[0] == {
         "AGG_STALE_ROUNDS": 4, "HEAX_MISS_BEFORE_DROP": 6}
 
 
@@ -3594,7 +3604,7 @@ def test_대화_저장이_한도를_넘기면_손잡이와_다시_보내기_전�
 
 def test_대화_저장_한도의_기본값과_손잡이(tmp_path):
     assert _limits(tmp_path, ["PORTAL_SAVE_TIMEOUT_S"])[0] == {"PORTAL_SAVE_TIMEOUT_S": 120.0}
-    assert _limits(tmp_path, ["PORTAL_SAVE_TIMEOUT_S"], GATEWAY_PORTAL_SAVE_TIMEOUT="300")[0] == {"PORTAL_SAVE_TIMEOUT_S": 300.0}
+    assert _limits(tmp_path, ["PORTAL_SAVE_TIMEOUT_S"], **_KNOBS_SET)[0] == {"PORTAL_SAVE_TIMEOUT_S": 300.0}
 
 
 # ── rest_call — 전용 도구가 없을 때의 다리도 도구 호출과 같은 한도를 받는다(결정표 gateway-21) ───────────────────
@@ -3653,7 +3663,7 @@ async def test_rest_call_연결_시간_초과는_여전히_안_닿는_사이트�
 def test_rest_call_한도는_호출_한도를_따르고_따로_줄_수도_있다(tmp_path):
     names = ["REST_CALL_TIMEOUT_S", "CALL_TIMEOUT_S"]
     assert _limits(tmp_path, names)[0] == {"REST_CALL_TIMEOUT_S": 600.0, "CALL_TIMEOUT_S": 600}
-    assert _limits(tmp_path, names, GATEWAY_CALL_TIMEOUT="900")[0] == {"REST_CALL_TIMEOUT_S": 900.0, "CALL_TIMEOUT_S": 900}
+    assert _limits(tmp_path, names, **_KNOBS_SET)[0] == {"REST_CALL_TIMEOUT_S": 900.0, "CALL_TIMEOUT_S": 900}
     assert _limits(tmp_path, names, GATEWAY_REST_CALL_TIMEOUT="45")[0] == {"REST_CALL_TIMEOUT_S": 45.0, "CALL_TIMEOUT_S": 600}
 
 
@@ -3807,7 +3817,7 @@ def test_REST_프록시도_만료를_같은_말로_답한다(monkeypatch):
 
 def test_키_조회_한도의_기본값과_손잡이(tmp_path):
     assert _limits(tmp_path, ["JWKS_TIMEOUT_S"])[0] == {"JWKS_TIMEOUT_S": 5.0}
-    assert _limits(tmp_path, ["JWKS_TIMEOUT_S"], GATEWAY_JWKS_TIMEOUT="2")[0] == {"JWKS_TIMEOUT_S": 2.0}
+    assert _limits(tmp_path, ["JWKS_TIMEOUT_S"], **_KNOBS_SET)[0] == {"JWKS_TIMEOUT_S": 2.0}
 
 
 # ── verify_answer — 낡아서 버린 조회 기록을 '조회한 적 없다' 로 말하지 않는다(결정표 gateway-19, 값은 그대로) ─────────
@@ -3878,34 +3888,21 @@ def test_응답_스트림의_15초_ping_전제가_그대로다():
 
 
 # ── 기동 로그 — 손잡이가 닿았는지 볼 자리 ─────────────────────────────────────────────────────────────
-_LIMITS_LINE_PROBE = r'''
-import gateway as gw
-print(gw._limits_line())
-'''
-
-
 def test_기동_로그의_시간_한도_줄은_이_프로세스에_실제로_걸린_값을_말한다(tmp_path):
     """게이트웨이는 `.env` 를 읽지 않는다 — 적었는데 닿지 않은 손잡이와 재기동 뒤의 옛 코드를 볼 자리가 이 줄뿐이다.
     손잡이 이름을 그대로 적어 로그에서 찾을 수 있게 하고, 바꿔 준 값이 그대로 나오는지 본다."""
-    (tmp_path / "cfg.json").write_text(json.dumps({"_gateway": {"token": "gw-test-token"}}), encoding="utf-8")
-
-    def line(**env):
-        full = {k: v for k, v in os.environ.items() if not k.startswith("GATEWAY_")}
-        full.update(GATEWAY_CONFIG=str(tmp_path / "cfg.json"), GATEWAY_AUDIT=str(tmp_path / "audit.jsonl"),
-                    PYTHONDONTWRITEBYTECODE="1", **env)
-        run = subprocess.run([sys.executable, "-c", _LIMITS_LINE_PROBE], cwd=os.path.dirname(os.path.abspath(gw.__file__)),
-                             env=full, capture_output=True, text=True, timeout=120)
-        assert run.returncode == 0, run.stderr[-2000:]
-        return run.stdout.strip()
-    said = line()
+    said = _limits(tmp_path, ["_line"])[0]["_line"]
     for want in ("GATEWAY_CALL_TIMEOUT=600 ", "GATEWAY_RECONNECT_TIMEOUT=30 ", "GATEWAY_BACKEND_READ_TIMEOUT=660 ",
                  "GATEWAY_BACKEND_HTTP_TIMEOUT=30 ", "GATEWAY_LIVENESS_TIMEOUT=10 × GATEWAY_LIVENESS_STRIKES=2(주기 60)",
                  "GATEWAY_AGG_STALE_ROUNDS=10 ", "GATEWAY_HEAX_MISS_DROP=10 ", "GATEWAY_REST_CALL_TIMEOUT=600 ",
                  "GATEWAY_PORTAL_SAVE_TIMEOUT=120 ", "GATEWAY_JWKS_TIMEOUT=5"):
         assert want in said, f"{want!r} 가 없다: {said}"
-    said = line(GATEWAY_CALL_TIMEOUT="900", GATEWAY_LIVENESS_STRIKES="3", GATEWAY_JWKS_TIMEOUT="2")
-    assert "GATEWAY_CALL_TIMEOUT=900 " in said and "GATEWAY_BACKEND_READ_TIMEOUT=960 " in said
-    assert "GATEWAY_REST_CALL_TIMEOUT=900 " in said and "GATEWAY_LIVENESS_STRIKES=3(" in said and said.endswith("GATEWAY_JWKS_TIMEOUT=2")
+    said = _limits(tmp_path, ["_line"], **_KNOBS_SET)[0]["_line"]
+    for want in ("GATEWAY_CALL_TIMEOUT=900 ", "GATEWAY_RECONNECT_TIMEOUT=12 ", "GATEWAY_BACKEND_READ_TIMEOUT=960 ",
+                 "GATEWAY_BACKEND_HTTP_TIMEOUT=7 ", "GATEWAY_LIVENESS_STRIKES=3(", "GATEWAY_AGG_STALE_ROUNDS=4 ",
+                 "GATEWAY_HEAX_MISS_DROP=6 ", "GATEWAY_REST_CALL_TIMEOUT=900 ", "GATEWAY_PORTAL_SAVE_TIMEOUT=300 "):
+        assert want in said, f"{want!r} 가 없다: {said}"
+    assert said.endswith("GATEWAY_JWKS_TIMEOUT=2")
 
 
 def test_기동할_때_그_줄을_남긴다():

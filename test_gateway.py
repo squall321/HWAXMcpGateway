@@ -1004,7 +1004,7 @@ def _per_user_kit(monkeypatch, aff_payload, base_headers=None, sso_extra=None,
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text="{}")], isError=False)
 
-    def fake_stream(url, headers=None):
+    def fake_stream(url, headers=None, **_kw):
         seen["headers"] = dict(headers or {})
         return _StubCM((None, None, "sid"))
 
@@ -1646,7 +1646,7 @@ def _ra_kit(monkeypatch, tool, *, backend="reportarchive", svc_headers=None, **p
             user["tool"] = original
             return types.CallToolResult(content=[types.TextContent(type="text", text="{}")], isError=False)
 
-    def fake_stream(url, headers=None):
+    def fake_stream(url, headers=None, **_kw):
         user["headers"] = dict(headers or {})
         return _StubCM((None, None, "sid"))
 
@@ -1786,7 +1786,7 @@ def _ts_kit(monkeypatch, per_user_sso, sso_status=200):
         async def call_tool(self, original, arguments, read_timeout_seconds=None):
             return types.CallToolResult(content=[types.TextContent(type="text", text="{}")], isError=False)
 
-    def fake_stream(url, headers=None):
+    def fake_stream(url, headers=None, **_kw):
         user["headers"] = dict(headers or {})
         return _StubCM((None, None, "sid"))
 
@@ -2218,7 +2218,7 @@ def _remint_kit(monkeypatch, replies: list[str | None]):
             return types.CallToolResult(content=[types.TextContent(type="text", text=err or '{"nodes": []}')],
                                         isError=err is not None)
 
-    def fake_stream(url, headers=None):
+    def fake_stream(url, headers=None, **_kw):
         seen["tokens"].append((headers or {}).get("Authorization"))
         return _StubCM((None, None, "sid"))
 
@@ -2387,7 +2387,7 @@ def _recon_kit(monkeypatch, backend, *, session="up", oneshot_fails=0, user="u@c
         async def call_tool(self, original, arguments, read_timeout_seconds=None):
             return types.CallToolResult(content=[types.TextContent(type="text", text="{}")], isError=False)
 
-    def fake_stream(url, headers=None):
+    def fake_stream(url, headers=None, **_kw):
         shots.append(dict(headers or {}))
         if len(shots) <= oneshot_fails:
             raise httpx.ConnectError("refused")
@@ -2893,3 +2893,300 @@ def test_포털이_거두었다고_알린_뒤의_불통은_거두기_전_권한�
     assert call() == during, "실패는 캐시되지 않는다 — 불통이 이어지는 동안 매 호출이 같아야 한다"
     portal["down"] = False
     assert call() == ["mes-user", "feat:chat"]
+
+
+# ── 시간 한도 — 느린 도구는 한 번으로 끝내고, 죽은 상대는 짧게 재고, 만료는 손잡이를 말한다(2026-10-08 결정표 gateway-01~05) ──
+# 실사용 팀의 리스크 심사는 17~22석이 공용 LLM·백엔드를 같이 쓴다. 120초 한도는 이미 걸리고 있었고(dev 감사 15,429건 중 5건이
+# 재시도까지 약 240초에 실패), 시간 초과가 세션을 갈아 같은 백엔드의 멀쩡한 호출까지 끊었다.
+_LIMITS_PROBE = r'''
+import json, sys
+import gateway as gw
+print(json.dumps({k: getattr(gw, k, None) for k in sys.argv[1:]}))
+'''
+
+
+def _limits(tmp_path, names, **env):
+    """게이트웨이를 **실제로 import** 해(설정은 임시 파일) 손잡이가 닿는지 본다 — 상수를 monkeypatch 하는 시험은 env 를 읽는
+    줄이 사라져도 통과한다. 돌려주는 것 — {이름: 값} · 기동 로그."""
+    (tmp_path / "cfg.json").write_text(json.dumps({"_gateway": {"token": "gw-test-token"}}), encoding="utf-8")
+    full = {k: v for k, v in os.environ.items() if not k.startswith("GATEWAY_")}
+    full.update(GATEWAY_CONFIG=str(tmp_path / "cfg.json"), GATEWAY_AUDIT=str(tmp_path / "audit.jsonl"),
+                PYTHONDONTWRITEBYTECODE="1", **env)
+    run = subprocess.run([sys.executable, "-c", _LIMITS_PROBE, *names], cwd=os.path.dirname(os.path.abspath(gw.__file__)),
+                         env=full, capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    return json.loads(run.stdout), run.stderr
+
+
+_CALL_LIMITS = ["CALL_TIMEOUT_S", "RECONNECT_TIMEOUT_S", "BACKEND_HTTP_TIMEOUT_S", "BACKEND_READ_TIMEOUT_S"]
+
+
+def test_호출_한도의_기본값은_안쪽이_바깥보다_작다(tmp_path):
+    """핸드셰이크·재연결 30 < 호출 600 < 전송 read 660. 게이트웨이는 `.env` 를 읽지 않고 포털 services.yaml 도 env 를 넘기지
+    않는다 — **코드 기본값이 곧 운영값**이라 기본값을 건다."""
+    got, _ = _limits(tmp_path, _CALL_LIMITS)
+    assert got == {"CALL_TIMEOUT_S": 600, "RECONNECT_TIMEOUT_S": 30.0, "BACKEND_HTTP_TIMEOUT_S": 30.0,
+                   "BACKEND_READ_TIMEOUT_S": 660.0}
+
+
+def test_호출_한도를_올리면_전송_한도가_따라_오르고_뒤집힌_설정은_따르지_않는다(tmp_path):
+    got, log_ = _limits(tmp_path, _CALL_LIMITS, GATEWAY_CALL_TIMEOUT="900", GATEWAY_RECONNECT_TIMEOUT="12",
+                        GATEWAY_BACKEND_HTTP_TIMEOUT="7")
+    assert got == {"CALL_TIMEOUT_S": 900, "RECONNECT_TIMEOUT_S": 12.0, "BACKEND_HTTP_TIMEOUT_S": 7.0,
+                   "BACKEND_READ_TIMEOUT_S": 960.0}, "전송 read 는 호출 한도 + 60 으로 유도된다"
+    assert "GATEWAY_BACKEND_READ_TIMEOUT" not in log_, "유도된 값은 경고 없이 맞아야 한다(호출 한도만 올린 운영자에게 거짓 경고)"
+    got, _ = _limits(tmp_path, _CALL_LIMITS, GATEWAY_BACKEND_READ_TIMEOUT="1200")
+    assert got["BACKEND_READ_TIMEOUT_S"] == 1200.0
+    # 전송 한도가 호출 한도보다 작으면 ping 을 안 보내는 백엔드에서 그것이 먼저 걸려 세션째 무너진다 — 조용히 따르지 않는다
+    got, log_ = _limits(tmp_path, _CALL_LIMITS, GATEWAY_BACKEND_READ_TIMEOUT="300")
+    assert got["BACKEND_READ_TIMEOUT_S"] == 660.0
+    assert "GATEWAY_BACKEND_READ_TIMEOUT" in log_ and "GATEWAY_CALL_TIMEOUT" in log_, "왜 다른 값을 쓰는지 기동 로그가 말해야 한다"
+
+
+def test_호출_한도_줄의_마지막_숫자가_기본값이다():
+    """HWAXPortal 절차 시험(test_procedures_census)은 이 줄의 **마지막 숫자**를 게이트웨이 기본값으로 읽어 30~600 으로 묶고,
+    절차 단계 상한 < 이 값 < 워밍업을 단언한다. 줄 끝에 숫자 든 주석을 달거나 600 을 넘기면 저쪽이 조용히 다른 값을 읽는다."""
+    import re
+    line = re.search(r"^CALL_TIMEOUT_S\s*=.*$", open(gw.__file__, encoding="utf-8").read(), re.M).group(0)
+    assert re.findall(r"\d+(?:\.\d+)?", line)[-1] == "600", line
+
+
+class _SlowSess(_CallSess):
+    """부르면 답이 오지 않는 세션 — 도구가 느린 것이고 세션은 멀쩡하다."""
+    async def call_tool(self, original, args, read_timeout_seconds=None):
+        self.calls.append(original)
+        await asyncio.sleep(3600)
+
+
+_LATE_BACKEND = {"shared": "signalforge", "identity": "hwax-deliberation", "per-user": "ste", "conn": "reportarchive"}
+
+
+def _late_kit(monkeypatch, path, *, hang="call", call_s=0.05, handshake_s=5.0):
+    """답이 오지 않는 백엔드를 실제 `_call_tool` 로 부른다(전송 계층만 막는다).
+    path — shared(상주 세션) · identity(신원 전달) · per-user(사람별 위임) · conn(등록 토큰).
+    hang — call(도구가 안 끝난다) · handshake(단발 세션의 initialize 가 안 끝난다).
+    돌려주는 것 — 결과 글 · 걸린 초 · 센 것(도구 호출 · 단발 세션 · 재연결 · 토큰 발급의 force) · 감사 줄 전부.
+    하네스 자체의 상한은 5초다 — 고치기 전의 상주 세션 길은 여기서 끝나지 않았다."""
+    import time as _time
+    backend = _LATE_BACKEND[path]
+    b = _ReconB(["slow_tool"])
+    b.session = _SlowSess([])
+    n = {"calls": b.session.calls, "shots": 0, "mints": []}
+
+    class _Sess:
+        async def initialize(self):
+            if hang == "handshake":
+                await asyncio.sleep(3600)
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            n["calls"].append(original)
+            await asyncio.sleep(3600)
+
+    def fake_stream(url, headers=None, **_kw):
+        n["shots"] += 1
+        return _StubCM((None, None, "sid"))
+
+    async def fake_pat(app_id, email, *, force=False):
+        n["mints"].append(force)
+        return "tok"
+
+    async def fake_access(email, base_groups, **_kw):
+        return {"keys": [], "affiliation": ""}
+
+    async def fake_conn(service, email):
+        return {"token": "rat_x", "workspace": ""}
+    monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+    monkeypatch.setattr(gw, "CALL_TIMEOUT_S", call_s)
+    monkeypatch.setattr(gw, "RECONNECT_TIMEOUT_S", handshake_s)
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {backend: b})
+    monkeypatch.setattr(gw, "route", {"slow_tool": (backend, "slow_tool")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"ste": {"sso_url": "http://x", "secret": "s"}} if path == "per-user" else {})
+    monkeypatch.setattr(gw, "IDENTITY_FWD", {"hwax-deliberation"})
+    monkeypatch.setattr(gw, "_task_group_holder", {"tg": object()})
+    monkeypatch.setattr(gw, "_REAGG", {})
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["mes-user"])
+    monkeypatch.setattr(gw, "_user_pat", fake_pat)
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    monkeypatch.setattr(gw, "_portal_connection", fake_conn)
+    t0 = _time.monotonic()
+    res = asyncio.run(asyncio.wait_for(gw._call_tool("slow_tool", {}), 5))
+    n["reconnects"] = b.reconnects
+    return res.content[0].text, _time.monotonic() - t0, n, _rows(), res
+
+
+@pytest.mark.parametrize("path", ["shared", "identity", "per-user", "conn"])
+def test_시간_초과는_한_번으로_끝내고_손잡이를_말한다(monkeypatch, path):
+    """종전에는 시간 초과에도 세션을 갈고(사람별 길은 토큰을 다시 받고) 도구를 한 번 더 불렀다 — 실효 한도가 두 배였고, 같은
+    세션의 멀쩡한 호출이 전부 끊겨 다시 돌았고, 쓰기 도구가 두 번 실행될 수 있었다. 문구는 `unavailable: TimeoutError()` ·
+    '자격증명으로 호출하지 못했습니다' · '토큰을 다시 등록하세요' 여서 느린 도구가 죽은 백엔드·틀린 토큰으로 읽혔다."""
+    text, took, n, rows, res = _late_kit(monkeypatch, path)
+    assert res.isError and took < 2
+    assert n["calls"] == ["slow_tool"], f"도구는 한 번만 불린다(쓰기 도구가 두 번 실행되면 안 된다): {n['calls']}"
+    assert n["reconnects"] == 0, "시간 초과는 세션이 죽었다는 뜻이 아니다 — 갈면 같은 세션의 다른 호출이 끊긴다"
+    assert n["mints"] == ([False] if path == "per-user" else []), "재발급하면 같은 사람의 다른 좌석이 쥔 토큰이 폐기된다"
+    assert f"backend {_LATE_BACKEND[path]}: slow_tool 이 0.05초 안에 답하지 않았다(GATEWAY_CALL_TIMEOUT)" in text, text
+    assert "다시 보내지 말고" in text
+    for wrong in ("unavailable", "TimeoutError", "자격증명으로 호출하지 못했습니다", "다시 등록"):
+        assert wrong not in text, f"느린 도구를 다른 고장으로 읽게 한다: {wrong}"
+    assert len(rows) == 1, "호출 한 건에 감사 한 줄"
+    assert rows[0]["ok"] is False and "GATEWAY_CALL_TIMEOUT" in rows[0]["error"] and rows[0]["caller"] == "u@corp.com"
+
+
+@pytest.mark.parametrize("path", ["identity", "per-user", "conn"])
+def test_단발_세션을_못_여는_백엔드는_호출_한도가_아니라_핸드셰이크_한도에_드러난다(monkeypatch, path):
+    """바깥 기한과 안쪽 호출 한도가 같은 값이었다 — 핸드셰이크를 못 끝내는 백엔드도 호출 한도를 다 채운 뒤에야(그리고 한 번 더)
+    이름 없는 `TimeoutError()` 로 끝났다. 한도를 600 으로 올리면 그것이 10분씩이다."""
+    text, took, n, rows, res = _late_kit(monkeypatch, path, hang="handshake", call_s=3.0, handshake_s=0.05)
+    assert res.isError and took < 1, f"호출 한도(3초)를 기다렸다: {took:.2f}s"
+    assert "0.05초 안에 세션을 열지 못했다(GATEWAY_RECONNECT_TIMEOUT)" in text, text
+    assert text.startswith(f"backend {_LATE_BACKEND[path]} unavailable:"), "죽은 상대는 포털 판정기가 '불통' 으로 읽어야 한다"
+    assert n["calls"] == [] and n["shots"] == 1 and n["reconnects"] == 0
+    assert len(rows) == 1 and "GATEWAY_RECONNECT_TIMEOUT" in rows[0]["error"]
+
+
+def test_만료_문구를_포털_절차_판정기가_제_갈래로_읽는다():
+    """HWAXPortal 절차 판정기는 게이트웨이 평문의 **머리**로 갈래를 가른다(`backend … unavailable:` = 불통, 다시 해 볼 만하다).
+    죽은 상대는 그 갈래에 남아야 하고, 느린 도구는 들어가면 안 된다 — 도구가 아직 돌고 있을 수 있어 다시 보내면 쓰기가 두 번
+    실행된다. 문구를 고치면 저쪽 시험은 초록인 채(그 머리가 소스 어딘가에만 있으면 통과한다) 갈래만 조용히 바뀐다."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(gw.__file__))),
+                        "HWAXPortal", "backend", "app", "procedures", "judge.py")
+    if not os.path.exists(path):
+        pytest.skip("HWAXPortal 리포가 옆에 없다")
+    spec = importlib.util.spec_from_file_location("_portal_judge", path)
+    judge = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = judge              # dataclass 가 제 모듈을 sys.modules 에서 찾는다
+    keep, sys.dont_write_bytecode = sys.dont_write_bytecode, True      # 남의 리포에 .pyc 를 남기지 않는다
+    try:
+        spec.loader.exec_module(judge)
+    finally:
+        sys.dont_write_bytecode = keep
+        sys.modules.pop(spec.name, None)
+
+    def read(what):
+        v = judge.judge(is_error=True, text=gw._late_text(gw._Late(what), "ste", "submit_job"))
+        return v.kind, v.retriable
+    assert read("handshake") == ("unavailable", True)
+    assert read("reconnect") == ("unavailable", True)
+    assert read("call") == ("tool_error", False), "느린 도구를 '다시 해 볼 만하다' 로 읽히게 하면 안 된다"
+
+
+def test_답을_받은_뒤_세션_닫기가_매달려도_답을_돌려준다(monkeypatch):
+    """도구는 이미 실행됐다 — 닫다가 바깥 기한이 걸렸다고 실패로 돌려주면 호출자가 쓰기를 다시 보낸다."""
+    class _Sess:
+        async def initialize(self): return None
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            return types.CallToolResult(content=[types.TextContent(type="text", text="saved")])
+
+    class _HangOnClose(_StubCM):
+        async def __aexit__(self, *a):
+            await asyncio.sleep(3600)
+    monkeypatch.setattr(gw, "streamablehttp_client", lambda url, headers=None, **kw: _HangOnClose((None, None, "sid")))
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+    monkeypatch.setattr(gw, "RECONNECT_TIMEOUT_S", 0.05)
+    res = asyncio.run(asyncio.wait_for(gw._oneshot(_CallB([]), {}, "save_report", {}, 0.05), 5))
+    assert res.content[0].text == "saved"
+
+
+def test_핸드셰이크에_쓴_시간이_호출_한도를_깎지_않는다(monkeypatch):
+    """바깥 기한이 핸드셰이크 **전에** 출발해 호출 한도와 같은 값이던 때는, 세션을 여는 데 쓴 시간만큼 도구가 일찍 잘렸다.
+    핸드셰이크 0.6초(한도 1초) + 도구 1.6초(한도 2초) = 2.2초 — 둘 다 제 한도 안이므로 답이 와야 한다."""
+    class _Sess:
+        async def initialize(self):
+            await asyncio.sleep(0.6)
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            await asyncio.sleep(1.6)
+            return types.CallToolResult(content=[types.TextContent(type="text", text="done")])
+    monkeypatch.setattr(gw, "streamablehttp_client", lambda url, headers=None, **kw: _StubCM((None, None, "sid")))
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+    monkeypatch.setattr(gw, "RECONNECT_TIMEOUT_S", 1.0)
+    res = asyncio.run(asyncio.wait_for(gw._oneshot(_CallB([]), {}, "report_summary", {}, 2.0), 10))
+    assert res.content[0].text == "done"
+
+
+def test_전송_한도는_상주_세션과_단발_세션에_모두_넘긴다(monkeypatch):
+    """MCP SDK 의 숨은 read 300초가 호출 한도(600) 아래에 깔려 있으면, ping 을 안 보내는 백엔드에서는 그것이 실제 상한이고
+    걸리면 세션째 무너진다. 세션을 여는 자리 둘 다 넘겨야 한다."""
+    seen = []
+
+    class _Sess:
+        async def initialize(self): return None
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            return types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
+
+    def fake_stream(url, headers=None, **kw):
+        seen.append(kw)
+        return _StubCM((None, None, "sid"))
+    monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+
+    async def go():
+        b = gw._Backend("k", "http://stub/mcp", {})
+        b._stop.set()                                   # 세션을 열자마자 내려온다
+        await b.run()
+        await gw._oneshot(b, {}, "t", {}, gw.CALL_TIMEOUT_S)
+    asyncio.run(asyncio.wait_for(go(), 5))
+    want = {"timeout": gw.BACKEND_HTTP_TIMEOUT_S, "sse_read_timeout": gw.BACKEND_READ_TIMEOUT_S}
+    assert seen == [want, want]
+    assert gw.BACKEND_READ_TIMEOUT_S > gw.CALL_TIMEOUT_S > gw.RECONNECT_TIMEOUT_S
+
+
+class _NeverBackB(_ReconB):
+    """재연결을 걸어도 돌아오지 않는 백엔드 — 준비 이벤트를 새로 갈아 끼우고 아무도 세우지 않는다."""
+    async def reconnect(self, tg, seen_gen=None):
+        self.reconnects += 1
+        self.session, self._ready = None, asyncio.Event()
+
+
+def test_실패한_호출이_백엔드가_돌아오기를_끝없이_기다리지_않는다(monkeypatch):
+    """한도가 없던 자리다. 멈춘 백엔드를 만난 호출은 백엔드가 복구된 뒤에도 돌아오지 않았고 감사 줄도 남지 않았다
+    (사본 재현: 40초 뒤 복구, 42초에 다른 세션이 섰는데 그 호출은 75초째 대기)."""
+    b = _NeverBackB(["deliberate_status"], "dead")
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {"signalforge": b})
+    monkeypatch.setattr(gw, "route", {"deliberate_status": ("signalforge", "deliberate_status")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "PER_USER_SSO", {})
+    monkeypatch.setattr(gw, "_task_group_holder", {"tg": object()})
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "RECONNECT_TIMEOUT_S", 0.05)
+    res = asyncio.run(asyncio.wait_for(gw._call_tool("deliberate_status", {}), 5))
+    assert res.isError and b.reconnects == 1
+    assert res.content[0].text == "backend signalforge unavailable: 0.05초 안에 돌아오지 않았다(GATEWAY_RECONNECT_TIMEOUT)"
+    row = _rows()[-1]
+    assert row["ok"] is False and "GATEWAY_RECONNECT_TIMEOUT" in row["error"], "끝난 호출은 감사에 남아야 한다"
+
+
+def test_취소된_시작도_준비_이벤트를_세운다(monkeypatch):
+    """재활 패스의 기한이 핸드셰이크 중인 시작을 취소하면 예외가 아니라 취소라 준비 이벤트가 영영 안 섰다 — 그 이벤트를
+    기다리던 호출이 위 시험의 끝없는 대기였다. 기한은 마지막 그물이고, 이쪽이 원인이다."""
+    class _Hang:
+        async def __aenter__(self):
+            await asyncio.sleep(3600)
+
+        async def __aexit__(self, *a): return False
+    monkeypatch.setattr(gw, "streamablehttp_client", lambda url, headers=None, **kw: _Hang())
+
+    async def go():
+        import anyio
+        b = gw._Backend("stuck", "http://stub/mcp", {})
+        ready = b._ready
+        async with anyio.create_task_group() as tg:
+            with anyio.move_on_after(0.05):
+                await tg.start(b.run)
+        return ready.is_set(), b.session
+    assert asyncio.run(asyncio.wait_for(go(), 5)) == (True, None)

@@ -80,6 +80,22 @@ MCP fan-out과 같은 패턴("호출자 토큰 1개 → 백엔드별 네이티�
 
 TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 방식 중 하나로 붙는다 — TestScope 코드는 여기서 손대지 않는다. **기본(`TESTSCOPE_SSO_SECRET` 없음)** 은 이 등록 토큰 길이고, **비밀이 있으면** `per_user_sso.testscope` 가 생겨 위 우선순위대로 그쪽이 먼저 탄다(등록할 것 없음). 위임은 TestScope 가 `POST /api/auth/sso`(위 계약)를 갖춘 뒤에만 켠다 — 그 전에 비밀이 생기면 발급이 실패해 신원 있는 TestScope 호출이 전부 거부되고 등록 토큰으로 돌아가지 않는다. 그래서 비밀은 자동으로 만들지 않고 사람이 넣는다. 백엔드는 두 방식이 같다 — `provision-config.sh` 가 `TESTSCOPE_MCP_URL`(> 직전 config 주소)로 만든다(`streamable_http`, 서비스 `Authorization` 없음 — tools/list 는 토큰 없이 된다). 기본 호스트가 없어 주소를 모르면 만들지 않는다.
 
+## 시간 한도 — 손잡이는 전부 프로세스 env, 기본값은 코드
+게이트웨이는 `.env` 를 읽지 않고 HWAXPortal `infra/services.yaml` 의 `mcp-gateway` 항목도 env 를 넘기지 않는다 — **`gateway.py` 의 기본값이 곧 운영값**이다. 바꾸려면 `start.sh` 를 부르는 환경에 export 한다(값은 초).
+
+원칙은 셋이다. ① 안쪽 한도가 그것을 감싸는 한도보다 작다. ② 느린 도구(시간 초과)와 죽은 상대(연결 실패)를 가른다 — 시간 초과는 **한 번으로 끝내고**(재시도·세션 교체·토큰 재발급 없음) 연결 실패만 한 번 다시 건다. ③ 만료 문구는 몇 초였고 어느 손잡이인지 말한다.
+
+| env | 기본 | 무엇을 재나 | 걸리면 |
+|---|---|---|---|
+| `GATEWAY_CALL_TIMEOUT` | 600 | 백엔드 도구 호출 1건(상주 세션·사람별·등록 토큰·신원 전달 네 길 공통) | `backend <키>: <도구> 이 600초 안에 답하지 않았다(GATEWAY_CALL_TIMEOUT)…` — 도구는 한 번만 불렸고 세션은 그대로다. 백엔드는 아직 일하고 있을 수 있다 |
+| `GATEWAY_RECONNECT_TIMEOUT` | 30 | 죽은 상대 — 단발 세션의 핸드셰이크(connect + initialize)와, 연결 실패 뒤 상주 세션이 돌아오기를 기다리는 시간 | `backend <키> unavailable: 30초 안에 세션을 열지 못했다(GATEWAY_RECONNECT_TIMEOUT)` · `… unavailable: 30초 안에 돌아오지 않았다(…)` — 죽은 상대라 머리에 `unavailable:` 를 남긴다(포털 절차 판정기가 이 머리로 '불통' 을 가른다). 느린 도구의 문구에는 붙이지 않는다 |
+| `GATEWAY_BACKEND_READ_TIMEOUT` | 호출 한도 + 60 | 백엔드 세션 아래 HTTP read 침묵(MCP SDK 의 숨은 300초에 이름을 붙였다) | 호출 한도가 먼저 걸리므로 위 문구가 나온다. 호출 한도보다 크지 않게 적으면 따르지 않고 기본값을 쓴다(기동 로그에 경고) — 이것이 먼저 걸리면 세션째 끊긴다 |
+| `GATEWAY_BACKEND_HTTP_TIMEOUT` | 30 | 같은 세션의 connect·write·pool | 연결 실패로 다뤄진다(한 번 다시 건다) |
+
+층 — 핸드셰이크·재연결 30 < 호출 600 < 전송 read·단발 세션 바깥 기한 660(= 30 + 600 + 30) < 엔진 `MCP_CALL_TIMEOUT_S` 900 < nginx `/mcp-gw/` 3600. 포털 절차 워밍업(690)도 660 바깥이다. **`GATEWAY_CALL_TIMEOUT` 을 올리면 엔진·포털 워밍업·nginx 셋을 같은 폭으로 올린다**(전송 read 와 단발 세션 바깥 기한은 스스로 따라 오른다). 안쪽(백엔드 자신의 한도 — KooRemapper MCP→REST 240, AIDataHub 풀 60 + 검색 90 등)은 600 보다 작아야 한다. HWAXPortal 절차 시험(`test_procedures_census`)이 `gateway.py` 의 기본값을 읽어 30~600 으로 묶으므로 600 을 넘기려면 그 상한부터 고친다. 600 으로도 모자란 도구는 한도를 올리지 말고 잡 도구(제출 + 상태 조회)로 돌린다 — 이 값이 호출 중 죽은 무상태 백엔드에서 호출자를 풀어 주는 마지막 값이다.
+
+진행 중인 도구 호출은 끝날 때까지 감사 줄도 진행 알림도 없다(호출자에게는 15초마다 SSE ping 만 흐른다). 살아 있음은 호출자 쪽(엔진의 ping·상태줄)이 보인다.
+
 ## 실행
 ```bash
 ./start.sh          # 에이전트 venv 파이썬으로 gateway.py 기동 (streamable-http :9110/mcp)

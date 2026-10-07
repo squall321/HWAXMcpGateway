@@ -9,7 +9,7 @@ import re
 import time
 from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -125,7 +125,29 @@ PORT = int(os.environ.get("GATEWAY_PORT") or GW.get("port", 9110))
 MCP_AUDIENCE = PORTAL.get("mcp_audience", "mcp-gateway")
 AUDIT_PATH = os.environ.get("GATEWAY_AUDIT", str(Path(__file__).with_name("audit.jsonl")))
 # 백엔드 도구 호출 타임아웃(초) — 행 걸린 백엔드가 챗 SSE 를 무기한 붙잡지 않게.
-CALL_TIMEOUT_S = int(os.environ.get("GATEWAY_CALL_TIMEOUT", "120"))
+# 기본 600. 종전 120 은 실사용에서 걸렸다 — dev 감사 15,429건 중 검색 5건이 재시도까지 약 240초에 실패했고 13건은 첫 시도가
+# 120초에 잘린 뒤 재시도로 답했다. 정당하게 더 긴 도구도 있다(StepForge 본판 동박 쌍 264~276초). 좌석 17~22석이 공용 LLM·백엔드를
+# 같이 쓰는 심의에서는 더 느리다. 수 시간으로 올리지 않는 까닭 — 호출 중 죽거나 재기동한 무상태 백엔드에서 호출자를 풀어 주는
+# 값이 이것뿐이다. 더 긴 일은 잡 도구(제출 + 상태 조회)로 간다(2026-10-08 시간 한도 결정표 gateway-01).
+# ⚠ 이 값을 **감싸는** 쪽이 여럿이다 — 아래 BACKEND_READ_TIMEOUT_S 와 단발 세션 바깥 기한(+60, 스스로 따라 오른다), 그리고
+#   엔진 MCP_CALL_TIMEOUT_S(900) · 포털 절차 워밍업(690) · nginx /mcp-gw/(3600). 올리면 뒤의 셋을 같은 폭으로 올린다.
+#   HWAXPortal 절차 시험(test_procedures_census)은 `CALL_TIMEOUT_S =` 줄의 **마지막 숫자**를 기본값으로 읽어 30~600 으로
+#   묶는다 — 그 줄 끝에 숫자 든 주석을 달지 않고, 600 을 넘기려면 그 시험의 상한부터 고친다.
+CALL_TIMEOUT_S = int(os.environ.get("GATEWAY_CALL_TIMEOUT", "600"))
+# 죽은 상대를 기다리는 한도(초) — 단발 세션의 핸드셰이크(connect + initialize)와, 실패한 호출 뒤 상주 세션이 돌아오기를 기다리는
+# 시간. 느린 도구가 아니라 답 없는 상대를 재는 값이라 호출 한도와 따로, 짧게 둔다(gateway-04·05).
+RECONNECT_TIMEOUT_S = float(os.environ.get("GATEWAY_RECONNECT_TIMEOUT", "30"))
+# 백엔드 세션 아래에 깔린 HTTP 한도(초). MCP SDK 기본값(connect/write/pool 30 · read 침묵 300)이 손잡이 없이 숨어 있었다.
+# read 는 호출 한도보다 **커야** 한다 — ping 을 안 보내는 백엔드(JSON 응답)에서는 이것이 먼저 걸리면 호출 한 건이 아니라 세션째
+# 무너져 같은 세션의 무관한 호출까지 끊긴다(사본 재현). 호출 한도가 300 을 넘는 순간 숨은 300 이 실제 상한이 되므로 기본을
+# 호출 한도 + 60 으로 유도한다(gateway-03).
+BACKEND_HTTP_TIMEOUT_S = float(os.environ.get("GATEWAY_BACKEND_HTTP_TIMEOUT", "30"))
+BACKEND_READ_TIMEOUT_S = float(os.environ.get("GATEWAY_BACKEND_READ_TIMEOUT") or CALL_TIMEOUT_S + 60)
+if BACKEND_READ_TIMEOUT_S <= CALL_TIMEOUT_S:
+    # 층이 뒤집힌 설정은 조용히 따르지 않는다 — 걸리는 순간까지 아무도 모르고, 걸리면 세션의 다른 호출까지 데려간다.
+    log.warning("GATEWAY_BACKEND_READ_TIMEOUT=%g 가 GATEWAY_CALL_TIMEOUT=%d 보다 크지 않다 — 전송 한도가 먼저 걸리면 세션째 "
+                "끊기므로 %d 로 올려 쓴다", BACKEND_READ_TIMEOUT_S, CALL_TIMEOUT_S, CALL_TIMEOUT_S + 60)
+    BACKEND_READ_TIMEOUT_S = float(CALL_TIMEOUT_S + 60)
 # 죽은 백엔드 재활 주기(초) — 부팅 때 없던 백엔드가 나중에 떠도 재시작 없이 합류.
 REVIVE_INTERVAL_S = int(os.environ.get("GATEWAY_REVIVE_INTERVAL", "60"))
 # 연결 상태 백엔드의 list_tools 확인 타임아웃 — 행 걸린 백엔드가 revive 루프를 막지 않게.
@@ -495,22 +517,31 @@ class _Backend:
 
     async def run(self, task_status=anyio.TASK_STATUS_IGNORED):
         """streamablehttp_client + ClientSession을 열고 stop 이벤트까지 park."""
+        # 이 시작이 세울 준비 이벤트를 쥐고 들어간다 — reconnect 가 `self._ready` 를 새것으로 갈아 끼워도 기다리는 쪽은 이것을 본다.
+        ready = self._ready
         try:
-            async with streamablehttp_client(self.url, headers=self.headers) as (read, write, _get_sid):
+            async with streamablehttp_client(self.url, headers=self.headers, timeout=BACKEND_HTTP_TIMEOUT_S,
+                                             sse_read_timeout=BACKEND_READ_TIMEOUT_S) as (read, write, _get_sid):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     self.session = session
                     self._failed = None
-                    self._ready.set()
+                    ready.set()
                     task_status.started()
                     await self._stop.wait()
         except Exception as e:  # noqa: BLE001
             self._failed = e
             self.session = None
-            if not self._ready.is_set():
-                self._ready.set()
+            if not ready.is_set():
+                ready.set()
                 task_status.started()
             log.warning("backend %s session ended: %r", self.key, e)
+        finally:
+            # **취소된 시작도 준비 이벤트를 세운다.** 재활 패스의 기한(LIVENESS_TIMEOUT_S)이 핸드셰이크 중인 시작을 취소하면
+            # 예외가 아니라 취소라 위 except 를 안 타고, 이벤트가 영영 안 선다. 그 이벤트를 기다리던 호출은 백엔드가 복구돼
+            # 다른 세션이 선 뒤에도 돌아오지 않았고 감사 줄도 남지 않았다(사본 재현: 40초 뒤 복구, 75초째 대기 — gateway-04).
+            if not ready.is_set():
+                ready.set()
 
     async def reconnect(self, tg, seen_gen: int | None = None):
         """call 시 세션이 죽었으면 새 태스크로 1회 재연결.
@@ -2595,6 +2626,79 @@ def _token_rejected(res) -> bool:
     return bool(_TOKEN_REJECTED.match(text.strip()))
 
 
+class _Late(Exception):
+    """기한을 넘겼다 — **다시 부르지 않는다**(세션 교체도 토큰 재발급도 없다).
+
+    종전에는 모든 실패에 한 번 더 불렀다. 시간 초과에도 상주 세션을 갈고 도구를 다시 불러서 ① 실효 한도가 적힌 값의 두 배였고
+    ② 같은 세션의 멀쩡한 호출이 전부 끊겨 다시 돌았고(좌석 17~22석이 한 백엔드를 같이 쓴다) ③ 쓰기 도구가 두 번 실행될 수 있었다
+    (사본 재현: 한도 3초·도구 8초 → 도구가 두 번 불리고 6.0초에 실패, 같은 세션의 2.5초짜리 호출은 3.5초 대신 6.5초에 답했다).
+    사람별 길에서는 재발급이 같은 사람의 다른 좌석이 쥔 토큰을 폐기했다. 시간 초과는 도구가 느리다는 뜻이지 세션이 죽었다는
+    뜻이 아니다 — 재시도 1회는 연결 실패(세션 다운·연결 종료·401)에만 남긴다(gateway-02).
+
+    `what` — call(도구가 호출 한도 안에 답하지 않았다) · handshake(단발 세션을 열지 못했다) · reconnect(상주 세션이 돌아오지 않았다).
+    """
+
+    def __init__(self, what: str):
+        super().__init__(what)
+        self.what = what
+
+
+def _late_text(exc: _Late, backend_key: str, tool: str) -> str:
+    """호출자에게 돌려줄 문구 — 몇 초였고 **어느 손잡이**인지 말한다. 종전의 `unavailable: TimeoutError()` 와 '토큰을 다시
+    등록하세요' 는 느린 도구를 죽은 백엔드·틀린 토큰으로 읽게 했다.
+
+    ⚠ 머리가 갈래를 가른다 — HWAXPortal 절차 판정기(`procedures/judge.py` 의 `GW_UNAVAILABLE`)가 `backend … unavailable:` 를
+      '불통, 다시 해 볼 만하다' 로 읽는다. 그래서 **죽은 상대**(세션을 못 열었다·안 돌아왔다)에는 그 머리를 남기고, **느린 도구**
+      에는 붙이지 않는다 — 도구는 아직 돌고 있을 수 있어 다시 보내면 쓰기가 두 번 실행된다.
+    """
+    if exc.what == "handshake":
+        return (f"backend {backend_key} unavailable: {RECONNECT_TIMEOUT_S:g}초 안에 세션을 열지 못했다"
+                "(GATEWAY_RECONNECT_TIMEOUT)")
+    if exc.what == "reconnect":
+        return (f"backend {backend_key} unavailable: {RECONNECT_TIMEOUT_S:g}초 안에 돌아오지 않았다"
+                "(GATEWAY_RECONNECT_TIMEOUT)")
+    return (f"backend {backend_key}: {tool} 이 {CALL_TIMEOUT_S:g}초 안에 답하지 않았다(GATEWAY_CALL_TIMEOUT). "
+            "백엔드는 아직 일하고 있을 수 있다 — 같은 호출을 다시 보내지 말고 상태 도구로 확인하라")
+
+
+async def _call_shared(b: "_Backend", original: str, arguments: dict):
+    """상주 세션으로 도구 1건. 호출 한도를 넘기면 `_Late` — 세션은 그대로 둔다(같은 세션의 다른 호출이 계속 돈다)."""
+    sess = b.session
+    if sess is None:
+        raise RuntimeError("backend session down")
+    with anyio.move_on_after(CALL_TIMEOUT_S):
+        return await sess.call_tool(original, arguments)
+    raise _Late("call")
+
+
+async def _oneshot(b: "_Backend", hdrs: dict, original: str, arguments: dict, timeout_s: float):
+    """이 호출만을 위한 단발 세션 — 핸드셰이크(connect + initialize)와 도구 호출에 기한을 **따로** 준다.
+
+    종전에는 바깥 기한과 안쪽 호출 한도가 같은 값이었다. 먼저 출발한 바깥이 늘 이겨 초도 이름도 없는 `TimeoutError()` 만 남았고,
+    핸드셰이크를 못 끝내는 백엔드도 호출 한도를 다 채운 뒤에야 드러났다 — 한도를 600 으로 올리면 그것이 10분이다. 안쪽이 바깥보다
+    작아야 구체적인 문구가 이긴다: 핸드셰이크 RECONNECT_TIMEOUT_S < 호출 timeout_s < 바깥(핸드셰이크 + 호출 + 세션을 닫는 여유로
+    RECONNECT_TIMEOUT_S 한 번 더 — 기본 30 + 600 + 30 = 660, gateway-05).
+    ⚠ 기한을 넘긴 것은 예외가 아니라 **단계 표시**로 들고 나와 `async with` 밖에서 던진다. 세션과 전송이 안에 태스크 그룹을 두고
+      있어 안에서 던진 예외는 `ExceptionGroup` 두 겹에 싸여 나온다(사본 실측) — 호출부가 시간 초과를 연결 실패와 못 가른다.
+    ⚠ 답을 받은 뒤에는 세션 닫기가 늦어 바깥 기한이 걸려도 **답을 돌려준다** — 도구는 이미 실행됐다.
+    """
+    stage, res = "handshake", None
+    with anyio.move_on_after(RECONNECT_TIMEOUT_S + timeout_s + RECONNECT_TIMEOUT_S):
+        async with streamablehttp_client(b.url, headers=hdrs, timeout=BACKEND_HTTP_TIMEOUT_S,
+                                         sse_read_timeout=BACKEND_READ_TIMEOUT_S) as (read, write, _sid):
+            async with ClientSession(read, write) as sess:
+                with anyio.move_on_after(RECONNECT_TIMEOUT_S):
+                    await sess.initialize()
+                    stage = "call"
+                if stage == "call":
+                    with anyio.move_on_after(timeout_s):
+                        res = await sess.call_tool(original, arguments)
+                        stage = "done"
+    if stage != "done":
+        raise _Late(stage)
+    return res
+
+
 async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: str, timeout_s: float,
                         extra_headers: dict | None = None, token_header: str | None = None):
     """이 호출만을 위한 단발 세션으로 백엔드를 부른다.
@@ -2617,12 +2721,7 @@ async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: st
     auth = {token_header: token} if token_header else {"Authorization": f"Bearer {token}"}
     hdrs = {**base, **auth,
             **{k: v for k, v in (extra_headers or {}).items() if v is not None}}
-    with anyio.fail_after(timeout_s):
-        async with streamablehttp_client(b.url, headers=hdrs) as (read, write, _sid):
-            async with ClientSession(read, write) as sess:
-                await sess.initialize()
-                return await sess.call_tool(original, arguments,
-                                            read_timeout_seconds=timedelta(seconds=timeout_s))
+    return await _oneshot(b, hdrs, original, arguments, timeout_s)
 
 
 
@@ -2648,12 +2747,7 @@ async def _call_with_identity(b: "_Backend", original: str, arguments: dict, tim
         hdrs[GROUPS_HEADER] = quote(",".join(groups), safe=",:")
     if user:
         hdrs[USER_HEADER] = quote(user, safe="@.")
-    with anyio.fail_after(timeout_s):
-        async with streamablehttp_client(b.url, headers=hdrs) as (read, write, _sid):
-            async with ClientSession(read, write) as sess:
-                await sess.initialize()
-                return await sess.call_tool(original, arguments,
-                                            read_timeout_seconds=timedelta(seconds=timeout_s))
+    return await _oneshot(b, hdrs, original, arguments, timeout_s)
 
 
 @_low.list_tools()
@@ -2771,8 +2865,14 @@ async def _call_tool(name: str, arguments: dict):
         # 캐시 대상이 아니다 = 쓰기이거나 알 수 없는 도구. 그 백엔드의 캐시를 버린다 —
         # 방금 만든 것이 TTL 동안 목록에 안 보이는 read-after-write 를 막는다.
         _cache_flush_backend(backend_key)
-    # 행 걸린 백엔드가 챗 SSE 체인 전체를 무기한 블록하지 않게 호출당 타임아웃을 건다.
-    call_timeout = timedelta(seconds=CALL_TIMEOUT_S)
+    # 행 걸린 백엔드가 챗 SSE 체인 전체를 무기한 블록하지 않게 호출당 타임아웃을 건다(_call_shared·_oneshot).
+    # 기한을 넘긴 호출은 어느 길(사람별·등록 토큰·신원 전달·상주 세션)이든 여기서 **한 번으로** 끝난다 — 문구도 감사 줄도 같다.
+    def _late(exc: _Late):
+        text = _late_text(exc, backend_key, name)
+        log.warning("%s", text)
+        _audit(name, backend_key, False, text, round((time.monotonic() - t0) * 1000),
+               caller=_request_user() or None, corr=_request_corr())
+        return types.CallToolResult(content=[types.TextContent(type="text", text=text)], isError=True)
 
     # 사용자 위임 — 이 백엔드가 사용자별 스코프를 쓰고 호출자 신원이 있으면, 서비스 계정이 아니라
     # 그 사용자의 자격증명으로 부른다. 신원이 없으면 종전대로 서비스 계정(감사에 사유를 남긴다).
@@ -2805,6 +2905,9 @@ async def _call_tool(name: str, arguments: dict):
                     res = await _call_as_user(
                         b, original, arguments, tok, CALL_TIMEOUT_S, extra_headers=extra,
                         token_header=PER_USER_SSO[app_id].get("token_header"))
+                except _Late as exc:
+                    # 시간 초과는 토큰 문제가 아니다 — 재발급하면 발급자가 직전 토큰을 폐기해 같은 사람의 다른 좌석이 죽는다.
+                    return _late(exc)
                 except Exception as exc:  # noqa: BLE001
                     if attempt == 0:
                         log.warning("per-user call %s failed (%r) — 토큰 재발급 후 1회 재시도",
@@ -2867,6 +2970,9 @@ async def _call_tool(name: str, arguments: dict):
             try:
                 res = await _call_as_user(b, original, arguments, conn["token"],
                                           CALL_TIMEOUT_S, extra_headers=extra)
+            except _Late as exc:
+                # 느린 도구에 '토큰을 다시 등록하세요' 라고 말하지 않는다 — 수 시간짜리 심의의 보고서 저장이 이 길이다.
+                return _late(exc)
             except Exception as exc:  # noqa: BLE001
                 _audit(name, backend_key, False, f"conn-user: {exc!r}",
                        round((time.monotonic() - t0) * 1000))
@@ -2902,20 +3008,25 @@ async def _call_tool(name: str, arguments: dict):
                    round((time.monotonic() - t0) * 1000),
                    caller=_u or None, mode="identity-fwd", corr=_request_corr())
             return _cache_put(ckey, _evid_keep(name, res))
-        if b.session is None:
-            raise RuntimeError("backend session down")
-        res = await b.session.call_tool(original, arguments, read_timeout_seconds=call_timeout)
+        res = await _call_shared(b, original, arguments)
         _audit(name, backend_key, not getattr(res, "isError", False), None,
                round((time.monotonic() - t0) * 1000),
                caller=_u or None, mode="service", note=note, corr=_request_corr())
         return _cache_put(ckey, _evid_keep(name, res))
+    except _Late as late:
+        return _late(late)
     except Exception as e:  # noqa: BLE001
         log.warning("call %s on %s failed (%r), reconnecting once", name, backend_key, e)
         try:
             tg = _task_group_holder.get("tg")
             if tg is not None:
-                await b.reconnect(tg, _gen)
-                await b._ready.wait()
+                # 돌아오기를 기다리는 데에도 기한을 둔다. 여기만 한도가 없어서, 멈춘 백엔드를 만난 호출은 백엔드가 복구된
+                # 뒤에도 영영 돌아오지 않았고 감사 줄도 남지 않았다 — 이 경로에서 끝없는 대기가 되던 한 자리다(gateway-04).
+                with anyio.move_on_after(RECONNECT_TIMEOUT_S) as _rc:
+                    await b.reconnect(tg, _gen)
+                    await b._ready.wait()
+                if _rc.cancelled_caught:
+                    raise _Late("reconnect")
                 if b.session is not None:
                     # 재연결했으면 그 백엔드의 도구 구성이 바뀌었을 수 있다(앱 교체). 호출 지연을
                     # 늘리지 않도록 여기서 재집계하지 않고 revive 루프에 예약만 건다(G3).
@@ -2926,14 +3037,15 @@ async def _call_tool(name: str, arguments: dict):
                     if _fwd:
                         res = await _call_with_identity(b, original, arguments, CALL_TIMEOUT_S, _u, _g)
                     else:
-                        res = await b.session.call_tool(original, arguments,
-                                                        read_timeout_seconds=call_timeout)
+                        res = await _call_shared(b, original, arguments)
                     _audit(name, backend_key, not getattr(res, "isError", False), None,
                            round((time.monotonic() - t0) * 1000),
                            caller=_u or None, mode="identity-fwd" if _fwd else "service",
                            note="reconnected" + (f"+{note}" if note else ""),
                            corr=_request_corr())
                     return _cache_put(ckey, _evid_keep(name, res))
+        except _Late as late:
+            return _late(late)
         except Exception as e2:  # noqa: BLE001 — 재시도 실패도 정돈된 isError 로 (프로토콜 에러 방지)
             log.warning("retry of %s on %s failed too (%r)", name, backend_key, e2)
             e = e2

@@ -2818,18 +2818,22 @@ async def _call_tool(name: str, arguments: dict):
     # 그 사이 다른 호출이 이미 갈아 끼웠다면 새 세션을 또 부수지 않는다. try 밖에서 잡는다 —
     # 안에서 잡으면 session is None 분기에서 미정의가 된다.
     _gen = b._gen
+    # 신원도 try 밖에서 잡는다 — 아래 재시도가 같은 분기를 타야 하는데, 안에서 잡으면 첫 시도가 일찍 던졌을 때 미정의다.
+    _u, _g = _request_user(), _request_groups()
+    _fwd = backend_key in IDENTITY_FWD and bool(_u or _g)
     try:
-        if b.session is None:
-            raise RuntimeError("backend session down")
-        _u, _g = _request_user(), _request_groups()
-        if backend_key in IDENTITY_FWD and (_u or _g):
+        if _fwd:
             # 신원이 있는 호출은 그 신원으로 간다 — 심의가 서비스 계정 시야로 돌면 사용자별
             # 데이터가 통째로 비어 보이고 보고서 귀속도 서비스 계정이 된다.
+            # 상주 세션 검사보다 먼저다 — 이 호출은 단발 세션을 따로 열어 상주 세션을 쓰지 않는다. 검사가 먼저이던 때는
+            # 상주 세션이 죽은 순간의 신원 호출이 재연결 분기로 떨어졌다.
             res = await _call_with_identity(b, original, arguments, CALL_TIMEOUT_S, _u, _g)
             _audit(name, backend_key, not getattr(res, "isError", False), None,
                    round((time.monotonic() - t0) * 1000),
                    caller=_u or None, mode="identity-fwd", corr=_request_corr())
             return _cache_put(ckey, _evid_keep(name, res))
+        if b.session is None:
+            raise RuntimeError("backend session down")
         res = await b.session.call_tool(original, arguments, read_timeout_seconds=call_timeout)
         _audit(name, backend_key, not getattr(res, "isError", False), None,
                round((time.monotonic() - t0) * 1000),
@@ -2846,11 +2850,17 @@ async def _call_tool(name: str, arguments: dict):
                     # 재연결했으면 그 백엔드의 도구 구성이 바뀌었을 수 있다(앱 교체). 호출 지연을
                     # 늘리지 않도록 여기서 재집계하지 않고 revive 루프에 예약만 건다(G3).
                     _REAGG["pending"] = True
-                    res = await b.session.call_tool(original, arguments,
-                                                    read_timeout_seconds=call_timeout)
+                    # 재시도도 정상 경로와 같은 분기를 탄다. 여기서 상주 세션을 곧바로 부르던 때는 신원 호출이 재연결
+                    # 한 번에 서비스 계정으로 바뀌어 나갔다 — 심의가 서비스 계정 시야로 돌았다(실측 2026-10-07 04:13Z
+                    # `deliberate_status`, HWAXPortal docs/change-request-8-10 #17).
+                    if _fwd:
+                        res = await _call_with_identity(b, original, arguments, CALL_TIMEOUT_S, _u, _g)
+                    else:
+                        res = await b.session.call_tool(original, arguments,
+                                                        read_timeout_seconds=call_timeout)
                     _audit(name, backend_key, not getattr(res, "isError", False), None,
                            round((time.monotonic() - t0) * 1000),
-                           caller=_request_user() or None, mode="service",
+                           caller=_u or None, mode="identity-fwd" if _fwd else "service",
                            note="reconnected" + (f"+{note}" if note else ""),
                            corr=_request_corr())
                     return _cache_put(ckey, _evid_keep(name, res))

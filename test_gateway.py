@@ -2272,3 +2272,112 @@ def test_expires_in_이_2분도_안_남으면_캐시하지_않는다(monkeypatch
     async def run():
         return [await _pat_at(clk, 0), await _pat_at(clk, 0)]
     assert asyncio.run(run()) == ["t1", "t2"]
+
+
+# ── 재연결 재시도도 신원을 싣는다(HWAXPortal docs/change-request-8-10 #17) ─────────────────────────
+class _DeadSess(_CallSess):
+    """객체는 살아 있는데 호출하면 터지는 상주 세션 — 앱이 재기동된 뒤의 모양이다."""
+    async def call_tool(self, original, args, read_timeout_seconds=None):
+        raise RuntimeError("session closed")
+
+
+class _ReconB(_CallB):
+    """`_call_tool` 의 재연결 분기를 태우는 백엔드 — reconnect 가 새 상주 세션을 세우고 횟수를 센다."""
+    def __init__(self, tools, session="up"):
+        super().__init__(tools)
+        self._tools, self.reconnects = tools, 0
+        self.session = {"up": self.session, "dead": _DeadSess([]), "none": None}[session]
+
+    async def reconnect(self, tg, seen_gen=None):
+        self.reconnects += 1
+        self.session = _CallSess([_tool(n) for n in self._tools])
+
+
+def _recon_kit(monkeypatch, backend, *, session="up", oneshot_fails=0, user="u@corp.com",
+               groups=("mes-user", "feat:chat")):
+    """재연결 분기를 실제로 태운다(전송 계층만 막는다). 단발 세션(신원 호출)의 연결은 `oneshot_fails` 번까지 터진다.
+    돌려주는 것 — 결과 · 백엔드(상주 세션이 받은 호출·재연결 횟수) · 단발 세션이 연결마다 실은 헤더 · 감사 마지막 줄."""
+    b = _ReconB(["deliberate_status"], session)
+    shots = []
+
+    class _Sess:
+        async def initialize(self): return None
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            return types.CallToolResult(content=[types.TextContent(type="text", text="{}")], isError=False)
+
+    def fake_stream(url, headers=None):
+        shots.append(dict(headers or {}))
+        if len(shots) <= oneshot_fails:
+            raise httpx.ConnectError("refused")
+        return _StubCM((None, None, "sid"))
+
+    monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {backend: b})
+    monkeypatch.setattr(gw, "route", {"deliberate_status": (backend, "deliberate_status")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "PER_USER_SSO", {})
+    monkeypatch.setattr(gw, "IDENTITY_FWD", {"hwax-deliberation"})
+    monkeypatch.setattr(gw, "_task_group_holder", {"tg": object()})
+    monkeypatch.setattr(gw, "_REAGG", {})
+    monkeypatch.setattr(gw, "_request_user", lambda: user)
+    monkeypatch.setattr(gw, "_request_groups", lambda: list(groups))
+    res = asyncio.run(gw._call_tool("deliberate_status", {"job_id": "j1"}))
+    return res, b, shots, _rows()[-1]
+
+
+def _carries_identity(headers: dict) -> bool:
+    return (headers.get(gw.USER_HEADER) == "u@corp.com"
+            and headers.get(gw.GROUPS_HEADER) == "mes-user,feat:chat")
+
+
+def test_재연결_재시도도_신원을_싣는다(monkeypatch):
+    """신원 호출이 터져 재연결한 뒤의 재시도가 **상주 세션(서비스 계정)** 으로 나갔다 — 심의가 서비스 계정 시야로
+    돌아 '내 것이 하나도 없다' 가 된다(실측 2026-10-07 04:13Z `deliberate_status`·`via=pat`). 정상 경로와 같은 분기를 탄다."""
+    res, b, shots, row = _recon_kit(monkeypatch, "hwax-deliberation", oneshot_fails=1)
+    assert not res.isError and b.reconnects == 1
+    assert b.session.calls == [], f"재시도가 서비스 세션으로 나갔다: {b.session.calls}"
+    assert len(shots) == 2 and _carries_identity(shots[1]), "재시도의 단발 세션이 신원 헤더를 실어야 한다"
+    assert (row["mode"], row["note"], row["caller"], row["ok"]) == ("identity-fwd", "reconnected", "u@corp.com", True)
+    assert gw._REAGG.get("pending") is True, "재연결했으면 카탈로그 재집계를 예약한다(종전대로)"
+
+
+def test_상주_세션이_죽어_있어도_신원_호출은_재연결_없이_나간다(monkeypatch):
+    """신원 호출은 상주 세션을 쓰지 않는다(호출마다 단발 세션) — 그런데 세션 검사가 먼저라 죽은 상주 세션 때문에
+    재연결 분기로 떨어졌고, 거기서 서비스 계정으로 나갔다."""
+    res, b, shots, row = _recon_kit(monkeypatch, "hwax-deliberation", session="none")
+    assert not res.isError and b.reconnects == 0 and b.session is None
+    assert len(shots) == 1 and _carries_identity(shots[0])
+    assert (row["mode"], row["caller"]) == ("identity-fwd", "u@corp.com") and "note" not in row
+
+
+def test_상주_세션이_죽은_채_단발_호출도_터지면_재연결_뒤_신원으로_다시_부른다(monkeypatch):
+    res, b, shots, row = _recon_kit(monkeypatch, "hwax-deliberation", session="none", oneshot_fails=1)
+    assert not res.isError and b.reconnects == 1 and b.session.calls == []
+    assert len(shots) == 2 and _carries_identity(shots[1])
+    assert (row["mode"], row["note"]) == ("identity-fwd", "reconnected")
+
+
+def test_재시도까지_터지면_서비스_계정으로_돌아가지_않고_실패를_알린다(monkeypatch):
+    res, b, shots, row = _recon_kit(monkeypatch, "hwax-deliberation", oneshot_fails=2)
+    assert res.isError and "unavailable" in res.content[0].text
+    assert b.session.calls == [] and len(shots) == 2 and row["ok"] is False
+
+
+@pytest.mark.parametrize("backend,session,user,groups", [
+    ("signalforge", "none", "u@corp.com", ("mes-user",)),     # 신원 전달 대상이 아닌 백엔드 — 세션이 없던 경우
+    ("signalforge", "dead", "u@corp.com", ("mes-user",)),     # 〃 — 세션은 있는데 호출이 터진 경우
+    ("hwax-deliberation", "none", "", ()),                    # 대상 백엔드라도 신원이 아예 없으면 서비스 세션
+    ("hwax-deliberation", "dead", "", ()),
+])
+def test_신원_전달_대상이_아니면_재시도는_종전대로_서비스_세션이다(monkeypatch, backend, session, user, groups):
+    """과하게 넓히지 않는다 — 그리고 첫 시도가 세션 검사에서 던진 경우에도 재시도가 터지지 않는다(변수 미정의)."""
+    res, b, shots, row = _recon_kit(monkeypatch, backend, session=session, user=user, groups=groups)
+    assert not res.isError, res.content[0].text
+    assert b.reconnects == 1 and b.session.calls == ["deliberate_status"] and shots == []
+    assert (row["mode"], row["note"], row.get("caller")) == ("service", "reconnected", user or None)

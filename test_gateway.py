@@ -3831,3 +3831,19 @@ def test_리스크_앱의_위임_토큰_수명이_게이트웨이_호출_한도�
     src = open(gw.__file__, encoding="utf-8").read()
     call = int(re.findall(r"\d+", re.search(r"^CALL_TIMEOUT_S\s*=.*$", src, re.M).group(0))[-1])
     assert int(m.group(1)) > call, f"위임 토큰 {m.group(1)}초가 호출 한도 {call}초보다 길지 않다"
+
+
+# ── 호출자들이 기대는 전제 — 게이트웨이는 응답 스트림에 15초마다 ping 을 싣는다(결정표의 계약) ─────────────────────
+def test_응답_스트림의_15초_ping_전제가_그대로다():
+    """sse-starlette 의 기본값이고 MCP SDK 는 간격을 따로 주지 않는다. 호출자들의 한도가 이 수에 기대어 있다 — httpx 침묵
+    한도가 15초보다 크면 죽은 게이트웨이만 잡고(포털 90·260초, 리스크 앱 30·60초) 15초보다 작으면 그것이 실제 호출 상한이며,
+    nginx `/mcp-gw/` 의 침묵 1시간과 수 시간짜리 `deliberate_status` 폴링 세션도 이 ping 덕에 끊기지 않는다. 라이브러리를
+    올려 간격이 바뀌거나 꺼지면 그 값들의 뜻이 조용히 바뀐다 — 여기서 걸리면 저쪽 한도를 같이 본다."""
+    import inspect
+    import re
+
+    import mcp.server.streamable_http as sh
+    from sse_starlette.sse import EventSourceResponse
+    assert EventSourceResponse.DEFAULT_PING_INTERVAL == 15
+    made = re.findall(r"EventSourceResponse\((.*?)\)", inspect.getsource(sh), re.S)
+    assert made and not any("ping" in args for args in made), "MCP SDK 가 ping 을 따로 준다 — 실제 간격을 확인하라"

@@ -1968,6 +1968,36 @@ def test_포털이_앱_설정을_바꾸면_권한_캐시도_비워_바로_반영
     gw._ENT_CACHE.clear()
 
 
+def test_계정을_정지하면_그_사람의_위임_토큰_연결_응답_캐시만_비운다(monkeypatch):
+    """포털의 계정 정지(HWAXPortal `auth/routes/local.py` `_revoke_app_credentials`)가 이 호출에 기댄다. ste 는 토큰을
+    클라이언트별로 회수하므로 포털의 ste 회수는 게이트웨이가 쥔 토큰을 죽이지 못한다 — `_USER_PATS` 에서 빼는 것이 유일한
+    제거다. 이 줄이 사라져도 시험이 전부 통과했다(포털 쪽 시험의 게이트웨이는 200 만 답하는 대역이다) — 그러면 포털은
+    `app_revocations.gateway = "ok"` 라고 답하는데 정지된 사람의 토큰은 캐시 수명(12시간) 동안 남는다."""
+    import asyncio
+    from collections import OrderedDict
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    monkeypatch.setattr(gw, "_USER_PATS", {("ste", "u@x.io"): ("tok-u-ste", 1e12),
+                                           ("reportarchive", "u@x.io"): ("tok-u-ra", 1e12),
+                                           ("ste", "other@x.io"): ("tok-o-ste", 1e12)})
+    monkeypatch.setattr(gw, "_CONN_CACHE", {("reportarchive", "u@x.io"): ({"token": "c-u"}, 1e12),
+                                            ("reportarchive", "other@x.io"): ({"token": "c-o"}, 1e12)})
+    # 응답 캐시 키의 넷째 칸이 호출자 신원이다(`_cache_key`).
+    monkeypatch.setattr(gw, "_RESP_CACHE", OrderedDict([(("ste", "list_x", "{}", "u@x.io", (), ""), ("r-u", 1e12)),
+                                                        (("ste", "list_x", "{}", "other@x.io", (), ""), ("r-o", 1e12))]))
+    monkeypatch.setattr(gw, "_ENT_CACHE", {})
+    sent = []
+
+    async def send(m): sent.append(m)
+    mw = gw._bearer_gate(None, None)
+    asyncio.run(mw({"type": "http", "path": "/conn-invalidate", "method": "POST", "query_string": b"email=u@x.io",
+                    "headers": [(b"authorization", b"Bearer gw-secret")]}, None, send))
+    assert sent[0]["status"] == 200
+    assert json.loads(sent[1]["body"]) == {"ok": True, "dropped": 1, "resp_dropped": 1, "pat_dropped": 2}
+    assert set(gw._USER_PATS) == {("ste", "other@x.io")}, "정지된 사람의 ste·RA 위임 토큰이 게이트웨이에 남았다"
+    assert set(gw._CONN_CACHE) == {("reportarchive", "other@x.io")}
+    assert list(gw._RESP_CACHE) == [("ste", "list_x", "{}", "other@x.io", (), "")]
+
+
 def test_지침이_끈_앱을_권한_문제와_구분하라고_말한다():
     assert "muted_apps" in gw._INSTRUCTIONS and "요청하라고 하지 마라" in gw._INSTRUCTIONS
     assert len(gw._INSTRUCTIONS) < 2048, "Claude Code 는 서버 지침을 2048자에서 자른다"

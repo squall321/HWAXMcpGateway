@@ -2912,7 +2912,8 @@ def test_포털이_거두었다고_알린_뒤의_불통은_거두기_전_권한�
 _LIMITS_PROBE = r'''
 import json, sys
 import gateway as gw
-print(json.dumps({k: getattr(gw, k, None) for k in sys.argv[1:]}))
+import rest_proxy
+print(json.dumps({k: getattr(gw, k, None) if hasattr(gw, k) else getattr(rest_proxy, k, None) for k in sys.argv[1:]}))
 '''
 
 
@@ -3628,3 +3629,154 @@ def test_rest_call_한도는_호출_한도를_따르고_따로_줄_수도_있다
     assert _limits(tmp_path, names)[0] == {"REST_CALL_TIMEOUT_S": 600.0, "CALL_TIMEOUT_S": 600}
     assert _limits(tmp_path, names, GATEWAY_CALL_TIMEOUT="900")[0] == {"REST_CALL_TIMEOUT_S": 900.0, "CALL_TIMEOUT_S": 900}
     assert _limits(tmp_path, names, GATEWAY_REST_CALL_TIMEOUT="45")[0] == {"REST_CALL_TIMEOUT_S": 45.0, "CALL_TIMEOUT_S": 600}
+
+
+# ── 호출자 토큰 검증 — 포털 키 조회가 게이트웨이를 세우지 않고, 만료는 만료라고 말한다(결정표 gateway-23) ──────────
+# 키 조회(PyJWKClient)는 urllib 로 **동기**이고 기본 한도가 30초다. 요청 인증 안에서 이벤트 루프를 붙잡으므로, 포털이 매달리면
+# 게이트웨이 전체(진행 중인 도구 호출과 호출자에게 보내는 15초 ping 까지)가 그만큼 멈춘다.
+import threading  # noqa: E402
+import time as _clock  # noqa: E402
+
+import jwt as _jwt  # noqa: E402
+import rest_proxy  # noqa: E402
+
+_RSA = {}
+
+
+def _rsa():
+    """시험용 RS256 키 한 벌(한 번만 만든다) — 서명은 맞고 수명만 끝난 토큰을 **진짜로** 만들어야 만료 갈래가 실행된다."""
+    if not _RSA:
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        _RSA["priv"] = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        _RSA["pub"] = _RSA["priv"].public_key()
+    return _RSA["priv"], _RSA["pub"]
+
+
+def _pat(aud, *, exp_in=600, key=None, **claims):
+    priv, _ = _rsa()
+    body = {"sub": "S-1", "email": "u@corp.com", "jti": "j-1", "scope": "api", "aud": aud, "groups": [],
+            "exp": int(_clock.time()) + exp_in, **claims}
+    return _jwt.encode(body, key or priv, algorithm="RS256", headers={"kid": "k1"})
+
+
+def _verifier(monkeypatch, key_lookup=None):
+    """실제 `PortalPatVerifier` — 포털 키 조회만 대역이다(네트워크 없음)."""
+    from types import SimpleNamespace as NS
+    v = rest_proxy.PortalPatVerifier({"jwks_url": "http://portal.invalid/.well-known/jwks.json"})
+    monkeypatch.setattr(v.jwks, "get_signing_key_from_jwt", key_lookup or (lambda token: NS(key=_rsa()[1])))
+    return v
+
+
+async def _ticks_while(coro):
+    """`coro` 가 도는 동안 이벤트 루프가 10ms 마다 몇 번 돌았나 — 루프가 붙잡히면 0 에 가깝다."""
+    n = {"ticks": 0}
+
+    async def ticker():
+        while True:
+            await asyncio.sleep(0.01)
+            n["ticks"] += 1
+    task = asyncio.create_task(ticker())
+    try:
+        return await coro, n["ticks"]
+    finally:
+        task.cancel()
+
+
+def test_포털_키_조회는_짧은_한도로_이벤트_루프_밖에서_한다(monkeypatch):
+    where = []
+
+    def slow_lookup(token):
+        where.append(threading.current_thread() is threading.main_thread())
+        _clock.sleep(0.4)                                   # 포털이 답이 늦다(동기 urllib)
+        raise _jwt.PyJWKClientError("portal hung")
+    v = _verifier(monkeypatch, slow_lookup)
+    assert v.jwks.timeout == rest_proxy.JWKS_TIMEOUT_S, "PyJWKClient 기본 30초가 그대로다"
+    got, ticks = asyncio.run(_ticks_while(v.verify("any.jwt.value", "mcp-gateway")))
+    assert got is None and where == [False], "키 조회가 이벤트 루프 스레드에서 돌았다"
+    assert ticks >= 10, f"조회 0.4초 동안 루프가 {ticks}번밖에 못 돌았다 — 진행 중인 호출과 ping 이 같이 멈춘다"
+
+
+def test_REST_프록시의_키_조회도_이벤트_루프_밖에서_한다(monkeypatch):
+    from starlette.requests import Request
+    where = []
+    p = rest_proxy.RestProxy({"s": {"base": "http://upstream.invalid"}},
+                             {"audience_ok": ["s"], "jwks_url": "http://portal.invalid/.well-known/jwks.json"}, gw._audit)
+
+    def slow_lookup(token):
+        where.append(threading.current_thread() is threading.main_thread())
+        _clock.sleep(0.4)
+        raise _jwt.PyJWKClientError("portal hung")
+    monkeypatch.setattr(p.jwks, "get_signing_key_from_jwt", slow_lookup)
+    assert p.jwks.timeout == rest_proxy.JWKS_TIMEOUT_S
+    req = Request({"type": "http", "method": "GET", "path": "/api/s/x", "query_string": b"", "client": ("198.51.100.9", 0),
+                   "headers": [(b"authorization", b"Bearer any.jwt.value")], "path_params": {"site": "s", "path": "x"}})
+    resp, ticks = asyncio.run(_ticks_while(p.handle(req)))
+    assert resp.status_code == 401 and where == [False] and ticks >= 10
+
+
+def test_만료된_토큰은_틀린_토큰과_다르게_답하고_감사에도_그렇게_남는다(monkeypatch):
+    """수 시간짜리 심의에서 시작할 때 받은 챗 토큰이 도중에 끝나면 좌석 조회와 마지막 보고서 저장이 여기서 거절된다.
+    틀린 토큰과 같은 `unauthorized` 면 엔진이 서비스 계정으로 넘기며 원인을 적을 수 없다."""
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    v = _verifier(monkeypatch)
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    expired, forged = _pat(gw.MCP_AUDIENCE, exp_in=-3600), _pat(gw.MCP_AUDIENCE, exp_in=-3600, key=other)
+
+    async def app(scope, receive, send):
+        raise AssertionError("인증 없이 앱까지 가면 안 된다")
+    sent = []
+
+    async def send(m):
+        sent.append(m)
+    mw = gw._bearer_gate(app, v)
+    for tok in (expired, forged):
+        asyncio.run(mw({"type": "http", "method": "POST", "path": "/mcp", "client": ("198.51.100.9", 0),
+                        "headers": [(b"authorization", b"Bearer " + tok.encode())]}, None, send))
+    statuses = [m["status"] for m in sent if m["type"] == "http.response.start"]
+    bodies = [json.loads(m["body"]) for m in sent if m["type"] == "http.response.body"]
+    assert statuses == [401, 401]
+    assert bodies[0] == {"error": "expired", "detail": "토큰 수명이 끝났다(포털 CHAT_PAT_TTL_S 또는 PAT 만료)"}
+    assert bodies[1] == {"error": "unauthorized"}, "서명이 틀린 토큰은 exp 가 지났어도 만료가 아니다(주장일 뿐이다)"
+    assert [r["error"] for r in _rows()] == ["unauthorized: expired", "unauthorized: unverified-token"]
+    assert all("caller" not in r for r in _rows())
+
+
+def test_수명이_남은_토큰은_검증을_통과하고_폐기된_것은_아니다(monkeypatch):
+    v = _verifier(monkeypatch)
+
+    async def none_revoked():
+        return set()
+
+    async def revoked():
+        return {"j-1"}
+    monkeypatch.setattr(v, "_revoked_set", none_revoked)
+    claims = asyncio.run(v.verify(_pat(gw.MCP_AUDIENCE), gw.MCP_AUDIENCE))
+    assert claims["email"] == "u@corp.com" and claims["jti"] == "j-1"
+    assert asyncio.run(v.verify(_pat("other-site"), gw.MCP_AUDIENCE)) is None, "청중이 다르면 만료가 아니라 그냥 거절이다"
+    monkeypatch.setattr(v, "_revoked_set", revoked)
+    assert asyncio.run(v.verify(_pat(gw.MCP_AUDIENCE), gw.MCP_AUDIENCE)) is None
+
+
+def test_REST_프록시도_만료를_같은_말로_답한다(monkeypatch):
+    from starlette.requests import Request
+    from types import SimpleNamespace as NS
+    p = rest_proxy.RestProxy({"s": {"base": "http://upstream.invalid"}},
+                             {"audience_ok": ["s"], "jwks_url": "http://portal.invalid/.well-known/jwks.json"}, gw._audit)
+    monkeypatch.setattr(p.jwks, "get_signing_key_from_jwt", lambda token: NS(key=_rsa()[1]))
+
+    def call(tok):
+        req = Request({"type": "http", "method": "GET", "path": "/api/s/x", "query_string": b"",
+                       "client": ("198.51.100.9", 0), "headers": [(b"authorization", b"Bearer " + tok.encode())],
+                       "path_params": {"site": "s", "path": "x"}})
+        resp = asyncio.run(p.handle(req))
+        return resp.status_code, json.loads(resp.body)
+    assert call(_pat("s", exp_in=-3600)) == (401, rest_proxy.EXPIRED_BODY)
+    code, body = call(_pat("other"))
+    assert code == 401 and body["error"] == "invalid PAT"
+    assert [r["error"][:12] for r in _rows()] == ["pat: expired", "pat: Invalid"]
+
+
+def test_키_조회_한도의_기본값과_손잡이(tmp_path):
+    assert _limits(tmp_path, ["JWKS_TIMEOUT_S"])[0] == {"JWKS_TIMEOUT_S": 5.0}
+    assert _limits(tmp_path, ["JWKS_TIMEOUT_S"], GATEWAY_JWKS_TIMEOUT="2")[0] == {"JWKS_TIMEOUT_S": 2.0}

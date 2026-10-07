@@ -9,8 +9,10 @@ site's REST base injecting the site's OWN service credential. Sub-sites are neve
 """
 
 import logging
+import os
 import time
 
+import anyio
 import httpx
 import jwt
 from jwt import PyJWKClient
@@ -25,6 +27,18 @@ _HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 
 
 log = logging.getLogger("hwax-mcp-gateway")
+
+# 포털 서명 키(JWKS) 조회 한도(초). PyJWKClient 의 기본은 30초이고 urllib 로 **동기**로 받는다 — 요청 인증 안에서 이벤트 루프를
+# 붙잡았다. 포털이 매달리면 게이트웨이 전체(진행 중인 도구 호출·호출자에게 보내는 ping 까지)가 최대 30초 멈춰, 호출자들의 침묵
+# 한도와 heartbeat 를 한꺼번에 건드린다. 죽은 상대를 재는 값이라 짧게 두고, 조회 자체는 스레드로 뺀다(2026-10-08 결정표 gateway-23).
+JWKS_TIMEOUT_S = float(os.environ.get("GATEWAY_JWKS_TIMEOUT", "5"))
+# 만료된 토큰에 돌려주는 401 본문 — `/mcp` 와 `/api/` 가 같은 말을 한다. 틀린 토큰과 같은 `unauthorized` 로 답하던 때는
+# 수 시간짜리 심의 도중에 자격이 끝난 것을 호출자(엔진)가 원인으로 적을 수 없었다.
+EXPIRED_BODY = {"error": "expired", "detail": "토큰 수명이 끝났다(포털 CHAT_PAT_TTL_S 또는 PAT 만료)"}
+
+
+class PatExpired(Exception):
+    """서명은 맞는데 수명이 끝난 토큰 — 틀린 토큰(None)과 가른다."""
 
 
 def credential_mode(conf: dict) -> str:
@@ -62,11 +76,11 @@ def allowed_methods(conf: dict) -> list[str] | None:
 
 class PortalPatVerifier:
     """포털 PAT 검증(JWKS RS256, scope=api, aud, 폐기목록 60s 캐시). /mcp 게이트와 REST 프록시가 공유.
-    verify(token, audience) → 성공 시 claims dict, 실패 시 None(모든 오류를 None 으로 흡수)."""
+    verify(token, audience) → 성공 시 claims dict, 실패 시 None(오류를 None 으로 흡수). **만료만** `PatExpired` 로 올린다."""
 
     def __init__(self, portal_conf: dict):
         jwks_url = portal_conf.get("jwks_url")
-        self.jwks = PyJWKClient(jwks_url, cache_keys=True) if jwks_url else None
+        self.jwks = PyJWKClient(jwks_url, cache_keys=True, timeout=JWKS_TIMEOUT_S) if jwks_url else None
         self._revoked_url = portal_conf.get("revoked_url")
         self._revoked: set[str] = set()
         self._revoked_at = 0.0
@@ -98,7 +112,8 @@ class PortalPatVerifier:
         if not self.jwks or not token:
             return None
         try:
-            key = self.jwks.get_signing_key_from_jwt(token).key
+            # 키 조회는 스레드에서 — 모르는 kid 면 포털에 동기로 묻는다(JWKS_TIMEOUT_S 주석).
+            key = (await anyio.to_thread.run_sync(self.jwks.get_signing_key_from_jwt, token)).key
             claims = jwt.decode(token, key, algorithms=["RS256"], audience=audience,
                                 options={"require": ["exp", "aud", "sub", "jti"], "leeway": 30})
             if claims.get("scope") != "api":
@@ -106,6 +121,8 @@ class PortalPatVerifier:
             if claims["jti"] in await self._revoked_set():
                 return None
             return claims
+        except jwt.ExpiredSignatureError:
+            raise PatExpired() from None
         except Exception:  # noqa: BLE001 — any failure = not a valid PAT
             return None
 
@@ -125,7 +142,7 @@ class RestProxy:
         self.audience_ok = set(portal_conf.get("audience_ok", list(self.rest)))
         self.audit = audit
         jwks_url = portal_conf.get("jwks_url")
-        self.jwks = PyJWKClient(jwks_url, cache_keys=True) if jwks_url else None
+        self.jwks = PyJWKClient(jwks_url, cache_keys=True, timeout=JWKS_TIMEOUT_S) if jwks_url else None
         self._revoked_url = portal_conf.get("revoked_url")
         self._revoked: set[str] = set()
         self._revoked_at = 0.0
@@ -182,9 +199,13 @@ class RestProxy:
             self.audit(what, site, False, "pat: missing bearer", 0, ip=ip)
             return JSONResponse({"error": "missing bearer PAT"}, status_code=401)
         try:
-            claims = self._verify(token, site)
+            # 스레드에서 — `_verify` 는 모르는 kid 면 포털에 동기로 묻는다(JWKS_TIMEOUT_S 주석).
+            claims = await anyio.to_thread.run_sync(self._verify, token, site)
             if claims["jti"] in await self._revoked_set():
                 raise ValueError("token revoked")
+        except jwt.ExpiredSignatureError:
+            self.audit(what, site, False, "pat: expired", 0, ip=ip)
+            return JSONResponse(EXPIRED_BODY, status_code=401)
         except Exception as e:  # noqa: BLE001
             self.audit(what, site, False, f"pat: {e!r}", 0, ip=ip)
             return JSONResponse({"error": "invalid PAT", "detail": str(e)}, status_code=401)

@@ -24,7 +24,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 # 메서드 허용 규칙의 정본. REST 프록시 라우트와 MCP 다리가 **같은 함수**를 봐야 한다.
 # (rest_proxy 는 gateway 를 import 하지 않으므로 이 방향은 순환이 아니다.)
-from rest_proxy import allowed_methods, credential_mode
+from rest_proxy import EXPIRED_BODY, PatExpired, allowed_methods, credential_mode
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("hwax-mcp-gateway")
@@ -3346,7 +3346,12 @@ def _bearer_gate(app, pat_verifier=None):
             return
         # GW_TOKEN 이 아니면 포털 PAT(개인 Claude 등) 로 검증 시도 → 성공 시 PAT 의 groups 로 도구 필터.
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
-        claims = await pat_verifier.verify(token, MCP_AUDIENCE) if (token and pat_verifier) else None
+        _expired = False
+        try:
+            claims = await pat_verifier.verify(token, MCP_AUDIENCE) if (token and pat_verifier) else None
+        except PatExpired:
+            # 서명은 맞고 수명만 끝났다 — 아래 401 과 감사 줄이 틀린 토큰과 다르게 말한다(gateway-23).
+            claims, _expired = None, True
         if claims is not None:
             # 권한(feat:·plat:)은 PAT 에 박힌 발급 때 값이 아니라 포털의 **지금** 값으로 바꾼다 —
             # 거둔 권한이 PAT 수명(최대 100년) 동안 남지 않게. 포털이 모르면(None) PAT 값 그대로.
@@ -3403,11 +3408,13 @@ def _bearer_gate(app, pat_verifier=None):
         # 정상 동작 중에도 401 을 받으므로 실패로 적으면 잡음이다. 검증 안 된 토큰의 신원은 적지 않는다(주장일 뿐, D-7).
         # 메서드는 정해진 것만 적는다 — 토큰 없이 누구나 보낼 수 있는 줄에 요청이 정한 긴 글자를 싣지 않는다(검토 1차).
         # `unverified-token` 은 토큰이 틀렸거나 **포털 키를 못 받아 검증을 못 한** 것이다(둘을 못 가른다, D-9).
+        # `expired` 는 서명까지 맞은 토큰의 수명이 끝난 것이다 — 수 시간짜리 심의에서 시작할 때 받은 챗 토큰이 도중에 끝나면
+        # 좌석 조회와 마지막 보고서 저장이 여기서 거절된다. 틀린 토큰과 같은 말이면 엔진이 서비스 계정으로 넘기며 원인을 못 적는다.
         if scope.get("path") in ("/mcp", "/mcp/"):
             _m = scope.get("method", "")
             _m = _m if _m in ("GET", "POST", "DELETE", "PUT", "PATCH", "HEAD", "OPTIONS") else "OTHER"
             _audit(f"{_m} {scope.get('path')}", None, False,
-                   "unauthorized: " + ("duplicate-authorization" if _dup_auth else
+                   "unauthorized: " + ("duplicate-authorization" if _dup_auth else "expired" if _expired else
                                        "unverified-token" if token else "no-bearer"), 0,
                    ip=(scope.get("client") or (None,))[0])
         await send({
@@ -3417,7 +3424,7 @@ def _bearer_gate(app, pat_verifier=None):
         })
         await send({
             "type": "http.response.body",
-            "body": b'{"error":"unauthorized"}',
+            "body": json.dumps(EXPIRED_BODY).encode() if _expired else b'{"error":"unauthorized"}',
         })
         return
 

@@ -96,8 +96,11 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 | `GATEWAY_AGG_STALE_ROUNDS` · `GATEWAY_HEAX_MISS_DROP` | 10 · 10 | 닿지 않는 백엔드(또는 레지스트리에서 빠진 앱)의 도구를 몇 패스 뒤에 카탈로그에서 빼는가 — 약 10분(종전 3패스) | 남아 있는 동안은 `backend <키> unavailable: … backend session down`, 빠진 뒤에는 `unknown tool`. 수 시간짜리 심의 도중의 앱 재배포가 '도구가 없다' 로 읽히지 않게 길게 둔다 |
 | `GATEWAY_PORTAL_SAVE_TIMEOUT` | 120 | `save_conversation` — 심의 전사 전체를 포털에 올리는 POST 의 답(연결은 8초) | `CONV_UNAVAILABLE: 포털이 120초 안에 저장을 확인하지 않았다(GATEWAY_PORTAL_SAVE_TIMEOUT) — 저장됐을 수 있으니 다시 보내기 전에 대화 목록을 확인하라` |
 | `GATEWAY_REST_CALL_TIMEOUT` | 호출 한도 | `rest_call` 한 건 — read 침묵과 전체 기한 둘 다(연결은 10초). 전용 도구가 없을 때의 다리라 도구 호출과 같은 단위다 | `<사이트> 가 600초 안에 답하지 않았다(GATEWAY_REST_CALL_TIMEOUT)` — 느린 것이다. 연결 시간 초과·거부는 종전대로 `upstream unreachable` |
+| `GATEWAY_JWKS_TIMEOUT` | 5 | 호출자 토큰(포털 PAT)을 검증할 때의 포털 서명 키 조회 — `/mcp` 와 `/api/<site>/` 둘 다. 스레드에서 돈다(동기 urllib 가 이벤트 루프를 붙잡지 않게) | 검증 실패로 다뤄져 401 `unauthorized`(감사 `unverified-token`). 포털이 매달려도 진행 중인 호출과 ping 은 멈추지 않는다 |
 
 층 — 핸드셰이크·재연결 30 < 호출 600 < 전송 read·단발 세션 바깥 기한 660(= 30 + 600 + 30) < 엔진 `MCP_CALL_TIMEOUT_S` 900 < nginx `/mcp-gw/` 3600. 포털 절차 워밍업(690)도 660 바깥이다. **`GATEWAY_CALL_TIMEOUT` 을 올리면 엔진·포털 워밍업·nginx 셋을 같은 폭으로 올린다**(전송 read 와 단발 세션 바깥 기한은 스스로 따라 오른다). 안쪽(백엔드 자신의 한도 — KooRemapper MCP→REST 240, AIDataHub 풀 60 + 검색 90 등)은 600 보다 작아야 한다. HWAXPortal 절차 시험(`test_procedures_census`)이 `gateway.py` 의 기본값을 읽어 30~600 으로 묶으므로 600 을 넘기려면 그 상한부터 고친다. 600 으로도 모자란 도구는 한도를 올리지 말고 잡 도구(제출 + 상태 조회)로 돌린다 — 이 값이 호출 중 죽은 무상태 백엔드에서 호출자를 풀어 주는 마지막 값이다.
+
+**만료된 호출자 토큰**은 틀린 토큰과 다르게 답한다 — 401 본문 `{"error": "expired", "detail": "토큰 수명이 끝났다(포털 CHAT_PAT_TTL_S 또는 PAT 만료)"}`, 감사 줄은 `/mcp` 가 `unauthorized: expired`, `/api/` 가 `pat: expired` 다. 서명이 틀린 토큰은 `exp` 가 지났어도 만료로 치지 않는다(주장일 뿐이다). 수 시간짜리 심의에서 시작할 때 받은 챗 토큰이 도중에 끝나면 여기서 거절되고, 엔진은 그것을 보고 서비스 계정으로 넘긴다.
 
 진행 중인 도구 호출은 끝날 때까지 감사 줄도 진행 알림도 없다(호출자에게는 15초마다 SSE ping 만 흐른다). 살아 있음은 호출자 쪽(엔진의 ping·상태줄)이 보인다.
 

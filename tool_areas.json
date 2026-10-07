@@ -20,7 +20,8 @@
     {"key": "report", "label": "보고서·문서·발표", "description": "보고서 작성·게시·템플릿, 백서 문서 편집, 발표 영상·PPTX 제작."},
     {"key": "expert", "label": "전문가·심의·리스크", "description": "전문가 페르소나 관리·추천, 다중 전문가 심의, 설계 리스크 심사."},
     {"key": "data", "label": "데이터 등록·온톨로지", "description": "레코드·문서형 등록, 파일 변환, 표 통계, 온톨로지 객체·연결·경보."},
-    {"key": "system", "label": "시스템·공통", "description": "계정·상태·능력 조회, 도구 검색·호출, 대화 저장."}
+    {"key": "system", "label": "시스템·공통", "description": "계정·상태·능력 조회, 도구 검색·호출, 대화 저장."},
+    {"key": "quality", "label": "품질·불량 이력", "description": "사내 PLM 문제점(불량) 조회 — 사례 상세·처리 이력·첨부, 과제/모델·담당자 검색, 증상으로 유사 사례 찾기."}
   ],
   "apps": {
     "heax-step_forge": "cad",
@@ -39,7 +40,9 @@
     "heax-web_design_agents": "report",
     "hwax-deliberation": "expert",
     "heax-hwax_risk": "expert",
-    "_gateway": "system"
+    "knox-bridge": "system",
+    "_gateway": "system",
+    "plm-defect": "quality"
   },
   "patterns": [
     ["_whoami$", "system"],

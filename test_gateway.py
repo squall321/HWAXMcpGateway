@@ -372,6 +372,31 @@ def test_list_tool_apps_영역보기(monkeypatch, tmp_path):
     assert body["hidden_no_access_or_down"] == 1
 
 
+def test_knox_bridge_와_plm_defect_도구는_미분류로_떨어지지_않는다(monkeypatch):
+    """cae00 실측(2026-10-08) — /tools-map 미분류 70개 안에 bridge_* 6개가 전부 들어 있었고, plm-defect 의 quality
+    영역은 박스 작업트리에만 있었다. **추적 파일 그대로** 영역 보기를 돌린다(change-request-8-10 #20)."""
+    import asyncio
+    monkeypatch.setattr(gw, "_AREAS_CACHE", {"mtime": None, "data": {}})
+
+    class _S:
+        session = object()
+    monkeypatch.setattr(gw, "backends", {"knox-bridge": _S(), "plm-defect": _S()})
+    monkeypatch.setattr(gw, "exposed_tools", [_tool("bridge_mail_search"), _tool("plm_case_detail")])
+    monkeypatch.setattr(gw, "route", {"bridge_mail_search": ("knox-bridge", "bridge_mail_search"),
+                                      "plm_case_detail": ("plm-defect", "plm_case_detail")})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    assert gw._area_of("bridge_mail_search", "knox-bridge") == "system"
+    assert gw._area_of("plm_case_detail", "plm-defect") == "quality"
+    body = json.loads(asyncio.run(gw._list_tool_apps({"by": "area"})).content[0].text)
+    by = {a["area"]: a for a in body["areas"]}
+    assert "" not in by, f"미분류로 떨어진 도구: {by.get('', {}).get('tools')}"
+    assert "bridge_mail_search" in by["system"]["tools"]      # 게이트웨이 자체 도구(_gateway)와 같은 칸이다
+    assert by["quality"]["tools"] == ["plm_case_detail"]
+    # 영역이 정의돼 있어야 라벨이 선다 — apps 줄만 먼저 나가면 UI 에 라벨 없는 칸이 생긴다
+    assert by["quality"]["label"] == "품질·불량 이력" and "PLM" in by["quality"]["description"]
+
+
 # ── 포털 권한 정책(HWAXPortal docs/access-control) ────────────────────────────
 import asyncio  # noqa: E402
 

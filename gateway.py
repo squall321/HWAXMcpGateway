@@ -2272,6 +2272,10 @@ async def _verify_answer(arguments: dict) -> types.CallToolResult:
 _OPENAPI_TTL_S = 300
 # rest_call 이 모델에 보여 줄 응답 상한. 넘으면 스트림을 끊는다(위 _rest_call 주석).
 REST_CALL_MAX_BYTES = int(os.environ.get("GATEWAY_REST_CALL_MAX_BYTES", str(1024 * 1024)))
+# rest_call 한 건의 한도(초) — read 침묵과 **전체 기한** 둘 다 이 값이다. 좌석이 전용 도구가 없을 때 쓰는 다리라 도구 호출과 같은
+# 단위의 일이고, 그래서 기본이 호출 한도다. 종전에는 30초(connect·read·write·pool 각각)에 전체 기한이 없었다 — MCP 길보다 엄했고
+# 느린 사이트를 `upstream unreachable` 이라고 말했다(gateway-21). 연결(10초)은 죽은 사이트를 재는 값이라 짧게 둔다.
+REST_CALL_TIMEOUT_S = float(os.environ.get("GATEWAY_REST_CALL_TIMEOUT") or CALL_TIMEOUT_S)
 _openapi_cache: dict[str, tuple[dict | None, float]] = {}
 
 
@@ -2450,25 +2454,34 @@ async def _rest_call(args: dict) -> types.CallToolResult:
     #   용도라 상한을 두고, 넘치면 스트림을 끊고 error 로 돌려준다(파일은 전용 도구·ste-sync 로 받는다).
     cap = REST_CALL_MAX_BYTES
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as cli:
-            async with cli.stream(method, conf["base"].rstrip("/") + path,
-                                  params={k: str(v) for k, v in dict(query).items()},
-                                  json=body if isinstance(body, (dict, list)) else None,
-                                  headers=headers) as up:
-                ctype = (up.headers.get("content-type") or "").lower()
-                clen = up.headers.get("content-length")
-                too_big = (clen is not None and clen.isdigit() and int(clen) > cap)
-                chunks: list[bytes] = []
-                got = 0
-                if not too_big:
-                    async for ch in up.aiter_bytes():
-                        chunks.append(ch)
-                        got += len(ch)
-                        if got > cap:
-                            too_big = True
-                            break                       # 스트림을 여기서 끊는다 — 나머지는 안 받는다
-                status = up.status_code
-                raw = b"".join(chunks)
+        with anyio.fail_after(REST_CALL_TIMEOUT_S):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(REST_CALL_TIMEOUT_S, connect=10.0),
+                                         follow_redirects=False) as cli:
+                async with cli.stream(method, conf["base"].rstrip("/") + path,
+                                      params={k: str(v) for k, v in dict(query).items()},
+                                      json=body if isinstance(body, (dict, list)) else None,
+                                      headers=headers) as up:
+                    ctype = (up.headers.get("content-type") or "").lower()
+                    clen = up.headers.get("content-length")
+                    too_big = (clen is not None and clen.isdigit() and int(clen) > cap)
+                    chunks: list[bytes] = []
+                    got = 0
+                    if not too_big:
+                        async for ch in up.aiter_bytes():
+                            chunks.append(ch)
+                            got += len(ch)
+                            if got > cap:
+                                too_big = True
+                                break                       # 스트림을 여기서 끊는다 — 나머지는 안 받는다
+                    status = up.status_code
+                    raw = b"".join(chunks)
+    except (TimeoutError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout):
+        # 느린 것과 안 닿는 것을 가른다 — 연결 시간 초과(ConnectTimeout)는 아래 'unreachable' 로 간다.
+        ms = round((time.monotonic() - t0) * 1000)
+        late = f"{site} 가 {REST_CALL_TIMEOUT_S:g}초 안에 답하지 않았다(GATEWAY_REST_CALL_TIMEOUT)"
+        _audit(f"rest_call {method} {path}", site, False, late, ms, caller=caller)
+        return _rest_text({"error": late, "site": site, "method": method, "path": path,
+                           "detail": "사이트는 아직 일하고 있을 수 있다 — 쓰기였다면 다시 보내기 전에 결과를 조회하라."})
     except Exception as e:  # noqa: BLE001
         ms = round((time.monotonic() - t0) * 1000)
         _audit(f"rest_call {method} {path}", site, False, f"upstream: {e!r}", ms, caller=caller)

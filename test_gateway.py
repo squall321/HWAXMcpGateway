@@ -3568,3 +3568,63 @@ def test_대화_저장이_한도를_넘기면_손잡이와_다시_보내기_전�
 def test_대화_저장_한도의_기본값과_손잡이(tmp_path):
     assert _limits(tmp_path, ["PORTAL_SAVE_TIMEOUT_S"])[0] == {"PORTAL_SAVE_TIMEOUT_S": 120.0}
     assert _limits(tmp_path, ["PORTAL_SAVE_TIMEOUT_S"], GATEWAY_PORTAL_SAVE_TIMEOUT="300")[0] == {"PORTAL_SAVE_TIMEOUT_S": 300.0}
+
+
+# ── rest_call — 전용 도구가 없을 때의 다리도 도구 호출과 같은 한도를 받는다(결정표 gateway-21) ───────────────────
+class _SlowUp(_Up):
+    """헤더조차 오지 않는 상류 — 사이트가 느리다."""
+    async def __aenter__(self):
+        await asyncio.sleep(3600)
+
+
+class _TimedCli(_Cli):
+    made = {}
+    fail = None
+
+    def __init__(self, *a, **k): _TimedCli.made = k
+
+    def stream(self, method, url, **kw):
+        if _TimedCli.fail == "hang":
+            return _SlowUp(200, b"")
+        if _TimedCli.fail is not None:
+            raise _TimedCli.fail
+        return _Up(200, b'{"ok": true}')
+
+
+@pytest.mark.anyio
+async def test_rest_call_은_도구_호출과_같은_한도를_받고_연결은_짧게_잰다(_rest, monkeypatch):
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _TimedCli)
+    _TimedCli.fail = None
+    out = _payload(await gw._rest_call({"site": "locked", "path": "/health"}))
+    assert out["status"] == 200
+    t = _TimedCli.made["timeout"]
+    assert isinstance(t, httpx.Timeout) and (t.read, t.connect) == (gw.REST_CALL_TIMEOUT_S, 10.0), \
+        "종전에는 connect·read·write·pool 이 전부 30초였다 — MCP 길(GATEWAY_CALL_TIMEOUT)보다 엄했다"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("how", ["hang", httpx.ReadTimeout("")], ids=["전체 기한", "read 침묵"])
+async def test_rest_call_이_한도를_넘기면_느리다고_말하고_손잡이를_말한다(_rest, monkeypatch, how):
+    """종전 문구는 `upstream unreachable` 이었다 — 느린 사이트를 안 닿는 사이트로 읽게 한다. 전체 기한도 없었다."""
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _TimedCli)
+    monkeypatch.setattr(gw, "REST_CALL_TIMEOUT_S", 0.05)
+    _TimedCli.fail = how
+    out = _payload(await asyncio.wait_for(gw._rest_call({"site": "locked", "path": "/slow"}), 5))
+    assert out["error"] == "locked 가 0.05초 안에 답하지 않았다(GATEWAY_REST_CALL_TIMEOUT)" and "unreachable" not in out["error"]
+    row = _rows()[-1]
+    assert row["ok"] is False and "GATEWAY_REST_CALL_TIMEOUT" in row["error"] and row["tool"] == "rest_call GET /slow"
+
+
+@pytest.mark.anyio
+async def test_rest_call_연결_시간_초과는_여전히_안_닿는_사이트다(_rest, monkeypatch):
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _TimedCli)
+    _TimedCli.fail = httpx.ConnectTimeout("")
+    out = _payload(await gw._rest_call({"site": "locked", "path": "/x"}))
+    assert out["error"] == "upstream unreachable"
+
+
+def test_rest_call_한도는_호출_한도를_따르고_따로_줄_수도_있다(tmp_path):
+    names = ["REST_CALL_TIMEOUT_S", "CALL_TIMEOUT_S"]
+    assert _limits(tmp_path, names)[0] == {"REST_CALL_TIMEOUT_S": 600.0, "CALL_TIMEOUT_S": 600}
+    assert _limits(tmp_path, names, GATEWAY_CALL_TIMEOUT="900")[0] == {"REST_CALL_TIMEOUT_S": 900.0, "CALL_TIMEOUT_S": 900}
+    assert _limits(tmp_path, names, GATEWAY_REST_CALL_TIMEOUT="45")[0] == {"REST_CALL_TIMEOUT_S": 45.0, "CALL_TIMEOUT_S": 600}

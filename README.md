@@ -91,6 +91,8 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 | `GATEWAY_RECONNECT_TIMEOUT` | 30 | 죽은 상대 — 단발 세션의 핸드셰이크(connect + initialize)와, 연결 실패 뒤 상주 세션이 돌아오기를 기다리는 시간 | `backend <키> unavailable: 30초 안에 세션을 열지 못했다(GATEWAY_RECONNECT_TIMEOUT)` · `… unavailable: 30초 안에 돌아오지 않았다(…)` — 죽은 상대라 머리에 `unavailable:` 를 남긴다(포털 절차 판정기가 이 머리로 '불통' 을 가른다). 느린 도구의 문구에는 붙이지 않는다 |
 | `GATEWAY_BACKEND_READ_TIMEOUT` | 호출 한도 + 60 | 백엔드 세션 아래 HTTP read 침묵(MCP SDK 의 숨은 300초에 이름을 붙였다) | 호출 한도가 먼저 걸리므로 위 문구가 나온다. 호출 한도보다 크지 않게 적으면 따르지 않고 기본값을 쓴다(기동 로그에 경고) — 이것이 먼저 걸리면 세션째 끊긴다 |
 | `GATEWAY_BACKEND_HTTP_TIMEOUT` | 30 | 같은 세션의 connect·write·pool | 연결 실패로 다뤄진다(한 번 다시 건다) |
+| `GATEWAY_LIVENESS_TIMEOUT` | 10 | 생사 탐침 — 재활 패스(`GATEWAY_REVIVE_INTERVAL`, 60초)마다 연결된 백엔드에 보내는 `list_tools` 한 번 | 아래 횟수만큼 **연속으로** 놓치면 세션을 간다 |
+| `GATEWAY_LIVENESS_STRIKES` | 2 | 탐침 무응답을 몇 번 연속 놓쳐야 세션을 가는가. 한 번으로 갈면 이벤트 루프가 잠깐 바쁜 건강한 백엔드의 진행 중인 답을 버린다. 예외로 실패한 탐침(세션 종료·연결 거부)은 종전대로 한 번에 간다 | 세션을 갈 때 그 세션에 걸린 진행 중 호출을 곧바로 실패로 돌려준다 — `backend <키> 가 탐침에 2회 연속 답하지 않아 세션을 갈았다(GATEWAY_LIVENESS_TIMEOUT × GATEWAY_LIVENESS_STRIKES) — <도구> 의 실행 여부는 모른다`. 죽은 백엔드는 약 2분 안에 호출자를 놓아 준다(단발 세션의 호출은 건드리지 않는다) |
 
 층 — 핸드셰이크·재연결 30 < 호출 600 < 전송 read·단발 세션 바깥 기한 660(= 30 + 600 + 30) < 엔진 `MCP_CALL_TIMEOUT_S` 900 < nginx `/mcp-gw/` 3600. 포털 절차 워밍업(690)도 660 바깥이다. **`GATEWAY_CALL_TIMEOUT` 을 올리면 엔진·포털 워밍업·nginx 셋을 같은 폭으로 올린다**(전송 read 와 단발 세션 바깥 기한은 스스로 따라 오른다). 안쪽(백엔드 자신의 한도 — KooRemapper MCP→REST 240, AIDataHub 풀 60 + 검색 90 등)은 600 보다 작아야 한다. HWAXPortal 절차 시험(`test_procedures_census`)이 `gateway.py` 의 기본값을 읽어 30~600 으로 묶으므로 600 을 넘기려면 그 상한부터 고친다. 600 으로도 모자란 도구는 한도를 올리지 말고 잡 도구(제출 + 상태 조회)로 돌린다 — 이 값이 호출 중 죽은 무상태 백엔드에서 호출자를 풀어 주는 마지막 값이다.
 

@@ -152,6 +152,10 @@ if BACKEND_READ_TIMEOUT_S <= CALL_TIMEOUT_S:
 REVIVE_INTERVAL_S = int(os.environ.get("GATEWAY_REVIVE_INTERVAL", "60"))
 # 연결 상태 백엔드의 list_tools 확인 타임아웃 — 행 걸린 백엔드가 revive 루프를 막지 않게.
 LIVENESS_TIMEOUT_S = float(os.environ.get("GATEWAY_LIVENESS_TIMEOUT", "10"))
+# 그 확인(탐침)을 **연속으로** 몇 번 놓쳐야 세션을 가는가. 값(10초)은 죽은 상대를 재는 것이라 짧게 두고, 한 번의 결과만 무르게
+# 한다 — 한 번 놓쳤다고 갈면 이벤트 루프가 잠깐 바쁜 건강한 백엔드(동기 도구를 도는 SmartTwinMCP, 동기 임베딩 중인 AIDataHub)의
+# 진행 중인 답을 버린다(dev 로그에 liveness 실패 62건). 죽은 백엔드는 재활 주기 × 이 값(약 2분) 안에 호출자를 놓아 준다(gateway-06).
+LIVENESS_STRIKES = max(1, int(os.environ.get("GATEWAY_LIVENESS_STRIKES", "2")))
 # 호출 경로에서 재연결이 일어났음을 revive 루프에 알리는 플래그(카탈로그 재집계 예약).
 _REAGG: dict[str, bool] = {}
 
@@ -614,11 +618,16 @@ async def _aggregate():
             with anyio.fail_after(LIVENESS_TIMEOUT_S):
                 res = await b.session.list_tools()
         except Exception as exc:  # noqa: BLE001 — 하나가 전체 재집계를 막으면 안 된다
-            # 세션을 죽은 것으로 표시해 **다음 회차 재연결 루프가 집어 가게** 한다.
-            log.error("backend %s list_tools 실패·초과 (%r) — 재연결 예약", key, exc)
-            b.session = None
+            log.error("backend %s list_tools 실패·초과 (%r)", key, exc)
+            # 재활 패스의 탐침과 **같은 판정**이다(_probe_missed) — 여기만 한 번에 갈면, 무관한 앱의 재배포로 재집계가 돌 때
+            # 잠깐 바쁜 백엔드의 세션이 갈려 좌석들의 진행 중 조회가 한꺼번에 죽는다. 죽은 것으로 표시되면 다음 회차 재연결
+            # 루프가 집어 간다. 세션을 남겼으면 다음 회차에 목록을 다시 받게 예약한다 — 안 그러면 부팅 때 한 번 늦은 백엔드의
+            # 도구가 그 구성이 바뀔 때까지 카탈로그에 안 올라온다(재집계는 '바뀐 것이 있을 때' 만 돈다).
+            if not _probe_missed(key, b, exc):
+                _REAGG["pending"] = True
             _keep_last(key, collected, "list_tools 실패")
             continue
+        _LIVENESS_MISS.pop(key, None)
         _LAST_TOOLS[key] = (list(res.tools), 0)
         for t in res.tools:
             collected.append((key, t))
@@ -739,6 +748,34 @@ def _keep_last(key: str, collected: list, why: str) -> None:
                 key, why, len(tools), misses + 1, AGG_STALE_ROUNDS)
 
 
+# 탐침(list_tools)을 **연속으로** 놓친 횟수 — 시간 초과만 센다(_probe_missed).
+_LIVENESS_MISS: dict[str, int] = {}
+
+
+def _probe_missed(key: str, b: "_Backend", exc: Exception) -> bool:
+    """탐침을 놓쳤다. 세션을 죽은 것으로 표시했으면(다음 재연결 루프가 집어 간다) True, 아직 두면 False.
+
+    · **시간 초과**는 LIVENESS_STRIKES 회 연속일 때만 죽은 것으로 본다 — 답이 늦은 것과 죽은 것은 한 번으로 못 가른다.
+    · 그 밖의 실패(세션 종료·연결 거부)는 종전대로 곧바로다. 앱이 재기동된 것이라 기다릴 이유가 없고, 미루면 재배포 직후의
+      `POST /refresh` 한 번으로 새 도구가 올라오지 않는다(update-all 이 그 한 번으로 카탈로그를 검증한다).
+    · 죽은 것으로 표시할 때 그 세션에 걸린 진행 중 호출을 **지금** 실패로 돌려준다(_release_inflight).
+    """
+    late = isinstance(exc, TimeoutError)
+    if late:
+        n = _LIVENESS_MISS[key] = _LIVENESS_MISS.get(key, 0) + 1
+        if n < LIVENESS_STRIKES:
+            log.warning("backend %s 탐침 무응답 %d/%d — 세션은 아직 둔다(GATEWAY_LIVENESS_STRIKES)", key, n, LIVENESS_STRIKES)
+            return False
+    _LIVENESS_MISS.pop(key, None)
+    b.session = None
+    freed = _release_inflight(key, (
+        f"탐침에 {LIVENESS_STRIKES}회 연속 답하지 않아 세션을 갈았다(GATEWAY_LIVENESS_TIMEOUT × GATEWAY_LIVENESS_STRIKES)"
+        if late else "탐침에 실패해 세션을 갈았다"))
+    log.warning("backend %s liveness 실패 (%r) — 재연결 예약%s", key, exc,
+                f", 진행 중 호출 {freed}건을 실패로 돌려줬다" if freed else "")
+    return True
+
+
 _HEAX_MISS: dict[str, int] = {}
 HEAX_MISS_BEFORE_DROP = int(os.environ.get("GATEWAY_HEAX_MISS_DROP", "3"))
 _HEAX_FAILS = {"n": 0}
@@ -819,6 +856,7 @@ async def _revive_once(tg) -> bool:
         try:
             with anyio.fail_after(LIVENESS_TIMEOUT_S):
                 res = await b.session.list_tools()
+            _LIVENESS_MISS.pop(key, None)
             # ⚠ **이름만 비교하면 안 된다.** 설명·입력 스키마가 바뀌어도 이름은 그대로라
             #   재집계가 안 걸리고, 카탈로그가 옛 설명으로 굳는다 — 게이트웨이를 재기동해야만
             #   반영됐다(실측 2026-09-02: 도구 설명 2건을 고치고 앱을 재기동했는데
@@ -832,8 +870,7 @@ async def _revive_once(tg) -> bool:
                              key, len(prev), len(now))
                     revived = True
         except Exception as exc:  # noqa: BLE001 — 죽은 세션 → 아래 재연결 루프가 처리
-            log.warning("backend %s liveness 실패 (%r) — 재연결 예약", key, exc)
-            b.session = None
+            _probe_missed(key, b, exc)
 
     for key, b in backends.items():
         if b.session is not None:
@@ -2635,12 +2672,13 @@ class _Late(Exception):
     사람별 길에서는 재발급이 같은 사람의 다른 좌석이 쥔 토큰을 폐기했다. 시간 초과는 도구가 느리다는 뜻이지 세션이 죽었다는
     뜻이 아니다 — 재시도 1회는 연결 실패(세션 다운·연결 종료·401)에만 남긴다(gateway-02).
 
-    `what` — call(도구가 호출 한도 안에 답하지 않았다) · handshake(단발 세션을 열지 못했다) · reconnect(상주 세션이 돌아오지 않았다).
+    `what` — call(도구가 호출 한도 안에 답하지 않았다) · handshake(단발 세션을 열지 못했다) · reconnect(상주 세션이 돌아오지 않았다)
+    · released(탐침이 세션을 갈며 이 호출을 풀어 줬다 — `why` 가 사유. 도구가 실행됐는지 모르므로 이것도 다시 부르지 않는다).
     """
 
-    def __init__(self, what: str):
-        super().__init__(what)
-        self.what = what
+    def __init__(self, what: str, why: str = ""):
+        super().__init__(what, why)
+        self.what, self.why = what, why
 
 
 def _late_text(exc: _Late, backend_key: str, tool: str) -> str:
@@ -2657,18 +2695,42 @@ def _late_text(exc: _Late, backend_key: str, tool: str) -> str:
     if exc.what == "reconnect":
         return (f"backend {backend_key} unavailable: {RECONNECT_TIMEOUT_S:g}초 안에 돌아오지 않았다"
                 "(GATEWAY_RECONNECT_TIMEOUT)")
+    if exc.what == "released":
+        return f"backend {backend_key} 가 {exc.why} — {tool} 의 실행 여부는 모른다"
     return (f"backend {backend_key}: {tool} 이 {CALL_TIMEOUT_S:g}초 안에 답하지 않았다(GATEWAY_CALL_TIMEOUT). "
             "백엔드는 아직 일하고 있을 수 있다 — 같은 호출을 다시 보내지 말고 상태 도구로 확인하라")
 
 
-async def _call_shared(b: "_Backend", original: str, arguments: dict):
-    """상주 세션으로 도구 1건. 호출 한도를 넘기면 `_Late` — 세션은 그대로 둔다(같은 세션의 다른 호출이 계속 돈다)."""
+# 상주 세션에서 **진행 중인** 호출 — {백엔드 키: {취소 스코프: 풀어 준 사유(아직이면 None)}}. 탐침이 세션을 죽은 것으로 표시할 때
+# 그 세션에 걸린 호출을 지금 실패로 돌려주려고 적어 둔다(_probe_missed). 갈린 세션의 답은 어차피 버려지는데, 알리지 않으면
+# 호출자는 호출 한도(600초)까지 기다린다 — 사본 실측: 백엔드가 5초 만에 끝낸 호출 둘이 한도 30초를 다 채우고 실패했다.
+_INFLIGHT: dict[str, dict] = {}
+
+
+def _release_inflight(backend_key: str, why: str) -> int:
+    """이 백엔드의 상주 세션에 걸린 호출을 **지금** 풀어 준다 → 풀어 준 건수. 단발 세션의 호출은 건드리지 않는다
+    (제 연결을 따로 쥐고 있어 상주 세션이 갈려도 답을 받는다)."""
+    mine = _INFLIGHT.get(backend_key) or {}
+    for scope in list(mine):
+        mine[scope] = why
+        scope.cancel()
+    return len(mine)
+
+
+async def _call_shared(b: "_Backend", backend_key: str, original: str, arguments: dict):
+    """상주 세션으로 도구 1건. 호출 한도를 넘기면 `_Late("call")` — 세션은 그대로 둔다(같은 세션의 다른 호출이 계속 돈다).
+    탐침이 세션을 갈면 `_Late("released")` — 어느 쪽도 다시 부르지 않는다."""
     sess = b.session
     if sess is None:
         raise RuntimeError("backend session down")
-    with anyio.move_on_after(CALL_TIMEOUT_S):
-        return await sess.call_tool(original, arguments)
-    raise _Late("call")
+    mine = _INFLIGHT.setdefault(backend_key, {})
+    with anyio.move_on_after(CALL_TIMEOUT_S) as scope:
+        mine[scope] = None
+        try:
+            return await sess.call_tool(original, arguments)
+        finally:
+            why = mine.pop(scope, None)
+    raise _Late("released", why) if why else _Late("call")
 
 
 async def _oneshot(b: "_Backend", hdrs: dict, original: str, arguments: dict, timeout_s: float):
@@ -3008,7 +3070,7 @@ async def _call_tool(name: str, arguments: dict):
                    round((time.monotonic() - t0) * 1000),
                    caller=_u or None, mode="identity-fwd", corr=_request_corr())
             return _cache_put(ckey, _evid_keep(name, res))
-        res = await _call_shared(b, original, arguments)
+        res = await _call_shared(b, backend_key, original, arguments)
         _audit(name, backend_key, not getattr(res, "isError", False), None,
                round((time.monotonic() - t0) * 1000),
                caller=_u or None, mode="service", note=note, corr=_request_corr())
@@ -3037,7 +3099,7 @@ async def _call_tool(name: str, arguments: dict):
                     if _fwd:
                         res = await _call_with_identity(b, original, arguments, CALL_TIMEOUT_S, _u, _g)
                     else:
-                        res = await _call_shared(b, original, arguments)
+                        res = await _call_shared(b, backend_key, original, arguments)
                     _audit(name, backend_key, not getattr(res, "isError", False), None,
                            round((time.monotonic() - t0) * 1000),
                            caller=_u or None, mode="identity-fwd" if _fwd else "service",

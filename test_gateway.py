@@ -719,17 +719,26 @@ def test_a_backend_that_never_answers_does_not_freeze_the_catalogue(monkeypatch)
     monkeypatch.setattr(gw, "exposed_tools", [])
     monkeypatch.setattr(gw, "route", {})
     monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "_LIVENESS_MISS", {})
+    monkeypatch.setattr(gw, "_REAGG", {})
+    monkeypatch.setattr(gw, "LIVENESS_STRIKES", 2)
 
     async def go():
         # 데드라인이 없으면 여기서 매달린다 — 그게 실제로 일어난 일이다
         await asyncio.wait_for(gw._aggregate(), timeout=5)
+        first = ({t.name for t in gw.exposed_tools}, stuck_answer.session is not None, gw._REAGG.get("pending"))
+        await asyncio.wait_for(gw._aggregate(), timeout=5)
+        return first
 
-    asyncio.run(go())
+    got, kept, again = asyncio.run(go())
 
-    got = {t.name for t in gw.exposed_tools}
     assert got == {"before", "after"}, f"막힌 백엔드가 나머지를 데려갔다: {got}"
-    # 응답 안 준 백엔드는 **죽은 것으로 표시**돼 다음 회차 재연결 루프가 집어 간다
+    # 한 번 놓친 것으로는 세션을 갈지 않는다(잠깐 바쁜 건강한 백엔드의 진행 중 답을 버린다, gateway-06). 대신 다음 회차에
+    # 목록을 다시 받게 예약한다 — 안 그러면 이 백엔드의 도구가 그 구성이 바뀔 때까지 카탈로그에 안 올라온다.
+    assert kept and again is True
+    # 연속으로 놓친 백엔드는 **죽은 것으로 표시**돼 다음 회차 재연결 루프가 집어 간다
     assert stuck_answer.session is None, "재연결 예약이 안 됐다 — 영영 안 돌아온다"
+    assert {t.name for t in gw.exposed_tools} == {"before", "after"}
 
 
 def test_the_stuck_backend_is_reported_not_swallowed(monkeypatch, caplog):
@@ -742,6 +751,8 @@ def test_the_stuck_backend_is_reported_not_swallowed(monkeypatch, caplog):
     monkeypatch.setattr(gw, "exposed_tools", [])
     monkeypatch.setattr(gw, "route", {})
     monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "_LIVENESS_MISS", {})
+    monkeypatch.setattr(gw, "_REAGG", {})
 
     with caplog.at_level(logging.ERROR, logger="hwax-mcp-gateway"):
         asyncio.run(asyncio.wait_for(gw._aggregate(), timeout=5))
@@ -3190,3 +3201,180 @@ def test_취소된_시작도_준비_이벤트를_세운다(monkeypatch):
                 await tg.start(b.run)
         return ready.is_set(), b.session
     assert asyncio.run(asyncio.wait_for(go(), 5)) == (True, None)
+
+
+# ── 생사 탐침 — 한 번 놓쳤다고 세션을 갈지 않고, 갈 때는 그 세션에 걸린 호출을 풀어 준다(결정표 gateway-06) ──────────
+# 탐침(list_tools 10초)을 한 번 놓치면 세션을 갈았다. 이벤트 루프가 잠깐 바쁜 건강한 백엔드(동기 도구·동기 임베딩)가 그렇게
+# 갈렸고(dev 로그에 liveness 실패 62건), 갈린 세션에 걸려 있던 호출은 통보 없이 호출 한도까지 기다린 뒤 실패했다 — 사본 실측:
+# 백엔드가 5초 만에 끝낸 호출 둘이 한도 30초를 다 채웠다. 한도가 600초가 되면 그 대기가 10분이다.
+class _ProbeSess(_CallSess):
+    """탐침(list_tools)과 도구 호출의 동작을 따로 정하는 상주 세션. `probes` — 탐침마다의 답: "hang"(답 없음) · "ok" ·
+    예외 객체(그 예외를 던진다). 다 쓰면 마지막 것을 되풀이한다. `call_s` — 도구가 답하기까지의 초."""
+    def __init__(self, probes, call_s=3600.0):
+        super().__init__([_tool("slow_tool")])
+        self.probes, self.call_s, self.probed = list(probes), call_s, 0
+
+    async def list_tools(self):
+        how = self.probes[min(self.probed, len(self.probes) - 1)]
+        self.probed += 1
+        if how == "hang":
+            await asyncio.sleep(3600)
+        if isinstance(how, Exception):
+            raise how
+        return _Res(self._t)
+
+    async def call_tool(self, original, args, read_timeout_seconds=None):
+        self.calls.append(original)
+        await asyncio.sleep(self.call_s)
+        return types.CallToolResult(content=[types.TextContent(type="text", text="answered")])
+
+
+def _probe_kit(monkeypatch, sess, *, strikes=2, backend="signalforge"):
+    """재활 패스(`_revive_once`)와 `_call_tool` 을 같은 백엔드 위에서 실제로 돌릴 판 — 백엔드 핸들을 돌려준다."""
+    b = _ReconB(["slow_tool"])
+    b.session = sess
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "HEAX", {})                       # 레지스트리 폴링 없음 — 탐침·재연결·재집계만 돈다
+    monkeypatch.setattr(gw, "backends", {backend: b})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {"slow_tool": (backend, "slow_tool")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "PER_USER_SSO", {})
+    monkeypatch.setattr(gw, "IDENTITY_FWD", {"hwax-deliberation"})
+    monkeypatch.setattr(gw, "_task_group_holder", {"tg": object()})
+    monkeypatch.setattr(gw, "_REAGG", {})
+    monkeypatch.setattr(gw, "_FP", {})
+    monkeypatch.setattr(gw, "_LAST_TOOLS", {})
+    monkeypatch.setattr(gw, "_LIVENESS_MISS", {})
+    monkeypatch.setattr(gw, "_INFLIGHT", {})
+    monkeypatch.setattr(gw, "LIVENESS_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(gw, "LIVENESS_STRIKES", strikes)
+    monkeypatch.setattr(gw, "CALL_TIMEOUT_S", 30)
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["mes-user"])
+    return b
+
+
+def test_탐침을_한_번_놓친_백엔드의_세션은_갈지_않고_진행_중_호출이_답을_받는다(monkeypatch):
+    sess = _ProbeSess(["hang", "ok", "hang"], call_s=0.3)
+    b = _probe_kit(monkeypatch, sess)
+
+    async def go():
+        call = asyncio.create_task(gw._call_tool("slow_tool", {}))
+        await asyncio.sleep(0)                                # 호출이 세션에 걸리게 한다
+        await gw._revive_once(object())                       # 탐침 1회 무응답
+        after_first = (b.session is sess, b.reconnects, gw._LIVENESS_MISS.get("signalforge"))
+        res = await asyncio.wait_for(call, 5)
+        await gw._revive_once(object())                       # 답했다 — 센 것을 지운다
+        cleared = gw._LIVENESS_MISS.get("signalforge")
+        await gw._revive_once(object())                       # 다시 한 번 놓쳐도 '연속' 이 아니다
+        return after_first, res, cleared
+    after_first, res, cleared = asyncio.run(go())
+    assert after_first == (True, 0, 1), "한 번 놓쳤다고 세션을 갈았다 — 건강한 백엔드의 진행 중 답이 버려진다"
+    assert not res.isError and res.content[0].text == "answered"
+    assert cleared is None and b.session is sess and b.reconnects == 0, "놓친 횟수는 연속일 때만 쌓인다"
+
+
+def test_재집계에서_목록을_받았으면_놓친_횟수가_끊긴다(monkeypatch):
+    """재집계도 같은 세션에 list_tools 를 보낸다 — 그 사이에 답을 받았으면 앞뒤의 무응답은 '연속' 이 아니다."""
+    sess = _ProbeSess(["hang", "ok", "hang"])
+    b = _probe_kit(monkeypatch, sess)
+
+    async def go():
+        await gw._revive_once(object())                       # 무응답 1회
+        await gw._aggregate()                                 # 다른 앱이 바뀌어 재집계가 돌았고, 이 백엔드는 답했다
+        await gw._revive_once(object())                       # 무응답 — 다시 1회째다
+    asyncio.run(asyncio.wait_for(go(), 5))
+    assert b.session is sess and b.reconnects == 0 and gw._LIVENESS_MISS == {"signalforge": 1}
+
+
+def test_탐침을_연속으로_놓치면_세션을_갈고_그_세션의_진행_중_호출을_곧바로_풀어_준다(monkeypatch):
+    """갈린 세션의 답은 어차피 버려진다. 알리지 않으면 호출자는 호출 한도(여기서는 30초, 운영 600초)까지 기다렸다."""
+    import time as _time
+    sess = _ProbeSess(["hang"])
+    b = _probe_kit(monkeypatch, sess)
+
+    async def go():
+        call = asyncio.create_task(gw._call_tool("slow_tool", {}))
+        await asyncio.sleep(0)
+        await gw._revive_once(object())
+        assert not call.done() and b.session is sess, "첫 번째에는 아직 둔다"
+        t0 = _time.monotonic()
+        await gw._revive_once(object())                       # 연속 2회째 — 세션을 갈고 호출을 풀어 준다
+        return await asyncio.wait_for(call, 2), _time.monotonic() - t0
+    res, took = asyncio.run(go())
+    assert res.isError and took < 2, "호출 한도까지 기다렸다"
+    assert res.content[0].text == ("backend signalforge 가 탐침에 2회 연속 답하지 않아 세션을 갈았다"
+                                   "(GATEWAY_LIVENESS_TIMEOUT × GATEWAY_LIVENESS_STRIKES) — slow_tool 의 실행 여부는 모른다")
+    assert sess.calls == ["slow_tool"] and b.session.calls == [], "실행 여부를 모르는 호출을 새 세션에 다시 보내면 안 된다"
+    assert b.reconnects == 1 and b.session is not sess, "죽은 세션은 같은 패스의 재연결 루프가 갈아 끼운다"
+    assert gw._INFLIGHT.get("signalforge") == {}, "풀어 준 호출이 장부에 남으면 안 된다"
+    row = _rows()[-1]
+    assert row["ok"] is False and "GATEWAY_LIVENESS_STRIKES" in row["error"]
+
+
+def test_탐침이_예외로_실패하면_종전대로_한_번에_간다(monkeypatch):
+    """세션 종료·연결 거부는 답이 늦은 것이 아니다. 미루면 앱 재배포 직후의 `POST /refresh` 한 번으로 새 도구가 올라오지 않는다
+    (update-all 이 그 한 번으로 카탈로그를 검증한다)."""
+    sess = _ProbeSess([RuntimeError("Session terminated")])
+    b = _probe_kit(monkeypatch, sess)
+
+    async def go():
+        call = asyncio.create_task(gw._call_tool("slow_tool", {}))
+        await asyncio.sleep(0)
+        changed = await gw._revive_once(object())
+        return changed, await asyncio.wait_for(call, 2)
+    changed, res = asyncio.run(go())
+    assert changed is True and b.reconnects == 1 and b.session is not sess
+    assert res.isError and "탐침에 실패해 세션을 갈았다" in res.content[0].text and "실행 여부는 모른다" in res.content[0].text
+
+
+def test_상주_세션이_갈려도_단발_세션의_호출은_답을_받는다(monkeypatch):
+    """신원 전달·사람별 호출은 제 연결을 따로 쥔다 — 상주 세션의 탐침 결과로 끊으면 건강한 호출을 죽인다."""
+    b = _probe_kit(monkeypatch, _ProbeSess(["hang"]), backend="hwax-deliberation")
+    monkeypatch.setattr(gw, "route", {"slow_tool": ("hwax-deliberation", "slow_tool")})
+
+    class _Sess:
+        async def initialize(self): return None
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            await asyncio.sleep(0.4)
+            return types.CallToolResult(content=[types.TextContent(type="text", text="identity-ok")])
+    monkeypatch.setattr(gw, "streamablehttp_client", lambda url, headers=None, **kw: _StubCM((None, None, "sid")))
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+
+    async def go():
+        call = asyncio.create_task(gw._call_tool("slow_tool", {}))
+        await asyncio.sleep(0)
+        await gw._revive_once(object())
+        await gw._revive_once(object())
+        return await asyncio.wait_for(call, 5)
+    res = asyncio.run(go())
+    assert b.reconnects == 1, "상주 세션은 갈렸다"
+    assert not res.isError and res.content[0].text == "identity-ok"
+
+
+def test_재집계의_목록_조회가_예외로_실패하면_종전대로_한_번에_죽은_것으로_표시한다(monkeypatch):
+    class _Broken:
+        async def list_tools(self):
+            raise RuntimeError("Session terminated")
+    b = _B([])
+    b.session = _Broken()
+    monkeypatch.setattr(gw, "backends", {"gone": b})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "_LIVENESS_MISS", {})
+    monkeypatch.setattr(gw, "_REAGG", {})
+    asyncio.run(asyncio.wait_for(gw._aggregate(), 5))
+    assert b.session is None and "pending" not in gw._REAGG
+
+
+def test_탐침_횟수_손잡이(tmp_path):
+    assert _limits(tmp_path, ["LIVENESS_STRIKES", "LIVENESS_TIMEOUT_S"])[0] == {"LIVENESS_STRIKES": 2, "LIVENESS_TIMEOUT_S": 10.0}
+    assert _limits(tmp_path, ["LIVENESS_STRIKES"], GATEWAY_LIVENESS_STRIKES="3")[0] == {"LIVENESS_STRIKES": 3}
+    assert _limits(tmp_path, ["LIVENESS_STRIKES"], GATEWAY_LIVENESS_STRIKES="0")[0] == {"LIVENESS_STRIKES": 1}, \
+        "0 이하는 1 로 읽는다(한 번 놓치면 간다 — 종전 동작)"

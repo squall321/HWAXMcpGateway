@@ -682,6 +682,14 @@ for _i, _pair in enumerate((e.get("PER_USER_SSO_APPS") or "").split(), 1):
     if _k in ("kooremapper_mcp", "hwax_risk", "ste", "reportarchive", "testscope"):
         print(f"  ⚠ PER_USER_SSO_APPS: {_k} — 이 파일이 직접 만드는 위임이라 순회로 덮지 않는다(건너뛴다)")
         continue
+    if _k in _GENERIC_SSO:
+        # 한 키는 **먼저 적힌 쌍 하나만** 쓴다 — per_user 키 하나에 위임은 하나다. HWAXPortal update-all 은 이미 그렇게 읽는다
+        # (_sso_generic_pairs — 뒤 쌍의 접두는 자식에게 넘기지도 않는다). 손으로 돌린 실행만 뒤 쌍이 앞 쌍의 주소·비밀을 덮었고,
+        # 끄는 표(_SSO_OFF_KEYS)까지 뒤 쌍의 비밀 이름으로 바뀌어 앞 쌍으로 방금 만든 위임이 같은 실행에서 지워졌다(블록을 떼어
+        # 재현). 못 읽은 쌍은 '먼저' 로 치지 않는다(위에서 이미 건너뛰었다). 키만 찍는다 — 쌍점 뒤는 비밀을 잘못 적은 것일 수 있다.
+        print(f"  ⚠ PER_USER_SSO_APPS: {_k} — 두 번 적혔다. 먼저 적힌 쌍만 쓴다({_i}번째 쌍은 건너뛴다 — 그 쌍의 비밀·주소는 "
+              "보지 않는다). provision.env 에서 한 쌍만 남긴다")
+        continue
     _GENERIC_SSO[_k] = (f"{_p}_SSO_SECRET", _k)
     if e.get(f"{_p}_SSO_SECRET"):
         _u = e.get(f"{_p}_SSO_URL") or (per_user.get(_k) or {}).get("sso_url")

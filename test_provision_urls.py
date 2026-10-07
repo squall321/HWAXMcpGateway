@@ -544,6 +544,45 @@ def test_PER_USER_SSO_APPS_의_못_읽은_쌍은_건너뛰되_말한다(tmp_path
         assert leak not in log[0], f"{leak} 가 로그에 샜다"
 
 
+def test_PER_USER_SSO_APPS_에_한_키를_두_번_적으면_먼저_적힌_쌍만_쓴다(tmp_path):
+    """per_user 키 하나에 위임은 하나다. HWAXPortal update-all 은 이미 먼저 적힌 쌍만 쓴다(뒤 쌍의 접두는 자식에게 넘기지도
+    않는다) — 손으로 돌린 실행만 뒤 쌍이 앞 쌍을 덮어, 같은 provision.env 로 누가 돌리느냐에 따라 위임의 주소·비밀이 갈렸다."""
+    log: list = []
+    out = _run_provision(tmp_path, {
+        "PER_USER_SSO_APPS": "dup:FIRST other:OTHER dup:SECOND",
+        "FIRST_SSO_SECRET": "first-secret-xyz", "FIRST_SSO_URL": "http://first.example/api/auth/sso",
+        "SECOND_SSO_SECRET": "second-secret-xyz", "SECOND_SSO_URL": "http://second.example/api/auth/sso",
+        "OTHER_SSO_SECRET": "other-secret-xyz", "OTHER_SSO_URL": "http://other.example/api/auth/sso"}, log)
+    pu = out["heax_registry"]["per_user_sso"]
+    assert pu["dup"] == {"sso_url": "http://first.example/api/auth/sso", "secret": "first-secret-xyz", "client": "gateway",
+                         **GENERIC_MARK}
+    assert pu["other"]["sso_url"] == "http://other.example/api/auth/sso", "겹치지 않은 쌍은 그대로 붙는다"
+    said = [l for l in log[0].splitlines() if "PER_USER_SSO_APPS" in l and "두 번" in l]
+    assert len(said) == 1 and "dup" in said[0] and "3번째 쌍" in said[0] and "먼저 적힌 쌍만" in said[0], log[0]
+    # 쌍점 뒤와 값은 찍지 않는다 — 비밀을 잘못 적었을 수 있고 이 출력은 운영 로그에 남는다
+    for leak in ("SECOND", "second-secret-xyz", "second.example", "first-secret-xyz"):
+        assert leak not in "\n".join(said), f"{leak} 가 로그에 샜다"
+
+
+def test_두_번_적힌_키의_끄기도_먼저_적힌_쌍의_비밀을_본다(tmp_path):
+    """끄는 표가 뒤 쌍의 비밀 이름으로 덮였다 — 앞 쌍의 비밀로 방금 만든 위임이, 뒤 쌍의 비밀이 비었다는 이유로 같은 실행에서
+    지워졌다(update-all 이 뒤 쌍의 비밀을 자식에게 넘기지 않으므로 그 실행에서는 늘 비어 있다)."""
+    log: list = []
+    out = _run_provision(tmp_path, {
+        "PER_USER_SSO_APPS": "dup:FIRST dup:SECOND", "PER_USER_SSO_OFF": "dup",
+        "FIRST_SSO_SECRET": "first-secret-xyz", "FIRST_SSO_URL": "http://first.example/api/auth/sso"}, log)
+    assert out["heax_registry"]["per_user_sso"]["dup"]["secret"] == "first-secret-xyz", log[0]
+    assert "위임 끔" not in log[0]
+    # 먼저 적힌 쌍의 비밀이 비었으면 꺼진다(뒤 쌍의 비밀이 있어도 — 그 쌍은 읽지 않는다)
+    log.clear()
+    _force_backup(tmp_path)
+    out = _run_provision(tmp_path, {
+        "PER_USER_SSO_APPS": "dup:FIRST dup:SECOND", "PER_USER_SSO_OFF": "dup",
+        "SECOND_SSO_SECRET": "second-secret-xyz", "SECOND_SSO_URL": "http://second.example/api/auth/sso"}, log)
+    assert "dup" not in (out.get("heax_registry") or {}).get("per_user_sso", {}), log[0]
+    assert "FIRST_SSO_SECRET 비어 있음" in log[0]
+
+
 # ── arp — 주소와 토큰이 둘 다 있을 때만 등재한다(change-request-8-10 #10 · D-5) ──────────────────────────
 # ARP 는 2026-10-01 부터 인증을 켰다. 토큰 없이 등재하면 401 → /health 의 arp 가 영영 false(가짜 DOWN)였다.
 ARP_BASE = "http://arp.example:3001"

@@ -31,6 +31,8 @@
 #   8) 사람별 위임(ste 방식, heax_registry.per_user_sso): STE_SSO_SECRET · RA_SSO_SECRET(+RA_SSO_URL) ·
 #      TESTSCOPE_SSO_SECRET(+TESTSCOPE_SSO_URL, 기본 주소 없음). 비밀이 없는 실행은 직전 값을 이어받는다 —
 #      끄는 것은 PER_USER_SSO_OFF(update-all 이 infra/.env 의 빈 RA·TestScope 비밀을 보고 넘긴다)로만.
+#      그 밖의 앱은 이 파일을 고치지 않고 붙인다 — PER_USER_SSO_APPS="<per_user 키>:<ENV 접두> …"
+#      (예: "newapp:NEWAPP" → NEWAPP_SSO_SECRET · NEWAPP_SSO_URL, 기본 주소 없음). PER_USER_SSO_OFF 로도 꺼진다.
 #   9) TestScope: TESTSCOPE_MCP_URL(> 직전 config 주소)이 있으면 testscope 백엔드(서비스 토큰 없음).
 #      사람별 호출은 RA 처럼 두 방식 중 하나다 — 기본은 사람이 포털 '개인 토큰 › 외부 연결' 에 등록한
 #      TestScope 토큰(게이트웨이 PORTAL_CONN_BACKENDS), TESTSCOPE_SSO_SECRET 이 있으면 8)의 위임(게이트웨이에서 먼저 탄다).
@@ -613,14 +615,44 @@ if e.get("TESTSCOPE_SSO_SECRET"):
     else:
         print("  ⚠ TESTSCOPE_SSO_SECRET 은 있는데 주소가 없다(TESTSCOPE_SSO_URL·직전 config 둘 다 없음) — "
               "TestScope 위임 생략, 사람별 호출은 등록 토큰 방식 그대로")
+# 일반 앱 — 모양이 {sso_url, secret, client:"gateway"} 인 앱은 이 파일을 고치지 않고 붙인다(앱별 분기가 위로 다섯까지 늘었다).
+# PER_USER_SSO_APPS="<per_user 키>:<ENV 접두> …"  예) "newapp:NEWAPP" → NEWAPP_SSO_SECRET · NEWAPP_SSO_URL
+# 규칙은 TestScope 와 같다 — env > 직전 config 주소, 주소가 없으면 만들지 않는다(기본 호스트 없음), 비밀이 없는 실행은 이어받는다.
+# 손으로 붙여 둔 필드(strip_headers 등)는 남는다. 위 다섯 앱은 모양이 제각각이라(auth·token_header·strip_headers·client)
+# 이 순회로 덮지 않는다 — 덮이면 그 앱의 위임이 다른 주소·모양으로 조용히 바뀐다. 못 읽은 쌍은 건너뛰되 말한다
+# (조용히 건너뛰면 '적었는데 왜 안 켜지나' 를 로그에서 찾을 수 없다). 못 읽은 쌍은 몇 번째인지와 콜론 앞 키만 찍는다 —
+# 값 자리에 비밀을 잘못 적었을 수 있고, 이 출력은 update-all 로그에 그대로 남는다.
+_GENERIC_SSO = {}
+for _i, _pair in enumerate((e.get("PER_USER_SSO_APPS") or "").split(), 1):
+    _k, _sep, _p = _pair.partition(":")
+    if not _k or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", _p):
+        print(f"  ⚠ PER_USER_SSO_APPS: {_i}번째 쌍" + (f"('{_k}:…')" if _sep else "(콜론 없음)")
+              + " 을 읽지 못했다(<per_user 키>:<ENV 접두> 꼴, 접두는 환경변수 이름) — 건너뛴다")
+        continue
+    if _k in ("kooremapper_mcp", "hwax_risk", "ste", "reportarchive", "testscope"):
+        print(f"  ⚠ PER_USER_SSO_APPS: {_k} — 이 파일이 직접 만드는 위임이라 순회로 덮지 않는다(건너뛴다)")
+        continue
+    _GENERIC_SSO[_k] = (f"{_p}_SSO_SECRET", _k)
+    if e.get(f"{_p}_SSO_SECRET"):
+        _u = e.get(f"{_p}_SSO_URL") or (per_user.get(_k) or {}).get("sso_url")
+        if _u:
+            per_user[_k] = {**(per_user.get(_k) or {}), "sso_url": _u, "secret": e[f"{_p}_SSO_SECRET"],
+                            "client": "gateway"}
+            print(f"  ✓ {_k} 사람별 위임 — {_u}")
+        else:
+            print(f"  ⚠ {_p}_SSO_SECRET 은 있는데 주소가 없다({_p}_SSO_URL·직전 config 둘 다 없음) — {_k} 위임 생략")
 # 끄기 — 위의 '비밀이 없는 실행은 이어받는다' 는 비밀을 **못 읽은** 실행(손으로 돌린 --force 등)을 위한 것이다. 그래서
 # infra/.env 에서 비밀을 비워도 위임이 남아, 포털 화면은 '토큰 등록' 인데 게이트웨이만 위임으로 부르고 거부했다(되돌리기가 안 됐다).
 # update-all 이 infra/.env 를 읽어 비밀이 빈 서비스를 PER_USER_SSO_OFF 로 넘기면 그 항목만 지운다. 비밀이 같이 왔으면 끄지 않고,
-# 받는 이름은 이 둘뿐이다(ste·hwax_risk 등은 비밀 출처가 다른 리포라 이 손잡이로 끄지 않는다).
-_SSO_OFF_KEYS = {"reportarchive": ("RA_SSO_SECRET", "RA"), "testscope": ("TESTSCOPE_SSO_SECRET", "TestScope")}
+# 받는 이름은 이 둘과 이번 실행의 PER_USER_SSO_APPS 에 적힌 일반 앱뿐이다(ste·hwax_risk 등은 비밀 출처가 다른 리포라 이 손잡이로
+# 끄지 않는다). 일반 앱은 목록에 있어야 꺼진다 — 어느 env 가 그 앱의 비밀인지 모르면 '비밀이 비었다' 를 판정할 수 없다.
+_SSO_OFF_KEYS = {"reportarchive": ("RA_SSO_SECRET", "RA"), "testscope": ("TESTSCOPE_SSO_SECRET", "TestScope"),
+                 **_GENERIC_SSO}
 for _k in (e.get("PER_USER_SSO_OFF") or "").split():
     if _k in _SSO_OFF_KEYS and not e.get(_SSO_OFF_KEYS[_k][0]) and per_user.pop(_k, None):
-        print(f"  · {_SSO_OFF_KEYS[_k][1]} 사람별 위임 끔({_SSO_OFF_KEYS[_k][0]} 비어 있음) — 등록 토큰 방식으로")
+        # 일반 앱에는 포털 등록 토큰 길(게이트웨이 PORTAL_CONN_BACKENDS)이 없다 — 위임을 끄면 서비스 계정으로 나간다.
+        _to = "서비스 계정으로" if _k in _GENERIC_SSO else "등록 토큰 방식으로"
+        print(f"  · {_SSO_OFF_KEYS[_k][1]} 사람별 위임 끔({_SSO_OFF_KEYS[_k][0]} 비어 있음) — {_to}")
 if per_user:
     cfg.setdefault("heax_registry", {})["per_user_sso"] = per_user
 

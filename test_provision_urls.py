@@ -371,3 +371,124 @@ def test_RA_위임과_TestScope_가_ste_hwax_risk_를_건드리지_않는다(tmp
     assert set(pu_) == {"ste", "hwax_risk", "reportarchive", "testscope"}
     assert out["rest"]["ste"]["per_user"] == "ste"
     assert "reportarchive" not in out["rest"] and "testscope" not in out["rest"], "REST 다리는 이번 범위가 아니다"
+
+
+# ── 일반 앱 위임(PER_USER_SSO_APPS) — 여섯 번째 앱부터 provision-config.sh 를 고치지 않는다(change-request-8-10 #8) ──
+def test_일반_앱_위임은_PER_USER_SSO_APPS_로_생긴다(tmp_path):
+    """앱별 분기가 3개에서 5개로 늘었다 — 모양이 {sso_url, secret, client} 인 앱은 env 만으로 붙는다."""
+    log: list = []
+    out = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP other-app:OTHER",
+                                    "NEWAPP_SSO_SECRET": "na-secret-xyz",
+                                    "NEWAPP_SSO_URL": "http://newapp.example:9000/api/auth/sso",
+                                    "OTHER_SSO_SECRET": "ot-secret-xyz",
+                                    "OTHER_SSO_URL": "http://other.example:9100/api/auth/sso"}, log)
+    pu_ = out["heax_registry"]["per_user_sso"]
+    assert pu_ == {
+        "newapp": {"sso_url": "http://newapp.example:9000/api/auth/sso", "secret": "na-secret-xyz", "client": "gateway"},
+        "other-app": {"sso_url": "http://other.example:9100/api/auth/sso", "secret": "ot-secret-xyz",
+                      "client": "gateway"}}
+    assert "newapp 사람별 위임 — http://newapp.example:9000/api/auth/sso" in log[0]
+    assert "na-secret-xyz" not in log[0] and "ot-secret-xyz" not in log[0]
+    # 목록에 없는 접두의 비밀은 아무것도 만들지 않는다 — 이름을 적어야 붙는다
+    (tmp_path / "gateway_config.json").unlink()
+    out = _run_provision(tmp_path, {"NEWAPP_SSO_SECRET": "na-secret-xyz",
+                                    "NEWAPP_SSO_URL": "http://newapp.example:9000/api/auth/sso"})
+    assert "newapp" not in ((out.get("heax_registry") or {}).get("per_user_sso") or {})
+
+
+def test_일반_앱_위임은_주소를_모르면_만들지_않고_그렇다고_말한다(tmp_path):
+    """TestScope 와 같다 — 기본 호스트가 없다. 지어내면 없는 서비스에 비밀을 보낸다."""
+    log: list = []
+    out = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP", "NEWAPP_SSO_SECRET": "na-secret-xyz"}, log)
+    assert "newapp" not in ((out.get("heax_registry") or {}).get("per_user_sso") or {})
+    assert "NEWAPP_SSO_SECRET 은 있는데 주소가 없다" in log[0] and "na-secret-xyz" not in log[0]
+
+
+def test_일반_앱_위임은_비밀이_없는_실행에도_지워지지_않는다(tmp_path):
+    """RA·TestScope 와 같은 규칙 — env > 직전 config 주소, 비밀을 못 읽은 실행은 직전 항목을 이어받는다.
+    손으로 붙여 둔 필드(strip_headers 등)는 비밀을 새로 줘도 남는다."""
+    prev = {"sso_url": "http://newapp.example:9000/api/auth/sso", "secret": "old", "client": "gateway",
+            "strip_headers": ["X-Team"]}
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({
+        "heax_registry": {"per_user_sso": {"newapp": prev}}}), encoding="utf-8")
+    # 목록도 비밀도 없는 실행
+    assert _run_provision(tmp_path, {})["heax_registry"]["per_user_sso"]["newapp"] == prev
+    # 목록만 있고 비밀이 없는 실행
+    got = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP"})["heax_registry"]["per_user_sso"]["newapp"]
+    assert got == prev
+    # 비밀만 새로 주면 주소는 직전 값을 지킨다
+    got = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP", "NEWAPP_SSO_SECRET": "new"}
+                         )["heax_registry"]["per_user_sso"]["newapp"]
+    assert got == {**prev, "secret": "new"}
+    # env 주소가 직전 값을 이긴다
+    got = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP", "NEWAPP_SSO_SECRET": "new",
+                                    "NEWAPP_SSO_URL": "http://newapp2.example:9000/api/auth/sso"}
+                         )["heax_registry"]["per_user_sso"]["newapp"]
+    assert got == {**prev, "secret": "new", "sso_url": "http://newapp2.example:9000/api/auth/sso"}
+
+
+def test_일반_순회로_기존_다섯_앱의_위임을_덮지_못한다(tmp_path):
+    """다섯 앱은 모양이 제각각이다(auth·token_header·strip_headers·client) — 순회가 덮으면 그 앱의 위임이
+    다른 주소·비밀·모양으로 조용히 바뀐다. 건너뛰되 말한다."""
+    ste = {"sso_url": "http://127.0.0.1:15810/api/auth/sso", "secret": "s2", "client": "gateway"}
+    ra = {"sso_url": "http://ra.example:3000/api/auth/sso", "secret": "ra-old", "client": "gateway",
+          "strip_headers": ["X-Workspace-Slug"]}
+    ts = {"sso_url": "http://testscope.example:8020/api/auth/sso", "secret": "ts-old", "client": "gateway"}
+    koorm = {"sso_url": "http://127.0.0.1:8700/api/v1/auth/sso", "secret": "k", "client": "deliberation"}
+    risk = {"sso_url": "http://127.0.0.1:4180/apps/hwax_risk/api/auth/sso", "secret": "hr", "client": "deliberation",
+            "auth": "heax", "token_header": "X-Heax-Sso-Assertion"}
+    before = {"ste": ste, "reportarchive": ra, "testscope": ts, "kooremapper_mcp": koorm, "hwax_risk": risk}
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({
+        "heax_registry": {"per_user_sso": before}}), encoding="utf-8")
+    log: list = []
+    out = _run_provision(tmp_path, {
+        "PER_USER_SSO_APPS": "ste:EVIL reportarchive:EVIL testscope:EVIL kooremapper_mcp:EVIL hwax_risk:EVIL",
+        "EVIL_SSO_SECRET": "evil-secret", "EVIL_SSO_URL": "http://evil.example/api/auth/sso"}, log)
+    assert out["heax_registry"]["per_user_sso"] == before
+    assert "evil" not in json.dumps(out)
+    for k in before:
+        assert f"PER_USER_SSO_APPS: {k} " in log[0], f"{k} 를 건너뛴 사실이 로그에 없다"
+    # 이 손잡이로 기존 앱을 끌 수도 없다 — 끄는 표에 EVIL 이름으로 올라가지 않는다
+    out = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "ste:EVIL hwax_risk:EVIL",
+                                    "PER_USER_SSO_OFF": "ste hwax_risk"})
+    assert out["heax_registry"]["per_user_sso"] == before
+
+
+def test_일반_앱_위임도_PER_USER_SSO_OFF_로_끈다(tmp_path):
+    prev = {"sso_url": "http://newapp.example:9000/api/auth/sso", "secret": "old", "client": "gateway"}
+    ste = {"sso_url": "http://127.0.0.1:15810/api/auth/sso", "secret": "s2", "client": "gateway"}
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({
+        "heax_registry": {"per_user_sso": {"newapp": prev, "ste": ste}}}), encoding="utf-8")
+    log: list = []
+    pu_ = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP", "PER_USER_SSO_OFF": "newapp"}, log
+                         )["heax_registry"]["per_user_sso"]
+    assert pu_ == {"ste": ste}
+    assert "newapp 사람별 위임 끔(NEWAPP_SSO_SECRET 비어 있음)" in log[0] and "old" not in log[0]
+    # 비밀이 같이 오면 끄지 않는다(켜는 쪽이 이긴다) — RA·TestScope 와 같다
+    pu_ = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP", "PER_USER_SSO_OFF": "newapp",
+                                    "NEWAPP_SSO_SECRET": "new"})["heax_registry"]["per_user_sso"]
+    assert pu_["newapp"] == {**prev, "secret": "new"}
+    # 목록에 없는 이름은 끄지 않는다 — 어느 env 가 그 앱의 비밀인지 모르면 '비밀이 비었다' 를 판정할 수 없다
+    pu_ = _run_provision(tmp_path, {"PER_USER_SSO_OFF": "newapp"})["heax_registry"]["per_user_sso"]
+    assert pu_["newapp"] == prev
+
+
+def test_PER_USER_SSO_APPS_의_못_읽은_쌍은_건너뛰되_말한다(tmp_path):
+    """조용히 건너뛰면 '적었는데 왜 위임이 안 켜지나' 를 로그에서 찾을 수 없다. 멀쩡한 쌍은 그대로 붙는다."""
+    log: list = []
+    out = _run_provision(tmp_path, {
+        "PER_USER_SSO_APPS": "nocolon :NOKEY noprefix: dash:NEW-APP digit:1APP two:A:B good:GOOD",
+        "GOOD_SSO_SECRET": "g-secret-xyz", "GOOD_SSO_URL": "http://good.example/api/auth/sso",
+        # 잘못된 접두가 우연히 env 이름과 맞아도 붙지 않는다
+        "NEW-APP_SSO_SECRET": "x", "NEW-APP_SSO_URL": "http://x.example/sso",
+        "A:B_SSO_SECRET": "x", "A:B_SSO_URL": "http://x.example/sso"}, log)
+    assert set(out["heax_registry"]["per_user_sso"]) == {"good"}
+    bad = [l for l in log[0].splitlines() if "PER_USER_SSO_APPS" in l and "읽지 못했다" in l]
+    assert len(bad) == 6, log[0]
+    for i, k in ((3, "noprefix"), (4, "dash"), (5, "digit"), (6, "two")):
+        assert any(f"{i}번째 쌍('{k}:…')" in l for l in bad), f"{k} 쌍을 건너뛴 사실이 로그에 없다"
+    assert any("2번째 쌍(':…')" in l for l in bad)
+    # 콜론 없는 낱말과 콜론 뒤는 찍지 않는다 — 비밀을 잘못 적었을 수 있고 이 출력은 운영 로그에 남는다
+    assert any("1번째 쌍(콜론 없음)" in l for l in bad)
+    for leak in ("nocolon", "NOKEY", "NEW-APP", "1APP", "A:B", "g-secret-xyz"):
+        assert leak not in log[0], f"{leak} 가 로그에 샜다"

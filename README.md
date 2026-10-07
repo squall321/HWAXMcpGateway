@@ -67,7 +67,8 @@ MCP fan-out과 같은 패턴("호출자 토큰 1개 → 백엔드별 네이티�
 | `STE_SSO_SECRET` · `STE_SSO_URL` | `per_user_sso.ste` |
 | `RA_SSO_SECRET` · `RA_SSO_URL`(기본 `http://127.0.0.1:3000/api/auth/sso`) | `per_user_sso.reportarchive` + `strip_headers: ["X-Workspace-Slug"]`. 서비스 백엔드(`RAT_TOKEN`)는 그대로 — 도구 목록은 그 세션으로 모은다 |
 | `TESTSCOPE_SSO_SECRET` · `TESTSCOPE_SSO_URL`(기본 없음 — 운영에서는 포털이 `TESTSCOPE_BASE_URL` 에서 유도해 넘긴다) | `per_user_sso.testscope`(부서 헤더가 없어 `strip_headers` 없음). 주소를 모르면 만들지 않고 생략을 로그에 남긴다 |
-| `PER_USER_SSO_OFF`(공백 구분 `reportarchive`·`testscope` — HWAXPortal update-all 이 infra/.env 의 빈 비밀을 보고 넘긴다) | 그 위임 항목을 지운다(토큰 등록으로 되돌리기). 비밀 없는 손 실행은 직전 값을 이어받으므로 끄는 길은 이것뿐이다. 비밀이 같이 오면 끄지 않는다 |
+| `PER_USER_SSO_APPS`(공백 구분 `<per_user 키>:<ENV 접두>`, 예 `newapp:NEWAPP`) + `<접두>_SSO_SECRET` · `<접두>_SSO_URL`(기본 없음) | `per_user_sso.<키>` = `{sso_url, secret, client: "gateway"}` — 이 모양의 앱은 `provision-config.sh` 를 고치지 않고 붙는다. 규칙은 TestScope 와 같고(env > 직전 config 주소, 주소를 모르면 만들지 않고 로그에 남긴다, 비밀 없는 실행은 이어받는다), 손으로 붙여 둔 필드(`strip_headers` 등)는 남는다. 스크립트가 직접 만드는 다섯 키(`kooremapper_mcp`·`hwax_risk`·`ste`·`reportarchive`·`testscope`)와 못 읽은 쌍은 건너뛰고 그 사실을 로그에 남긴다 |
+| `PER_USER_SSO_OFF`(공백 구분 `reportarchive`·`testscope` — HWAXPortal update-all 이 infra/.env 의 빈 비밀을 보고 넘긴다 — 와 그 실행의 `PER_USER_SSO_APPS` 에 적힌 키) | 그 위임 항목을 지운다(토큰 등록으로 되돌리기 — 일반 앱은 등록 토큰 길이 없어 서비스 계정으로 나간다). 비밀 없는 손 실행은 직전 값을 이어받으므로 끄는 길은 이것뿐이다. 비밀이 같이 오면 끄지 않는다 |
 
 ## 등록 토큰 방식 — `PORTAL_CONN_BACKENDS`(RA·TestScope)
 사람이 그 서비스에서 직접 받은 개인 토큰을 포털 '개인 토큰 › 외부 연결'(`/tokens?tab=connect`)에 등록하면, 게이트웨이가 호출 때 포털 `GET /internal/connections/<service>?email=`(GW_TOKEN)로 그 토큰을 읽어 그 사람 명의로 부른다. 신원이 있는데 등록이 없거나 포털에 묻지 못하면 **거부**하고 등록을 안내한다(서비스 계정으로 대신 부르지 않는다). 신원 없는 내부 호출만 서비스 세션으로 간다.

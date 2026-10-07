@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 import provision_urls as pu
 
 HERE = Path(__file__).resolve().parent
@@ -811,7 +813,6 @@ def test_추적_파일에_사내_주소가_박혀_있지_않다():
     어긋나면 **파일과 줄 번호만** 말한다 — 주소를 실패 글에 다시 찍지 않는다."""
     ls = subprocess.run(["git", "ls-files"], cwd=str(HERE), capture_output=True, text=True)
     if ls.returncode != 0 or not ls.stdout.strip():
-        import pytest
         pytest.skip("git 작업 트리가 아니다 — 추적 파일 목록을 알 수 없다")
     hits = []
     for name in ls.stdout.split():
@@ -821,3 +822,32 @@ def test_추적_파일에_사내_주소가_박혀_있지_않다():
             if _PRIVATE_V4.search(line):
                 hits.append(f"{name}:{n}")
     assert hits == [], f"사설 대역 주소가 적혀 있다: {hits}"
+
+
+# ── 포털이 **글자로** 읽는 두 줄 — 옆 리포의 방아쇠가 이 파일의 조건식 글자에 걸려 있다 ───────────────────────────
+# HWAXPortal update-all 의 `_gw_stale` 은 `grep -F` 로 이 프로비저너가 '옛 항목을 빼는 판' 인지 본다(옛 프로비저너에 방아쇠를
+# 당기면 매 실행 재프로비저닝이 헛돌고 게이트웨이·에이전트서버가 그때마다 내려갔다 올라온다). 그 줄을 모르고 고쳐 쓰면
+# 방아쇠가 조용히 꺼진다.
+_PORTAL_READS = ["_ST_PREV != _ST_DEFAULT", "if _ARP_BASE and _ARP:"]
+
+
+@pytest.mark.parametrize("literal", _PORTAL_READS)
+def test_포털이_글자로_읽는_줄은_코드에_한_번만_있고_그렇다고_적혀_있다(literal):
+    lines = (HERE / "provision-config.sh").read_text(encoding="utf-8").splitlines()
+    at = [i for i, ln in enumerate(lines) if literal in ln]
+    assert len(at) == 1, "그 글자가 주석에도 있으면 코드를 고쳐 써도 방아쇠가 켜진 채 남는다(주석이 대신 맞는다)"
+    assert not lines[at[0]].lstrip().startswith("#")
+    above = "\n".join(lines[at[0] - 3:at[0]])
+    assert "글자 그대로" in above and "update-all" in above and "_gw_stale" in above, \
+        "이 줄을 옆 리포가 읽는다는 경고가 바로 위에 있어야 한다"
+
+
+def test_포털의_방아쇠가_찾는_글자가_이_목록과_같다():
+    """저쪽이 찾는 글자를 바꾸면 여기서 걸린다 — 두 리포가 같은 글자를 봐야 한다."""
+    ua = HERE.parent / "HWAXPortal" / "infra" / "scripts" / "update-all.sh"
+    if not ua.exists():
+        pytest.skip("HWAXPortal 리포가 옆에 없다")
+    src = ua.read_text(encoding="utf-8")
+    body = src[src.index("_gw_stale() {"):]
+    body = body[:body.index("\n}\n")]
+    assert sorted(re.findall(r"grep -qF '([^']+)'", body)) == sorted(_PORTAL_READS)

@@ -501,6 +501,9 @@ cfg["ai-data-hub"] = {"url": _url("AIDH_MCP_URL", "ai-data-hub", "http://127.0.0
 #   provision.env 에 SMARTTWIN_MCP_URL 을 적어야 한다. update-all 의 기대 조건이 이 조건·이 기본값과 글자까지 같아야 한다.
 _ST_DEFAULT = "http://127.0.0.1:5013/mcp"
 _ST_PREV = _prev("smart-twin-mcp")
+# ⚠ 아래 줄은 **글자 그대로** 읽힌다 — HWAXPortal update-all 의 `_gw_stale` 이 이 줄의 비교식을 `grep -F` 로 찾아 '옛 기본값을 빼는
+#   판' 인지 가리고, 포털 시험(test_update_all_gateway_expectations)이 이 줄과 위 기본값 줄을 원문에서 꺼내 돌린다. 고쳐 쓰면 방아쇠가
+#   조용히 꺼진다 — 저쪽과 함께 고친다. 그 글자를 주석에 옮겨 적지 않는다(주석이 대신 맞아 버린다).
 _ST_URL = e.get("SMARTTWIN_MCP_URL") or (_ST_PREV if _ST_PREV != _ST_DEFAULT else None)
 if _ST_URL:
     cfg["smart-twin-mcp"] = {"url": _ST_URL, "transport": "streamable_http"}
@@ -577,6 +580,8 @@ _ARP = _carry("ARP_TOKEN",
               "ARP_TOKEN")
 _ARP_PREV = _prev("arp")                      # 예: http://<ARP 서버>:3001/mcp
 _ARP_BASE = e.get("ARP_BASE") or (_ARP_PREV.split("/mcp")[0] if _ARP_PREV else None)
+# ⚠ 아래 `if` 줄도 **글자 그대로** 읽힌다 — update-all 의 `_gw_stale` 이 `grep -F` 로 찾아 '무토큰 arp 를 빼는 판' 인지 가리고, 포털
+#   시험이 이 블록을 원문에서 꺼내 돌린다. 고쳐 쓰면 방아쇠가 조용히 꺼진다 — 저쪽과 함께 고친다(그 글자를 주석에 옮겨 적지 않는다).
 if _ARP_BASE and _ARP:
     cfg["arp"] = {"url": f'{_ARP_BASE.rstrip("/")}/mcp', "transport": "streamable_http",
                   "headers": {"Authorization": f"Bearer {_ARP}"}}

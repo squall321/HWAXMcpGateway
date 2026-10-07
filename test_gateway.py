@@ -3780,3 +3780,23 @@ def test_REST_프록시도_만료를_같은_말로_답한다(monkeypatch):
 def test_키_조회_한도의_기본값과_손잡이(tmp_path):
     assert _limits(tmp_path, ["JWKS_TIMEOUT_S"])[0] == {"JWKS_TIMEOUT_S": 5.0}
     assert _limits(tmp_path, ["JWKS_TIMEOUT_S"], GATEWAY_JWKS_TIMEOUT="2")[0] == {"JWKS_TIMEOUT_S": 2.0}
+
+
+# ── verify_answer — 낡아서 버린 조회 기록을 '조회한 적 없다' 로 말하지 않는다(결정표 gateway-19, 값은 그대로) ─────────
+def test_조회_기록이_만료됐으면_없다고_하지_않고_만료라고_손잡이와_함께_말한다(monkeypatch):
+    monkeypatch.setattr(gw, "_EVID", gw.OrderedDict())
+    monkeypatch.setattr(gw, "_request_user", lambda: "a@b.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    clk = _Clock()
+    monkeypatch.setattr(gw, "time", clk)
+    gw._evid_keep("compute_x", types.CallToolResult(content=[types.TextContent(type="text", text='{"stress": 48039.32}')]))
+
+    def note():
+        body = json.loads(asyncio.run(gw._verify_answer({"text": "응력 48039.32 MPa"})).content[0].text)
+        return body["note"], body["unsourced"], body["tool_calls"]
+    assert note() == ("모든 수치가 조회 결과에 있다.", [], ["compute_x"])
+    clk.now += gw.EVID_TTL_S + 1                            # 30분 넘게 아무 도구도 안 불렀다(긴 심의를 기다렸다)
+    said, unsourced, calls = note()
+    assert unsourced == ["48039.32"] and calls == [], "낡은 기록으로 초록을 주면 안 된다(값은 그대로다)"
+    assert "만료" in said and "EVID_TTL_S" in said and str(gw.EVID_TTL_S) in said and "도구를 다시" in said
+    assert "조회 기록이 없다" not in said, "조회를 안 한 것으로 읽힌다"

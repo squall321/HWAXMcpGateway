@@ -2233,7 +2233,10 @@ async def _verify_answer(arguments: dict) -> types.CallToolResult:
                        "검증을 건너뛴 것이지 수치가 맞다는 뜻이 아닙니다."},
             ensure_ascii=False))], isError=False)
     exp, calls = _EVID.get(key, (0.0, []))
-    if exp and exp < time.monotonic():
+    # 조회는 했는데 기록이 낡아 버려진 것과, 조회를 아예 안 한 것은 다르다 — 같은 말("조회 기록이 없다")이면 방금 수치를
+    # 조회하고 긴 작업을 돌린 사람이 '내가 조회를 안 했구나' 로 읽는다. 만료는 만료라고 말한다(gateway-19).
+    stale = bool(exp and exp < time.monotonic())
+    if stale:
         calls = []
     src = " ".join(t for _, t in calls).replace(",", "")
     seen, bad, checked = set(), [], 0
@@ -2255,7 +2258,9 @@ async def _verify_answer(arguments: dict) -> types.CallToolResult:
     payload = {
         "checked": checked, "unsourced": bad[:12],
         "tool_calls": [t for t, _ in calls],
-        "note": ("조회 기록이 없다 — 도구를 먼저 부르고 그 결과로 답하라."
+        "note": (f"조회 기록이 만료됐다 — 마지막 조회 뒤 {EVID_TTL_S}초가 지났다(EVID_TTL_S). 도구를 다시 부르고 그 결과로 답하라."
+                 if stale else
+                 "조회 기록이 없다 — 도구를 먼저 부르고 그 결과로 답하라."
                  if not calls else
                  ("모든 수치가 조회 결과에 있다." if not bad else
                   "위 수치는 이번 세션 조회 결과에서 찾지 못했다. 도구로 다시 확인하거나, "

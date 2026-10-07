@@ -3800,3 +3800,34 @@ def test_조회_기록이_만료됐으면_없다고_하지_않고_만료라고_�
     assert unsourced == ["48039.32"] and calls == [], "낡은 기록으로 초록을 주면 안 된다(값은 그대로다)"
     assert "만료" in said and "EVID_TTL_S" in said and str(gw.EVID_TTL_S) in said and "도구를 다시" in said
     assert "조회 기록이 없다" not in said, "조회를 안 한 것으로 읽힌다"
+
+
+# ── 사람별 위임 토큰의 수명은 호출 한도보다 길어야 한다(결정표의 계약 — gateway-12 는 값을 그대로 둔다) ──────────────
+@pytest.mark.parametrize("expires_in,warned", [(900, False), (601, False), (600, True), (300, True)])
+def test_위임_토큰의_수명이_호출_한도보다_길지_않으면_발급_때_말한다(monkeypatch, caplog, expires_in, warned):
+    """캐시 여유(2분)를 호출 한도만큼 늘리지 않기로 했다 — 수명 짧은 발급자에서 호출마다 재발급·폐기가 일어난다. 그 대신
+    발급자의 수명이 호출 한도보다 길어야 하는데, 그 값은 남의 리포에 있어 어긋나도 아무도 모른다. 실제로 받은 값으로 말한다.
+    hwax_risk 의 900초는 맞는 값이다 — 거짓 경고를 내면 안 된다."""
+    monkeypatch.setattr(gw, "CALL_TIMEOUT_S", 600)
+    n, clk = _mint_kit(monkeypatch, lambda i: {"access_token": f"secret-tok-{i}", "expires_in": expires_in})
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        asyncio.run(_pat_at(clk, 0))
+    said = [r.getMessage() for r in caplog.records if "GATEWAY_CALL_TIMEOUT" in r.getMessage()]
+    assert len(said) == (1 if warned else 0), said
+    if warned:
+        assert "reportarchive" in said[0] and str(expires_in) in said[0] and "600" in said[0]
+    assert "secret-tok" not in caplog.text, "토큰은 찍지 않는다"
+
+
+def test_리스크_앱의_위임_토큰_수명이_게이트웨이_호출_한도보다_길다():
+    """두 리포에 걸친 계약이다 — 한쪽만 바꾸면 리스크 앱의 긴 도구가 도는 중에 자격이 끝난다. 소스의 기본값끼리 본다
+    (배포값은 발급 때의 경고가 본다)."""
+    import re
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(gw.__file__))), "HWAXRisk", "backend", "app", "config.py")
+    if not os.path.exists(path):
+        pytest.skip("HWAXRisk 리포가 옆에 없다")
+    m = re.search(r'"HWAXRISK_SSO_TTL_S",\s*"(\d+)"', open(path, encoding="utf-8").read())
+    assert m, "HWAXRisk 에서 HWAXRISK_SSO_TTL_S 기본값을 못 읽었다 — 이름이 바뀌었나"
+    src = open(gw.__file__, encoding="utf-8").read()
+    call = int(re.findall(r"\d+", re.search(r"^CALL_TIMEOUT_S\s*=.*$", src, re.M).group(0))[-1])
+    assert int(m.group(1)) > call, f"위임 토큰 {m.group(1)}초가 호출 한도 {call}초보다 길지 않다"

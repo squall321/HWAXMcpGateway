@@ -2685,6 +2685,13 @@ async def _user_pat(app_id: str, email: str, *, force: bool = False) -> str:
         ttl = USER_PAT_TTL_S
         if isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp > 0:
             ttl = max(0, min(USER_PAT_TTL_S, exp - 120))
+            # ⚠ 여유 2분은 **이 토큰을 받는 백엔드의 도구가 짧거나, 토큰을 요청이 도착할 때만 본다**는 전제 위에 있다. 여유를 호출
+            #   한도만큼 늘리지 않는다 — 수명이 짧은 발급자(hwax_risk 900초)에서 캐시가 사실상 꺼져 호출마다 재발급이 일어나고,
+            #   발급이 직전 토큰을 폐기해 같은 사람의 다른 좌석이 쥔 토큰이 죽는다(결정표 gateway-12). 대신 발급자의 수명이 호출
+            #   한도보다 길어야 한다 — 짧으면 도구가 도는 중에 끝날 수 있으므로, 조용히 두지 않고 발급 때 말한다.
+            if exp <= CALL_TIMEOUT_S:
+                log.warning("user PAT on %s: 수명 %g초가 호출 한도 %g초(GATEWAY_CALL_TIMEOUT)보다 길지 않다 — 도구가 도는 중에 "
+                            "토큰이 끝날 수 있다. 그 앱의 위임 토큰 수명을 호출 한도보다 길게 둔다", app_id, exp, CALL_TIMEOUT_S)
         _USER_PATS[key] = (tok, time.monotonic() + ttl)
         log.info("user PAT minted for %s on %s", email, app_id)
         return tok

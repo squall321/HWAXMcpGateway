@@ -1223,6 +1223,10 @@ async def _portal_affiliation(email: str, base_groups: list[str]) -> str:
 # 신원 귀속: 호출자의 Authorization(포털 PAT)을 그대로 포털 REST 에 포워딩 → 포털이
 # 자체 검증해 owner_sub = PAT sub. 게이트웨이는 신원 매핑을 하지 않는다(위조 불가).
 # GW_TOKEN 경로(내부 에이전트)는 포털이 401 → CONV_UNAVAILABLE 반환(비치명적 폴백).
+# 포털이 저장을 확인하기까지 기다리는 한도(초). 종전 15초는 엄한 쪽이 틀렸다 — 수 시간짜리 심의의 전사(발언 200개, 각 2만 자까지)를
+# 보존하는 단 한 번의 쓰기이고, 이 도구는 실패를 비치명으로 안내해 오케스트레이터가 전사 없이 넘어간다(gateway-15).
+# 연결(8초)은 죽은 포털을 재는 값이라 짧게 둔다.
+PORTAL_SAVE_TIMEOUT_S = float(os.environ.get("GATEWAY_PORTAL_SAVE_TIMEOUT", "120"))
 SAVE_CONV_TOOL = types.Tool(
     name="save_conversation",
     description=(
@@ -1338,7 +1342,7 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
             [_msg(m) for m in raw_msgs if isinstance(m, dict)]),
     }
     try:
-        async with httpx.AsyncClient(timeout=15.0) as cli:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(PORTAL_SAVE_TIMEOUT_S, connect=8.0)) as cli:
             r = await cli.post(f"{base}/agent/conversations", json=body,
                                headers={"Authorization": auth})
         if r.status_code != 200:
@@ -1350,6 +1354,10 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
             content=[types.TextContent(type="text",
                      text=json.dumps({"ok": True, "conversation_id": cid}))],
         )
+    except httpx.ReadTimeout:
+        # 본문은 다 보냈고 답만 못 받았다 — 포털이 이미 커밋했을 수 있어 무턱대고 다시 보내면 같은 대화가 두 벌 생긴다.
+        return _fail(f"포털이 {PORTAL_SAVE_TIMEOUT_S:g}초 안에 저장을 확인하지 않았다(GATEWAY_PORTAL_SAVE_TIMEOUT) — "
+                     "저장됐을 수 있으니 다시 보내기 전에 대화 목록을 확인하라")
     except Exception as e:  # noqa: BLE001 — 포털 미가용은 비치명적(폴백 계약)
         return _fail(repr(e))
 

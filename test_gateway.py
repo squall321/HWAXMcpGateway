@@ -3522,3 +3522,49 @@ def test_레지스트리에서_빠진_앱은_열_패스째에_뗀다(monkeypatch
         return seen
     seen = asyncio.run(asyncio.wait_for(go(), 5))
     assert len(seen) == 10 and seen == [True] * 9 + [False] and stopped == [1]
+
+
+# ── save_conversation — 수 시간의 전사를 남기는 한 번의 쓰기(결정표 gateway-15) ──────────────────────────────
+def _save_kit(monkeypatch, post):
+    """`_save_conversation` 을 실제로 태우고 포털 POST 만 `post` 로 바꾼다 → (결과, 클라이언트를 만든 timeout)."""
+    from types import SimpleNamespace as NS
+    made = {}
+
+    class _Cli:
+        def __init__(self, *a, **k): made["timeout"] = k.get("timeout")
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None): return await post()
+    monkeypatch.setattr(gw, "_portal_api_base", lambda: "http://portal")
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    monkeypatch.setattr(gw, "_low", NS(request_context=NS(request=NS(headers={"authorization": "Bearer t"}, client=None))))
+    res = asyncio.run(gw._save_conversation({"title": "심의", "messages": [{"role": "user", "content": "q"}]}))
+    return res, made["timeout"]
+
+
+def test_대화_저장은_포털의_확인을_넉넉히_기다리고_죽은_포털은_짧게_잰다(monkeypatch):
+    async def ok():
+        return httpx.Response(200, json={"id": "c-1"})
+    res, timeout = _save_kit(monkeypatch, ok)
+    assert not res.isError and json.loads(res.content[0].text) == {"ok": True, "conversation_id": "c-1"}
+    assert isinstance(timeout, httpx.Timeout), "종전에는 connect·read·write·pool 이 전부 15초였다"
+    assert (timeout.read, timeout.connect) == (gw.PORTAL_SAVE_TIMEOUT_S, 8.0)
+
+
+def test_대화_저장이_한도를_넘기면_손잡이와_다시_보내기_전에_할_일을_말한다(monkeypatch):
+    """종전 문구는 `CONV_UNAVAILABLE: ReadTimeout('')` 였다 — 얼마를 기다렸는지도, 포털이 이미 저장했을 수 있다는 것도 없어
+    오케스트레이터는 전사 없이 넘어가거나 같은 대화를 두 벌 만들었다."""
+    async def slow():
+        raise httpx.ReadTimeout("")
+    res, _ = _save_kit(monkeypatch, slow)
+    text = res.content[0].text
+    assert res.isError and text.startswith("CONV_UNAVAILABLE: ")
+    assert f"{gw.PORTAL_SAVE_TIMEOUT_S:g}초 안에 저장을 확인하지 않았다(GATEWAY_PORTAL_SAVE_TIMEOUT)" in text
+    assert "대화 목록을 확인" in text
+    row = _rows()[-1]
+    assert row["ok"] is False and "GATEWAY_PORTAL_SAVE_TIMEOUT" in row["error"]
+
+
+def test_대화_저장_한도의_기본값과_손잡이(tmp_path):
+    assert _limits(tmp_path, ["PORTAL_SAVE_TIMEOUT_S"])[0] == {"PORTAL_SAVE_TIMEOUT_S": 120.0}
+    assert _limits(tmp_path, ["PORTAL_SAVE_TIMEOUT_S"], GATEWAY_PORTAL_SAVE_TIMEOUT="300")[0] == {"PORTAL_SAVE_TIMEOUT_S": 300.0}

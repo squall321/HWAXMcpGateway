@@ -387,6 +387,9 @@ def test_RA_위임과_TestScope_가_ste_hwax_risk_를_건드리지_않는다(tmp
 
 
 # ── 일반 앱 위임(PER_USER_SSO_APPS) — 여섯 번째 앱부터 provision-config.sh 를 고치지 않는다(change-request-8-10 #8) ──
+GENERIC_MARK = {"managed_by": "PER_USER_SSO_APPS"}      # 순회가 쓴 항목의 표지 — 목록에서 뺀 앱을 끌 때 이것으로 가린다
+
+
 def test_일반_앱_위임은_PER_USER_SSO_APPS_로_생긴다(tmp_path):
     """앱별 분기가 3개에서 5개로 늘었다 — 모양이 {sso_url, secret, client} 인 앱은 env 만으로 붙는다."""
     log: list = []
@@ -397,9 +400,10 @@ def test_일반_앱_위임은_PER_USER_SSO_APPS_로_생긴다(tmp_path):
                                     "OTHER_SSO_URL": "http://other.example:9100/api/auth/sso"}, log)
     pu_ = out["heax_registry"]["per_user_sso"]
     assert pu_ == {
-        "newapp": {"sso_url": "http://newapp.example:9000/api/auth/sso", "secret": "na-secret-xyz", "client": "gateway"},
+        "newapp": {"sso_url": "http://newapp.example:9000/api/auth/sso", "secret": "na-secret-xyz", "client": "gateway",
+                   **GENERIC_MARK},
         "other-app": {"sso_url": "http://other.example:9100/api/auth/sso", "secret": "ot-secret-xyz",
-                      "client": "gateway"}}
+                      "client": "gateway", **GENERIC_MARK}}
     assert "newapp 사람별 위임 — http://newapp.example:9000/api/auth/sso" in log[0]
     assert "na-secret-xyz" not in log[0] and "ot-secret-xyz" not in log[0]
     # 목록에 없는 접두의 비밀은 아무것도 만들지 않는다 — 이름을 적어야 붙는다
@@ -429,15 +433,15 @@ def test_일반_앱_위임은_비밀이_없는_실행에도_지워지지_않는�
     # 목록만 있고 비밀이 없는 실행
     got = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP"})["heax_registry"]["per_user_sso"]["newapp"]
     assert got == prev
-    # 비밀만 새로 주면 주소는 직전 값을 지킨다
+    # 비밀만 새로 주면 주소는 직전 값을 지킨다 — 순회가 쓴 항목이라 표지가 붙는다(이어받기만 한 위의 둘에는 없다)
     got = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP", "NEWAPP_SSO_SECRET": "new"}
                          )["heax_registry"]["per_user_sso"]["newapp"]
-    assert got == {**prev, "secret": "new"}
+    assert got == {**prev, "secret": "new", **GENERIC_MARK}
     # env 주소가 직전 값을 이긴다
     got = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP", "NEWAPP_SSO_SECRET": "new",
                                     "NEWAPP_SSO_URL": "http://newapp2.example:9000/api/auth/sso"}
                          )["heax_registry"]["per_user_sso"]["newapp"]
-    assert got == {**prev, "secret": "new", "sso_url": "http://newapp2.example:9000/api/auth/sso"}
+    assert got == {**prev, "secret": "new", "sso_url": "http://newapp2.example:9000/api/auth/sso", **GENERIC_MARK}
 
 
 def test_일반_순회로_기존_다섯_앱의_위임을_덮지_못한다(tmp_path):
@@ -480,10 +484,43 @@ def test_일반_앱_위임도_PER_USER_SSO_OFF_로_끈다(tmp_path):
     # 비밀이 같이 오면 끄지 않는다(켜는 쪽이 이긴다) — RA·TestScope 와 같다
     pu_ = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP", "PER_USER_SSO_OFF": "newapp",
                                     "NEWAPP_SSO_SECRET": "new"})["heax_registry"]["per_user_sso"]
-    assert pu_["newapp"] == {**prev, "secret": "new"}
+    assert pu_["newapp"] == {**prev, "secret": "new", **GENERIC_MARK}
     # 목록에 없는 이름은 끄지 않는다 — 어느 env 가 그 앱의 비밀인지 모르면 '비밀이 비었다' 를 판정할 수 없다
     pu_ = _run_provision(tmp_path, {"PER_USER_SSO_OFF": "newapp"})["heax_registry"]["per_user_sso"]
     assert pu_["newapp"] == prev
+
+
+def test_목록에서_뺀_일반_앱은_표지가_있는_것만_PER_USER_SSO_OFF_로_꺼진다(tmp_path):
+    """앱을 걷는 자연스러운 방법은 provision.env 에서 PER_USER_SSO_APPS 의 쌍과 <접두>_SSO_* 줄을 지우는 것이다. 그런데 끄는
+    표는 **이번 실행의 목록에 있는** 키만 받아, 줄을 지운 앱은 PER_USER_SSO_OFF 로도 꺼지지 않았다 — 위임이 옛 비밀로 남아
+    게이트웨이가 그 앱에 계속 사람별 토큰을 청한다. 순회가 쓴 항목에 표지를 남겨, 목록에서 빠진 표지 항목은 이름만 오면 끈다.
+    목록이 빈 실행에 스스로 지우지는 않는다 — 손으로 돌린 --force 에는 목록이 없다(그러면 일반 앱 위임이 전부 꺼진다)."""
+    made = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP", "NEWAPP_SSO_SECRET": "na-secret-xyz",
+                                    "NEWAPP_SSO_URL": "http://newapp.example:9000/api/auth/sso"}
+                          )["heax_registry"]["per_user_sso"]["newapp"]
+    assert made["managed_by"] == "PER_USER_SSO_APPS"
+    hand = {"sso_url": "http://hand.example:9200/api/auth/sso", "secret": "hand-secret", "client": "gateway"}   # 손으로 붙인 위임
+    ste = {"sso_url": "http://127.0.0.1:15810/api/auth/sso", "secret": "s2", "client": "gateway"}
+    tagged = {**hand, "managed_by": "ops-playbook"}                 # 다른 것이 붙인 표지 — 이 순회의 것이 아니다
+    before = {"newapp": made, "hand": hand, "tagged": tagged, "ste": ste}
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({
+        "heax_registry": {"per_user_sso": before}}), encoding="utf-8")
+
+    def run(env, log=None):
+        return _run_provision(tmp_path, env, log)["heax_registry"]["per_user_sso"]
+    # 목록도 끄기 신호도 없는 실행(손으로 돌린 --force) — 이어받는다
+    assert run({}) == before
+    # 쌍은 남아 있는데 접두를 잘못 적었다 — 뺀 것으로 치지 않는다(오타 하나로 위임이 꺼지면 안 된다)
+    assert run({"PER_USER_SSO_APPS": "newapp:NEW-APP", "PER_USER_SSO_OFF": "newapp"}) == before
+    # 목록에서 빠졌고 update-all 이 이름을 넘겼다 — 그 앱만 꺼진다. 표지 없는 항목과 이 파일이 직접 만드는 앱은 그대로다
+    log: list = []
+    assert run({"PER_USER_SSO_OFF": "reportarchive testscope newapp hand tagged ste"}, log) == {
+        "hand": hand, "tagged": tagged, "ste": ste}
+    off = [l for l in log[0].splitlines() if "사람별 위임 끔" in l]
+    assert len(off) == 1 and "newapp" in off[0] and "PER_USER_SSO_APPS 에서 빠졌다" in off[0] and "서비스 계정으로" in off[0]
+    assert "na-secret-xyz" not in log[0] and "hand-secret" not in log[0]
+    # 다른 앱만 목록에 남은 실행도 같다
+    assert "newapp" not in run({"PER_USER_SSO_APPS": "other:OTHER", "PER_USER_SSO_OFF": "newapp"})
 
 
 def test_PER_USER_SSO_APPS_의_못_읽은_쌍은_건너뛰되_말한다(tmp_path):

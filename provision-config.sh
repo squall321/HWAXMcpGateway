@@ -33,7 +33,9 @@
 #      TESTSCOPE_SSO_SECRET(+TESTSCOPE_SSO_URL, 기본 주소 없음). 비밀이 없는 실행은 직전 값을 이어받는다 —
 #      끄는 것은 PER_USER_SSO_OFF(update-all 이 infra/.env 의 빈 RA·TestScope 비밀을 보고 넘긴다)로만.
 #      그 밖의 앱은 이 파일을 고치지 않고 붙인다 — PER_USER_SSO_APPS="<per_user 키>:<ENV 접두> …"
-#      (예: "newapp:NEWAPP" → NEWAPP_SSO_SECRET · NEWAPP_SSO_URL, 기본 주소 없음). PER_USER_SSO_OFF 로도 꺼진다.
+#      (예: "newapp:NEWAPP" → NEWAPP_SSO_SECRET · NEWAPP_SSO_URL, 기본 주소 없음). PER_USER_SSO_OFF 로도 꺼진다 —
+#      쌍을 남기고 비밀을 비웠든, 쌍째 지웠든(순회가 쓴 항목의 managed_by 표지로 가린다). 어느 쪽이든 **이름이 와야** 꺼진다 —
+#      목록이 비었다고 스스로 지우지 않는다. 넘기는 쪽은 provision.env 를 읽은 호출자다(update-all, 손으로는 PER_USER_SSO_OFF=<키>).
 #   9) TestScope: TESTSCOPE_MCP_URL(> 직전 config 주소)이 있으면 testscope 백엔드(서비스 토큰 없음).
 #      사람별 호출은 RA 처럼 두 방식 중 하나다 — 기본은 사람이 포털 '개인 토큰 › 외부 연결' 에 등록한
 #      TestScope 토큰(게이트웨이 PORTAL_CONN_BACKENDS), TESTSCOPE_SSO_SECRET 이 있으면 8)의 위임(게이트웨이에서 먼저 탄다).
@@ -684,8 +686,9 @@ for _i, _pair in enumerate((e.get("PER_USER_SSO_APPS") or "").split(), 1):
     if e.get(f"{_p}_SSO_SECRET"):
         _u = e.get(f"{_p}_SSO_URL") or (per_user.get(_k) or {}).get("sso_url")
         if _u:
+            # managed_by — 이 순회가 쓴 항목이라는 표지다(게이트웨이는 읽지 않는다). 목록에서 뺀 앱을 아래 끄기가 이것으로 가린다.
             per_user[_k] = {**(per_user.get(_k) or {}), "sso_url": _u, "secret": e[f"{_p}_SSO_SECRET"],
-                            "client": "gateway"}
+                            "client": "gateway", "managed_by": "PER_USER_SSO_APPS"}
             print(f"  ✓ {_k} 사람별 위임 — {_u}")
         else:
             print(f"  ⚠ {_p}_SSO_SECRET 은 있는데 주소가 없다({_p}_SSO_URL·직전 config 둘 다 없음) — {_k} 위임 생략")
@@ -693,10 +696,25 @@ for _i, _pair in enumerate((e.get("PER_USER_SSO_APPS") or "").split(), 1):
 # infra/.env 에서 비밀을 비워도 위임이 남아, 포털 화면은 '토큰 등록' 인데 게이트웨이만 위임으로 부르고 거부했다(되돌리기가 안 됐다).
 # update-all 이 infra/.env 를 읽어 비밀이 빈 서비스를 PER_USER_SSO_OFF 로 넘기면 그 항목만 지운다. 비밀이 같이 왔으면 끄지 않고,
 # 받는 이름은 이 둘과 이번 실행의 PER_USER_SSO_APPS 에 적힌 일반 앱뿐이다(ste·hwax_risk 등은 비밀 출처가 다른 리포라 이 손잡이로
-# 끄지 않는다). 일반 앱은 목록에 있어야 꺼진다 — 어느 env 가 그 앱의 비밀인지 모르면 '비밀이 비었다' 를 판정할 수 없다.
+# 끄지 않는다). 일반 앱은 목록에 있어야 '비밀이 비었다' 로 꺼진다 — 어느 env 가 그 앱의 비밀인지 모르면 그 판정을 할 수 없다.
+# ⚠ 목록에서 **뺀** 일반 앱은 따로 받는다 — 앱을 걷을 때 사람은 PER_USER_SSO_APPS 의 쌍과 <접두>_SSO_* 줄을 지운다. 그러면
+# 위 규칙으로는 끌 길이 없어(목록에 없으니 표에 없다) 위임이 옛 비밀로 남고, 게이트웨이는 그 앱에 계속 사람별 토큰을 청했다.
+# 순회가 쓴 항목(managed_by 표지)이고 이번 목록의 어느 쌍도 그 이름이 아니면, PER_USER_SSO_OFF 에 이름이 온 것만으로 끈다.
+#   · 이름은 쌍의 콜론 앞으로 본다(못 읽은 쌍도) — 접두를 잘못 적은 것을 '뺐다' 로 읽어 위임을 끄지 않게.
+#   · 목록이 비었다고 **스스로** 지우지 않는다. 이 스크립트는 provision.env 를 읽지 않아 손으로 돌린 --force 에는 목록이 없다 —
+#     스스로 지우면 그때마다 일반 앱 위임이 전부 꺼진다. '목록에 없다 = 껐다' 는 provision.env 를 읽은 쪽(update-all)이 판정해
+#     이름을 넘길 일이다(RA·TestScope 의 빈 비밀과 같은 길). 손으로 끌 때는 PER_USER_SSO_OFF=<키> 를 주고 --force.
+#   · 표지 없는 이름은 여전히 받지 않는다 — 이 손잡이가 ste·hwax_risk 나 손으로 붙인 위임(비밀 출처를 이 실행이 모른다)을
+#     지우면 안 된다. 표지가 생기기 전에 만든 일반 앱 항목은 비밀과 함께 한 번 다시 돌면 표지가 붙는다.
 _SSO_OFF_KEYS = {"reportarchive": ("RA_SSO_SECRET", "RA"), "testscope": ("TESTSCOPE_SSO_SECRET", "TestScope"),
                  **_GENERIC_SSO}
+_SSO_LISTED = {_pair.partition(":")[0] for _pair in (e.get("PER_USER_SSO_APPS") or "").split()}
 for _k in (e.get("PER_USER_SSO_OFF") or "").split():
+    _cur = per_user.get(_k)
+    if _k not in _SSO_LISTED and isinstance(_cur, dict) and _cur.get("managed_by") == "PER_USER_SSO_APPS":
+        per_user.pop(_k)
+        print(f"  · {_k} 사람별 위임 끔(PER_USER_SSO_APPS 에서 빠졌다) — 서비스 계정으로")
+        continue
     if _k in _SSO_OFF_KEYS and not e.get(_SSO_OFF_KEYS[_k][0]) and per_user.pop(_k, None):
         # 일반 앱에는 포털 등록 토큰 길(게이트웨이 PORTAL_CONN_BACKENDS)이 없다 — 위임을 끄면 서비스 계정으로 나간다.
         _to = "서비스 계정으로" if _k in _GENERIC_SSO else "등록 토큰 방식으로"

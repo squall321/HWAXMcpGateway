@@ -3886,9 +3886,11 @@ def test_리스크_앱의_위임_토큰_수명이_게이트웨이_호출_한도�
 # ── 호출자들이 기대는 전제 — 게이트웨이는 응답 스트림에 15초마다 ping 을 싣는다(결정표의 계약) ─────────────────────
 def test_응답_스트림의_15초_ping_전제가_그대로다():
     """sse-starlette 의 기본값이고 MCP SDK 는 간격을 따로 주지 않는다. 호출자들의 한도가 이 수에 기대어 있다 — httpx 침묵
-    한도가 15초보다 크면 죽은 게이트웨이만 잡고(포털 90·260초, 리스크 앱 30·60초) 15초보다 작으면 그것이 실제 호출 상한이며,
-    nginx `/mcp-gw/` 의 침묵 1시간과 수 시간짜리 `deliberate_status` 폴링 세션도 이 ping 덕에 끊기지 않는다. 라이브러리를
-    올려 간격이 바뀌거나 꺼지면 그 값들의 뜻이 조용히 바뀐다 — 여기서 걸리면 저쪽 한도를 같이 본다."""
+    한도가 15초보다 크면 죽은 게이트웨이만 잡고(포털 `upload.mcp_call` 의 timeout·절차 실행기 `CLIENT_TIMEOUT`, 리스크 앱
+    `HWAXRISK_SOURCE_CALL_TIMEOUT_S`·`ra_client.DEFAULT_TIMEOUT` — 값은 각 리포가 정본이라 여기 적지 않는다) 15초보다 작으면
+    그것이 실제 호출 상한이며(리스크 앱의 필드 근거 조회 `field_source.FIELD_TIMEOUT_S`), nginx `/mcp-gw/` 의 침묵 1시간과
+    수 시간짜리 `deliberate_status` 폴링 세션도 이 ping 덕에 끊기지 않는다. 라이브러리를 올려 간격이 바뀌거나 꺼지면 그
+    값들의 뜻이 조용히 바뀐다 — 여기서 걸리면 저쪽 한도를 같이 본다."""
     import inspect
     import re
 

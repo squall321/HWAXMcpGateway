@@ -98,6 +98,8 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 | `GATEWAY_REST_CALL_TIMEOUT` | 호출 한도 | `rest_call` 한 건 — read 침묵과 전체 기한 둘 다(연결은 10초). 전용 도구가 없을 때의 다리라 도구 호출과 같은 단위다 | `<사이트> 가 600초 안에 답하지 않았다(GATEWAY_REST_CALL_TIMEOUT)` — 느린 것이다. 연결 시간 초과·거부는 종전대로 `upstream unreachable` |
 | `GATEWAY_JWKS_TIMEOUT` | 5 | 호출자 토큰(포털 PAT)을 검증할 때의 포털 서명 키 조회 — `/mcp` 와 `/api/<site>/` 둘 다. 스레드에서 돈다(동기 urllib 가 이벤트 루프를 붙잡지 않게) | 검증 실패로 다뤄져 401 `unauthorized`(감사 `unverified-token`). 포털이 매달려도 진행 중인 호출과 ping 은 멈추지 않는다 |
 
+**0 은 '끔' 이 아니다.** 이 표에 0 을 '끔'·'없음' 으로 읽는 손잡이는 없다 — 기한 0 은 상대에 닿기도 전에 걸린다. 엔진의 `MCP_CALL_TIMEOUT_S`·`DELIB_TIMEOUT_S` 가 0=없음이라 같은 뜻으로 적기 쉽다. `GATEWAY_CALL_TIMEOUT` 과 `GATEWAY_RECONNECT_TIMEOUT` 은 0 이하를 **받지 않는다** — 따르면 모든 도구 호출(재연결 한도는 단발 세션의 호출)이 곧바로 실패하므로, 기본값(600 · 30)으로 돌고 기동 로그에 `GATEWAY_CALL_TIMEOUT=0 는 따르지 않는다 …` 를 남긴다. 호출 한도는 끌 수 없다(아래 '층'). 나머지 초 단위 손잡이는 적은 값을 그대로 쓰므로 0 을 적지 않는다 — 그 길이 곧바로 실패한다(`GATEWAY_BACKEND_READ_TIMEOUT` 만 호출 한도보다 크지 않으면 스스로 바로잡는다).
+
 층 — 핸드셰이크·재연결 30 < 호출 600 < 전송 read·단발 세션 바깥 기한 660(= 30 + 600 + 30) < 엔진 `MCP_CALL_TIMEOUT_S` 900 < nginx `/mcp-gw/` 3600. 포털 절차 워밍업(690)도 660 바깥이다. **`GATEWAY_CALL_TIMEOUT` 을 올리면 엔진·포털 워밍업·nginx 셋을 같은 폭으로 올린다**(전송 read 와 단발 세션 바깥 기한은 스스로 따라 오른다). 안쪽(백엔드 자신의 한도 — KooRemapper MCP→REST 240, AIDataHub 풀 60 + 검색 90 등)은 600 보다 작아야 한다. HWAXPortal 절차 시험(`test_procedures_census`)이 `gateway.py` 의 기본값을 읽어 30~600 으로 묶으므로 600 을 넘기려면 그 상한부터 고친다. 600 으로도 모자란 도구는 한도를 올리지 말고 잡 도구(제출 + 상태 조회)로 돌린다 — 이 값이 호출 중 죽은 무상태 백엔드에서 호출자를 풀어 주는 마지막 값이다.
 
 그대로 둔 값 — 느린 일을 재지 않고 죽은 상대·신선도를 재는 값이라 짧게 둔다.

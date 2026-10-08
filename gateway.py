@@ -134,9 +134,22 @@ AUDIT_PATH = os.environ.get("GATEWAY_AUDIT", str(Path(__file__).with_name("audit
 #   HWAXPortal 절차 시험(test_procedures_census)은 `CALL_TIMEOUT_S =` 줄의 **마지막 숫자**를 기본값으로 읽어 30~600 으로
 #   묶는다 — 그 줄 끝에 숫자 든 주석을 달지 않고, 600 을 넘기려면 그 시험의 상한부터 고친다.
 CALL_TIMEOUT_S = int(os.environ.get("GATEWAY_CALL_TIMEOUT", "600"))
+if CALL_TIMEOUT_S <= 0:
+    # 0 은 '끔' 이 아니다 — 기한 0 은 백엔드에 닿기도 전에 걸려 모든 도구 호출이 `0초 안에 답하지 않았다` 로 곧바로 실패하고,
+    # 여기서 유도되는 전송 read·rest_call 한도까지 같이 무너진다(사본 재현). 엔진의 MCP_CALL_TIMEOUT_S·DELIB_TIMEOUT_S 는
+    # 0=없음이라 같은 뜻으로 적기 쉽다. 이 한도는 끌 수 없으므로(위) 조용히 따르지도, 0 을 '없음' 으로 읽지도 않고 기본값으로
+    # 돈다 — 아래 숫자는 위 줄의 기본값과 같아야 한다(시험이 '적지 않은 것과 같다' 로 둘을 묶는다).
+    log.warning("GATEWAY_CALL_TIMEOUT=%d 는 따르지 않는다 — 0 이하는 '끔' 이 아니라 모든 도구 호출의 즉시 실패다(이 한도는 끌 수 "
+                "없다). 기본값 600 으로 돈다", CALL_TIMEOUT_S)
+    CALL_TIMEOUT_S = 600
 # 죽은 상대를 기다리는 한도(초) — 단발 세션의 핸드셰이크(connect + initialize)와, 실패한 호출 뒤 상주 세션이 돌아오기를 기다리는
 # 시간. 느린 도구가 아니라 답 없는 상대를 재는 값이라 호출 한도와 따로, 짧게 둔다(gateway-04·05).
 RECONNECT_TIMEOUT_S = float(os.environ.get("GATEWAY_RECONNECT_TIMEOUT", "30"))
+if RECONNECT_TIMEOUT_S <= 0:
+    # 같은 이유다 — 0 이면 단발 세션(사람별·등록 토큰·신원 전달)이 `0초 안에 세션을 열지 못했다` 로 한 번도 열리지 않는다.
+    log.warning("GATEWAY_RECONNECT_TIMEOUT=%g 는 따르지 않는다 — 0 이하는 '끔' 이 아니라 단발 세션 호출의 즉시 실패다. "
+                "기본값 30 으로 돈다", RECONNECT_TIMEOUT_S)
+    RECONNECT_TIMEOUT_S = 30.0
 # 백엔드 세션 아래에 깔린 HTTP 한도(초). MCP SDK 기본값(connect/write/pool 30 · read 침묵 300)이 손잡이 없이 숨어 있었다.
 # read 는 호출 한도보다 **커야** 한다 — ping 을 안 보내는 백엔드(JSON 응답)에서는 이것이 먼저 걸리면 호출 한 건이 아니라 세션째
 # 무너져 같은 세션의 무관한 호출까지 끊긴다(사본 재현). 호출 한도가 300 을 넘는 순간 숨은 300 이 실제 상한이 되므로 기본을

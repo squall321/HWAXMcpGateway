@@ -2975,6 +2975,18 @@ def test_호출_한도를_올리면_전송_한도가_따라_오르고_뒤집힌_
     assert "GATEWAY_BACKEND_READ_TIMEOUT" in log_ and "GATEWAY_CALL_TIMEOUT" in log_, "왜 다른 값을 쓰는지 기동 로그가 말해야 한다"
 
 
+def test_호출_한도와_재연결_한도에_0_이하를_적으면_따르지_않는다(tmp_path):
+    """0 은 '끔' 이 아니다 — 기한 0 은 백엔드에 닿기도 전에 걸린다. 호출 한도가 0 이면 모든 도구 호출이 `0초 안에 답하지 않았다` 로,
+    재연결 한도가 0 이면 단발 세션(사람별·등록 토큰·신원 전달)의 호출이 `0초 안에 세션을 열지 못했다` 로 곧바로 실패했다.
+    엔진의 `MCP_CALL_TIMEOUT_S`·`DELIB_TIMEOUT_S` 는 0=없음이라 같은 뜻으로 적기 쉽다. 적지 않은 것과 **같아야** 한다 —
+    유도되는 값까지(종전에는 전송 read 가 60, rest_call 이 운영자가 적지도 않은 손잡이 이름을 대며 0 이 됐다)."""
+    names = _CALL_LIMITS + ["REST_CALL_TIMEOUT_S"]
+    got, log_ = _limits(tmp_path, names, GATEWAY_CALL_TIMEOUT="0", GATEWAY_RECONNECT_TIMEOUT="-1")
+    assert got == _limits(tmp_path, names)[0]
+    for said in ("GATEWAY_CALL_TIMEOUT=0 ", "GATEWAY_RECONNECT_TIMEOUT=-1 "):
+        assert said in log_, f"적은 값을 왜 안 따르는지 기동 로그가 말해야 한다({said.strip()})"
+
+
 def test_호출_한도_줄의_마지막_숫자가_기본값이다():
     """HWAXPortal 절차 시험(test_procedures_census)은 이 줄의 **마지막 숫자**를 게이트웨이 기본값으로 읽어 30~600 으로 묶고,
     절차 단계 상한 < 이 값 < 워밍업을 단언한다. 줄 끝에 숫자 든 주석을 달거나 600 을 넘기면 저쪽이 조용히 다른 값을 읽는다."""

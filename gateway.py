@@ -1049,6 +1049,8 @@ _INSTRUCTIONS = """HWAX 엔지니어링 허브 — 사내 설계·해석·품질
    게이트웨이가 정책을 아직 못 받은 일시 상태다, 잠시 뒤 같은 호출을 다시 하라(요청하라고 하지 마라).
 10. `list_tool_apps` 의 `muted_apps` 는 사용자가 포털에서 **꺼 둔** 앱이다(권한 문제가 아니다 — 요청하라고 하지 마라).
    사용자가 그 앱을 쓰라고 할 때만 `list_tool_apps(app='<키>')` 로 도구를 보고 `invoke_tool` 로 부른다.
+11. 설계 리스크 심사(과제 올리기·캡처·변경 비교·심사 시작·결과)는 `risk_next_step` 부터 — 단계·막힌 곳·다음 호출을 준다.
+   그 `next` 를 따라 쓰기 도구를 부를 때도 5번대로 사용자에게 먼저 확인한다(`consent` 는 사람이 동의한 뒤에만 true).
 """
 
 fm = FastMCP("hwax-mcp-gateway", instructions=_INSTRUCTIONS)

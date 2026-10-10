@@ -4623,3 +4623,14 @@ def test_위임_헤더_이름과_단언_꼴이_리스크_앱과_같다():
     if "x-hwax-delegate" not in routes.lower():
         pytest.skip("이 체크아웃의 리스크 앱은 아직 위임 헤더를 읽지 않는다(HWAXRisk 8e327d6 이전)")
     assert f'"{gw.DELEGATE_HEADER.lower()}"' in routes, "앱이 읽는 위임 헤더 이름이 게이트웨이가 싣는 것과 다르다"
+
+
+def test_지침이_리스크_심사는_risk_next_step_부터라고_말한다():
+    """리스크 앱의 Claude 입구(쓰기 9종 + 길잡이)는 id 를 여럿 잇는 긴 길이라, 모델이 도구 목록에서 아무 쓰기나 먼저 고르면
+    과제·소스가 엉뚱한 자리에 생긴다(소스는 지울 수 없다). 길잡이가 단계·막힌 곳·다음 호출을 한 번에 준다 — 허브 지침에서 그리로
+    보낸다. 길잡이가 채워 주는 쓰기 인자도 사람 확인을 건너뛰는 근거가 아니다(5번)."""
+    assert "risk_next_step" in gw._INSTRUCTIONS
+    i = gw._INSTRUCTIONS.index("risk_next_step")
+    item = gw._INSTRUCTIONS[gw._INSTRUCTIONS.rfind("\n", 0, i):]
+    assert "리스크 심사" in item and "확인" in item and "consent" in item, item
+    assert len(gw._INSTRUCTIONS) < 2048, "Claude Code 는 서버 지침을 2048자에서 자른다"

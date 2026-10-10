@@ -2773,7 +2773,7 @@ def test_소속_조회는_게이트웨이가_붙인_관리자_표지를_로그�
 
 
 # ── REST 프록시(/api/<site>/…)도 같은 규칙이다 — 두 경로가 그룹을 따로 계산한다(검토 2026-10-07) ─────────────
-def _rest_gate(monkeypatch, portal_resp, token_groups, site="sec"):
+def _rest_gate(monkeypatch, portal_resp, token_groups, site="sec", query=b""):
     """REST 프록시 라우트를 실제로 태운다 — `main()` 과 같은 배선이고 가짜는 서명 검증·폐기 목록·상류 전송·포털 응답뿐이다.
     돌려주는 것 — 응답 · 상류에 닿은 주소 · 포털에 물은 로그인 그룹."""
     from starlette.requests import Request
@@ -2795,7 +2795,7 @@ def _rest_gate(monkeypatch, portal_resp, token_groups, site="sec"):
     monkeypatch.setattr(p._client, "send", fake_send)
     resp = asyncio.run(p.handle(Request({
         "type": "http", "method": "GET", "path": f"/api/{site}/x", "headers": [(b"authorization", b"Bearer me")],
-        "query_string": b"", "path_params": {"site": site, "path": "x"}, "client": ("203.0.113.5", 0)})))
+        "query_string": query, "path_params": {"site": site, "path": "x"}, "client": ("203.0.113.5", 0)})))
     return resp, shots, asked
 
 
@@ -4433,3 +4433,23 @@ def test_대화_저장_상한은_포털_입력_모델의_한도를_넘지_않는
     assert gw.CONV_PERSONA_MAX <= cap("ConvMessageIn", "persona")
     assert gw.CONV_TITLE_MAX <= cap("ConvCreate", "title")
     assert gw.CONV_BATCH_MAX <= cap("ConvCreate", "messages")
+
+
+# ── 같은 쿼리 키를 여러 번 주는 필터(`?tags=a&tags=b`)가 하나로 접히거나 글자로 깨지지 않는다 ─────────────────────
+@pytest.mark.anyio
+async def test_rest_call_은_목록_쿼리값을_키를_되풀이해_보낸다(_rest, monkeypatch):
+    """종전 `{k: str(v)}` 는 목록을 `"['a', 'b']"` 라는 글자 하나로 보냈다 — 필터가 깨지거나 엉뚱한 결과가 온다."""
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    _Cli.status, _Cli.raw, _Cli.ctype, _Cli.clen = 200, b'{"ok": true}', "application/json", None
+    await gw._rest_call({"site": "locked", "path": "/rows", "query": {"tags": ["a", "b"], "n": 2}})
+    url = httpx.Request("GET", "http://s/rows", params=_Cli.seen["params"]).url
+    assert url.query == b"tags=a&tags=b&n=2"
+
+
+def test_REST_프록시는_같은_쿼리_키를_하나로_접지_않는다(monkeypatch):
+    """`dict(request.query_params)` 는 같은 키의 마지막 값만 남겼다 — `?tags=a&tags=b` 가 `tags=b` 로 갔다."""
+    monkeypatch.setattr(gw, "POLICY", {"sec": []})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    resp, shots, _ = _rest_gate(monkeypatch, {"keys": []}, [], query=b"tags=a&tags=b&n=1")
+    assert resp.status_code == 200 and shots == ["http://upstream.invalid/x?tags=a&tags=b&n=1"]

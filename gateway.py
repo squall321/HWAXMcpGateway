@@ -2659,7 +2659,9 @@ async def _rest_call(args: dict) -> types.CallToolResult:
             async with httpx.AsyncClient(timeout=httpx.Timeout(REST_CALL_TIMEOUT_S, connect=10.0),
                                          follow_redirects=False) as cli:
                 async with cli.stream(method, conf["base"].rstrip("/") + path,
-                                      params={k: str(v) for k, v in dict(query).items()},
+                                      # 목록 값은 키를 되풀이해 보낸다(`tags=a&tags=b`) — 종전 str(v) 는 "['a', 'b']" 글자 하나였다.
+                                      params={k: ([str(x) for x in v] if isinstance(v, (list, tuple)) else str(v))
+                                              for k, v in dict(query).items()},
                                       json=body if isinstance(body, (dict, list)) else None,
                                       headers=headers) as up:
                     ctype = (up.headers.get("content-type") or "").lower()

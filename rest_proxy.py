@@ -286,7 +286,8 @@ class RestProxy:
             async for chunk in request.stream():
                 yield chunk
         try:
-            req = self._client.build_request(request.method, url, params=dict(request.query_params),
+            # 같은 키를 여러 번 준 쿼리(`?tags=a&tags=b`)를 접지 않는다 — dict() 는 마지막 값만 남겼다.
+            req = self._client.build_request(request.method, url, params=request.query_params.multi_items(),
                                              content=_body(), headers=headers)
             up = await self._client.send(req, stream=True)
         except Exception as e:  # noqa: BLE001

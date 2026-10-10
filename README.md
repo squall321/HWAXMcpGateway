@@ -130,6 +130,7 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 
 - 백엔드 도구 결과(직접 호출·`invoke_tool`·캐시 적중)는 본문을 그대로 준다. 감사 줄의 `chars` 가 돌려준 결과의 글자 수다.
 - `search_tools` 는 찾은 도구의 설명 전문과 인자 스키마 전부(`$defs` 포함)를, `list_tool_apps` 는 도구·앱 설명 전문을, `use_experts` 는 역할 문서 전문을, `rest_catalog` 는 경로의 인자(`params`)·본문(`body`) 스키마를 준다. `rest_call` 은 JSON 이 아닌 본문도 통째로 준다.
+- 순위·목록은 이름을 먼저 싣는다 — `search_tools` 의 `ranked`(그다음 `truncated`·`note`, 전문 `matches` 는 맨 뒤), `list_tool_apps(app=)` 의 `tool_names`. 작은 창의 소비자가 앞에서부터 글자로 잘라도(dev 웹 챗 6,000자) 뒤 순위 도구가 '없다' 로 읽히지 않는다.
 - `save_conversation` 은 포털 입력 한도(발언 20,000자·한 번에 200건 — 포털 `ConvMessageIn`·`ConvCreate` 가 정본, 시험이 대조한다)를 넘는 것을 버리지 않는다. 긴 발언은 `(긴 발언 나눔 k/N)` 로 이어 싣고, 200건 넘는 것은 덧붙이기로 보낸다. 도중에 멈추면 `CONV_PARTIAL:` 이다.
 
 남는 상한 — 창이 아닌 까닭이 있는 것만 두고, 넘으면 말한다.

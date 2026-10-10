@@ -1882,19 +1882,19 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
             if sch.get(k):
                 out[k] = sch[k]
         return out
-    payload = {
-        "query": q,
-        "matches": [{"tool": n, "app": a, "description": d, "args": _args_summary(t)}
-                    for _, n, a, d, t in rows[:limit]],
-        "match_count": len(rows),
-        "note": "여기 나온 도구는 현재 목록에 없어도 invoke_tool(name, arguments) 로 즉시 "
-                "호출할 수 있다(args 의 required 를 채워라). 원하는 게 없으면 질문을 바꿔 "
-                "다시 검색하거나 list_tool_apps(app='<키>') 로 앱 상세를 보라.",
-    }
+    matches = [{"tool": n, "app": a, "description": d, "args": _args_summary(t)} for _, n, a, d, t in rows[:limit]]
+    # ⚠ 순서가 뜻이다 — 이름 순위·안내를 먼저, 설명·스키마 전문(matches)을 맨 뒤에 둔다. 작은 창의 소비자(dev 웹 챗
+    #   TOOL_RESULT_MAX=6,000)는 앞에서부터 글자로 자르므로, 전문이 앞서면 6~8위 도구는 이름조차 사라져 '없다' 로 읽혔다(gw-adh GA-7,
+    #   리스크 앱 도구 실측 8건 7,000~8,400자). 게이트웨이는 자르지 않는다 — 잘려도 순위가 남게 놓을 뿐이다.
+    payload = {"query": q, "match_count": len(rows), "ranked": [m["tool"] for m in matches]}
     if len(rows) > limit:
         # 순위 목록이라 건수는 둔다 — 다만 더 맞은 도구가 있다는 것을 match_count 숫자로만 두지 않는다.
         payload["truncated"] = (f"{len(rows)}건 중 상위 {limit}건만 보였다 — limit 를 올리거나(최대 20) 질의를 좁혀라. "
                                 "보이지 않는 도구가 없다는 뜻이 아니다.")
+    payload["note"] = ("여기 나온 도구는 현재 목록에 없어도 invoke_tool(name, arguments) 로 즉시 "
+                       "호출할 수 있다(args 의 required 를 채워라). 원하는 게 없으면 질문을 바꿔 "
+                       "다시 검색하거나 list_tool_apps(app='<키>') 로 앱 상세를 보라.")
+    payload["matches"] = matches
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
     )
@@ -1984,6 +1984,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         if want_app:
             # 설명은 자르지 않는다 — search_tools 와 같은 계약 자리다(300자에서 자르면 tools/list 원문에 있는 함정·인자 규칙이
             # 이 길로만 사라졌다). 운영 창 1,048,576 토큰에서 한 앱의 도구 설명 전부는 묶이지 않는다.
+            # 이름을 먼저 — 작은 창의 소비자가 앞에서부터 글자로 잘라도 도구가 다 보이게(search_tools 의 ranked 와 같은 까닭).
+            entry["tool_names"] = [t.name for t in tools]
             entry["tools"] = [{"name": t.name, "description": t.description or ""} for t in tools]
         elif include:
             entry["tools"] = sorted(t.name for t in tools)

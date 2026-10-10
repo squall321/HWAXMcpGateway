@@ -4701,3 +4701,43 @@ def test_응답_캐시는_큰_결과를_담지_않고_합도_바이트로_묶는
         gw._cache_put(kk, _txt("x" * 1000))
     assert list(gw._RESP_CACHE) == keys[2:], "합이 상한을 넘으면 오래된 것부터 버린다"
     assert gw._cache_get(keys[3]).content[0].text == "x" * 1000
+
+
+# ── 순위 목록은 작은 창 소비자의 글자 절단을 견딘다(gw-adh GA-7) ─────────────────────────────────────────────────
+def _long_tools(monkeypatch, n, app="heax-hwax_risk"):
+    """설명·스키마가 리스크 앱 입구 도구만큼 긴 도구 n 개(실측: 8건 검색 결과 7,000~8,400자)."""
+    tools = [types.Tool(name=f"risk_tool_{i:02d}", description=f"리스크 심사 도구 {i} — " + "설명 " * 300,
+                        inputSchema={"type": "object", "properties": {"project_id": {"type": "string", "description": "과제 " * 60}},
+                                     "required": ["project_id"]}) for i in range(n)]
+    monkeypatch.setattr(gw, "exposed_tools", tools)
+    monkeypatch.setattr(gw, "route", {t.name: (app, t.name) for t in tools})
+    monkeypatch.setattr(gw, "backends", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    return [t.name for t in tools]
+
+
+def test_search_tools_는_찾은_도구_이름을_순위대로_먼저_싣는다(monkeypatch):
+    """게이트웨이는 결과를 자르지 않는다 — 작은 창의 소비자(dev 웹 챗 TOOL_RESULT_MAX=6,000)가 앞에서부터 글자로 자른다. 설명·스키마
+    전문이 앞서면 그 절단에 6~8위 도구는 이름조차 사라져 '없다' 로 읽힌다. 이름 순위를 먼저 실으면 잘려도 순위는 남는다."""
+    _long_tools(monkeypatch, 12)
+    out = asyncio.run(gw._search_tools({"query": "리스크 심사"})).content[0].text
+    body = json.loads(out)
+    assert len(out) > 6000 and len(body["matches"]) == 8, "시험 입력이 dev 상한을 넘어야 뜻이 있다"
+    ranked = [m["tool"] for m in body["matches"]]
+    assert body["ranked"] == ranked, "순위 목록은 matches 와 같은 순서다"
+    head = out[:6000]
+    assert all(f'"{n}"' in head for n in ranked), "6,000자에서 잘려도 8건 이름이 다 남아야 한다"
+    assert head.index('"ranked"') < head.index('"matches"') and head.index('"note"') < head.index('"matches"')
+
+
+def test_list_tool_apps_앱_상세는_도구_이름을_먼저_싣는다(monkeypatch):
+    names = _long_tools(monkeypatch, 40)
+    out = asyncio.run(gw._list_tool_apps({"app": "heax-hwax_risk"})).content[0].text
+    entry = json.loads(out)["apps"][0]
+    assert len(out) > 6000 and [t["name"] for t in entry["tools"]] == names, "설명은 전부 그대로다"
+    assert entry["tool_names"] == names
+    assert all(f'"{n}"' in out[:6000] for n in names), "6,000자에서 잘려도 40개 이름이 다 남아야 한다"

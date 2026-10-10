@@ -4096,3 +4096,47 @@ def test_레지스트리가_준_앱_설명을_자르지_않는다(monkeypatch):
                                                           "description": desc}]})), **kw))
     found = asyncio.run(gw._discover_heax())
     assert found["heax-ts"]["description"] == desc.strip() and found["heax-ts"]["label"] == "열충격"
+
+
+def test_use_experts_는_역할_문서를_자르지_않고_상한을_넘긴_것은_알린다(monkeypatch):
+    """역할 문서는 Claude 가 그 전문가가 되려고 읽는 전부다 — 8,000자에서 자르면 뒤쪽 함정·작업 순서가 사라진다.
+    5명·앱 3·입구 도구 12 는 포털 pinned_agents·에이전트 서버 페르소나와 같은 제품 규칙이라 둔다 — 다만 넘긴 것을 말한다.
+    (get_agent_session 은 AIDataHub 의 도구다 — 응답 키 system_prompt·response_config 는 mcp_runtime.get_agent_session 의 것.)"""
+    role = "역할 " + "함정·작업순서 " * 3000
+    assert len(role) > 8000
+    sess = {"system_prompt": role, "response_config": {
+        "persona_kind": "mcp_operator", "mcp_apps": [f"app{i}" for i in range(5)],
+        "key_tools": [f"tool{i}" for i in range(15)]}}
+
+    async def fake_call(name, args):
+        assert name == "get_agent_session"
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(sess, ensure_ascii=False))])
+    monkeypatch.setattr(gw, "_call_tool", fake_call)
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    keys = [f"k{i}" for i in range(7)]
+    out = json.loads(asyncio.run(gw._use_experts({"keys": keys})).content[0].text)
+    e = out["experts"][0]
+    assert e["role_doc"] == role
+    assert [x["key"] for x in out["experts"]] == keys[:5]
+    assert out["dropped_keys"] == ["k5", "k6"] and "5명" in out["dropped_note"]
+    assert len(e["apps"]) == 3 and e["apps_omitted"] == ["app3", "app4"]
+    assert len(e["entry_tools"]) == 12 and e["entry_tools_omitted"] == ["tool12", "tool13", "tool14"]
+    few = json.loads(asyncio.run(gw._use_experts({"keys": ["k0"]})).content[0].text)
+    assert "dropped_keys" not in few, "넘지 않았으면 칸을 만들지 않는다"
+
+
+def test_browse_experts_가_limit_로_자르면_잘랐다고_말한다(monkeypatch):
+    rows = [{"agent_type": f"cam-p{i:02d}", "name": f"카메라 {i}"} for i in range(50)]
+
+    async def fake_call(name, args):
+        return types.CallToolResult(content=[types.TextContent(
+            type="text", text=json.dumps({"result": rows}, ensure_ascii=False))])
+    monkeypatch.setattr(gw, "_call_tool", fake_call)
+    monkeypatch.setattr(gw, "_ORG_TAX", {})
+    monkeypatch.setattr(gw, "_portal_api_base", lambda: "")
+    hit = json.loads(asyncio.run(gw._browse_experts({"q": "카메라"})).content[0].text)
+    assert hit["found"] == 50 and len(hit["experts"]) == 40 and "50" in hit["truncated"] and "limit" in hit["truncated"]
+    dom = json.loads(asyncio.run(gw._browse_experts({"domain": "cam"})).content[0].text)
+    assert dom["count"] == 50 and len(dom["experts"]) == 40 and "50" in dom["truncated"]
+    whole = json.loads(asyncio.run(gw._browse_experts({"domain": "cam", "limit": 50})).content[0].text)
+    assert len(whole["experts"]) == 50 and "truncated" not in whole

@@ -2059,6 +2059,12 @@ async def _agents_json(args: dict) -> list[dict]:
     return out
 
 
+def _browse_cut(total: int, limit: int) -> str:
+    """조직도 목록을 limit 로 잘랐다는 말 — 뒤 사람이 '없다' 로 읽히지 않게(rest_catalog 의 truncated 와 같은 자세)."""
+    return (f"{total}명 중 {limit}명만 보였다 — limit 를 올리거나(최대 200) q·domain 으로 좁혀라. "
+            "보이지 않는 사람이 없다는 뜻이 아니다.")
+
+
 async def _browse_experts(arguments: dict) -> types.CallToolResult:
     tax = await _org_taxonomy()
     q = str((arguments or {}).get("q") or "").strip()
@@ -2079,6 +2085,8 @@ async def _browse_experts(arguments: dict) -> types.CallToolResult:
                    "experts": [{**p, "domain_label": _tax_domain_label(p["domain"])} for p in hit[:limit]],
                    "note": "이름·키 일치만 본다. 주제로 찾으려면 recommend_agents(q) 를 쓰고, "
                            "고른 뒤에는 use_experts(keys=[...]) 로 역할과 도구를 받아라."}
+        if len(hit) > limit:
+            payload["truncated"] = _browse_cut(len(hit), limit)
         return types.CallToolResult(content=[types.TextContent(
             type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
 
@@ -2086,6 +2094,8 @@ async def _browse_experts(arguments: dict) -> types.CallToolResult:
         payload = {"domain": domain, "domain_label": _tax_domain_label(domain),
                    "count": len(people), "experts": people[:limit],
                    "note": "use_experts(keys=[...]) 로 고른 사람의 역할·도구를 받아라(첫 명이 주 전문가)."}
+        if len(people) > limit:
+            payload["truncated"] = _browse_cut(len(people), limit)
         return types.CallToolResult(content=[types.TextContent(
             type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
 
@@ -2127,7 +2137,9 @@ async def _use_experts(arguments: dict) -> types.CallToolResult:
     """고른 전문가의 역할·운영 앱·입구 도구. 포털 챗의 pinned_agents 와 같은 규칙이다 —
     첫 명이 주 전문가(목소리)이고 나머지는 도구와 판단 기준만 빌려준다."""
     keys = [str(k).strip()[:120] for k in ((arguments or {}).get("keys") or []) if str(k).strip()]
-    keys = list(dict.fromkeys(keys))[:5]
+    # 5명은 포털 챗의 pinned_agents(max_length=5)와 같은 제품 규칙이다(창과 무관). 넘긴 사람은 조용히 버리지 않고 말한다.
+    keys = list(dict.fromkeys(keys))
+    keys, dropped = keys[:5], keys[5:]
     if not keys:
         return types.CallToolResult(content=[types.TextContent(
             type="text", text="use_experts: keys 에 전문가 키를 하나 이상 주세요(browse_experts 참조).")],
@@ -2147,14 +2159,23 @@ async def _use_experts(arguments: dict) -> types.CallToolResult:
             if not isinstance(d, dict):
                 continue
             d = d.get("data", d)
-            role = str(d.get("system_prompt") or d.get("description") or "")[:8000]
+            # 역할 문서는 자르지 않는다 — Claude 가 그 전문가가 되려고 읽는 전부다. 종전 8,000자에서 뒤쪽 함정·작업 순서가
+            # 사라졌다. 운영 창 1,048,576 토큰에서 다섯 명의 역할 문서는 묶이지 않는다.
+            role = str(d.get("system_prompt") or d.get("description") or "")
             rc = d.get("response_config") if isinstance(d.get("response_config"), dict) else {}
             if rc.get("persona_kind") == "mcp_operator":
                 kind = "operator"
-                apps = [str(a) for a in (rc.get("mcp_apps") or [])][:3]
-                key_tools = [str(t) for t in (rc.get("key_tools") or [])][:12]
+                apps = [str(a) for a in (rc.get("mcp_apps") or [])]
+                key_tools = [str(t) for t in (rc.get("key_tools") or [])]
+        # 앱 3·입구 도구 12 는 에이전트 서버 페르소나 챗과 같은 규칙이다(`_persona_meta` 의 [:3]·[:12]) — 두되 넘긴 것은 싣는다.
+        apps, apps_cut = apps[:3], apps[3:]
+        key_tools, tools_cut = key_tools[:12], key_tools[12:]
         entry = {"key": k, "role": "lead" if i == 0 else "helper", "kind": kind,
                  "role_doc": role, "apps": apps, "entry_tools": key_tools}
+        if apps_cut:
+            entry["apps_omitted"] = apps_cut
+        if tools_cut:
+            entry["entry_tools_omitted"] = tools_cut
         _m = [a for a in apps if a in _request_muted()]
         if _m:
             # 운영자가 묶인 앱을 사용자가 꺼 뒀다 — 도구가 search_tools 에 안 나오므로 계획에 넣기 전에 알린다
@@ -2164,6 +2185,9 @@ async def _use_experts(arguments: dict) -> types.CallToolResult:
         out.append(entry)
     payload = {
         "lead": keys[0], "helpers": keys[1:], "experts": out,
+        **({"dropped_keys": dropped,
+            "dropped_note": (f"한 번에 5명까지다(포털 챗과 같은 규칙) — 뒤 {len(dropped)}명은 쓰지 않았다. "
+                             "그 사람들이 필요하면 사용자에게 알리고 다섯 명을 다시 고르게 하라.")} if dropped else {}),
         "how": ("첫 명의 목소리로 한 사람처럼 답하라. 보조는 이름으로 따로 말하지 말고 그들의 "
                 "판단 기준과 도구를 녹여라. 운영자의 앱 도구는 search_tools 로 찾아 invoke_tool 로 "
                 "부르고, 사내 지식은 agent_search(<키>, 질의) 로 조회한다. 관점이 갈리면 숨기지 "

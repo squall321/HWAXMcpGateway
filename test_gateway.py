@@ -4190,27 +4190,70 @@ def test_verify_answer_는_못_찾은_수치를_전부_말한다(monkeypatch):
     assert body["unsourced"] == nums, "13번째부터 '없다' 는 말도 없이 빠졌다"
 
 
-def test_verify_answer_의_판정은_원문_대조와_같다(monkeypatch):
-    """원장은 쉼표를 지운 원문에서 숫자 줄기만 남긴다 — 판정 규칙(에이전트 서버 evidence.py 와 같은 부분문자열 대조)은 그대로여야
-    한다. 원문 전체로 대조하던 옛 규칙을 오라클로 둔다."""
+def test_verify_answer_의_판정표(monkeypatch):
+    """원장은 숫자 줄기만 남기고, 판정은 '답의 수치가 원장의 어느 수치 하나와 같은가' 다 — 그 수 전체이거나, 정수부이거나(답에
+    소수점이 없을 때), 소수 자리를 덜 적은 꼴(답에 소수점이 있을 때). 다른 수의 한가운데에 걸린 것은 근거가 아니다(gw-adh GA-6).
+    쉼표는 두 가지로 읽는다 — 천 단위('1,250.5' → 1250.5)와 목록 구분('[100,200,300]' → 100·200·300)."""
     _evid_ctx(monkeypatch)
     srcs = ['{"a": "1,250.5원", "b": "v1.2.3", "c": "12.5.6", "d": "x408명", "e": "0.25%", "f": "2026-10-10"}',
             '배열 [100,200,300] · 좌표 (35.123, 129.04) · ID ABC12345XYZ · 1.0e5']
     for i, s in enumerate(srcs):
         _keep(f"t{i}", s)
-    answers = ["1250.5", "1,250.5", "250.5", "1.2.3", "12.5", "2.5.6", "408", "4080", "0.25", "2026", "1010",
-               "100200300", "200300", "35.123", "129.04", "129.040", "12345", "123456", "1.0", "100,200"]
-    oracle_src = " ".join(srcs).replace(",", "")
-    for a in answers:
+    want = {"1250.5": True, "1,250.5": True, "250.5": True,       # 250.5 — '1,250.5' 를 목록으로 읽은 꼴(쉼표의 두 읽기)
+            "12.5": False,                                         # '12.5.6' 은 수가 아니다(판 번호 꼴)
+            "408": True, "4080": False, "0.25": True, "2026": True, "1010": False,
+            "100200300": True, "200300": False, "200": True, "100,200": False,
+            "35.123": True, "35.1": True, "35": None, "129.04": True, "129.040": False, "129": True,
+            "12345": True, "123456": False, "2345": False, "1.0": True}
+    for a, sourced in want.items():
         m = gw._NUM_TOK_RE.search(a)
-        if not m:
-            continue
         norm = m.group(0).replace(",", "")
         if "." not in norm and float(norm) < 100:
+            assert sourced is None, a                              # 작은 정수는 보지 않는다
             continue
-        want = norm not in oracle_src
-        got = m.group(0) in _verify(a)["unsourced"]
-        assert got == want, (a, norm, want, got)
+        got = m.group(0) not in _verify(a)["unsourced"]
+        assert got is sourced, (a, sourced, got)
+
+
+def test_verify_answer_는_다른_수치의_한가운데에_걸린_것을_근거로_치지_않는다(monkeypatch):
+    """부분문자열 대조는 원장이 클수록 아무 수나 통과시킨다 — 곡선 조회가 쌓인 세션에서 원장은 숫자 덩어리라, 지어낸 '232' 가
+    '1232' 에, '125' 가 '0.125' 에 걸려 '모든 수치가 조회 결과에 있다' 로 초록을 받았다. 원장을 1백만 자로 키운 뒤(9a2b3d5)
+    지어낸 수의 통과율이 크게 늘었다(GA-6)."""
+    _evid_ctx(monkeypatch)
+    _keep("t", '{"a": 1232, "b": 0.125, "c": 1250.47, "d": 98765, "e": [1.5,2.5]}')
+    body = _verify("232 · 125 · 250.47 · 876 · 50.4 · 1232 · 98765 · 1250 · 1250.4 · 1250.47 · 2.5 · 1.5")
+    assert body["unsourced"] == ["232", "125", "250.47", "876", "50.4"], body["unsourced"]
+
+
+def test_verify_answer_의_우연_일치는_원장이_커져도_늘지_않는다(monkeypatch):
+    """곡선(변형률 6자리 소수·응력 0~600)을 1번·12번 조회한 세션에서, 데이터에 없는 값(응력 범위 밖 정수·소수)을 지어내 묻는다.
+    그 숫자들은 변형률 '0.123456' 같은 수의 한가운데에는 흔히 있다 — 옛 부분문자열 대조는 원장이 클수록 그것을 근거로 쳤다
+    (같은 자료에서 3자리 정수 0.8 → 0.97). 새 판정은 몇 번을 조회했든 하나도 통과시키지 않고, 진짜 값(같은 수·정수부·소수 덜 적은
+    꼴)은 늘 통과시킨다."""
+    import random
+    _evid_ctx(monkeypatch)
+    rnd = random.Random(7)
+
+    def curve(seed):
+        r = random.Random(seed)
+        return json.dumps({"points": [{"strain": round(i * 0.0004 + r.random() * 1e-5, 6),
+                                       "stress": round(600 * (1 - 2.718281828 ** (-i / 400)) + r.gauss(0, 2), 3)}
+                                      for i in range(1500)]}, indent=2)
+    fab = ([str(rnd.randint(620, 999)) for _ in range(150)] + [str(rnd.randint(1000, 9999)) for _ in range(150)]
+           + [f"{rnd.uniform(700, 999):.1f}" for _ in range(150)])
+
+    def passed():
+        bad = set(_verify(" , ".join(fab))["unsourced"])
+        return [n for n in fab if n not in bad]
+    _keep("get_curve", curve(0))
+    assert passed() == []
+    for sd in range(1, 12):
+        _keep("get_curve", curve(sd))
+    assert passed() == [], "원장이 12배가 되자 지어낸 수가 다른 수의 한가운데에 걸려 통과했다"
+    old_src = " ".join(curve(sd).replace(",", "") for sd in range(12))
+    assert sum(n in old_src for n in fab[:150]) / 150 > 0.9, "옛 부분문자열 대조로는 대부분 통과한다 — 시험이 이빨이 있는지"
+    real = [p["stress"] for p in json.loads(curve(11))["points"][::30] if p["stress"] >= 100]
+    assert _verify(" , ".join(f"{v} · {int(v)} · {int(v * 10) / 10:.1f}" for v in real))["unsourced"] == []
 
 
 def test_verify_answer_는_원장을_메모리_상한에서_줄였으면_그렇다고_말한다(monkeypatch):

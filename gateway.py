@@ -2300,13 +2300,14 @@ async def _use_experts(arguments: dict) -> types.CallToolResult:
 # ── 답변 수치 대조 (클로드용) ──────────────────────────────────────────────────
 # 웹 챗에는 **코드가 만드는** 근거 블록이 있어 답의 수치를 도구 출력과 대조한다. MCP 에는 그게
 # 없어 지침(부탁)뿐이었다 — 지침은 보장이 아니다. 호출자별로 최근 도구 출력을 들고 있다가
-# verify_answer(초안) 로 대조해 준다. 판정 기준은 에이전트서버 evidence.py 와 같다:
-# 소수점이 있거나 100 이상인 수치만 보고, 부분문자열로 대조한다(경고 남발이 기능을 죽인다).
+# verify_answer(초안) 로 대조해 준다. 무엇을 보나는 에이전트서버 evidence.py 와 같다(소수점이 있거나 100 이상인 수치).
+# ⚠ **대조는 부분문자열이 아니라 수치 단위다**(`_evid_has`) — evidence.py 는 그 턴의 출력만 보지만 이 원장은 세션 내내 1백만 자까지
+#   쌓인다. 부분문자열로 보면 원장이 클수록 지어낸 수가 아무 수의 한가운데('1232' 의 '232')에 걸려 초록을 받는다(gw-adh GA-6).
+#   느슨함은 사람이 쓰는 꼴에만 남긴다 — 정수부('1250.47' → 1250)와 소수 자리를 덜 적은 꼴(→ 1250.4).
 # ⚠ 뒤 경계에 `(?!\w)` 를 쓰면 한글 단위가 붙은 수치를 놓친다 — 파이썬 \w 는 유니코드라
 # 한글도 단어 글자다("408명"은 검사조차 안 되고 "1250.5원"은 "1250" 으로 잘린다, 실측).
 # 에이전트서버 evidence.py 와 같은 패턴을 쓴다 — 두 화면의 경고 기준이 달라지면 안 된다.
 _NUM_TOK_RE = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?![\d.])")
-_EVID_RUN_RE = re.compile(r"[\d.]+")
 # 호출자별 최근 도구 출력의 숫자 줄기 — {키: (마감시각, [(도구, 숫자 줄기), …], 줄인 것)}. 메모리 상한을 건다.
 # ⚠ 한 호출을 자르지 않는다. 종전엔 원문을 호출당 50,000자·최근 20호출·합 200,000자로 쌓아, 큰 결과의 뒤쪽 수치와 21번째 앞의
 #   조회를 '지어낸 값' 으로 고발했다(운영 창 1,048,576 토큰이라 모델은 그 뒤쪽까지 읽는다). 이제 원문 대신 숫자 줄기만 쌓는다.
@@ -2351,12 +2352,40 @@ def _evid_key() -> str:
     return "s:" + sid if sid else ""
 
 
-def _evid_digest(txt: str) -> str:
-    """판정에 쓰는 것만 남긴다 — 쉼표를 지운 원문의 숫자 줄기(`[0-9.]` 의 최대 연속)를 공백으로 잇는다.
+_EVID_COMMA_RUN_RE = re.compile(r"[\d.,]+")
 
-    판정은 '답의 수치(숫자와 점뿐)가 쉼표를 지운 원문에 부분문자열로 있나' 라서 그런 출현은 언제나 한 줄기 안에 있다 — 원문
-    전체로 대조할 때와 판정이 같다(시험이 옛 규칙을 오라클로 건다). 그래서 한 호출을 자르지 않아도 메모리가 작다."""
-    return " ".join(_EVID_RUN_RE.findall(txt.replace(",", "")))
+
+def _evid_digest(txt: str) -> str:
+    """판정에 쓰는 것만 남긴다 — 원문의 숫자 줄기(`[0-9.]` 의 최대 연속)를 공백으로 잇는다. 그래서 한 호출을 자르지 않아도 메모리가 작다.
+
+    쉼표가 낀 줄기는 두 가지로 읽어 둘 다 싣는다 — 천 단위('1,250.5' → 1250.5)와 목록 구분(압축 JSON '[1.5,2.5]' → 1.5·2.5).
+    한쪽만 남기면 다른 쪽에서 온 진짜 값이 '지어낸 값' 이 된다(판정이 줄기 경계를 보므로 — `_evid_has`)."""
+    out = []
+    for run in _EVID_COMMA_RUN_RE.findall(txt):
+        if "," not in run:
+            out.append(run)
+            continue
+        pieces = [p for p in run.split(",") if p]
+        joined = run.replace(",", "")
+        if joined and joined not in pieces:
+            out.append(joined)
+        out.extend(pieces)
+    return " ".join(out)
+
+
+def _evid_has(src: str, norm: str) -> bool:
+    """답의 수치 `norm`(쉼표를 지운 숫자와 점)이 원장의 줄기 하나와 맞는가. 줄기 **처음부터** 맞아야 하고, 끝은 셋 중 하나다 —
+    줄기 끝(같은 수), 소수점 앞(답에 소수점이 없으면 정수부), 숫자 앞(답에 소수점이 있으면 소수 자리를 덜 적은 꼴).
+    다른 수의 한가운데('1232' 의 '232', '0.125' 의 '125', '12500' 의 '1250')는 근거가 아니다."""
+    i = src.find(norm)
+    while i >= 0:
+        if i == 0 or src[i - 1] == " ":
+            j = i + len(norm)
+            nxt = src[j] if j < len(src) else " "
+            if nxt == " " or (nxt == "." and "." not in norm) or (nxt.isdigit() and "." in norm):
+                return True
+        i = src.find(norm, i + 1)
+    return False
 
 
 def _evid_keep(tool: str, res):
@@ -2446,7 +2475,7 @@ async def _verify_answer(arguments: dict) -> types.CallToolResult:
             continue
         seen.add(norm)
         checked += 1
-        if norm not in src:
+        if not _evid_has(src, norm):
             bad.append(raw)
     payload = {
         "checked": checked, "unsourced": bad,       # 전부 — 종전 12개 뒤로는 '없다' 는 말도 없이 빠졌다

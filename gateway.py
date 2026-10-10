@@ -1612,20 +1612,20 @@ LIST_APPS_TOOL = types.Tool(
 # 그래서 **둘만** 둔다: 무엇이 있는지 묻는 것과, 하나를 부르는 것.
 REST_CATALOG_TOOL = types.Tool(
     name="rest_catalog",
-    description='⚠ **먼저 전용 도구를 찾아라** — `list_tool_apps` / `search_tools` 로 그 일을 하는 도구가 있는지 \n보고, 있으면 그걸 써라. 이 도구는 **전용 도구로 안 되는 것**(웹 화면에서만 되던 조작)을 위한 우회로다.\n\n하위 사이트가 여는 REST API 목록을 돌려준다. 사이트별로 base 경로와, 그 사이트가 OpenAPI 를 \n내면 **경로·메서드·요약**까지 준다. 내 포털 권한으로 **쓸 수 있는 사이트만** 보인다.\n\nsite 를 주면 그 사이트만 상세히. q 를 주면 경로·요약에 그 말이 든 것만 추린다\n(경로가 많은 사이트는 q 없이 부르면 요약만 준다).',
+    description='⚠ **먼저 전용 도구를 찾아라** — `list_tool_apps` / `search_tools` 로 그 일을 하는 도구가 있는지 \n보고, 있으면 그걸 써라. 이 도구는 **전용 도구로 안 되는 것**(웹 화면에서만 되던 조작)을 위한 우회로다.\n\n하위 사이트가 여는 REST API 목록을 돌려준다. 사이트별로 base 경로와, 그 사이트가 OpenAPI 를 \n내면 **경로·메서드·요약과 인자(params)·본문(body) 스키마**까지 준다. 내 포털 권한으로 **쓸 수 있는 사이트만** 보인다.\n\nsite 를 주면 그 사이트만 상세히. q 를 주면 경로·요약에 그 말이 든 것만 추린다\n(경로가 많은 사이트는 q 없이 부르면 요약만 준다).',
     inputSchema={
         "type": "object",
         "properties": {
             "site": {"type": "string", "description": "특정 사이트만(생략 시 전체 요약)"},
             "q": {"type": "string", "description": "경로·요약에서 찾을 말(예: upload, job, report)"},
-            "limit": {"type": "integer", "description": "사이트당 반환할 경로 수(기본 40)"},
+            "limit": {"type": "integer", "description": "사이트당 반환할 경로 수(기본 40, 최대 200). 넘으면 truncated 가 말한다"},
         },
     },
 )
 
 REST_CALL_TOOL = types.Tool(
     name="rest_call",
-    description='⚠ **먼저 전용 도구를 찾아라**(`list_tool_apps`/`search_tools`). 이건 그것으로 안 될 때의 우회로다.\n\n`rest_catalog` 로 확인한 하위 사이트 REST 를 **내 이름으로** 부른다. 게이트웨이가 그 사이트의 \n자격을 대신 붙이므로 사이트별 토큰이 따로 필요 없고, **내 포털 권한**으로 열리는 것만 통한다.\n\n경로·메서드를 추측하지 마라 — `rest_catalog` 에 없는 경로는 404 다. \n파일 본문은 이 도구로 나르지 않는다(대용량은 경로를 넘기는 전용 도구를 쓴다).',
+    description='⚠ **먼저 전용 도구를 찾아라**(`list_tool_apps`/`search_tools`). 이건 그것으로 안 될 때의 우회로다.\n\n`rest_catalog` 로 확인한 하위 사이트 REST 를 **내 이름으로** 부른다. 게이트웨이가 그 사이트의 \n자격을 대신 붙이므로 사이트별 토큰이 따로 필요 없고, **내 포털 권한**으로 열리는 것만 통한다.\n\n경로·메서드를 추측하지 마라 — `rest_catalog` 에 없는 경로는 404 다. query·body 는 그 표의 params·body 를 따른다. \n파일 본문은 이 도구로 나르지 않는다(대용량은 경로를 넘기는 전용 도구를 쓴다).',
     inputSchema={
         "type": "object",
         "properties": {
@@ -2375,7 +2375,8 @@ async def _verify_answer(arguments: dict) -> types.CallToolResult:
 # groups 를 다시 계산해 헤더에 실어 두었으므로 여기서 다시 묻지 않는다 — 다시 물으면 두 경로가
 # 어긋난다(`_rest_allowed` 주석과 같은 이유).
 _OPENAPI_TTL_S = 300
-# rest_call 이 모델에 보여 줄 응답 상한. 넘으면 스트림을 끊는다(위 _rest_call 주석).
+# rest_call 이 모델에 보여 줄 응답 상한. 넘으면 스트림을 끊는다(위 _rest_call 주석). 창이 아니라 **메모리 보호**라 둔다 — 자르지
+# 않고 거부하며(크기·손잡이·좁히는 법을 말한다), 1MiB JSON 은 한글로 약 35만 자라 운영 창(1,048,576 토큰)의 3분의 1 안쪽이다.
 REST_CALL_MAX_BYTES = int(os.environ.get("GATEWAY_REST_CALL_MAX_BYTES", str(1024 * 1024)))
 # rest_call 한 건의 한도(초) — read 침묵과 **전체 기한** 둘 다 이 값이다. 좌석이 전용 도구가 없을 때 쓰는 다리라 도구 호출과 같은
 # 단위의 일이고, 그래서 기본이 호출 한도다. 종전에는 30초(connect·read·write·pool 각각)에 전체 기한이 없었다 — MCP 길보다 엄했고
@@ -2417,19 +2418,59 @@ async def _openapi_of(site: str) -> dict | None:
     return doc
 
 
+def _openapi_deref(doc: dict, node, seen: tuple = ()):
+    """`$ref`(문서 안 `#/…`)를 풀어 준다 — 모델은 components 를 따로 받지 못하므로 참조만 실으면 스키마가 끊긴다.
+    순환하는 참조는 그 자리에 `$ref` 를 남긴다(같은 참조를 한 갈래에서 두 번 펴지 않는다)."""
+    if isinstance(node, list):
+        return [_openapi_deref(doc, x, seen) for x in node]
+    if not isinstance(node, dict):
+        return node
+    ref = node.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/"):
+        if ref in seen:
+            return {"$ref": ref}
+        tgt = doc
+        for part in ref[2:].split("/"):
+            tgt = tgt.get(part.replace("~1", "/").replace("~0", "~")) if isinstance(tgt, dict) else None
+        return node if tgt is None else _openapi_deref(doc, tgt, seen + (ref,))
+    return {k: _openapi_deref(doc, v, seen) for k, v in node.items()}
+
+
 def _openapi_rows(doc: dict) -> list[dict]:
+    """경로 표 — 메서드·경로·요약에 **인자(params)와 본문(body) 스키마**까지 싣는다. 종전엔 요약(첫 줄 120자)만 주고
+    parameters·requestBody 를 버려, rest_call 이 '추측하지 마라' 면서 쿼리·본문은 추측하게 했다(search_tools 와 같은 실패 꼴)."""
     rows = []
     for p, ops in (doc.get("paths") or {}).items():
         if not isinstance(ops, dict):
             continue
+        shared = ops.get("parameters") if isinstance(ops.get("parameters"), list) else []
         for m, op in ops.items():
             if m.upper() not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}:
                 continue
-            text = ""
-            if isinstance(op, dict):
-                text = str(op.get("summary") or op.get("description") or "")
-            summary = text.strip().splitlines()[0][:120] if text.strip() else ""
-            rows.append({"method": m.upper(), "path": p, "summary": summary})
+            op = op if isinstance(op, dict) else {}
+            text = str(op.get("summary") or op.get("description") or "")
+            summary = text.strip().splitlines()[0] if text.strip() else ""
+            row = {"method": m.upper(), "path": p, "summary": summary}
+            params = []
+            for prm in shared + (op.get("parameters") if isinstance(op.get("parameters"), list) else []):
+                prm = _openapi_deref(doc, prm)
+                if not isinstance(prm, dict) or not prm.get("name"):
+                    continue
+                one = {"name": prm["name"], "in": prm.get("in"), "required": bool(prm.get("required"))}
+                if prm.get("schema"):
+                    one["schema"] = _openapi_deref(doc, prm["schema"])
+                if prm.get("description"):
+                    one["description"] = prm["description"]
+                params.append(one)
+            if params:
+                row["params"] = params
+            rb = _openapi_deref(doc, op.get("requestBody") or {})
+            content = rb.get("content") if isinstance(rb, dict) and isinstance(rb.get("content"), dict) else {}
+            if content:
+                ctype = next((c for c in content if "json" in c), next(iter(content)))
+                row["body"] = {"content_type": ctype, "required": bool(rb.get("required")),
+                               "schema": (content.get(ctype) or {}).get("schema") or {}}
+            rows.append(row)
     rows.sort(key=lambda r: (r["path"], r["method"]))
     return rows
 
@@ -2595,16 +2636,20 @@ async def _rest_call(args: dict) -> types.CallToolResult:
     ms = round((time.monotonic() - t0) * 1000)
     if too_big:
         _audit(f"rest_call {method} {path}", site, False, f"response > {cap}B", ms, caller=caller)
-        return _rest_text({"error": f"응답이 {cap // (1024 * 1024)}MB 를 넘는다 — 이 도구로 나르지 않는다",
+        return _rest_text({"error": f"응답이 상한 {cap:,}바이트(GATEWAY_REST_CALL_MAX_BYTES)를 넘는다 — 자르지 않고 "
+                                    "이 도구로 나르지 않는다",
                            "site": site, "method": method, "path": path, "status": status,
                            "content_type": ctype,
-                           "detail": "파일·아카이브는 전용 도구(예: ste 의 get_job_file·ste-sync)로 받는다. "
+                           "detail": "목록·조회면 그 사이트가 받는 쿼리(rest_catalog 의 params — limit·page_size·필드 선택 등)로 "
+                                     "좁혀 다시 불러라. 파일·아카이브는 전용 도구(예: ste 의 get_job_file·ste-sync)로 받는다. "
                                      "rest_call 은 모델에 보일 텍스트/JSON 답 전용이다."})
     _audit(f"rest_call {method} {path}", site, status < 400, None, ms, caller=caller)
     try:
         parsed = json.loads(raw.decode("utf-8"))
-    except Exception:  # noqa: BLE001 — JSON 이 아니면 본문을 잘라서 그대로 보인다
-        parsed = raw.decode("utf-8", errors="replace")[:8000]
+    except Exception:  # noqa: BLE001 — JSON 이 아니면 본문을 글로 그대로 보인다
+        # 자르지 않는다 — 종전 8,000자에서 표지 없이 끊겨, 좌석이 잡 로그·CSV 를 이 길로 읽으면 앞만 봤다. 크기는 위의 바이트
+        # 상한(메모리 보호)이 이미 지킨다.
+        parsed = raw.decode("utf-8", errors="replace")
     payload = {"site": site, "method": method, "path": path,
                "status": status, "ms": ms, "body": parsed}
     if status >= 400:

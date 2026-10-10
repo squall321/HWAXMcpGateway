@@ -4227,3 +4227,91 @@ async def test_rest_call_로_읽은_수치도_조회한_값이다(_rest, monkeyp
     await gw._rest_call({"site": "locked", "path": "/x"})
     body = json.loads((await gw._verify_answer({"text": "응력 48039.32"})).content[0].text)
     assert body["unsourced"] == [] and body["tool_calls"] == ["rest_call"]
+
+
+def _fastapi_openapi() -> dict:
+    """하위 사이트(FastAPI)가 OpenAPI 를 만드는 **실제 경로**로 문서를 만든다 — 손으로 쓰지 않는다."""
+    from fastapi import FastAPI, Query
+    from pydantic import BaseModel, Field
+
+    class Window(BaseModel):
+        start: str = Field(description="시작일(YYYY-MM-DD)")
+        days: int = 7
+
+    class JobIn(BaseModel):
+        name: str = Field(description="잡 이름")
+        cores: int = Field(128, description="코어 수 — ste 는 128 고정")
+        window: Window | None = None
+
+    app = FastAPI(title="T")
+    long_summary = "잡을 제출한다 — " + "입력 덱 경로·코어 수·라이선스 서버를 확인한 뒤 큐에 넣는다 " * 5
+
+    @app.post("/api/jobs", summary=long_summary)
+    def submit(job: JobIn, dry_run: bool = Query(False, description="검증만")):
+        return {}
+
+    @app.get("/api/jobs/{job_id}")
+    def get_job(job_id: int, fields: str | None = None):
+        """잡 하나."""
+        return {}
+    return app.openapi()
+
+
+@pytest.mark.anyio
+async def test_rest_catalog_는_요약을_자르지_않고_경로의_인자와_본문_스키마를_싣는다(_rest, monkeypatch):
+    """rest_call 설명이 '경로·메서드를 추측하지 마라' 고 하는데 쿼리·본문은 추측할 수밖에 없었다 — 표가 경로·메서드·요약(120자)
+    만 주고 OpenAPI 의 parameters·requestBody 를 버렸다. search_tools 의 인자 요약과 같은 실패 꼴이다."""
+    doc = _fastapi_openapi()
+
+    async def _doc(site):
+        return doc
+    monkeypatch.setattr(gw, "_openapi_of", _doc)
+    rows = {(r["method"], r["path"]): r for r in _payload(await gw._rest_catalog({"site": "locked"}))["sites"][0]["paths"]}
+    post = rows[("POST", "/api/jobs")]
+    want_summary = doc["paths"]["/api/jobs"]["post"]["summary"]
+    assert len(want_summary) > 120 and post["summary"] == want_summary.strip()
+    assert post["params"] == [{"name": "dry_run", "in": "query", "required": False,
+                               "schema": doc["paths"]["/api/jobs"]["post"]["parameters"][0]["schema"],
+                               "description": "검증만"}]
+    body = post["body"]
+    assert body["content_type"] == "application/json" and body["required"] is True
+    props = body["schema"]["properties"]                          # `$ref` 를 문서 안에서 풀었다
+    assert props["cores"]["description"] == "코어 수 — ste 는 128 고정" and body["schema"]["required"] == ["name"]
+    win = props["window"]["anyOf"][0]                             # 중첩 참조도 풀었다
+    assert win["properties"]["start"]["description"] == "시작일(YYYY-MM-DD)"
+    assert "$ref" not in json.dumps(post), "풀지 못한 참조가 남았다"
+    get = rows[("GET", "/api/jobs/{job_id}")]
+    assert [(p["name"], p["in"], p["required"]) for p in get["params"]] == [("job_id", "path", True), ("fields", "query", False)]
+    assert "body" not in get
+
+
+def test_openapi_참조가_순환이면_그_자리에_참조를_남긴다():
+    doc = {"components": {"schemas": {"Node": {"type": "object", "properties": {
+        "child": {"$ref": "#/components/schemas/Node"}, "name": {"type": "string"}}}}}}
+    got = gw._openapi_deref(doc, {"$ref": "#/components/schemas/Node"})
+    assert got["properties"]["name"] == {"type": "string"}
+    assert got["properties"]["child"] == {"$ref": "#/components/schemas/Node"}
+
+
+@pytest.mark.anyio
+async def test_rest_call_은_JSON_이_아닌_본문도_자르지_않는다(_rest, monkeypatch):
+    """JSON 이면 바이트 상한까지 통째인데 텍스트(로그·CSV·마크다운)는 8,000자에서 표지 없이 끊겼다 — 좌석이 잡 로그를 이 길로
+    읽으면 앞 8,000자만 봤다."""
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    text = "줄 " + "로그 한 줄 끝에 결론이 있다\n" * 2000 + "최종 판정 PASS"
+    assert len(text) > 8000
+    _Cli.status, _Cli.raw, _Cli.ctype, _Cli.clen = 200, text.encode("utf-8"), "text/plain", None
+    out = _payload(await gw._rest_call({"site": "locked", "path": "/log"}))
+    assert out["body"] == text and "error" not in out
+
+
+@pytest.mark.anyio
+async def test_rest_call_이_상한을_넘겨_거부할_때는_크기와_좁히는_법을_말한다(_rest, monkeypatch):
+    """상한은 메모리 보호라 둔다(120MB 응답에 피크 521MB 실측) — 자르지 않고 거부한다. 다만 `0MB 를 넘는다` 처럼 상한을 MB 로
+    내림해 말했고, 목록을 좁혀 다시 부르는 법이 없었다."""
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    monkeypatch.setattr(gw, "REST_CALL_MAX_BYTES", 10_000)
+    _Cli.status, _Cli.raw, _Cli.ctype, _Cli.clen, _Cli.streamed = 200, b"[" + b"1," * 50_000 + b"1]", "application/json", None, 0
+    out = _payload(await gw._rest_call({"site": "locked", "path": "/rows"}))
+    assert "넘는다" in out["error"] and "10,000" in out["error"] and "GATEWAY_REST_CALL_MAX_BYTES" in out["error"]
+    assert "rest_catalog" in out["detail"] and "좁혀" in out["detail"]

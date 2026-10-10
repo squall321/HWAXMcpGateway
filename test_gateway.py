@@ -4453,3 +4453,21 @@ def test_REST_프록시는_같은_쿼리_키를_하나로_접지_않는다(monke
     monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
     resp, shots, _ = _rest_gate(monkeypatch, {"keys": []}, [], query=b"tags=a&tags=b&n=1")
     assert resp.status_code == 200 and shots == ["http://upstream.invalid/x?tags=a&tags=b&n=1"]
+
+
+def test_search_tools_가_limit_로_자르면_잘랐다고_말한다(monkeypatch):
+    """순위 목록이라 건수(기본 8·최대 20)는 둔다 — 다만 더 맞은 도구가 있다는 것을 match_count 만으로 두지 않고 말한다."""
+    tools = [_tool(f"report_x{i:02d}") for i in range(25)]
+    monkeypatch.setattr(gw, "exposed_tools", tools)
+    monkeypatch.setattr(gw, "route", {t.name: ("sf", t.name) for t in tools})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    out = json.loads(asyncio.run(gw._search_tools({"query": "report_x"})).content[0].text)
+    assert out["match_count"] == 25 and len(out["matches"]) == 8
+    assert "25" in out["truncated"] and "limit" in out["truncated"]
+    whole = json.loads(asyncio.run(gw._search_tools({"query": "report_x0"})).content[0].text)
+    assert whole["match_count"] == 10 and len(whole["matches"]) == 8 and "truncated" in whole
+    few = json.loads(asyncio.run(gw._search_tools({"query": "report_x2"})).content[0].text)
+    assert few["match_count"] == 5 and "truncated" not in few

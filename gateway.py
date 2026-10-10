@@ -1754,7 +1754,7 @@ SEARCH_TOOLS_TOOL = types.Tool(
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "하고 싶은 일(한국어/영어, 예: '과거 보고서 요약', 'mesh quality check')"},
-            "limit": {"type": "integer", "description": "최대 결과 수(기본 8)"},
+            "limit": {"type": "integer", "description": "최대 결과 수(기본 8, 최대 20). 더 맞은 것이 있으면 truncated 가 말한다"},
         },
         "required": ["query"],
     },
@@ -1851,6 +1851,10 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
                 "호출할 수 있다(args 의 required 를 채워라). 원하는 게 없으면 질문을 바꿔 "
                 "다시 검색하거나 list_tool_apps(app='<키>') 로 앱 상세를 보라.",
     }
+    if len(rows) > limit:
+        # 순위 목록이라 건수는 둔다 — 다만 더 맞은 도구가 있다는 것을 match_count 숫자로만 두지 않는다.
+        payload["truncated"] = (f"{len(rows)}건 중 상위 {limit}건만 보였다 — limit 를 올리거나(최대 20) 질의를 좁혀라. "
+                                "보이지 않는 도구가 없다는 뜻이 아니다.")
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
     )

@@ -3923,3 +3923,65 @@ def test_기동할_때_그_줄을_남긴다():
     src = open(gw.__file__, encoding="utf-8").read()
     main = src[src.index("\ndef main():"):]
     assert 'log.info("%s", _limits_line())' in main[:main.index("uvicorn.run(")], "main() 이 기동 전에 시간 한도 줄을 남겨야 한다"
+
+
+# ── 1백만 토큰 창 — 게이트웨이는 도구 결과를 자르지 않고, 남는 절단은 조용하지 않다(리스크 심사 재설계 M1) ─────────
+# 운영 모델은 GLM-5.2·창 1,048,576 토큰이다. 실사용 팀은 Claude 에서 이 게이트웨이를 거쳐 도구를 부르고 그 결과로 심의한다 —
+# 여기서 잘리면 잘린 근거로 심의한다. 작은 창이 필요한 소비자(에이전트 서버의 웹 챗)는 자기 쪽에서 자른다(TOOL_RESULT_MAX).
+def _result_kit(monkeypatch, text: str):
+    """백엔드 하나에 결과가 `text` 인 읽기 도구를 세운다 — 상주 세션 길(신원 없음)."""
+    b = _CallB(["get_big"])
+
+    async def _ct(original, args, read_timeout_seconds=None):
+        b.session.calls.append(original)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
+    b.session.call_tool = _ct
+    monkeypatch.setattr(gw, "backends", {"sf": b})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    gw._RESP_CACHE.clear()
+    asyncio.run(gw._aggregate())
+    return b
+
+
+def _audit_rows():
+    return [json.loads(ln) for ln in open(gw.AUDIT_PATH, encoding="utf-8")]
+
+
+def test_백엔드_도구_결과는_직접_불러도_invoke_tool_로_불러도_캐시에서_와도_한_글자도_안_잘린다(monkeypatch):
+    big = '{"rows": "' + "가1" * 400_000 + '"}'           # 80만 자 — 옛 상한 어느 것보다 크다
+    b = _result_kit(monkeypatch, big)
+    direct = asyncio.run(gw._call_tool("get_big", {}))
+    assert direct.content[0].text == big
+    via = asyncio.run(gw._call_tool("invoke_tool", {"name": "get_big", "arguments": {}}))
+    assert via.content[0].text == big
+    assert b.session.calls == ["get_big"], "두 번째는 캐시 적중이어야 한다(캐시 길도 같이 본다)"
+
+
+def test_감사_원장에_도구_결과의_크기가_남는다(monkeypatch):
+    """도구 결과가 몇 자였는지를 사후에 원장으로 알 길이 없었다 — '남는 절단은 원장에 남긴다' 의 자리가 비어 있었다."""
+    text = "x" * 12_345
+    _result_kit(monkeypatch, text)
+    asyncio.run(gw._call_tool("get_big", {}))
+    asyncio.run(gw._call_tool("get_big", {}))              # 캐시 적중
+    rows = [r for r in _audit_rows() if r["tool"] == "get_big"]
+    assert [r.get("note") for r in rows] == [None, "cache-hit"]
+    assert [r.get("chars") for r in rows] == [12_345, 12_345]
+
+
+def test_감사_원장에_잘린_글은_원문_길이를_단다(tmp_path, monkeypatch):
+    """감사 줄의 크기는 둘 수 있다(무기한 보존·한 호출 한 줄). 다만 잘린 오류가 온전한 오류처럼 보이면 안 된다."""
+    f = tmp_path / "a.jsonl"
+    monkeypatch.setattr(gw, "AUDIT_PATH", str(f))
+    gw._audit("t", "b", False, "E" * 5000, 1, note="n" * 500, corr="c" * 500)
+    gw._audit("t", "b", False, "짧은 실패", 1, note="cache-hit", corr="conv-9")
+    long_, short = [json.loads(x) for x in f.read_text(encoding="utf-8").splitlines()]
+    assert long_["error"].startswith("E" * 200) and "5000" in long_["error"] and len(long_["error"]) < 260
+    assert long_["note"].startswith("n" * 120) and "500" in long_["note"]
+    assert long_["corr"].startswith("c" * 120) and "500" in long_["corr"]
+    assert (short["error"], short["note"], short["corr"]) == ("짧은 실패", "cache-hit", "conv-9"), "짧은 글은 그대로다"

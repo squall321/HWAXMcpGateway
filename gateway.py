@@ -467,7 +467,21 @@ def _cache_flush_backend(backend_key: str):
         _CACHE_STAT["flush"] += len(doomed)
 
 
-def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=None, ip=None, via=None):
+def _clip(s, n: int) -> str:
+    """`n` 자까지만 남기고, 잘랐으면 원문 길이를 표식으로 붙인다 — 잘린 글이 온전한 글처럼 보이지 않게.
+
+    도구 결과·모델 입력은 이것으로 자르지 않는다(운영 창이 1,048,576 토큰이다). 크기를 둘 까닭이 따로 있는 자리 — 감사 줄,
+    오류 문구 — 에만 쓴다."""
+    s = str(s)
+    return s if len(s) <= n else f"{s[:n]}…(원문 {len(s)}자)"
+
+
+def _res_chars(res) -> int:
+    """도구 결과의 글자 수 — 감사 원장의 `chars`. 결과가 컸는지·어디서 잘렸는지를 사후에 원장으로 묻는 자리다."""
+    return sum(len(getattr(c, "text", "") or "") for c in (getattr(res, "content", None) or []))
+
+
+def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=None, ip=None, via=None, res=None):
     """호출 1건을 JSONL 감사 로그에 append (감사 실패가 호출을 막지 않게).
 
     ⚠ **`error` 는 실패에만 쓴다.** 종전에는 위임 신원(`as:someone@…`)과 메모(`cache-hit`·
@@ -485,6 +499,10 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
                주소 형식일 때만 남긴다. ⚠ 박스 안에서 게이트웨이로 직접 붙는 프로세스는 X-Forwarded-For 로
                아무 주소나 주장할 수 있다 — 127.0.0.1 을 믿는 uvicorn 기본값이다(docs/gateway-audit-ip).
       via    : 어느 자격으로 들어왔나(gw-token · chat · procedure · pat). 127.0.0.1 을 읽는 열쇠다.
+      chars  : 호출자에게 돌려준 도구 결과의 글자 수(`res` 를 준 자리만). 게이트웨이는 결과를 자르지 않는다 —
+               이 칸이 '그때 얼마나 컸나' 를 남긴다.
+    corr·note·error 는 길이를 둔다(무기한 보존·한 호출 한 줄). 잘렸으면 원문 길이를 붙인다(`_clip`) — 실측으로 오류 1,423줄 중
+    200자에 닿은 것은 1줄이었다.
     `caller`·`ip`·`via` 를 안 주면 요청 컨텍스트에서 읽는다 — 호출부마다 넘기게 하면 빠뜨린 자리가 빈 칸이 된다
     (대화 저장·검색 줄이 그래서 계정이 비어 있었다). REST 다리처럼 MCP 컨텍스트가 없는 곳은 직접 넘긴다.
     """
@@ -497,11 +515,13 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
         if mode:
             rec["mode"] = mode
         if corr:
-            rec["corr"] = str(corr)[:120]
+            rec["corr"] = _clip(corr, 120)
         if note:
-            rec["note"] = str(note)[:120]
+            rec["note"] = _clip(note, 120)
         if err:
-            rec["error"] = err[:200]
+            rec["error"] = _clip(err, 200)
+        if res is not None:
+            rec["chars"] = _res_chars(res)
         purpose = _request_purpose()
         if purpose:
             rec["purpose"] = purpose
@@ -2455,7 +2475,7 @@ async def _rest_call(args: dict) -> types.CallToolResult:
             _audit(f"rest_call {method} {path}", site, False, f"per-user: {e!r}", 0, caller=caller)
             # 서비스 자격으로 조용히 강등하지 않는다 — 그러면 남의 시야로 답하고,
             # 실패가 정상 응답과 구분되지 않는다(MCP 경로와 같은 자세).
-            return _rest_text({"error": f"{caller} 자격증명을 받지 못했다", "detail": str(e)[:300]})
+            return _rest_text({"error": f"{caller} 자격증명을 받지 못했다", "detail": _clip(e, 300)})
         # Caddy forward_auth 뒤의 앱은 Authorization 을 그 문이 아는 토큰으로 지켜야 통과하므로
         # 앱 전용 자격을 따로 싣는다(`_call_as_user` 의 token_header 와 같은 이유).
         hdr = PER_USER_SSO[app_id].get("token_header")
@@ -2507,7 +2527,7 @@ async def _rest_call(args: dict) -> types.CallToolResult:
     except Exception as e:  # noqa: BLE001
         ms = round((time.monotonic() - t0) * 1000)
         _audit(f"rest_call {method} {path}", site, False, f"upstream: {e!r}", ms, caller=caller)
-        return _rest_text({"error": "upstream unreachable", "site": site, "detail": str(e)[:300]})
+        return _rest_text({"error": "upstream unreachable", "site": site, "detail": _clip(e, 300)})
 
     ms = round((time.monotonic() - t0) * 1000)
     if too_big:
@@ -2668,7 +2688,7 @@ async def _mint_user_pat(conf: dict, email: str) -> tuple[str, object]:
     async with httpx.AsyncClient(timeout=15) as cli:
         resp = await cli.post(conf["sso_url"], headers=headers)
     if resp.status_code != 200:
-        raise RuntimeError(f"SSO {resp.status_code}: {resp.text[:200]}")
+        raise RuntimeError(f"SSO {resp.status_code}: {_clip(resp.text, 200)}")
     data = resp.json()
 
     # expires_in 은 토큰과 **같은 객체**에서 읽는다 — RA 는 {success, data:{access_token, expires_in}} 봉투다.
@@ -2684,7 +2704,7 @@ async def _mint_user_pat(conf: dict, email: str) -> tuple[str, object]:
 
     got = _find(data)
     if not got:
-        raise RuntimeError(f"SSO 응답에 토큰 없음: {json.dumps(data, ensure_ascii=False)[:200]}")
+        raise RuntimeError(f"SSO 응답에 토큰 없음: {_clip(json.dumps(data, ensure_ascii=False), 200)}")
     return got
 
 
@@ -2983,7 +3003,7 @@ async def _call_tool(name: str, arguments: dict):
         _hit = _cache_get(ckey)
         if _hit is not None:
             _audit(name, backend_key, True, None, 0, caller=_request_user() or None,
-                   note="cache-hit", corr=_request_corr())
+                   note="cache-hit", corr=_request_corr(), res=_hit)
             # ⚠ **캐시 적중도 근거다.** 이 줄만 `_evid_keep` 이 빠져 있었다(나머지 반환
             # 경로 다섯은 전부 감쌌다). 그래서 캐시가 데워진 뒤에는 `verify_answer` 가
             # **방금 제대로 조회한 수치**를 지어낸 값이라고 고발했다 — 간헐적이라
@@ -3057,7 +3077,7 @@ async def _call_tool(name: str, arguments: dict):
                 _audit(name, backend_key, not getattr(res, "isError", False), None,
                        round((time.monotonic() - t0) * 1000),
                        caller=email, mode="as-user-pat", corr=_request_corr(),
-                       note="re-minted" if attempt else None)
+                       note="re-minted" if attempt else None, res=res)
                 return _cache_put(ckey, _evid_keep(name, res))
     elif backend_key in PORTAL_CONN_BACKENDS:
         # 포털 등록 연결 토큰 위임(RA 등). 신원이 있는 호출은 **본인 토큰으로만** 간다. 서비스 계정(cae00 에선
@@ -3115,7 +3135,7 @@ async def _call_tool(name: str, arguments: dict):
                 )
             _audit(name, backend_key, not getattr(res, "isError", False), None,
                    round((time.monotonic() - t0) * 1000),
-                   caller=email, mode="as-conn", corr=_request_corr())
+                   caller=email, mode="as-conn", corr=_request_corr(), res=res)
             return _cache_put(ckey, _evid_keep(name, res))
 
     # 이 호출이 쓰는 세션의 세대. 실패했을 때 "내가 죽었다고 본 그 세션" 을 가리키므로,
@@ -3134,12 +3154,12 @@ async def _call_tool(name: str, arguments: dict):
             res = await _call_with_identity(b, original, arguments, CALL_TIMEOUT_S, _u, _g)
             _audit(name, backend_key, not getattr(res, "isError", False), None,
                    round((time.monotonic() - t0) * 1000),
-                   caller=_u or None, mode="identity-fwd", corr=_request_corr())
+                   caller=_u or None, mode="identity-fwd", corr=_request_corr(), res=res)
             return _cache_put(ckey, _evid_keep(name, res))
         res = await _call_shared(b, backend_key, original, arguments)
         _audit(name, backend_key, not getattr(res, "isError", False), None,
                round((time.monotonic() - t0) * 1000),
-               caller=_u or None, mode="service", note=note, corr=_request_corr())
+               caller=_u or None, mode="service", note=note, corr=_request_corr(), res=res)
         return _cache_put(ckey, _evid_keep(name, res))
     except _Late as late:
         return _late(late)
@@ -3170,7 +3190,7 @@ async def _call_tool(name: str, arguments: dict):
                            round((time.monotonic() - t0) * 1000),
                            caller=_u or None, mode="identity-fwd" if _fwd else "service",
                            note="reconnected" + (f"+{note}" if note else ""),
-                           corr=_request_corr())
+                           corr=_request_corr(), res=res)
                     return _cache_put(ckey, _evid_keep(name, res))
         except _Late as late:
             return _late(late)
@@ -3343,7 +3363,7 @@ def _bearer_gate(app, pat_verifier=None):
                 _status = 200
             except Exception as exc:  # noqa: BLE001 — 트리거 실패가 게이트웨이를 죽이면 안 된다
                 log.warning("/refresh 실패: %r", exc)
-                _body = json.dumps({"ok": False, "error": str(exc)[:200]}).encode()
+                _body = json.dumps({"ok": False, "error": _clip(exc, 200)}).encode()
                 _status = 500
             await send({"type": "http.response.start", "status": _status,
                         "headers": [(b"content-type", b"application/json")]})

@@ -267,18 +267,21 @@ def test_save_conversation_meta_를_옮긴다(monkeypatch):
     assert out[1]["meta"]["non_negotiable"] == "양산 금형 변경 불가"
 
 
-def test_save_conversation_meta_는_알려진_칸만_잘라서(monkeypatch):
+def test_save_conversation_meta_는_알려진_칸만_자르지_않고(monkeypatch):
+    """알려진 두 칸(rebut·non_negotiable)만 옮긴다 — 임의 dict 는 넘기지 않는다. 다만 자르지 않는다: 종전엔 웹 경로처럼
+    반박 4건·요지 160자·조항 1,200자로 잘랐는데, 포털 입력 모델은 meta 에 한도가 없고 이어하기는 그 조항을 다음 심의에 넘긴다."""
     big = [{"target": "t" * 500, "quote": "q" * 500, "counter": "c" * 500, "basis": "b" * 500, "junk": 1}] * 9
     out = _drive_save(monkeypatch, [
-        {"role": "persona", "persona": "a", "content": "x", "meta": {"rebut": big, "evil": "x" * 99999}},
+        {"role": "persona", "persona": "a", "content": "x",
+         "meta": {"rebut": big, "non_negotiable": "조" * 5000, "evil": "x" * 99999}},
         {"role": "persona", "persona": "b", "content": "y", "meta": "문자열은 meta 가 아니다"},
         {"role": "persona", "persona": "c", "content": "z"},
     ])
     m = out[0]["meta"]
-    assert set(m) == {"rebut"}                               # 모르는 칸은 옮기지 않는다
-    assert len(m["rebut"]) == 4                              # 웹 경로와 같은 상한
+    assert set(m) == {"rebut", "non_negotiable"}             # 모르는 칸은 옮기지 않는다
+    assert len(m["rebut"]) == 9 and m["non_negotiable"] == "조" * 5000
     r = m["rebut"][0]
-    assert (len(r["target"]), len(r["quote"]), len(r["counter"]), len(r["basis"])) == (60, 80, 160, 60)
+    assert (len(r["target"]), len(r["quote"]), len(r["counter"]), len(r["basis"])) == (500, 500, 500, 500)
     assert "junk" not in r
     assert "meta" not in out[1] and "meta" not in out[2]    # dict 아니면·없으면 칸 자체를 안 만든다
 
@@ -4315,3 +4318,118 @@ async def test_rest_call_이_상한을_넘겨_거부할_때는_크기와_좁히�
     out = _payload(await gw._rest_call({"site": "locked", "path": "/rows"}))
     assert "넘는다" in out["error"] and "10,000" in out["error"] and "GATEWAY_REST_CALL_MAX_BYTES" in out["error"]
     assert "rest_catalog" in out["detail"] and "좁혀" in out["detail"]
+
+
+# ── save_conversation — MCP 심의 전사의 유일한 서버 사본이다. 포털 한도(발언 20,000자·한 번에 200건)를 넘는 것을 버리지 않는다 ──
+def _drive_save_all(monkeypatch, arguments, fail_at=None):
+    """포털 자리에 앉아 받은 요청을 **전부** 기록한다. fail_at=n 이면 n번째 요청(0부터)에 500 으로 답한다."""
+    from types import SimpleNamespace as NS
+    posts, audits = [], []
+
+    class _Resp:
+        def __init__(self, code): self.status_code = code
+        def json(self): return {"id": "c-1"} if self.status_code == 200 else {}
+
+    class _Cli:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None):
+            posts.append((url, json))
+            return _Resp(500 if fail_at is not None and len(posts) - 1 == fail_at else 200)
+
+    monkeypatch.setattr(gw, "_portal_api_base", lambda: "http://portal")
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    monkeypatch.setattr(gw, "_audit", lambda *a, **k: audits.append((a, k)))
+    monkeypatch.setattr(gw, "_low", NS(request_context=NS(request=NS(headers={"authorization": "Bearer t"}))))
+    res = asyncio.run(gw._save_conversation(arguments))
+    return res, posts, audits
+
+
+def _stored(posts):
+    """포털에 실제로 쌓인 순서 — 일괄 생성의 messages 뒤에 덧붙이기들."""
+    out = list(posts[0][1]["messages"])
+    out += [b for url, b in posts[1:] if url.endswith("/messages")]
+    return out
+
+
+def test_save_conversation_은_포털_한도를_넘는_발언을_나눠_싣고_한_글자도_버리지_않는다(monkeypatch):
+    """1백만 토큰 창의 좌석 발언·결정문은 20,000자를 넘는다. 종전엔 표지 없이 잘라 저장했고, 이어하기가 그 잘린 글을 정본으로
+    읽었다. 포털 한도는 그대로 지키되(넘으면 배치 전체가 422) 이어지는 메시지로 나눠 싣는다."""
+    say = "결정문 " + "".join(f"[{i:05d}] 근거와 판정을 적는다. " for i in range(3000))
+    assert len(say) > 2 * 20000
+    rb = [{"target": "b", "quote": "q", "counter": "c", "basis": "x"}]
+    res, posts, audits = _drive_save_all(monkeypatch, {"title": "심의", "messages": [
+        {"role": "user", "content": "질문"},
+        {"role": "persona", "persona": "의장", "round": 3, "content": say, "meta": {"rebut": rb}},
+        {"role": "persona", "persona": "b", "round": 3, "content": "짧다"}]})
+    assert not res.isError
+    got = _stored(posts)
+    parts = [m for m in got if m.get("persona") == "의장"]
+    assert len(parts) >= 3 and all(len(m["content"]) <= 20000 for m in got)
+    import re as _re
+    assert "".join(_re.sub(r"^\(긴 발언 나눔 \d+/\d+\)\n", "", m["content"]) for m in parts) == say
+    assert parts[0]["meta"]["rebut"] == rb and all("meta" not in m for m in parts[1:]), "meta 는 첫 조각에만"
+    assert {m["round"] for m in parts} == {3} and got[-1]["content"] == "짧다", "순서가 그대로다"
+    body = json.loads(res.content[0].text)
+    assert body["ok"] is True and body["split"] == [{"index": 1, "chars": len(say), "parts": len(parts)}]
+
+
+def test_save_conversation_은_200건을_넘는_전사를_덧붙이기로_마저_보낸다(monkeypatch):
+    """한 번에 200건(포털 ConvCreate 한도)을 넘으면 첫 항목 + 꼬리 199 만 남겨 가운데 발언이 통째로 사라졌다. 포털에는 한 건씩
+    덧붙이는 길(POST /agent/conversations/{id}/messages)이 있다 — 200건으로 만들고 나머지를 순서대로 덧붙인다."""
+    msgs = [{"role": "user", "content": "질문"}] + [
+        {"role": "persona", "persona": f"s{i % 20}", "round": i // 20 + 1, "content": f"발언 {i}"} for i in range(258)
+    ] + [{"role": "assistant", "content": "결정문"}]
+    res, posts, _ = _drive_save_all(monkeypatch, {"title": "심의", "messages": msgs})
+    assert not res.isError
+    assert posts[0][0] == "http://portal/agent/conversations" and len(posts[0][1]["messages"]) == 200
+    assert {u for u, _ in posts[1:]} == {"http://portal/agent/conversations/c-1/messages"} and len(posts) == 61
+    assert [m["content"] for m in _stored(posts)] == [m["content"] for m in msgs], "가운데도 끝도 순서대로 전부"
+    assert json.loads(res.content[0].text)["messages_saved"] == 260
+
+
+def test_save_conversation_이_덧붙이다_실패하면_어디까지_저장됐는지_말한다(monkeypatch):
+    msgs = [{"role": "persona", "persona": "s", "content": f"발언 {i}"} for i in range(230)]
+    res, posts, audits = _drive_save_all(monkeypatch, {"title": "심의", "messages": msgs}, fail_at=11)
+    assert res.isError
+    text = res.content[0].text
+    assert text.startswith("CONV_PARTIAL:")
+    body = json.loads(text.split(":", 1)[1])
+    assert (body["conversation_id"], body["saved_messages"], body["total_messages"]) == ("c-1", 210, 230)
+    assert audits and audits[-1][0][2] is False and "partial" in str(audits[-1])
+
+
+def test_save_conversation_이_포털_한도로_자른_이름과_제목은_원문_길이와_함께_알린다(monkeypatch):
+    res, posts, audits = _drive_save_all(monkeypatch, {"title": "제" * 300, "messages": [
+        {"role": "persona", "persona": "p" * 150, "content": "x"}]})
+    assert posts[0][1]["title"] == "제" * 200 and posts[0][1]["messages"][0]["persona"] == "p" * 120
+    body = json.loads(res.content[0].text)
+    assert body["ok"] is True
+    assert {"field": "title", "chars": 300, "kept": 200} in body["clipped"]
+    assert {"field": "persona", "index": 0, "chars": 150, "kept": 120} in body["clipped"]
+    assert "clipped" in (audits[-1][1].get("note") or "")
+    plain, _, _ = _drive_save_all(monkeypatch, {"title": "t", "messages": [{"role": "user", "content": "x"}]})
+    assert json.loads(plain.content[0].text) == {"ok": True, "conversation_id": "c-1"}, "아무것도 안 바꿨으면 종전 응답 그대로"
+
+
+def test_대화_저장_상한은_포털_입력_모델의_한도를_넘지_않는다():
+    """두 리포에 걸친 계약이다 — 게이트웨이가 포털보다 크게 보내면 배치 전체가 422 로 거부돼 심의 전사가 통째로 유실된다(전기박리
+    심의 사고). 작게 보내는 것은 안전하다(조각이 늘 뿐). 포털이 한도를 올리면 이 상수를 따라 올린다. 형제 리포가 있을 때만 본다."""
+    import re
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(gw.__file__))),
+                        "HWAXPortal", "backend", "app", "agent", "routes.py")
+    if not os.path.exists(path):
+        pytest.skip("HWAXPortal 리포가 옆에 없다")
+    src = open(path, encoding="utf-8").read()
+
+    def cap(cls: str, field: str) -> int:
+        body = re.search(rf"class {cls}\(BaseModel\):(.*?)\n\n\n", src, re.S)
+        assert body, f"포털에서 {cls} 를 못 찾았다 — 이름이 바뀌었나"
+        m = re.search(rf"^\s+{field}:[^\n]*max_length=(\d+)", body.group(1), re.M)
+        assert m, f"포털 {cls}.{field} 의 max_length 를 못 읽었다"
+        return int(m.group(1))
+    assert gw.CONV_CONTENT_MAX <= cap("ConvMessageIn", "content")
+    assert gw.CONV_PERSONA_MAX <= cap("ConvMessageIn", "persona")
+    assert gw.CONV_TITLE_MAX <= cap("ConvCreate", "title")
+    assert gw.CONV_BATCH_MAX <= cap("ConvCreate", "messages")

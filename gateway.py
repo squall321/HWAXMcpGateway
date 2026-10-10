@@ -1266,13 +1266,23 @@ async def _portal_affiliation(email: str, base_groups: list[str]) -> str:
 # 보존하는 단 한 번의 쓰기이고, 이 도구는 실패를 비치명으로 안내해 오케스트레이터가 전사 없이 넘어간다(gateway-15).
 # 연결(8초)은 죽은 포털을 재는 값이라 짧게 둔다.
 PORTAL_SAVE_TIMEOUT_S = float(os.environ.get("GATEWAY_PORTAL_SAVE_TIMEOUT", "120"))
+# 포털 대화 저장소의 입력 한도 — 정본은 포털 입력 모델(HWAXPortal backend/app/agent/routes.py 의 ConvMessageIn·ConvCreate)이다.
+# 창이 아니라 남의 API 한도라 따른다(넘으면 배치 전체가 422). 발언은 나눠 싣고 200건 넘는 것은 덧붙여 **버리지 않는다** — 자르는 것은
+# 이름(persona)·제목뿐이고 그것도 응답의 clipped 와 감사 note 에 남는다. 포털이 올리면 따라 올린다(작게 보내는 것은 안전하다 —
+# 시험이 포털 소스와 대조한다).
+CONV_CONTENT_MAX = 20000
+CONV_PERSONA_MAX = 120
+CONV_TITLE_MAX = 200
+CONV_BATCH_MAX = 200
 SAVE_CONV_TOOL = types.Tool(
     name="save_conversation",
     description=(
         "심의/대화 로그를 포털 서버 대화 저장소에 저장한다(웹 챗에서 이어보기·GLM 이어가기용). "
         "messages: [{role: user|assistant|system|persona, content, persona?, round?, meta?}] 순서대로. "
         "meta 는 심의 발언의 {rebut:[{target,quote,counter,basis}], non_negotiable} — 웹 관계도·이어하기가 쓴다. "
-        "성공 시 conversation_id 반환, 포털 미가용/인증 불가면 CONV_UNAVAILABLE."
+        "성공 시 conversation_id 반환, 포털 미가용/인증 불가면 CONV_UNAVAILABLE. "
+        "발언은 자르지 않는다 — 포털 한 칸(20,000자)을 넘으면 이어지는 메시지로 나눠 싣고(split), 200건을 넘으면 나머지를 "
+        "덧붙인다. 덧붙이다 멈추면 CONV_PARTIAL(어디까지 들어갔는지) — 그때는 다시 보내지 마라(같은 대화가 두 벌 생긴다)."
     ),
     inputSchema={
         "type": "object",
@@ -1333,65 +1343,110 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
         auth = None
     if not auth:
         return _fail("no caller authorization to forward")
-    # 포털 검증 상한(persona 120·content 20000·messages 200)에 맞춰 사전 정규화 — 항목 하나가
-    # 길면 포털이 배치 전체를 422 로 거부해 심의 대화가 통째로 유실된다(전기박리 심의 사고).
-    def _msg(m: dict) -> dict:
+    # 포털 검증 한도(CONV_*)에 맞춰 사전 정규화 — 항목 하나가 길면 포털이 배치 전체를 422 로 거부해 심의 대화가 통째로
+    # 유실된다(전기박리 심의 사고). ⚠ 맞추되 **버리지 않는다.** 종전엔 발언을 20,000자에서 표지 없이 자르고 200건을 넘으면 첫 항목 +
+    # 꼬리 199 만 남겼다 — 1백만 토큰 창의 발언·결정문과 20석 다회차 심의에서 이어하기가 잘린 글을 정본으로 읽었다.
+    split: list[dict] = []
+    clipped: list[dict] = []
+
+    def _msgs(i: int, m: dict) -> list[dict]:
         role = m.get("role")
-        out = {"role": role if role in ("user", "assistant", "system", "persona") else "assistant",
-               "content": str(m.get("content") or "")[:20000]}
+        base_msg = {"role": role if role in ("user", "assistant", "system", "persona") else "assistant"}
         if m.get("persona") is not None:
-            out["persona"] = str(m["persona"])[:120]
+            p = str(m["persona"])
+            if len(p) > CONV_PERSONA_MAX:
+                clipped.append({"field": "persona", "index": i, "chars": len(p), "kept": CONV_PERSONA_MAX})
+            base_msg["persona"] = p[:CONV_PERSONA_MAX]
         if m.get("round") is not None:
             try:
-                out["round"] = int(m["round"])
+                base_msg["round"] = int(m["round"])
             except (TypeError, ValueError):
                 pass
-        # meta — ⚠ 종전엔 여기서 role/content/persona/round 만 옮겨 meta 를 **조용히** 버렸다.
-        # 그래서 MCP 심의는 반박 구조를 만들어도 포털 관계도·이어하기 조항 승계에 닿지 않았다.
-        # 알려진 두 칸만, 웹 경로(포털 routes.py 발언 저장)와 같은 자르기로 옮긴다 — 임의 dict 를
-        # 통째로 넘기면 크기 폭주로 배치 전체가 거부될 수 있다(위 사전 정규화와 같은 이유).
+        text = str(m.get("content") or "")
+        if len(text) <= CONV_CONTENT_MAX:
+            chunks = [text]
+        else:
+            # 포털 한 칸에 들어가게 이어지는 메시지로 나눈다 — 머리표를 붙여도 한도 안이게 여유를 둔다.
+            step = CONV_CONTENT_MAX - 40
+            n = -(-len(text) // step)
+            chunks = [f"(긴 발언 나눔 {k + 1}/{n})\n" + text[k * step:(k + 1) * step] for k in range(n)]
+            split.append({"index": i, "chars": len(text), "parts": n})
+        out = [{**base_msg, "content": c} for c in chunks]
+        # meta — ⚠ 종전엔 meta 를 **조용히** 버렸고, 그다음엔 웹 경로처럼 잘라(non_negotiable 1,200자·반박 4건·요지 160자) 옮겼다.
+        # 포털 입력 모델은 meta 에 한도가 없다 — 알려진 두 칸만 옮기되(관계도·이어하기 조항 승계가 읽는 칸) 자르지 않는다.
+        # 임의 dict 를 통째로 넘기지 않는 것은 그대로다. 첫 조각에만 싣는다.
         meta = m.get("meta")
         if isinstance(meta, dict):
             mo: dict = {}
             if meta.get("non_negotiable"):
-                mo["non_negotiable"] = str(meta["non_negotiable"])[:1200]
+                mo["non_negotiable"] = str(meta["non_negotiable"])
             if isinstance(meta.get("rebut"), list):
-                rb = [{"target": str(r.get("target") or "")[:60], "quote": str(r.get("quote") or "")[:80],
-                       "counter": str(r.get("counter") or "")[:160], "basis": str(r.get("basis") or "")[:60]}
-                      for r in meta["rebut"][:4] if isinstance(r, dict)]
+                rb = [{k: str(r.get(k) or "") for k in ("target", "quote", "counter", "basis")}
+                      for r in meta["rebut"] if isinstance(r, dict)]
                 if rb:
                     mo["rebut"] = rb
             if mo:
-                out["meta"] = mo
+                out[0]["meta"] = mo
         return out
 
-    raw_msgs = arguments.get("messages") or []
+    msgs: list[dict] = []
+    for i, m in enumerate(x for x in (arguments.get("messages") or []) if isinstance(x, dict)):
+        msgs.extend(_msgs(i, m))
     # kind/source 도 정규화한다. 포털 스키마가 Literal 이라 값 하나가 어긋나면 422 로
     # 배치 전체가 거부돼 심의 전문이 통째로 유실된다 — 길이 상한만 맞춰 두고 여기를
     # 비워 두면 같은 사고가 다른 필드로 재현될 뿐이다.
     _kind = str(arguments.get("kind") or "deliberation")
     _source = str(arguments.get("source") or "mcp")
+    title = str(arguments.get("title") or "심의")
+    if len(title) > CONV_TITLE_MAX:
+        clipped.append({"field": "title", "chars": len(title), "kept": CONV_TITLE_MAX})
     body = {
-        "title": str(arguments.get("title") or "심의")[:200],
+        "title": title[:CONV_TITLE_MAX],
         "kind": _kind if _kind in ("chat", "deliberation") else "deliberation",
         "source": _source if _source in ("web", "mcp") else "mcp",
-        # ⚠ 머리 200 을 남기면 잘리는 쪽이 꼬리 = 결정문 분할(워크플로 msgs 는 결정문이 맨 뒤다).
-        #   첫 항목(user 질문) + 꼬리 199 를 지킨다 — 발언 일부를 버려도 결정문은 산다(감사 C48).
-        "messages": (lambda ms: ms if len(ms) <= 200 else [ms[0]] + ms[-199:])(
-            [_msg(m) for m in raw_msgs if isinstance(m, dict)]),
+        # 한 번에 CONV_BATCH_MAX 건으로 만들고 나머지는 순서대로 덧붙인다(POST /agent/conversations/{id}/messages).
+        "messages": msgs[:CONV_BATCH_MAX],
     }
+    rest = msgs[CONV_BATCH_MAX:]
+    note = " ".join(x for x in (f"split:{len(split)}" if split else "", f"clipped:{len(clipped)}" if clipped else "",
+                                f"appended:{len(rest)}" if rest else "") if x) or None
+    hdrs = {"Authorization": auth}
+
+    def _partial(cid, saved: int, why: str) -> types.CallToolResult:
+        # 대화는 만들어졌고 일부만 들어갔다 — '실패' 로만 말하면 다시 보내 같은 대화가 두 벌 생기고, '성공' 으로 말하면 빠진 발언을 모른다.
+        _audit("save_conversation", "portal", False, f"partial {saved}/{len(msgs)}: {why}",
+               round((time.monotonic() - t0) * 1000), note=note)
+        return types.CallToolResult(content=[types.TextContent(type="text", text="CONV_PARTIAL: " + json.dumps(
+            {"ok": False, "conversation_id": cid, "saved_messages": saved, "total_messages": len(msgs), "error": why,
+             "detail": "대화는 만들어졌고 앞 saved_messages 건만 들어갔다 — 다시 보내면 같은 대화가 두 벌 생긴다. "
+                       "웹에서 그 대화를 열어 확인하라."}, ensure_ascii=False))], isError=True)
+
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(PORTAL_SAVE_TIMEOUT_S, connect=8.0)) as cli:
-            r = await cli.post(f"{base}/agent/conversations", json=body,
-                               headers={"Authorization": auth})
-        if r.status_code != 200:
-            return _fail(f"portal {r.status_code}")
-        cid = r.json().get("id")
+            r = await cli.post(f"{base}/agent/conversations", json=body, headers=hdrs)
+            if r.status_code != 200:
+                return _fail(f"portal {r.status_code}")
+            cid = r.json().get("id")
+            saved = len(body["messages"])
+            for m in rest:
+                try:
+                    ra = await cli.post(f"{base}/agent/conversations/{cid}/messages", json=m, headers=hdrs)
+                except Exception as e:  # noqa: BLE001 — 답을 못 받은 한 건은 들어갔을 수도 있다
+                    return _partial(cid, saved, f"덧붙이기 {saved + 1}번째에서 {e!r} — 그 건은 들어갔을 수 있다")
+                if ra.status_code != 200:
+                    return _partial(cid, saved, f"덧붙이기 {saved + 1}번째에서 portal {ra.status_code}")
+                saved += 1
         _audit("save_conversation", "portal", True, None,
-               round((time.monotonic() - t0) * 1000))
+               round((time.monotonic() - t0) * 1000), note=note)
+        out = {"ok": True, "conversation_id": cid}
+        if split or clipped or rest:
+            out["messages_saved"] = saved
+        if split:
+            out["split"] = split      # 포털 한 칸(CONV_CONTENT_MAX)을 넘어 이어지는 메시지로 나눈 발언 — 글은 다 들어갔다
+        if clipped:
+            out["clipped"] = clipped  # 포털 한도로 자른 이름·제목(원문 길이 chars, 남긴 길이 kept)
         return types.CallToolResult(
-            content=[types.TextContent(type="text",
-                     text=json.dumps({"ok": True, "conversation_id": cid}))],
+            content=[types.TextContent(type="text", text=json.dumps(out, ensure_ascii=False))],
         )
     except httpx.ReadTimeout:
         # 본문은 다 보냈고 답만 못 받았다 — 포털이 이미 커밋했을 수 있어 무턱대고 다시 보내면 같은 대화가 두 벌 생긴다.

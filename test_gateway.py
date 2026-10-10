@@ -3963,6 +3963,8 @@ def _audit_rows():
 def test_백엔드_도구_결과는_직접_불러도_invoke_tool_로_불러도_캐시에서_와도_한_글자도_안_잘린다(monkeypatch):
     big = '{"rows": "' + "가1" * 400_000 + '"}'           # 80만 자 — 옛 상한 어느 것보다 크다
     b = _result_kit(monkeypatch, big)
+    # 1.6MB(UTF-8)라 캐시 한 칸 상한(1MiB)을 넘는다 — 이 시험은 캐시 길의 무절단을 보므로 그 상한만 올린다.
+    monkeypatch.setattr(gw, "CACHE_ITEM_MAX_BYTES", 4 * 1024 * 1024)
     direct = asyncio.run(gw._call_tool("get_big", {}))
     assert direct.content[0].text == big
     via = asyncio.run(gw._call_tool("invoke_tool", {"name": "get_big", "arguments": {}}))
@@ -4634,3 +4636,25 @@ def test_지침이_리스크_심사는_risk_next_step_부터라고_말한다():
     item = gw._INSTRUCTIONS[gw._INSTRUCTIONS.rfind("\n", 0, i):]
     assert "리스크 심사" in item and "확인" in item and "consent" in item, item
     assert len(gw._INSTRUCTIONS) < 2048, "Claude Code 는 서버 지침을 2048자에서 자른다"
+
+
+# ── 응답 캐시의 바이트 상한(gw-adh GA-5) ─────────────────────────────────────────────────────────────────────
+def test_응답_캐시는_큰_결과를_담지_않고_합도_바이트로_묶는다(monkeypatch):
+    """검색 도구의 top_k 천장과 200자 스니펫이 걷혀 결과 한 건이 수십 MB 가 될 수 있다(hybrid_search(top_k=5000) 약 21MB 추정).
+    캐시는 건수(512)만 봐서 그런 결과를 300초 쥐었다 — rest_call 이 1MiB 로 막는 그 꼴이 MCP 길에서는 안 막혔다. 결과는 자르지
+    않고 그대로 돌려주되(호출자 몫) 캐시에는 담지 않고, 담는 것도 합을 바이트로 묶어 오래된 것부터 버린다."""
+    monkeypatch.setattr(gw, "CACHE_TTL_S", 300.0)
+    monkeypatch.setattr(gw, "_RESP_CACHE", gw.OrderedDict())
+    big = _txt('{"hits": "' + "가" * 600_000 + '"}')                      # 한글 60만 자 ≈ 1.8MB(UTF-8)
+    k = gw._cache_key("ai-data-hub", "hybrid_search", {"q": "x", "top_k": 5000})
+    assert gw._cache_put(k, big) is big, "결과는 자르지 않고 그대로 돌려준다"
+    assert k not in gw._RESP_CACHE, "1MiB 를 넘는 결과가 캐시에 300초 남았다"
+    assert gw._cache_put(k, _txt('{"hits": []}')) and k in gw._RESP_CACHE, "작은 결과는 종전대로 담는다"
+
+    monkeypatch.setattr(gw, "_RESP_CACHE", gw.OrderedDict())
+    monkeypatch.setattr(gw, "CACHE_MAX_BYTES", 2500)
+    keys = [gw._cache_key("b", "get_x", {"i": i}) for i in range(4)]
+    for kk in keys:
+        gw._cache_put(kk, _txt("x" * 1000))
+    assert list(gw._RESP_CACHE) == keys[2:], "합이 상한을 넘으면 오래된 것부터 버린다"
+    assert gw._cache_get(keys[3]).content[0].text == "x" * 1000

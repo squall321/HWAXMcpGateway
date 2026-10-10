@@ -137,6 +137,7 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 | 무엇 | 값 | 까닭 · 넘으면 |
 |---|---|---|
 | `GATEWAY_REST_CALL_MAX_BYTES` | 1,048,576 바이트 | 메모리 보호(120MB 응답에 피크 521MB 실측). 자르지 않고 **거부**하며 바이트·손잡이·좁히는 법을 말한다 |
+| `GATEWAY_CACHE_ITEM_MAX_BYTES` · `GATEWAY_CACHE_MAX_BYTES` | 1,048,576 · 67,108,864 바이트 | 응답 캐시(300초)의 메모리 보호 — 결과는 자르지 않는다. 한 건이 앞의 값을 넘으면 그대로 돌려주되 캐시에 담지 않고(`/health` 의 `cache.too_big`), 담은 것의 합(`cache.bytes`)이 뒤의 값을 넘으면 오래된 것부터 버린다 |
 | `EVID_MAX_CHARS` | 1,048,576 | `verify_answer` 근거 원장의 호출자 한 칸(원문이 아니라 숫자 줄기). 메모리 보호. 넘치면 오래된 조회부터 버리고 `evidence_trimmed` 로 말한다 |
 | `EVID_MAX_CALLS` | 없음(0) | 적으면 건수 천장이다 — 낮출 때만 쓴다 |
 | 결과 건수 `search_tools`·`browse_experts`·`rest_catalog` | 8(≤20)·40(≤200)·40(≤200) | 순위·목록이다. 넘으면 `truncated` 가 말한다 |

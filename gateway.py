@@ -344,6 +344,11 @@ async def _portal_connection(service: str, email: str) -> dict | None:
 # rate-limit 에 걸려 같은 실측에서 호출의 33%가 거부됐다. 중복을 없애면 판정 부하도 준다.
 CACHE_TTL_S = float(os.environ.get("GATEWAY_CACHE_TTL", "300"))
 CACHE_MAX = int(os.environ.get("GATEWAY_CACHE_MAX", "512"))
+# 바이트 상한 — 메모리 보호다(결과를 자르지 않는다). 건수만 보면 검색 한 번이 수십 MB 인 결과(top_k 천장·스니펫 상한이 걷힌 뒤
+# hybrid_search(top_k=5000) 추정 21MB)를 512칸 × 300초 쥔다 — dev 는 OOM 이력이 있는 박스다. 한 건이 ITEM 을 넘으면 그대로 돌려주되
+# 담지 않고(`/health` cache.too_big 이 센다), 담은 것의 합이 MAX 를 넘으면 오래된 것부터 버린다. ITEM 은 rest_call 상한과 같은 값이다.
+CACHE_ITEM_MAX_BYTES = int(os.environ.get("GATEWAY_CACHE_ITEM_MAX_BYTES", str(1024 * 1024)))
+CACHE_MAX_BYTES = int(os.environ.get("GATEWAY_CACHE_MAX_BYTES", str(64 * 1024 * 1024)))
 # 캐시해도 되는 도구 — 접두사 화이트리스트로만 연다(deny-by-default). 심의 엔진의
 # _FREE_ALLOW 와 같은 자세다. 여기 없으면 캐시하지 않고, 쓰기로 보이면 아래에서 무효화한다.
 _CACHEABLE = ("list_", "get_", "search_", "find_", "query_", "describe_", "hybrid_",
@@ -362,9 +367,9 @@ _CACHE_DENY = ("report_ingest", "report_fragmentize", "get_agent_session")
 #   앱에서만 7개가 캐시되고 있었다). 이름 목록이 아니라 낱말로 막는 이유는 앱이 새로 붙을 때마다
 #   같은 구멍이 다시 열리기 때문이다. 틀려도 캐시를 안 할 뿐이라 넓게 잡는다.
 _CACHE_DENY_WORDS = re.compile(r"(task|status|progress|job)")
-# {(backend, tool, args, identity): (result, expiry)} — 삽입 순서 = LRU 근사(오래된 것부터 버린다)
+# {(backend, tool, args, identity): (result, expiry, 바이트)} — 삽입 순서 = LRU 근사(오래된 것부터 버린다)
 _RESP_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
-_CACHE_STAT = {"hit": 0, "miss": 0, "flush": 0}
+_CACHE_STAT = {"hit": 0, "miss": 0, "flush": 0, "too_big": 0}
 
 
 # 백엔드별 도구 지문 — {이름: 설명·스키마 해시}. 이름 집합만 보면 설명·스키마 변경을 못 잡는다.
@@ -410,7 +415,7 @@ def _cache_get(key):
     hit = _RESP_CACHE.get(key)
     if hit is None:
         return None
-    res, exp = hit
+    res, exp = hit[0], hit[1]
     if time.monotonic() >= exp:
         _RESP_CACHE.pop(key, None)
         return None
@@ -452,16 +457,42 @@ def _looks_failed(res) -> bool:
     return False
 
 
+def _res_bytes(res, stop: int) -> int:
+    """결과가 메모리에 쥐는 크기의 근사(바이트) — 본문 글(UTF-8)·바이너리 블록(base64 글)·structuredContent(JSON).
+    `stop` 을 넘으면 거기서 그만 센다(그보다 크다는 것만 알면 된다)."""
+    n = 0
+    for c in getattr(res, "content", None) or []:
+        for v in (getattr(c, "text", None), getattr(c, "data", None),
+                  getattr(getattr(c, "resource", None), "text", None), getattr(getattr(c, "resource", None), "blob", None)):
+            if isinstance(v, str):
+                n += len(v.encode("utf-8"))
+        if n > stop:
+            return n
+    sc = getattr(res, "structuredContent", None)
+    if sc:
+        n += len(json.dumps(sc, ensure_ascii=False, default=str).encode("utf-8"))
+    return n
+
+
 def _cache_put(key, res):
-    """성공 결과만 담는다 — 오류를 캐시하면 일시적 실패가 TTL 동안 굳는다."""
+    """성공 결과만 담는다 — 오류를 캐시하면 일시적 실패가 TTL 동안 굳는다. 큰 결과는 담지 않는다(CACHE_ITEM_MAX_BYTES 주석)."""
     if key is None or getattr(res, "isError", False) or _looks_failed(res):
         return res
-    _RESP_CACHE[key] = (res, time.monotonic() + CACHE_TTL_S)
+    size = _res_bytes(res, CACHE_ITEM_MAX_BYTES)
+    if size > CACHE_ITEM_MAX_BYTES:
+        _CACHE_STAT["too_big"] += 1
+        return res
+    _RESP_CACHE[key] = (res, time.monotonic() + CACHE_TTL_S, size)
     _RESP_CACHE.move_to_end(key)
-    while len(_RESP_CACHE) > CACHE_MAX:
+    while _RESP_CACHE and (len(_RESP_CACHE) > CACHE_MAX or _cache_bytes() > CACHE_MAX_BYTES):
         _RESP_CACHE.popitem(last=False)
     _CACHE_STAT["miss"] += 1
     return res
+
+
+def _cache_bytes() -> int:
+    """담은 결과의 바이트 합. 지우는 길이 여럿(flush·conn-invalidate·만료)이라 누계를 들고 다니지 않고 그때 센다(최대 CACHE_MAX 칸)."""
+    return sum(v[2] for v in _RESP_CACHE.values())
 
 
 def _cache_flush_backend(backend_key: str):
@@ -3433,7 +3464,7 @@ def _bearer_gate(app, pat_verifier=None):
                 "tools": len(exposed_tools),
                 "backends": {k: (b.session is not None) for k, b in backends.items()},
                 # 캐시 효과를 밖에서 볼 수 있게 — 안 보이면 켜졌는지도 모른다.
-                "cache": {**_CACHE_STAT, "size": len(_RESP_CACHE), "ttl_s": CACHE_TTL_S},
+                "cache": {**_CACHE_STAT, "size": len(_RESP_CACHE), "bytes": _cache_bytes(), "ttl_s": CACHE_TTL_S},
                 # 정책이 **실려 있는지**는 무인증으로도 봐야 한다 — 비어 있으면 권한이
                 # 통째로 풀린 채 도는 것이고, 그건 프로브가 잡아야 할 사고다. 내용은 가린다.
                 "access_policy_loaded": len(_ACCESS_POLICY),

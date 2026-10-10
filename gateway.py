@@ -1764,19 +1764,27 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
         if score > 0:
             # 커버리지 승수 — 질의어를 더 많이 맞힌 도구가 개별 단어 빈도보다 앞선다.
             rows.append((score * (1 + covered / max(1, len(terms))),
-                         t.name, app, (t.description or "").strip()[:220], t))
+                         t.name, app, (t.description or "").strip(), t))
     rows.sort(key=lambda r: (-r[0], r[1]))
 
     def _args_summary(t) -> dict:
-        """invoke_tool 로 바로 부를 수 있게 인자 요약을 붙인다 — 이게 없으면 모델이
-        스키마를 추측해 넣는다(범용 실행기의 최대 실패 모드)."""
+        """invoke_tool 로 바로 부를 수 있게 인자 계약을 붙인다 — 이게 없으면 모델이
+        스키마를 추측해 넣는다(범용 실행기의 최대 실패 모드).
+
+        ⚠ 요약하지 않는다. 종전엔 인자 12개까지·`type` 만 남겼다 — 13번째부터는 안 보였고(deliberate_start 의
+        save_report·advanced), `anyOf` 인자는 type 이 없어 `any` 로 보였으며 enum·default·설명도 빠졌다. 설명도 220자에서
+        잘라 docstring 의 인자 설명(job 의 값 목록)이 사라졌다. 운영 창이 1,048,576 토큰이라 결과 8~20건의 전체 스키마는
+        묶이지 않는다. 작은 창의 소비자(에이전트 서버 웹 챗)는 자기 쪽 상한(TOOL_RESULT_MAX)으로 자른다."""
         sch = getattr(t, "inputSchema", None) or {}
-        props = sch.get("properties") or {}
-        return {
+        out = {
             "required": sch.get("required") or [],
-            "properties": {k: str((v or {}).get("type") or "any")
-                           for k, v in list(props.items())[:12]},
+            "properties": sch.get("properties") or {},
         }
+        # 모델 인자의 정의 — 속성이 `$ref` 로 가리키는 곳이다. 빼면 참조가 끊긴다(FastMCP 는 `$defs`, 옛 생성기는 `definitions`).
+        for k in ("$defs", "definitions"):
+            if sch.get(k):
+                out[k] = sch[k]
+        return out
     payload = {
         "query": q,
         "matches": [{"tool": n, "app": a, "description": d, "args": _args_summary(t)}

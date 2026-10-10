@@ -3985,3 +3985,75 @@ def test_감사_원장에_잘린_글은_원문_길이를_단다(tmp_path, monkey
     assert long_["note"].startswith("n" * 120) and "500" in long_["note"]
     assert long_["corr"].startswith("c" * 120) and "500" in long_["corr"]
     assert (short["error"], short["note"], short["corr"]) == ("짧은 실패", "cache-hit", "conv-9"), "짧은 글은 그대로다"
+
+
+def _fastmcp_tool(fn) -> types.Tool:
+    """백엔드(FastMCP)가 함수에서 도구를 만드는 **실제 경로**로 만든다 — 인자 스키마를 손으로 쓰지 않는다."""
+    from mcp.server.fastmcp.tools.base import Tool as _FTool
+    ft = _FTool.from_function(fn)
+    return types.Tool(name=ft.name, description=ft.description, inputSchema=ft.parameters)
+
+
+def _deliberate_start_like():
+    def deliberate_start(question: str, job: str = "default", rounds: int = 0, modifiers: list[str] | None = None,
+                         evidence: list[dict] | None = None, personas: list[dict] | None = None,
+                         tools: list[str] | None = None, apps: list[str] | None = None, human_note: str = "",
+                         search_sources: list[str] | None = None, options: list[str] | None = None,
+                         stop_after_round: int = 0, save_report: bool = True, advanced: dict | None = None) -> dict:
+        """심의를 연다. 즉시 job_id 를 돌려주고 심의는 뒤에서 계속 돈다 — 결과는 deliberate_status 로 받는다.
+
+        Args:
+            question: 심의할 화두. 구체적일수록 좌석 발굴이 정확하다.
+            job: 심의 종류 — diagnosis(원인 규명) · option-select(안 선택) · credibility(신뢰 판정) ·
+                 risk-review(리스크 심사) · mechanism(메커니즘 규명) · sim-plan(해석 설계 2단) · default(자유 심의).
+            modifiers: 얹을 층 — voi · premortem · toulmin · eliminative · anon1r.
+            save_report: 끝나면 보고서를 저장한다.
+        """
+        return {}
+    return _fastmcp_tool(deliberate_start)
+
+
+def test_search_tools_는_도구_설명과_인자_스키마를_자르지_않는다(monkeypatch):
+    """invoke_tool 로 부르기 전에 모델이 보는 계약이 이것뿐이다. 설명 220자·인자 12개·type 만 남기던 때는
+    deliberate_start 의 `job` 값 목록(설명 뒤쪽)이 잘리고 13·14번째 인자(save_report·advanced)가 사라졌으며,
+    `anyOf` 인자(modifiers 등)는 type 이 없어 `any` 로 보였다 — 모델이 스키마를 추측해 넣는 바로 그 실패 모드다."""
+    t = _deliberate_start_like()
+    assert len(t.description) > 220 and len(t.inputSchema["properties"]) == 14     # 전제 — 옛 상한을 넘는 도구다
+    monkeypatch.setattr(gw, "exposed_tools", [t])
+    monkeypatch.setattr(gw, "route", {t.name: ("hwax-deliberation", t.name)})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    out = json.loads(asyncio.run(gw._search_tools({"query": "deliberate 심의"})).content[0].text)
+    hit = next(m for m in out["matches"] if m["tool"] == "deliberate_start")
+    assert hit["description"] == t.description.strip()
+    assert "default(자유 심의)" in hit["description"]
+    assert hit["args"]["required"] == ["question"]
+    assert hit["args"]["properties"] == t.inputSchema["properties"], "인자 스키마는 생산자가 준 그대로여야 한다"
+    assert hit["args"]["properties"]["modifiers"]["anyOf"][0]["type"] == "array"
+    assert "advanced" in hit["args"]["properties"] and "save_report" in hit["args"]["properties"]
+
+
+def test_search_tools_의_인자_계약은_참조하는_정의까지_싣는다(monkeypatch):
+    """모델 인자를 받는 도구는 FastMCP 가 정의를 `$defs` 에 두고 속성은 `$ref` 로 가리킨다 — properties 만 실으면 참조가 끊긴다."""
+    from pydantic import BaseModel
+
+    class Seat(BaseModel):
+        key: str
+        stance: str = "neutral"
+
+    def seat_panel(seats: list[Seat], note: str = "") -> dict:
+        """좌석을 앉힌다."""
+        return {}
+    t = _fastmcp_tool(seat_panel)
+    assert "$defs" in t.inputSchema                                              # 전제 — 생산자가 정의를 따로 둔다
+    monkeypatch.setattr(gw, "exposed_tools", [t])
+    monkeypatch.setattr(gw, "route", {t.name: ("sf", t.name)})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    out = json.loads(asyncio.run(gw._search_tools({"query": "seat_panel"})).content[0].text)
+    args = next(m for m in out["matches"] if m["tool"] == "seat_panel")["args"]
+    assert args["$defs"] == t.inputSchema["$defs"] and "Seat" in args["$defs"]

@@ -4140,3 +4140,90 @@ def test_browse_experts_가_limit_로_자르면_잘랐다고_말한다(monkeypat
     assert dom["count"] == 50 and len(dom["experts"]) == 40 and "50" in dom["truncated"]
     whole = json.loads(asyncio.run(gw._browse_experts({"domain": "cam", "limit": 50})).content[0].text)
     assert len(whole["experts"]) == 50 and "truncated" not in whole
+
+
+def _evid_ctx(monkeypatch):
+    monkeypatch.setattr(gw, "_EVID", gw.OrderedDict())
+    monkeypatch.setattr(gw, "_request_user", lambda: "a@b.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+
+
+def _keep(tool, text):
+    gw._evid_keep(tool, types.CallToolResult(content=[types.TextContent(type="text", text=text)]))
+
+
+def _verify(text):
+    return json.loads(asyncio.run(gw._verify_answer({"text": text})).content[0].text)
+
+
+def test_verify_answer_는_큰_도구_출력의_뒤쪽_수치도_조회한_값으로_본다(monkeypatch):
+    """근거 원장이 호출당 50,000자에서 잘라, 큰 결과(카드 묶음·곡선·rest_call JSON)의 뒤쪽 수치를 '지어낸 값' 으로 고발했다 —
+    거짓 경고는 사람이 도구를 못 믿게 만든다. 운영 창이 1,048,576 토큰이라 모델은 그 뒤쪽까지 읽는다."""
+    _evid_ctx(monkeypatch)
+    _keep("get_curve", '{"pts": "' + "가나다라 " * 60_000 + '", "peak": 48039.32}')   # 30만 자 뒤의 값
+    body = _verify("최대값은 48039.32 MPa")
+    assert body["unsourced"] == [] and body["checked"] == 1
+
+
+def test_verify_answer_는_스무_번째보다_앞선_조회도_기억한다(monkeypatch):
+    _evid_ctx(monkeypatch)
+    for i in range(30):
+        _keep(f"t{i}", '{"v": %d.5}' % (1000 + i))
+    body = _verify("첫 값 1000.5, 끝 값 1029.5")
+    assert body["unsourced"] == [] and len(body["tool_calls"]) == 30
+
+
+def test_verify_answer_는_못_찾은_수치를_전부_말한다(monkeypatch):
+    _evid_ctx(monkeypatch)
+    _keep("t", '{"v": 1}')
+    nums = [f"{100 + i}.5" for i in range(20)]
+    body = _verify(", ".join(nums))
+    assert body["unsourced"] == nums, "13번째부터 '없다' 는 말도 없이 빠졌다"
+
+
+def test_verify_answer_의_판정은_원문_대조와_같다(monkeypatch):
+    """원장은 쉼표를 지운 원문에서 숫자 줄기만 남긴다 — 판정 규칙(에이전트 서버 evidence.py 와 같은 부분문자열 대조)은 그대로여야
+    한다. 원문 전체로 대조하던 옛 규칙을 오라클로 둔다."""
+    _evid_ctx(monkeypatch)
+    srcs = ['{"a": "1,250.5원", "b": "v1.2.3", "c": "12.5.6", "d": "x408명", "e": "0.25%", "f": "2026-10-10"}',
+            '배열 [100,200,300] · 좌표 (35.123, 129.04) · ID ABC12345XYZ · 1.0e5']
+    for i, s in enumerate(srcs):
+        _keep(f"t{i}", s)
+    answers = ["1250.5", "1,250.5", "250.5", "1.2.3", "12.5", "2.5.6", "408", "4080", "0.25", "2026", "1010",
+               "100200300", "200300", "35.123", "129.04", "129.040", "12345", "123456", "1.0", "100,200"]
+    oracle_src = " ".join(srcs).replace(",", "")
+    for a in answers:
+        m = gw._NUM_TOK_RE.search(a)
+        if not m:
+            continue
+        norm = m.group(0).replace(",", "")
+        if "." not in norm and float(norm) < 100:
+            continue
+        want = norm not in oracle_src
+        got = m.group(0) in _verify(a)["unsourced"]
+        assert got == want, (a, norm, want, got)
+
+
+def test_verify_answer_는_원장을_메모리_상한에서_줄였으면_그렇다고_말한다(monkeypatch):
+    """상한(EVID_MAX_CHARS)은 메모리 보호라 남긴다 — 다만 넘쳐 버린 근거로 '찾지 못했다' 를 말할 때는 그 사실을 같이 말한다."""
+    _evid_ctx(monkeypatch)
+    monkeypatch.setattr(gw, "EVID_MAX_CHARS", 50)
+    _keep("old", '{"v": 11111.5, "w": 22222.5, "x": 33333.5}')
+    _keep("new", '{"v": ' + ", ".join(f"{90000 + i}.5" for i in range(10)) + "}")
+    body = _verify("옛 값 11111.5")
+    assert body["unsourced"] == ["11111.5"]
+    assert body["evidence_trimmed"]["calls_dropped"] >= 1 and "EVID_MAX_CHARS" in body["note"]
+    _evid_ctx(monkeypatch)
+    _keep("t", '{"v": 48039.32}')
+    assert "evidence_trimmed" not in _verify("값 48039.32"), "줄이지 않았으면 칸이 없다"
+
+
+@pytest.mark.anyio
+async def test_rest_call_로_읽은_수치도_조회한_값이다(_rest, monkeypatch):
+    """rest_call 출력이 근거 원장에 안 쌓여, 그 길로 읽은 수치는 verify_answer 가 늘 '조회 결과에 없다' 고 했다."""
+    monkeypatch.setattr(gw, "_EVID", gw.OrderedDict())
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    _Cli.status, _Cli.raw, _Cli.ctype, _Cli.clen = 200, b'{"stress": 48039.32}', "application/json", None
+    await gw._rest_call({"site": "locked", "path": "/x"})
+    body = json.loads((await gw._verify_answer({"text": "응력 48039.32"})).content[0].text)
+    assert body["unsourced"] == [] and body["tool_calls"] == ["rest_call"]

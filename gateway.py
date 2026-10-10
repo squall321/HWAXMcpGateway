@@ -751,8 +751,10 @@ async def _discover_heax() -> dict[str, dict] | None:
             hdrs = {**headers, "Authorization": f"Bearer {app_tokens[sid]}"}
         out[f"{HEAX_PREFIX}{sid}"] = {"url": f"{base}{path}", "headers": hdrs,
                                       "allowed_groups": list(s.get("allowed_groups") or []),
+                                      # 라벨은 이름이라 80자를 둔다(타일 제목). 설명은 자르지 않는다 — list_tool_apps 로 모델이
+                                      # 읽고 search_tools 의 앱 가산점 낱말이라 300자 뒤의 업무 낱말이 사라지면 그 낱말로 못 찾는다.
                                       "label": (s.get("name") or "").strip()[:80],
-                                      "description": (s.get("description") or "").strip()[:300]}
+                                      "description": (s.get("description") or "").strip()}
     # 발견한 앱의 세션을 열기 **전에** 그 호스트도 프록시에서 뺀다(기동 때와 같은 함수 — 이미 있으면 아무것도 안 한다).
     _bypass_proxy_for(spec["url"] for spec in out.values())
     return out
@@ -1881,7 +1883,9 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             entry["muted_note"] = ("사용자가 포털에서 꺼 둔 앱이다 — 사용자가 이 앱을 쓰라고 한 경우에만 부른다. "
                                    "계속 쓰려면 포털 '개인 토큰 › 허브에 보일 앱'(/tokens?tab=apps)에서 켜면 된다.")
         if want_app:
-            entry["tools"] = [{"name": t.name, "description": (t.description or "")[:300]} for t in tools]
+            # 설명은 자르지 않는다 — search_tools 와 같은 계약 자리다(300자에서 자르면 tools/list 원문에 있는 함정·인자 규칙이
+            # 이 길로만 사라졌다). 운영 창 1,048,576 토큰에서 한 앱의 도구 설명 전부는 묶이지 않는다.
+            entry["tools"] = [{"name": t.name, "description": t.description or ""} for t in tools]
         elif include:
             entry["tools"] = sorted(t.name for t in tools)
         apps.append(entry)
@@ -1940,7 +1944,7 @@ def _list_by_area(by_app: dict, groups: list[str], want_area: str) -> types.Call
         m = meta.get(key) or {"label": "미분류", "description": "tool_areas.json 에 없는 도구 — 영역을 지정해야 한다."}
         entry = {"area": key or "", "label": m["label"], "description": m["description"], "tool_count": len(items)}
         if want_area:
-            entry["tools"] = [{"name": t.name, "app": a, "description": (t.description or "")[:300]} for t, a in items]
+            entry["tools"] = [{"name": t.name, "app": a, "description": t.description or ""} for t, a in items]
         else:
             entry["tools"] = sorted(t.name for t, _ in items)
         if items or want_area:

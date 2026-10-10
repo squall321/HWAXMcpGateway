@@ -4057,3 +4057,42 @@ def test_search_tools_의_인자_계약은_참조하는_정의까지_싣는다(m
     out = json.loads(asyncio.run(gw._search_tools({"query": "seat_panel"})).content[0].text)
     args = next(m for m in out["matches"] if m["tool"] == "seat_panel")["args"]
     assert args["$defs"] == t.inputSchema["$defs"] and "Seat" in args["$defs"]
+
+
+def test_list_tool_apps_는_앱_상세와_영역_상세의_도구_설명을_자르지_않는다(monkeypatch, tmp_path):
+    """search_tools 와 같은 계약 자리다 — 이 허브는 도구 설명에 함정·인자 규칙을 길게 적는다(deliberate_start). 300자에서
+    자르면 tools/list 원문에는 있는 것이 이 길로만 사라진다."""
+    t = _deliberate_start_like()
+    assert len(t.description) > 300                                             # 전제 — 옛 상한을 넘는다
+    f = tmp_path / "tool_areas.json"
+    f.write_text(json.dumps({"areas": [{"key": "expert", "label": "전문가"}],
+                             "apps": {"hwax-deliberation": "expert"}, "patterns": [], "tools": {}}), encoding="utf-8")
+    monkeypatch.setattr(gw, "_AREAS_PATH", f)
+    monkeypatch.setattr(gw, "_AREAS_CACHE", {"mtime": None, "data": {}})
+
+    class _S:
+        session = object()
+    monkeypatch.setattr(gw, "backends", {"hwax-deliberation": _S()})
+    monkeypatch.setattr(gw, "exposed_tools", [t])
+    monkeypatch.setattr(gw, "route", {t.name: ("hwax-deliberation", t.name)})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    app = json.loads(asyncio.run(gw._list_tool_apps({"app": "hwax-deliberation"})).content[0].text)
+    assert app["apps"][0]["tools"] == [{"name": t.name, "description": t.description}]
+    area = json.loads(asyncio.run(gw._list_tool_apps({"by": "area", "area": "expert"})).content[0].text)
+    assert area["areas"][0]["tools"] == [{"name": t.name, "app": "hwax-deliberation", "description": t.description}]
+
+
+def test_레지스트리가_준_앱_설명을_자르지_않는다(monkeypatch):
+    """앱 설명은 list_tool_apps 로 모델이 읽고 search_tools 의 앱 가산점 낱말이기도 하다 — 300자 뒤의 업무 낱말이 사라졌다."""
+    desc = "열충격 해석 앱 — " + "사이클·크랙·솔더·피로 " * 60
+    assert len(desc) > 300
+    monkeypatch.setattr(gw, "_bypass_proxy_for", lambda urls: [])
+    monkeypatch.setattr(gw, "HEAX", {"servers_url": "http://hub.test/servers", "base": "http://hub.test"})
+    monkeypatch.setattr(gw.httpx, "AsyncClient", lambda **kw: _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json={"servers": [{"id": "ts", "path": "/ts/mcp", "name": "열충격",
+                                                          "description": desc}]})), **kw))
+    found = asyncio.run(gw._discover_heax())
+    assert found["heax-ts"]["description"] == desc.strip() and found["heax-ts"]["label"] == "열충격"

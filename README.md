@@ -123,6 +123,26 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 
 그 **15초 ping** 은 sse-starlette 의 기본값이다(MCP SDK 는 간격을 따로 주지 않는다). 호출자들의 한도가 이 수에 기대어 있다 — 게이트웨이를 부르는 쪽의 httpx 침묵 한도는 15초보다 크면 죽은 게이트웨이만 잡고(포털 `upload.mcp_call` 의 timeout·절차 실행기 `CLIENT_TIMEOUT`, 리스크 앱 `HWAXRISK_SOURCE_CALL_TIMEOUT_S`·`ra_client.DEFAULT_TIMEOUT` — 값은 각 리포가 정본이라 여기 적지 않는다), 15초보다 작으면 그것이 실제 호출 상한이다(리스크 앱의 필드 근거 조회 `field_source.FIELD_TIMEOUT_S` 가 그 경우다). 15초를 넘는 '상한' 은 벽시계 기한으로 구현해야 걸린다. 게이트웨이는 에이전트 venv 로 뜨므로 그쪽 라이브러리를 올릴 때 이 전제를 다시 확인한다(시험이 건다).
 
+## 크기 — 게이트웨이는 도구 결과를 자르지 않는다
+
+운영 모델의 창은 1,048,576 토큰(GLM-5.2)이다. Claude 사용자는 이 게이트웨이를 거쳐 받은 결과로 심의하므로 여기서 잘리면 잘린 근거로 심의한다. 그래서 게이트웨이는 **생산자로서 자르지 않고**, 작은 창이 필요한 소비자(에이전트 서버의 웹 챗)가 자기 쪽에서 자른다(`TOOL_RESULT_MAX`).
+
+- 백엔드 도구 결과(직접 호출·`invoke_tool`·캐시 적중)는 본문을 그대로 준다. 감사 줄의 `chars` 가 돌려준 결과의 글자 수다.
+- `search_tools` 는 찾은 도구의 설명 전문과 인자 스키마 전부(`$defs` 포함)를, `list_tool_apps` 는 도구·앱 설명 전문을, `use_experts` 는 역할 문서 전문을, `rest_catalog` 는 경로의 인자(`params`)·본문(`body`) 스키마를 준다. `rest_call` 은 JSON 이 아닌 본문도 통째로 준다.
+- `save_conversation` 은 포털 입력 한도(발언 20,000자·한 번에 200건 — 포털 `ConvMessageIn`·`ConvCreate` 가 정본, 시험이 대조한다)를 넘는 것을 버리지 않는다. 긴 발언은 `(긴 발언 나눔 k/N)` 로 이어 싣고, 200건 넘는 것은 덧붙이기로 보낸다. 도중에 멈추면 `CONV_PARTIAL:` 이다.
+
+남는 상한 — 창이 아닌 까닭이 있는 것만 두고, 넘으면 말한다.
+
+| 무엇 | 값 | 까닭 · 넘으면 |
+|---|---|---|
+| `GATEWAY_REST_CALL_MAX_BYTES` | 1,048,576 바이트 | 메모리 보호(120MB 응답에 피크 521MB 실측). 자르지 않고 **거부**하며 바이트·손잡이·좁히는 법을 말한다 |
+| `EVID_MAX_CHARS` | 1,048,576 | `verify_answer` 근거 원장의 호출자 한 칸(원문이 아니라 숫자 줄기). 메모리 보호. 넘치면 오래된 조회부터 버리고 `evidence_trimmed` 로 말한다 |
+| `EVID_MAX_CALLS` | 없음(0) | 적으면 건수 천장이다 — 낮출 때만 쓴다 |
+| 결과 건수 `search_tools`·`browse_experts`·`rest_catalog` | 8(≤20)·40(≤200)·40(≤200) | 순위·목록이다. 넘으면 `truncated` 가 말한다 |
+| `use_experts` 5명·앱 3·입구 도구 12 | — | 포털 `pinned_agents`·에이전트 서버 `_persona_meta` 와 같은 제품 규칙. 넘긴 것은 `dropped_keys`·`*_omitted` |
+| 감사 `corr`·`note`·`error` | 120·120·200자 | 무기한 보존·한 호출 한 줄. 잘렸으면 `…(원문 N자)` 가 붙는다 |
+| 대화 저장의 이름·제목 | 120·200자 | 포털 입력 한도. 응답 `clipped` 와 감사 `note` 에 남는다 |
+
 ## 실행
 ```bash
 ./start.sh          # 에이전트 venv 파이썬으로 gateway.py 기동 (streamable-http :9110/mcp)

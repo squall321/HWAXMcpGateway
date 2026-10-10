@@ -2773,9 +2773,10 @@ def test_소속_조회는_게이트웨이가_붙인_관리자_표지를_로그�
 
 
 # ── REST 프록시(/api/<site>/…)도 같은 규칙이다 — 두 경로가 그룹을 따로 계산한다(검토 2026-10-07) ─────────────
-def _rest_gate(monkeypatch, portal_resp, token_groups, site="sec", query=b""):
+def _rest_gate(monkeypatch, portal_resp, token_groups, site="sec", query=b"", headers=(), sent=None):
     """REST 프록시 라우트를 실제로 태운다 — `main()` 과 같은 배선이고 가짜는 서명 검증·폐기 목록·상류 전송·포털 응답뿐이다.
-    돌려주는 것 — 응답 · 상류에 닿은 주소 · 포털에 물은 로그인 그룹."""
+    돌려주는 것 — 응답 · 상류에 닿은 주소 · 포털에 물은 로그인 그룹. `headers` 는 클라이언트가 더 실어 보낸 헤더이고,
+    `sent`(목록)를 주면 상류에 닿은 요청 헤더를 거기 담는다."""
     from starlette.requests import Request
     from rest_proxy import RestProxy
     shots, asked = [], []
@@ -2791,10 +2792,13 @@ def _rest_gate(monkeypatch, portal_resp, token_groups, site="sec", query=b""):
 
     async def fake_send(req, stream=False):
         shots.append(str(req.url))
+        if sent is not None:
+            sent.append({k.lower(): v for k, v in req.headers.items()})
         return httpx.Response(200, content=b"ok", request=req)
     monkeypatch.setattr(p._client, "send", fake_send)
     resp = asyncio.run(p.handle(Request({
-        "type": "http", "method": "GET", "path": f"/api/{site}/x", "headers": [(b"authorization", b"Bearer me")],
+        "type": "http", "method": "GET", "path": f"/api/{site}/x",
+        "headers": [(b"authorization", b"Bearer me"), *headers],
         "query_string": query, "path_params": {"site": site, "path": "x"}, "client": ("203.0.113.5", 0)})))
     return resp, shots, asked
 
@@ -4471,3 +4475,151 @@ def test_search_tools_가_limit_로_자르면_잘랐다고_말한다(monkeypatch
     assert whole["match_count"] == 10 and len(whole["matches"]) == 8 and "truncated" in whole
     few = json.loads(asyncio.run(gw._search_tools({"query": "report_x2"})).content[0].text)
     assert few["match_count"] == 5 and "truncated" not in few
+
+
+# ── 리스크 앱 위임 — 호출자를 Caddy 가 지우지 않는 X-Hwax-Delegate-Email 로 싣는다(risk-entry SEC-1 게이트웨이 반쪽) ──────
+# 발급 요청은 Caddy 경로(/apps/hwax_risk/api/auth/sso)로 가고, 그 라우트의 forward_auth(copy_identity)가 X-Heax-User-Email 을
+# 지운 뒤 authz 가 준 이메일 — 게이트웨이 서비스 토큰의 주인(heax 첫 관리자) — 로 다시 싣는다(HEAXHub proxy_manager
+# `_forward_auth_handler`). 그래서 그 헤더만 보내면 게이트웨이를 거친 모든 사람이 한 사람으로 단언을 받았다. 앱(HWAXRisk 8e327d6)은
+# 시크릿 대조 뒤 X-Hwax-Delegate-Email 을 먼저 읽는다. 아래 가짜 상류는 그 둘(Caddy 덮어쓰기 + 앱의 단언 발급)을 흉내 낸다.
+_RISK_SSO = {"sso_url": "http://caddy.invalid/apps/hwax_risk/api/auth/sso", "secret": "rs", "client": "deliberation",
+             "auth": "heax", "token_header": "X-Heax-Sso-Assertion"}
+_FIRST_ADMIN = "first-admin@corp.com"
+
+
+def _rrsso(email: str) -> str:
+    """앱 identity.mint_sso_assertion 과 같은 꼴 — `rrsso_<b64u({"e","x"})>.<서명>`(서명은 게이트웨이가 보지 않는다)."""
+    import base64
+    body = base64.urlsafe_b64encode(json.dumps({"e": email, "x": 4102444800}, separators=(",", ":")).encode()).decode()
+    return f"rrsso_{body.rstrip('=')}.c2ln"
+
+
+def _risk_kit(monkeypatch, *, app_reads_delegate=True, user="a@corp.com"):
+    """heax-hwax_risk 백엔드 하나로 `_call_tool` 을 태운다. 발급(`_user_pat`·`_mint_user_pat`)은 진짜이고 상류는 가짜다.
+    돌려주는 것 — 결과 · 앱에 닿은 발급 요청 헤더(Caddy 를 지난 뒤) · 백엔드에 닿은 헤더 · 감사 마지막 줄."""
+    reached, backend = [], {}
+
+    def handler(req):
+        h = {k.lower(): v for k, v in req.headers.items()}
+        # Caddy forward_auth(copy_identity=True): 동명 헤더를 지우고 authz 가 Bearer(서비스 PAT)의 주인으로 다시 싣는다.
+        assert h.get("authorization") == "Bearer heax-svc-pat", "Caddy 문은 서비스 토큰으로 지난다(auth=heax)"
+        h.pop("x-heax-user-email", None)
+        h["x-heax-user-email"] = _FIRST_ADMIN
+        reached.append(h)
+        if h.get("x-heax-gateway-secret") != "rs":
+            return httpx.Response(401, json={"error": "unauthorized"})
+        delegate = h.get("x-hwax-delegate-email") if app_reads_delegate else None
+        email = (delegate if delegate is not None else h["x-heax-user-email"]).strip().lower()
+        return httpx.Response(200, json={"access_token": _rrsso(email), "token_type": "bearer", "expires_in": 900})
+    _mock_http(monkeypatch, handler)
+    b = _CallB(["risk_create_project"])
+
+    class _Sess:
+        async def initialize(self): return None
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            return types.CallToolResult(content=[types.TextContent(type="text", text='{"created": true}')], isError=False)
+
+    def fake_stream(url, headers=None, **_kw):
+        backend["headers"] = dict(headers or {})
+        return _StubCM((None, None, "sid"))
+
+    async def fake_access(email, base_groups, **_kw):
+        return {"keys": [], "affiliation": ""}
+    monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    monkeypatch.setitem(gw.HEAX, "token", "heax-svc-pat")
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"hwax_risk": dict(_RISK_SSO)})
+    monkeypatch.setattr(gw, "_USER_PATS", {})
+    monkeypatch.setattr(gw, "_USER_PAT_LOCKS", {})
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {"heax-hwax_risk": b})
+    monkeypatch.setattr(gw, "route", {"risk_create_project": ("heax-hwax_risk", "risk_create_project")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_user", lambda: user)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    res = asyncio.run(gw._call_tool("risk_create_project", {"code": "P1", "name": "n", "classification": "internal"}))
+    return res, reached, backend.get("headers"), _rows()[-1]
+
+
+def _assertion_email(tok: str) -> str:
+    import base64
+    body = tok[len("rrsso_"):].partition(".")[0]
+    return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))["e"]
+
+
+def test_리스크_위임_단언은_Caddy_가_신원_헤더를_덮어도_호출자_본인이다(monkeypatch):
+    res, reached, backend, row = _risk_kit(monkeypatch)
+    assert reached[0]["x-heax-user-email"] == _FIRST_ADMIN, "가짜 상류가 Caddy 덮어쓰기를 흉내 내야 시험이 뜻이 있다"
+    assert reached[0].get("x-hwax-delegate-email") == "a@corp.com", "Caddy 가 지우지 않는 위임 헤더로 호출자를 싣는다"
+    assert not res.isError
+    assert _assertion_email(backend["X-Heax-Sso-Assertion"]) == "a@corp.com", \
+        "단언이 서비스 토큰 주인(첫 관리자)으로 접혔다 — 그러면 모든 사용자의 과제가 그 한 사람 것이 된다"
+    assert row["mode"] == "as-user-pat" and row["caller"] == "a@corp.com"
+
+
+def test_리스크_위임_단언이_다른_사람으로_접히면_발급을_실패로_돌린다(monkeypatch):
+    """위임 헤더를 읽지 않는 앱(옛 SIF)이나 Caddy·허브 쪽 변화로 다시 접혀도 **조용히 성공하지 않는다** — 첫 관리자 명의로
+    남의 과제를 쓰고 잡을 세우느니 거부한다. 서비스 계정으로 내려가지도 않는다(사용자별 앱의 종전 자세)."""
+    res, reached, backend, row = _risk_kit(monkeypatch, app_reads_delegate=False)
+    assert res.isError and backend is None, "접힌 단언으로 백엔드를 불렀다"
+    text = res.content[0].text
+    assert "a@corp.com" in text and "단언" in text and _FIRST_ADMIN not in text, \
+        "누구로 접혔는지(남의 이메일)는 호출자에게 내보이지 않는다 — 로그에만"
+    assert len(reached) == 2, "실패한 발급은 1회 재발급 뒤 끝난다(종전 per-user 규칙)"
+    assert row["ok"] is False and "단언" in row["error"]
+
+
+def test_위임_헤더는_바깥에서_실어_보내도_게이트웨이를_지나지_못한다(monkeypatch):
+    """게이트웨이만 `X-Hwax-Delegate-Email` 을 싣는다(확인한 신원으로, 발급 요청에만). 클라이언트가 같은 이름을 실어 보내면
+    /mcp 는 인증 미들웨어가 두 분기(PAT·GW_TOKEN) 모두 버리고, /api/ 는 REST 프록시가 상류로 넘기지 않는다 —
+    앱은 시크릿 대조 뒤 이 헤더를 그대로 믿는다."""
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["headers"] = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+
+    async def no_portal(email, base, **_kw):
+        return None
+    monkeypatch.setattr(gw, "_portal_access", no_portal)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        async def verify(self, token, aud): return {"email": "u@x.io", "groups": []}
+
+    forged = (gw.DELEGATE_HEADER.lower().encode(), b"victim@x.io")
+    for auth in (b"Bearer user-pat", b"Bearer gw-secret"):
+        seen.clear()
+        asyncio.run(gw._bearer_gate(app, _V())({"type": "http", "path": "/mcp",
+                                                "headers": [(b"authorization", auth), forged]}, None, None))
+        assert seen["headers"] and gw.DELEGATE_HEADER.lower() not in seen["headers"], auth
+
+    monkeypatch.setattr(gw, "POLICY", {"sec": []})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    sent = []
+    resp, shots, _ = _rest_gate(monkeypatch, {"keys": []}, [], headers=[forged, (b"x-keep", b"1")], sent=sent)
+    assert resp.status_code == 200 and sent[0].get("x-keep") == "1", "다른 헤더는 종전대로 넘긴다"
+    assert gw.DELEGATE_HEADER.lower() not in sent[0], "REST 프록시가 위조 위임 헤더를 상류로 넘겼다"
+
+
+def test_위임_헤더_이름과_단언_꼴이_리스크_앱과_같다():
+    """두 리포에 흩어진 문자열이다 — 한쪽만 바꾸면 양쪽 시험이 각자 초록인 채 위임이 다시 접히거나(헤더 이름), 접힘 대조가 말없이
+    꺼진다(단언 꼴이 바뀌면 `_sso_assertion_email` 이 None 이다). 형제 리포가 이 박스에 있을 때만 본다."""
+    import rest_proxy
+    from pathlib import Path
+    assert gw.DELEGATE_HEADER.lower() in rest_proxy._NEVER_FORWARD, "REST 프록시가 버리는 이름과 게이트웨이가 싣는 이름이 같아야 한다"
+    app = Path(gw.__file__).resolve().parent.parent / "HWAXRisk" / "backend" / "app"
+    if not (app / "identity.py").exists():
+        pytest.skip("HWAXRisk 리포가 이 박스에 없다")
+    ident = (app / "identity.py").read_text(encoding="utf-8")
+    assert f'SSO_PREFIX = "{gw._SSO_ASSERTION_PREFIX}"' in ident and '{"e": email' in ident, \
+        "리스크 앱 단언의 꼴이 바뀌었다 — 게이트웨이의 접힘 대조(_sso_assertion_email)를 같이 고친다"
+    routes = (app / "routes.py").read_text(encoding="utf-8")
+    if "x-hwax-delegate" not in routes.lower():
+        pytest.skip("이 체크아웃의 리스크 앱은 아직 위임 헤더를 읽지 않는다(HWAXRisk 8e327d6 이전)")
+    assert f'"{gw.DELEGATE_HEADER.lower()}"' in routes, "앱이 읽는 위임 헤더 이름이 게이트웨이가 싣는 것과 다르다"

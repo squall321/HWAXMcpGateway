@@ -23,6 +23,9 @@ from starlette.routing import Route
 # hop-by-hop headers not forwarded verbatim (+ host/authorization which we rewrite)
 _HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
         "trailers", "transfer-encoding", "upgrade", "host", "content-length", "authorization"}
+# 클라이언트가 실어 보내도 상류로 넘기지 않는 것 — 위임 발급의 호출자 헤더는 게이트웨이만 싣는다(gateway.DELEGATE_HEADER).
+# 앱은 시크릿 대조 뒤 이 값을 그대로 믿고, Caddy 는 이 이름을 지우지 않는다.
+_NEVER_FORWARD = {"x-hwax-delegate-email"}
 
 
 
@@ -251,7 +254,8 @@ class RestProxy:
                 return JSONResponse({"error": f"forbidden: {site}", "detail": detail}, status_code=403)
 
         url = conf["base"].rstrip("/") + "/" + path.lstrip("/")
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP}
+        _skip = _HOP | _NEVER_FORWARD
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in _skip}
         email = str(claims.get("email") or "").strip().lower()
         mode = credential_mode(conf)                       # per_user | inject | none
         if mode == "per_user":

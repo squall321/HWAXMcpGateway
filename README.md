@@ -59,6 +59,7 @@ MCP fan-out과 같은 패턴("호출자 토큰 1개 → 백엔드별 네이티�
 게이트웨이가 서비스의 `POST /api/auth/sso` 에 공유 비밀(`X-Heax-Gateway-Secret`)과 호출자 이메일을 보내 **그 사람 토큰**을 받아 그 명의로 부른다. 토큰은 12시간 캐시하되 응답의 `expires_in` 이 더 짧으면 그보다 2분 먼저 버린다. 그 2분은 위임 백엔드의 도구가 짧거나 토큰을 요청이 도착할 때만 본다는 전제이고, **발급자가 주는 수명은 호출 한도(`GATEWAY_CALL_TIMEOUT`, 600초)보다 길어야 한다**(hwax_risk `HWAXRISK_SSO_TTL_S` 900초) — 길지 않으면 발급 때 경고를 남긴다. 백엔드가 401 이면 한 번 다시 받고, 받지 못하면 거부한다(서비스 계정으로 강등하지 않는다). 포털은 토큰을 쥐지 않는다.
 
 - 항목 `{sso_url, secret, client, strip_headers?}` — `strip_headers` 는 서비스 계정 설정에만 맞는 헤더를 사람별 호출에서 뺀다(RA 의 `X-Workspace-Slug`: 서비스 부서가 남으면 남의 부서로 읽고 쓴다).
+- 발급 요청은 호출자를 `X-Heax-User-Email` 과 `X-Hwax-Delegate-Email` 둘에 싣는다. Caddy 경로로 발급받는 앱(`auth: heax` — hwax_risk)은 forward_auth 가 앞의 것을 지우고 서비스 토큰 주인(heax 첫 관리자)으로 다시 실으므로, 앱은 뒤의 것(Caddy 가 건드리지 않는다)을 먼저 읽는다. 값은 게이트웨이가 확인한 신원뿐이다 — 클라이언트가 보낸 같은 이름 헤더는 `/mcp`(인증 미들웨어)와 `/api/`(REST 프록시) 모두 버린다. 받은 단언이 리스크 앱 꼴(`rrsso_`)이면 그 이메일이 보낸 사람인지 보고, 다르면(위임이 접혔다) 발급 실패로 거부한다. 그래서 **위임 헤더를 읽는 리스크 앱(HWAXRisk 8e327d6 이후)보다 게이트웨이가 먼저 나가면 그 사이 hwax_risk 사람별 호출은 거부된다** — 종전에는 모두 첫 관리자 명의로 조용히 돌았다. 같은 출시로 묶거나 앱을 먼저 낸다.
 - `per_user_sso` 가 포털 등록 연결(`PORTAL_CONN_BACKENDS`, 포털 '개인 토큰 › 외부 연결' 의 RA·TestScope 토큰)보다 **먼저**다 — 위임이 켜진 서비스는 등록 토큰을 쓰지 않는다.
 - `provision-config.sh` 가 env 로 만든다. 순서는 env > 직전 config > 기본값이고, 비밀이 없는 실행은 직전 항목을 지우지 않고 이어받는다. 운영에서는 update-all 이 포털 `infra/.env` 에서 읽어 넘긴다(HWAXPortal `docs/sso-delegation`).
 

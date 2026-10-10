@@ -1,4 +1,5 @@
 # 3개 백엔드 MCP를 집계해 단일 streamable-http 엔드포인트로 재노출하는 게이트웨이
+import base64
 import hashlib
 import hmac
 import ipaddress
@@ -202,6 +203,12 @@ AFF_HEADER = "X-Heax-User-Affiliation"
 # 이메일과 같을 때만** 소속을 인정한다. 키는 이미 양쪽이 쥔 앱별 게이트웨이 시크릿이다
 # (`per_user_sso.<app>.secret` == 앱의 `heax_gateway_secret` — SSO 발급이 쓰는 그 값).
 AFF_PROOF_HEADER = "X-Heax-Aff-Proof"
+# 위임 발급(SSO) 요청에 싣는 **호출자** 이메일. 리스크 앱처럼 Caddy 경로로 발급받는 앱은 forward_auth 가 X-Heax-User-Email 을
+# 지우고 authz 가 준 이메일 — 게이트웨이 서비스 토큰의 주인(heax 첫 관리자) — 로 다시 싣는다(HEAXHub proxy_manager
+# `_IDENTITY_HEADERS`). 그 헤더만 보내면 게이트웨이를 거친 모든 사람이 한 사람으로 접힌다. 이 이름은 Caddy 가 건드리지 않고
+# 앱이 시크릿 대조 뒤 먼저 읽는다(HWAXRisk post_auth_sso). 값은 **게이트웨이가 확인한 신원**(`_request_user`)만 싣는다 —
+# 클라이언트가 실어 보낸 사본은 인증 미들웨어(/mcp)와 REST 프록시(/api/)가 버린다.
+DELEGATE_HEADER = "X-Hwax-Delegate-Email"
 # 이 호출이 **포털 절차 실행기**에서 왔나. 검증된 PAT 의 `purpose` 클레임에서만 나오고, 클라이언트가
 # 실어 보낸 같은 이름 헤더는 미들웨어가 버린다(groups·user 와 같은 규칙).
 # 쓰임은 하나다 — `invoke_tool` 의 **정확이름 차단 면제**(_INVOKE_DENY_EXACT). 절차는 늘 별칭으로
@@ -2848,6 +2855,8 @@ async def _mint_user_pat(conf: dict, email: str) -> tuple[str, object]:
     headers = {
         "X-Heax-Gateway-Secret": conf["secret"],
         "X-Heax-User-Email": email,
+        # Caddy 경로로 발급받는 앱은 위 헤더가 서비스 토큰 주인으로 덮인다 — 호출자는 이것으로 간다(DELEGATE_HEADER 주석).
+        DELEGATE_HEADER: email,
         # 클라이언트를 구분해야 이 발급이 사용자의 웹 세션 토큰을 회수하지 않는다.
         "X-Heax-Client": conf.get("client") or "deliberation",
     }
@@ -2875,7 +2884,31 @@ async def _mint_user_pat(conf: dict, email: str) -> tuple[str, object]:
     got = _find(data)
     if not got:
         raise RuntimeError(f"SSO 응답에 토큰 없음: {_clip(json.dumps(data, ensure_ascii=False), 200)}")
+    # 단언이 **보낸 사람의 것인가** — 리스크 앱 단언은 이메일을 평문 payload 에 담는다. 다른 사람이면 위임이 접힌 것이다(앱이 위임
+    # 헤더를 안 읽는 옛 SIF, 또는 Caddy·허브가 그 헤더를 지우게 바뀌었다). 그 단언으로 부르면 남의 명의로 과제를 쓰고 잡을 세운다 —
+    # 조용히 성공하느니 발급 실패로 돌린다(사람별 길은 서비스 계정으로 내려가지 않는다). 남의 이메일은 호출자에게 내보이지 않는다.
+    who = _sso_assertion_email(got[0])
+    if who is not None and who != email:
+        log.warning("SSO 단언 접힘: %s 로 청했는데 %s 의 단언이 왔다(%s)", email, who, conf.get("sso_url"))
+        raise RuntimeError("SSO 단언이 호출자가 아닌 다른 계정으로 발급됐다 — 위임이 접혔다"
+                           f"(앱이 {DELEGATE_HEADER} 헤더를 읽지 않거나 그 헤더가 도중에 지워졌다)")
     return got
+
+
+_SSO_ASSERTION_PREFIX = "rrsso_"
+
+
+def _sso_assertion_email(tok: str) -> str | None:
+    """리스크 앱 단언(`rrsso_<b64u JSON {e, x}>.<서명>`, HWAXRisk identity.mint_sso_assertion)의 이메일. 그 꼴이 아니면 None.
+    서명은 보지 않는다(시크릿은 앱이 쥔 것과 같지만 검증은 앱 몫이다) — 여기서는 '누구 단언인가' 만 묻는다."""
+    if not isinstance(tok, str) or not tok.startswith(_SSO_ASSERTION_PREFIX):
+        return None
+    body = tok[len(_SSO_ASSERTION_PREFIX):].partition(".")[0]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    except (ValueError, TypeError):
+        return None
+    return str(claims.get("e") or "").strip().lower() if isinstance(claims, dict) else None
 
 
 async def _user_pat(app_id: str, email: str, *, force: bool = False) -> str:
@@ -3557,7 +3590,8 @@ def _bearer_gate(app, pat_verifier=None):
             # 목적 헤더는 **검증된 PAT 에서만** 나온다 — 이 경로(GW_TOKEN)는 PAT 검증을 안 하므로
             # 클라이언트가 실어 보낸 값을 버린다. 안 버리면 GW_TOKEN 을 쥔 쪽이 차단을 면제받는다.
             _kept = [(k, v) for (k, v) in (scope.get("headers") or [])
-                     if k.lower() not in (PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode())]
+                     if k.lower() not in (PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
+                                          DELEGATE_HEADER.lower().encode())]
             if GROUPS_HEADER.encode() not in headers:
                 _kept.append((GROUPS_HEADER.encode(), SERVICE_GROUP.encode()))
             _kept.append((VIA_HEADER.encode(), b"gw-token"))
@@ -3600,7 +3634,8 @@ def _bearer_gate(app, pat_verifier=None):
             # 얻는 경로가 생기면 안 되므로, 신원 없음 쪽으로 닫는다).
             fresh = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (GROUPS_HEADER.encode(), USER_HEADER.encode(),
-                                          PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode())]
+                                          PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
+                                          DELEGATE_HEADER.lower().encode())]
             # PAT 의 groups 에도 한글이 올 수 있다 — 같은 규칙으로 인코딩해 실어야 헤더가 안 깨진다.
             fresh.append((GROUPS_HEADER.encode(), quote(groups, safe=",").encode("latin-1")))
             _email = str(claims.get("email") or "").strip().lower()

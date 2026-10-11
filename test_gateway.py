@@ -4196,7 +4196,9 @@ def test_verify_answer_의_판정표(monkeypatch):
     쉼표는 두 가지로 읽는다 — 천 단위('1,250.5' → 1250.5)와 목록 구분('[100,200,300]' → 100·200·300)."""
     _evid_ctx(monkeypatch)
     srcs = ['{"a": "1,250.5원", "b": "v1.2.3", "c": "12.5.6", "d": "x408명", "e": "0.25%", "f": "2026-10-10"}',
-            '배열 [100,200,300] · 좌표 (35.123, 129.04) · ID ABC12345XYZ · 1.0e5']
+            '배열 [100,200,300] · 좌표 (35.123, 129.04) · ID ABC12345XYZ · 1.0e5',
+            # 산문의 문장 끝 마침표 — 줄기가 '0.85.' 가 되어 그 '.' 를 다른 수의 소수점으로 읽었다(RR2-GW-2)
+            'thickness was 0.85. 인장강도는 450.5. 그 뒤 Fig. 3.2. shows 12.75. 합계 7,310.']
     for i, s in enumerate(srcs):
         _keep(f"t{i}", s)
     want = {"1250.5": True, "1,250.5": True, "250.5": True,       # 250.5 — '1,250.5' 를 목록으로 읽은 꼴(쉼표의 두 읽기)
@@ -4204,7 +4206,10 @@ def test_verify_answer_의_판정표(monkeypatch):
             "408": True, "4080": False, "0.25": True, "2026": True, "1010": False,
             "100200300": True, "200300": False, "200": True, "100,200": False,
             "35.123": True, "35.1": True, "35": None, "129.04": True, "129.040": False, "129": True,
-            "12345": True, "123456": False, "2345": False, "1.0": True}
+            "12345": True, "123456": False, "2345": False, "1.0": True,
+            # 소수 뒤 문장 마침표는 근거다(같은 수·소수 덜 적은 꼴·정수부 모두). 판 번호 꼴('12.5.6')의 앞 마디는 여전히 아니다.
+            "0.85": True, "0.8": True, "450.5": True, "450": True, "3.2": True, "12.75": True, "12.7": True,
+            "7,310": True, "7310": True, "0.855": False, "450.55": False}
     for a, sourced in want.items():
         m = gw._NUM_TOK_RE.search(a)
         norm = m.group(0).replace(",", "")

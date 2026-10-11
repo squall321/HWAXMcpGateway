@@ -740,6 +740,8 @@ async def _aggregate():
         route[exposed_name] = (key, t.name)
     log.info("AGGREGATED %d exposed tools (unique names: %d, call-only aliases: %d)",
              len(exposed_tools), len(set(route)), len(alias_route))
+    # 다음 initialize 부터 바뀐 카탈로그의 지침이 실린다(이미 붙은 세션은 그때 받은 것을 쓴다).
+    _low.instructions = _instructions()
 
 
 HEAX_PREFIX = "heax-"  # 자동탐지된 heax-hub MCP 앱 백엔드 키 프리픽스
@@ -1080,9 +1082,18 @@ _INSTRUCTIONS = """HWAX 엔지니어링 허브 — 사내 설계·해석·품질
    게이트웨이가 정책을 아직 못 받은 일시 상태다, 잠시 뒤 같은 호출을 다시 하라(요청하라고 하지 마라).
 10. `list_tool_apps` 의 `muted_apps` 는 사용자가 포털에서 **꺼 둔** 앱이다(권한 문제가 아니다 — 요청하라고 하지 마라).
    사용자가 그 앱을 쓰라고 할 때만 `list_tool_apps(app='<키>')` 로 도구를 보고 `invoke_tool` 로 부른다.
-11. 설계 리스크 심사(과제 올리기·캡처·변경 비교·심사 시작·결과)는 `risk_next_step` 부터 — 단계·막힌 곳·다음 호출을 준다.
+"""
+# 11번은 리스크 앱 길잡이(risk_next_step)가 **카탈로그에 있을 때만** 싣는다(`_instructions`). 위임을 모르는 옛 앱(HWAXRisk main)에는
+# 그 도구가 없어, 늘 실으면 없는 도구부터 부르라고 시킨다(RR2-GW-1). 지침은 initialize 때 실리므로 재집계(`_aggregate`)가 맞춘다.
+_INSTR_RISK_NEXT = """11. 설계 리스크 심사(과제 올리기·캡처·변경 비교·심사 시작·결과)는 `risk_next_step` 부터 — 단계·막힌 곳·다음 호출을 준다.
    그 `next` 를 따라 쓰기 도구를 부를 때도 5번대로 사용자에게 먼저 확인한다(`consent` 는 사람이 동의한 뒤에만 true).
 """
+
+
+def _instructions() -> str:
+    """지금 카탈로그에 맞춘 서버 지침 — 없는 도구를 가리키는 항목은 싣지 않는다."""
+    return _INSTRUCTIONS + (_INSTR_RISK_NEXT if "risk_next_step" in route else "")
+
 
 fm = FastMCP("hwax-mcp-gateway", instructions=_INSTRUCTIONS)
 # nginx 리버스프록시(/mcp-gw/) 뒤 + 개인 Claude(다양한 도메인 Host)로 접근되므로 MCP SDK 의

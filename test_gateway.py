@@ -4708,11 +4708,36 @@ def test_지침이_리스크_심사는_risk_next_step_부터라고_말한다():
     """리스크 앱의 Claude 입구(쓰기 9종 + 길잡이)는 id 를 여럿 잇는 긴 길이라, 모델이 도구 목록에서 아무 쓰기나 먼저 고르면
     과제·소스가 엉뚱한 자리에 생긴다(소스는 지울 수 없다). 길잡이가 단계·막힌 곳·다음 호출을 한 번에 준다 — 허브 지침에서 그리로
     보낸다. 길잡이가 채워 주는 쓰기 인자도 사람 확인을 건너뛰는 근거가 아니다(5번)."""
-    assert "risk_next_step" in gw._INSTRUCTIONS
-    i = gw._INSTRUCTIONS.index("risk_next_step")
-    item = gw._INSTRUCTIONS[gw._INSTRUCTIONS.rfind("\n", 0, i):]
+    full = gw._INSTRUCTIONS + gw._INSTR_RISK_NEXT          # 길잡이가 카탈로그에 있을 때 실리는 꼴(아래 시험)
+    assert "risk_next_step" in full
+    i = full.index("risk_next_step")
+    item = full[full.rfind("\n", 0, i):]
     assert "리스크 심사" in item and "확인" in item and "consent" in item, item
-    assert len(gw._INSTRUCTIONS) < 2048, "Claude Code 는 서버 지침을 2048자에서 자른다"
+    assert len(full) < 2048, "Claude Code 는 서버 지침을 2048자에서 자른다"
+
+
+def test_지침_11번은_risk_next_step_이_카탈로그에_있을_때만_싣는다(monkeypatch):
+    """위임을 모르는 옛 리스크 앱(HWAXRisk main — 도구 14종, 길잡이·입구 도구 없음)이 붙은 박스에서 허브 지침 11번이 없는 도구부터
+    부르라고 시켰다(RR2-GW-1 (c), dev 10-10 재부팅 뒤). 지침은 MCP initialize 때 클라이언트에 실리므로, 그때 카탈로그(`route`)에
+    risk_next_step 이 있을 때만 싣는다 — 재집계가 앱 판이 바뀐 것을 보면 다음 세션부터 따라간다."""
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "_LAST_TOOLS", {})
+    monkeypatch.setattr(gw._low, "instructions", gw._low.instructions)
+
+    def served(tools):
+        monkeypatch.setattr(gw, "backends", {"heax-hwax_risk": _CallB(tools)})
+        asyncio.run(gw._aggregate())
+        return gw._low.create_initialization_options().instructions      # initialize 응답에 실리는 그 값
+
+    old = served(["risk_taxonomy", "risk_list_projects"])
+    assert "risk_next_step" not in old, "옛 앱 박스에서 지침이 없는 도구를 가리킨다"
+    assert "browse_experts" in old and "muted_apps" in old, "나머지 지침은 그대로 실려야 한다"
+    new = served(["risk_taxonomy", "risk_next_step"])
+    assert "risk_next_step" in new and new.startswith(old), "길잡이가 붙으면 11번이 실려야 한다"
+    assert len(new) < 2048, "Claude Code 는 서버 지침을 2048자에서 자른다"
+    assert "risk_next_step" not in served(["risk_taxonomy"]), "길잡이가 빠진 판으로 돌아가면 11번도 빠져야 한다"
 
 
 # ── 응답 캐시의 바이트 상한(gw-adh GA-5) ─────────────────────────────────────────────────────────────────────

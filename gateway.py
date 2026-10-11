@@ -2948,22 +2948,37 @@ async def _mint_user_pat(conf: dict, email: str) -> tuple[str, object]:
     got = _find(data)
     if not got:
         raise RuntimeError(f"SSO 응답에 토큰 없음: {_clip(json.dumps(data, ensure_ascii=False), 200)}")
-    # 단언이 **보낸 사람의 것인가** — 리스크 앱 단언은 이메일을 평문 payload 에 담는다. 다른 사람이면 위임이 접힌 것이다(앱이 위임
-    # 헤더를 안 읽는 옛 SIF, 또는 Caddy·허브가 그 헤더를 지우게 바뀌었다). 그 단언으로 부르면 남의 명의로 과제를 쓰고 잡을 세운다 —
-    # 조용히 성공하느니 발급 실패로 돌린다(사람별 길은 서비스 계정으로 내려가지 않는다). 남의 이메일은 호출자에게 내보이지 않는다.
-    who = _sso_assertion_email(got[0])
+    # 단언이 **보낸 사람의 것인가** — 리스크 앱 단언은 이메일을 평문 payload 에 담는다. 다른 사람이면 위임이 접힌 것이다.
+    # 거부는 **앱이 위임을 아는 판일 때만** 한다 — 그 앱은 위임 헤더로 발급한 단언에만 표지 d 를 싣는다(HWAXRisk identity
+    # .mint_sso_assertion). d 가 있는데 남의 이메일이면 위임 헤더가 앱에 닿기 전에 바뀐 것이다(Caddy·허브 설정). 그 단언으로 부르면
+    # 남의 명의로 과제를 쓰고 잡을 세운다 — 조용히 성공하느니 발급 실패로 돌린다(사람별 길은 서비스 계정으로 내려가지 않는다).
+    # d 가 없으면 위임 헤더를 모르는 옛 앱(HWAXRisk main)이거나 그 헤더가 도중에 지워진 것이다. 그때 거부하면 첫 관리자가 아닌
+    # 모든 사람의 읽기까지 막혔다(dev 10-10 재부팅 뒤 실측 — RV-2·RR2-GW-1) — 종전 동작대로 두고 여기서 경고 한 줄, 호출마다 감사
+    # note(`_sso_fold_note`)를 남긴다. 접힌 신원의 쓰기는 위임을 아는 앱이 d 없는 단언을 받지 않아 스스로 막는다.
+    # 남의 이메일은 호출자에게 내보이지 않는다(로그에만).
+    claims = _sso_assertion_claims(got[0])
+    who = _sso_claims_email(claims)
     if who is not None and who != email:
-        log.warning("SSO 단언 접힘: %s 로 청했는데 %s 의 단언이 왔다(%s)", email, who, conf.get("sso_url"))
-        raise RuntimeError("SSO 단언이 호출자가 아닌 다른 계정으로 발급됐다 — 위임이 접혔다"
-                           f"(앱이 {DELEGATE_HEADER} 헤더를 읽지 않거나 그 헤더가 도중에 지워졌다)")
+        if _SSO_DELEGATED_CLAIM in claims:
+            log.warning("SSO 단언 접힘: %s 로 청했는데 %s 의 단언이 왔다(%s)", email, who, conf.get("sso_url"))
+            raise RuntimeError("SSO 단언이 호출자가 아닌 다른 계정으로 발급됐다 — 위임이 접혔다. 리스크 앱은 위임을 아는 판인데"
+                               f"(단언에 위임 표지가 있다) {DELEGATE_HEADER} 헤더가 앱에 닿기 전에 다른 값으로 바뀌었다 — "
+                               "허브·Caddy 의 신원 헤더 설정을 본다")
+        log.warning("SSO 단언 접힘(위임 표지 d 없음): %s 로 청했는데 %s 의 단언이 왔다(%s) — 리스크 앱이 위임을 아는 판이 아니다"
+                    "(또는 위임 헤더가 도중에 지워졌다). 종전대로 그 단언으로 부르고 감사에 %s 로 적는다 — HWAXRisk 새 판 배포가 필요하다",
+                    email, who, conf.get("sso_url"), _SSO_FOLD_NOTE)
     return got
 
 
 _SSO_ASSERTION_PREFIX = "rrsso_"
+# 위임을 아는 리스크 앱이 **위임 헤더로 발급한 단언에만** 싣는 표지(HWAXRisk identity.mint_sso_assertion `claims["d"] = 1`).
+_SSO_DELEGATED_CLAIM = "d"
+# 위임을 모르는 앱의 접힌 단언으로 부른 호출의 감사 note.
+_SSO_FOLD_NOTE = "folded-old-app"
 
 
-def _sso_assertion_email(tok: str) -> str | None:
-    """리스크 앱 단언(`rrsso_<b64u JSON {e, x}>.<서명>`, HWAXRisk identity.mint_sso_assertion)의 이메일. 그 꼴이 아니면 None.
+def _sso_assertion_claims(tok: str) -> dict | None:
+    """리스크 앱 단언(`rrsso_<b64u JSON {e, x[, d]}>.<서명>`, HWAXRisk identity.mint_sso_assertion)의 claims. 그 꼴이 아니면 None.
     서명은 보지 않는다(시크릿은 앱이 쥔 것과 같지만 검증은 앱 몫이다) — 여기서는 '누구 단언인가' 만 묻는다."""
     if not isinstance(tok, str) or not tok.startswith(_SSO_ASSERTION_PREFIX):
         return None
@@ -2972,7 +2987,21 @@ def _sso_assertion_email(tok: str) -> str | None:
         claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
     except (ValueError, TypeError):
         return None
-    return str(claims.get("e") or "").strip().lower() if isinstance(claims, dict) else None
+    return claims if isinstance(claims, dict) else None
+
+
+def _sso_claims_email(claims: dict | None) -> str | None:
+    return str(claims.get("e") or "").strip().lower() if claims is not None else None
+
+
+def _sso_fold_note(tok: str, email: str) -> str | None:
+    """이 단언이 위임을 모르는 앱이 접어 낸 것이면(남의 이메일 · 위임 표지 없음) 감사 note, 아니면 None.
+    캐시된 단언으로 부르는 호출마다 본다 — 발급 때 한 번만 적으면 그 뒤 호출이 접힌 신원으로 돈 줄 모른다."""
+    claims = _sso_assertion_claims(tok)
+    who = _sso_claims_email(claims)
+    if who is not None and who != email and _SSO_DELEGATED_CLAIM not in claims:
+        return _SSO_FOLD_NOTE
+    return None
 
 
 async def _user_pat(app_id: str, email: str, *, force: bool = False) -> str:
@@ -3344,7 +3373,8 @@ async def _call_tool(name: str, arguments: dict):
                 _audit(name, backend_key, not getattr(res, "isError", False), None,
                        round((time.monotonic() - t0) * 1000),
                        caller=email, mode="as-user-pat", corr=_request_corr(),
-                       note="re-minted" if attempt else None, res=res)
+                       note="+".join(n for n in ("re-minted" if attempt else None, _sso_fold_note(tok, email)) if n)
+                       or None, res=res)
                 return _cache_put(ckey, _evid_keep(name, res))
     elif backend_key in PORTAL_CONN_BACKENDS:
         # 포털 등록 연결 토큰 위임(RA 등). 신원이 있는 호출은 **본인 토큰으로만** 간다. 서비스 계정(cae00 에선

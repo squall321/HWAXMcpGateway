@@ -4532,15 +4532,20 @@ _RISK_SSO = {"sso_url": "http://caddy.invalid/apps/hwax_risk/api/auth/sso", "sec
 _FIRST_ADMIN = "first-admin@corp.com"
 
 
-def _rrsso(email: str) -> str:
-    """앱 identity.mint_sso_assertion 과 같은 꼴 — `rrsso_<b64u({"e","x"})>.<서명>`(서명은 게이트웨이가 보지 않는다)."""
+def _rrsso(email: str, *, delegated: bool = False) -> str:
+    """앱 identity.mint_sso_assertion 과 같은 꼴 — `rrsso_<b64u({"e","x"[,"d"]})>.<서명>`(서명은 게이트웨이가 보지 않는다).
+    `delegated` 는 앱이 X-Hwax-Delegate-Email 로 발급했을 때만 싣는 위임 표지 d 다(HWAXRisk 2eecb36 — 위임을 아는 판만 넣는다)."""
     import base64
-    body = base64.urlsafe_b64encode(json.dumps({"e": email, "x": 4102444800}, separators=(",", ":")).encode()).decode()
+    claims = {"e": email, "x": 4102444800, **({"d": 1} if delegated else {})}
+    body = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).decode()
     return f"rrsso_{body.rstrip('=')}.c2ln"
 
 
-def _risk_kit(monkeypatch, *, app_reads_delegate=True, user="a@corp.com"):
+def _risk_kit(monkeypatch, *, app_reads_delegate=True, caddy_overwrites_delegate=False, user="a@corp.com",
+              tool="risk_create_project"):
     """heax-hwax_risk 백엔드 하나로 `_call_tool` 을 태운다. 발급(`_user_pat`·`_mint_user_pat`)은 진짜이고 상류는 가짜다.
+    `app_reads_delegate=False` 는 위임 헤더를 모르는 옛 앱(HWAXRisk main — 단언에 d 가 없다), `caddy_overwrites_delegate` 는 허브·Caddy
+    가 위임 헤더마저 서비스 토큰 주인으로 덮게 바뀐 경우다(앱은 위임을 알아 d 를 싣는데 이메일이 남의 것이다).
     돌려주는 것 — 결과 · 앱에 닿은 발급 요청 헤더(Caddy 를 지난 뒤) · 백엔드에 닿은 헤더 · 감사 마지막 줄."""
     reached, backend = [], {}
 
@@ -4550,14 +4555,17 @@ def _risk_kit(monkeypatch, *, app_reads_delegate=True, user="a@corp.com"):
         assert h.get("authorization") == "Bearer heax-svc-pat", "Caddy 문은 서비스 토큰으로 지난다(auth=heax)"
         h.pop("x-heax-user-email", None)
         h["x-heax-user-email"] = _FIRST_ADMIN
+        if caddy_overwrites_delegate:
+            h["x-hwax-delegate-email"] = _FIRST_ADMIN
         reached.append(h)
         if h.get("x-heax-gateway-secret") != "rs":
             return httpx.Response(401, json={"error": "unauthorized"})
         delegate = h.get("x-hwax-delegate-email") if app_reads_delegate else None
         email = (delegate if delegate is not None else h["x-heax-user-email"]).strip().lower()
-        return httpx.Response(200, json={"access_token": _rrsso(email), "token_type": "bearer", "expires_in": 900})
+        return httpx.Response(200, json={"access_token": _rrsso(email, delegated=delegate is not None),
+                                         "token_type": "bearer", "expires_in": 900})
     _mock_http(monkeypatch, handler)
-    b = _CallB(["risk_create_project"])
+    b = _CallB([tool])
 
     class _Sess:
         async def initialize(self): return None
@@ -4580,14 +4588,14 @@ def _risk_kit(monkeypatch, *, app_reads_delegate=True, user="a@corp.com"):
     monkeypatch.setattr(gw, "_USER_PAT_LOCKS", {})
     gw._RESP_CACHE.clear()
     monkeypatch.setattr(gw, "backends", {"heax-hwax_risk": b})
-    monkeypatch.setattr(gw, "route", {"risk_create_project": ("heax-hwax_risk", "risk_create_project")})
+    monkeypatch.setattr(gw, "route", {tool: ("heax-hwax_risk", tool)})
     monkeypatch.setattr(gw, "alias_route", {})
     monkeypatch.setattr(gw, "POLICY", {})
     monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
     monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
     monkeypatch.setattr(gw, "_request_user", lambda: user)
     monkeypatch.setattr(gw, "_request_groups", lambda: [])
-    res = asyncio.run(gw._call_tool("risk_create_project", {"code": "P1", "name": "n", "classification": "internal"}))
+    res = asyncio.run(gw._call_tool(tool, {"code": "P1", "name": "n", "classification": "internal"}))
     return res, reached, backend.get("headers"), _rows()[-1]
 
 
@@ -4605,18 +4613,42 @@ def test_리스크_위임_단언은_Caddy_가_신원_헤더를_덮어도_호출�
     assert _assertion_email(backend["X-Heax-Sso-Assertion"]) == "a@corp.com", \
         "단언이 서비스 토큰 주인(첫 관리자)으로 접혔다 — 그러면 모든 사용자의 과제가 그 한 사람 것이 된다"
     assert row["mode"] == "as-user-pat" and row["caller"] == "a@corp.com"
+    assert "note" not in row, "접히지 않은 단언에 접힘 표기를 달았다"
 
 
 def test_리스크_위임_단언이_다른_사람으로_접히면_발급을_실패로_돌린다(monkeypatch):
-    """위임 헤더를 읽지 않는 앱(옛 SIF)이나 Caddy·허브 쪽 변화로 다시 접혀도 **조용히 성공하지 않는다** — 첫 관리자 명의로
-    남의 과제를 쓰고 잡을 세우느니 거부한다. 서비스 계정으로 내려가지도 않는다(사용자별 앱의 종전 자세)."""
-    res, reached, backend, row = _risk_kit(monkeypatch, app_reads_delegate=False)
+    """위임을 아는 앱(단언에 d)인데도 Caddy·허브 쪽 변화로 다시 접히면 **조용히 성공하지 않는다** — 첫 관리자 명의로 남의 과제를
+    쓰고 잡을 세우느니 거부한다. 서비스 계정으로 내려가지도 않는다(사용자별 앱의 종전 자세). 거부 문구는 원인을 말한다 — 운영자가
+    앱 판을 의심하지 않고 곧장 그 헤더의 길을 보게(RR2-GW-1 처방 4)."""
+    res, reached, backend, row = _risk_kit(monkeypatch, caddy_overwrites_delegate=True)
     assert res.isError and backend is None, "접힌 단언으로 백엔드를 불렀다"
     text = res.content[0].text
     assert "a@corp.com" in text and "단언" in text and _FIRST_ADMIN not in text, \
         "누구로 접혔는지(남의 이메일)는 호출자에게 내보이지 않는다 — 로그에만"
+    assert "위임을 아는 판" in text and gw.DELEGATE_HEADER in text, "거부 문구에 원인(어느 헤더가 어디서 바뀌었나)이 없다"
     assert len(reached) == 2, "실패한 발급은 1회 재발급 뒤 끝난다(종전 per-user 규칙)"
     assert row["ok"] is False and "단언" in row["error"]
+
+
+def test_위임을_모르는_옛_리스크_앱이면_접힌_단언도_거부하지_않고_경고와_감사_표기만_남긴다(monkeypatch, caplog):
+    """위임 헤더를 모르는 앱(HWAXRisk main — 단언에 위임 표지 d 가 없다)과 이 게이트웨이가 섞인 박스(dev 10-10 재부팅 뒤)에서는
+    접힘 대조가 첫 관리자가 아닌 모든 사람의 hwax_risk 호출을 읽기까지 거부했다 — risk_taxonomy 도 실패했다(RV-2·RR2-GW-1).
+    d 가 없으면 종전 동작대로 부르고 경고 로그 한 줄과 감사 note 만 남긴다. 접힌 신원의 쓰기는 위임을 아는 새 앱이 스스로 막는다."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger=gw.log.name):
+        res, reached, backend, row = _risk_kit(monkeypatch, app_reads_delegate=False, tool="risk_taxonomy")
+        assert not res.isError, res.content[0].text
+        assert _assertion_email(backend["X-Heax-Sso-Assertion"]) == _FIRST_ADMIN, "옛 앱에서는 종전 동작(접힌 단언) 그대로다"
+        assert len(reached) == 1, "거부·재발급 없이 한 번 발급한다"
+        assert row["ok"] is True and row["mode"] == "as-user-pat" and row["caller"] == "a@corp.com"
+        assert row.get("note") == "folded-old-app", row
+        # 캐시된 단언으로 부르는 다음 호출에도 표기가 남는다 — 발급 때 한 번만 적으면 그 뒤 12시간의 호출이 접힌 줄 모른다.
+        again = asyncio.run(gw._call_tool("risk_taxonomy", {"code": "P2"}))
+        assert not again.isError and len(reached) == 1
+        assert _rows()[-1].get("note") == "folded-old-app", _rows()[-1]
+    warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and "d 없음" in r.getMessage()]
+    assert len(warns) == 1, warns
+    assert "a@corp.com" in warns[0] and "HWAXRisk" in warns[0], warns
 
 
 def test_위임_헤더는_바깥에서_실어_보내도_게이트웨이를_지나지_못한다(monkeypatch):
@@ -4654,7 +4686,7 @@ def test_위임_헤더는_바깥에서_실어_보내도_게이트웨이를_지�
 
 def test_위임_헤더_이름과_단언_꼴이_리스크_앱과_같다():
     """두 리포에 흩어진 문자열이다 — 한쪽만 바꾸면 양쪽 시험이 각자 초록인 채 위임이 다시 접히거나(헤더 이름), 접힘 대조가 말없이
-    꺼진다(단언 꼴이 바뀌면 `_sso_assertion_email` 이 None 이다). 형제 리포가 이 박스에 있을 때만 본다."""
+    꺼진다(단언 꼴이 바뀌면 `_sso_assertion_claims` 가 None 이다). 형제 리포가 이 박스에 있을 때만 본다."""
     import rest_proxy
     from pathlib import Path
     assert gw.DELEGATE_HEADER.lower() in rest_proxy._NEVER_FORWARD, "REST 프록시가 버리는 이름과 게이트웨이가 싣는 이름이 같아야 한다"
@@ -4663,11 +4695,13 @@ def test_위임_헤더_이름과_단언_꼴이_리스크_앱과_같다():
         pytest.skip("HWAXRisk 리포가 이 박스에 없다")
     ident = (app / "identity.py").read_text(encoding="utf-8")
     assert f'SSO_PREFIX = "{gw._SSO_ASSERTION_PREFIX}"' in ident and '{"e": email' in ident, \
-        "리스크 앱 단언의 꼴이 바뀌었다 — 게이트웨이의 접힘 대조(_sso_assertion_email)를 같이 고친다"
+        "리스크 앱 단언의 꼴이 바뀌었다 — 게이트웨이의 접힘 대조(_sso_assertion_claims)를 같이 고친다"
     routes = (app / "routes.py").read_text(encoding="utf-8")
     if "x-hwax-delegate" not in routes.lower():
         pytest.skip("이 체크아웃의 리스크 앱은 아직 위임 헤더를 읽지 않는다(HWAXRisk 8e327d6 이전)")
     assert f'"{gw.DELEGATE_HEADER.lower()}"' in routes, "앱이 읽는 위임 헤더 이름이 게이트웨이가 싣는 것과 다르다"
+    assert f'claims["{gw._SSO_DELEGATED_CLAIM}"]' in ident, \
+        "위임을 아는 앱의 단언에 위임 표지가 없다 — 게이트웨이가 그 앱을 옛 앱으로 읽어 접힌 단언을 거부하지 않는다(_mint_user_pat)"
 
 
 def test_지침이_리스크_심사는_risk_next_step_부터라고_말한다():

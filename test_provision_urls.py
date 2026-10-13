@@ -388,6 +388,32 @@ def test_RA_위임과_TestScope_가_ste_hwax_risk_를_건드리지_않는다(tmp
     assert "reportarchive" not in out["rest"] and "testscope" not in out["rest"], "REST 다리는 이번 범위가 아니다"
 
 
+
+# ── 리스크 앱 포털 PAT 등록 주소(HWAXPortal docs/risk-credentials §4.2) ─────────────────────────────────────────────────
+def test_리스크_위임은_포털_PAT_등록_주소를_sso_url_에서_유도하고_force_재생성에서_잃지_않는다(tmp_path):
+    """게이트웨이는 `portal_pat_url` 이 있어야 리스크 앱이 바란 포털 PAT 를 넘긴다. 칸 하나가 --force 에서 빠져 위임이 조용히 꺼진
+    앞선 사고(portal.api_base, 2026-09-29)와 같은 꼴을 막는다 — 항목을 다시 쓰는 실행도, 비밀 없이 이어받는 실행도 그 칸을 지닌다."""
+    env = {"HWAXRISK_SSO_SECRET": "hr", "HEAX_MCP_TOKEN": "heax-svc", "HEAX_MCP_BASE": "https://hub.example:8443/"}
+    risk = _run_provision(tmp_path, env)["heax_registry"]["per_user_sso"]["hwax_risk"]
+    assert risk["sso_url"] == "https://hub.example:8443/apps/hwax_risk/api/auth/sso"
+    assert risk["portal_pat_url"] == "https://hub.example:8443/apps/hwax_risk/api/auth/portal-pat", "sso_url 과 같은 Caddy 문 뒤다"
+    _force_backup(tmp_path)
+    again = _run_provision(tmp_path, env)["heax_registry"]["per_user_sso"]["hwax_risk"]
+    assert again == risk, "--force 재생성이 항목을 다시 쓰며 칸을 잃었다"
+    _force_backup(tmp_path)
+    carried = _run_provision(tmp_path, {"HEAX_MCP_TOKEN": "heax-svc"})["heax_registry"]["per_user_sso"]["hwax_risk"]
+    assert carried == risk, "비밀을 못 읽은 실행은 직전 항목을 칸까지 이어받는다"
+
+
+def test_리스크_포털_PAT_등록_주소는_env_로_바꾸고_유도할_수_없으면_말한다(tmp_path):
+    out = _run_provision(tmp_path, {"HWAXRISK_SSO_SECRET": "hr",
+                                    "HWAXRISK_PORTAL_PAT_URL": "http://127.0.0.1:9295/api/auth/portal-pat"})
+    assert out["heax_registry"]["per_user_sso"]["hwax_risk"]["portal_pat_url"] == "http://127.0.0.1:9295/api/auth/portal-pat"
+    log: list = []
+    out = _run_provision(tmp_path, {"HWAXRISK_SSO_SECRET": "hr", "HWAXRISK_SSO_URL": "http://127.0.0.1:9295/sso"}, log)
+    assert "portal_pat_url" not in out["heax_registry"]["per_user_sso"]["hwax_risk"], "모르는 주소를 지어내지 않는다"
+    assert "portal_pat_url 생략" in log[0] and "HWAXRISK_PORTAL_PAT_URL" in log[0], "빠진 사실과 켜는 법을 말해야 한다"
+
 # ── 일반 앱 위임(PER_USER_SSO_APPS) — 여섯 번째 앱부터 provision-config.sh 를 고치지 않는다(change-request-8-10 #8) ──
 GENERIC_MARK = {"managed_by": "PER_USER_SSO_APPS"}      # 순회가 쓴 항목의 표지 — 목록에서 뺀 앱을 끌 때 이것으로 가린다
 

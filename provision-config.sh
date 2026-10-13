@@ -374,6 +374,7 @@ RA_MCP_URL="${RA_MCP_URL:-}" SF_MCP_URL="${SF_MCP_URL:-}" MXWP_MCP_URL="${MXWP_M
 AIDH_MCP_URL="${AIDH_MCP_URL:-}" AIDH_REST_BASE="${AIDH_REST_BASE:-}" \
 MXWP_REST_BASE="${MXWP_REST_BASE:-}" SF_REST_BASE="${SF_REST_BASE:-}" \
 HWAXRISK_SSO_URL="${HWAXRISK_SSO_URL:-}" HWAXRISK_SSO_SECRET="${HWAXRISK_SSO_SECRET:-}" \
+HWAXRISK_PORTAL_PAT_URL="${HWAXRISK_PORTAL_PAT_URL:-}" \
 CFG="$CFG" AGENT_DIR="$AGENT_DIR" HERE="$HERE" SIBLING_ROOT="$PARENT" python3 - <<'PYEOF'
 import json, os, re, sys
 e = os.environ
@@ -641,6 +642,17 @@ if e.get("HWAXRISK_SSO_SECRET"):
         # Authorization 이 아니라 이 헤더로 싣는다(token_header) — 둘 다 forward_auth 때문이다.
         "auth": "heax",
         "token_header": "X-Heax-Sso-Assertion"}
+    # 단언 발급 응답이 portal_pat_wanted 를 실으면 게이트웨이가 호출자 PAT 로 포털에서 바꿔 받은 PAT 를 넘길 곳(HWAXPortal
+    # docs/risk-credentials §4.2). sso_url 과 같은 Caddy 문 뒤라 거기서 유도하고, 이 항목을 다시 쓸 때마다 같이 쓴다 — --force 에서
+    # 빠지면 Claude 로 온 사람의 패널 잡이 자격 없음으로 멈춘다(빠진 칸이 위임을 조용히 끈 앞선 사고와 같은 꼴). 손잡이는 env 하나다.
+    _hr_sso = per_user["hwax_risk"]["sso_url"]
+    _hr_ppu = e.get("HWAXRISK_PORTAL_PAT_URL") or (
+        _hr_sso[:-len("/api/auth/sso")] + "/api/auth/portal-pat" if _hr_sso.endswith("/api/auth/sso") else "")
+    if _hr_ppu:
+        per_user["hwax_risk"]["portal_pat_url"] = _hr_ppu
+    else:
+        print("  ⚠ hwax_risk portal_pat_url 생략 — HWAXRISK_SSO_URL 이 …/api/auth/sso 로 끝나지 않아 등록 주소를 유도하지 못했다"
+              "(Claude 로 온 사람의 포털 PAT 를 리스크 앱에 넘기지 못한다). 켜려면 HWAXRISK_PORTAL_PAT_URL 을 주고 --force")
 if e.get("STE_SSO_SECRET"):
     # ste 는 heax-hub 앱이 아니라 설정에 직접 적은 백엔드다 — 키가 곧 위임 식별자다.
     # Caddy forward_auth 뒤가 아니므로 auth/token_header 는 쓰지 않는다(그 둘은 Caddy 전용

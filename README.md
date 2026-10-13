@@ -32,7 +32,7 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
 ## 내부 목적지는 사내 프록시를 거치지 않는다 — `NO_PROXY` 자동 유도
 httpx 는 환경의 `HTTP(S)_PROXY` 를 따른다(`trust_env` 기본값). 사내 프록시가 걸린 박스에서는 내부 백엔드 호출까지 프록시로 나가고, 상대가 IP 허용목록으로 거절한다(RA 사람별 위임 403). 게이트웨이는 **설정을 읽은 직후**(클라이언트를 하나도 만들기 전에) 자기가 부르는 주소의 호스트를 `NO_PROXY`·`no_proxy` 에 더한다 — 운영자가 셸에 따로 적지 않아도 된다.
 
-- 모으는 곳 — 백엔드 `url` · `heax_registry.per_user_sso.*.sso_url` · `rest.*.base` · `portal.api_base`·`jwks_url`·`revoked_url` · `heax_registry.servers_url`·`base`. 레지스트리로 뒤늦게 발견되는 앱은 발견할 때 같은 함수로 더한다. `127.0.0.1`·`localhost`·`::1` 은 늘 넣는다.
+- 모으는 곳 — 백엔드 `url` · `heax_registry.per_user_sso.*.sso_url`·`portal_pat_url` · `rest.*.base` · `portal.api_base`·`jwks_url`·`revoked_url` · `heax_registry.servers_url`·`base`. 레지스트리로 뒤늦게 발견되는 앱은 발견할 때 같은 함수로 더한다. `127.0.0.1`·`localhost`·`::1` 은 늘 넣는다.
 - 있던 값은 지우지 않는다. 한쪽 철자에만 있으면 다른 쪽이 그 값을 이어받고(파이썬은 소문자를 먼저 본다), 둘 다 있으면 각자 제 값 뒤에 붙인다. 값이 `*` 하나면 그대로 둔다.
 - 호스트만 적는다(포트·계정·쿼리는 뺀다). CIDR 이나 `.example.com` 항목이 이미 있어도 주소를 따로 더한다 — httpx 는 CIDR 을 대역으로 읽지 않고, 점으로 시작하는 항목은 하위 도메인만 덮는다.
 - 무엇을 더했는지는 기동 로그에 호스트 이름으로 남는다(`NO_PROXY 에 내부 목적지 N곳을 더했다`). IP·평범한 DNS 이름이 아닌 호스트는 적지 않고 경고를 남긴다.
@@ -60,6 +60,7 @@ MCP fan-out과 같은 패턴("호출자 토큰 1개 → 백엔드별 네이티�
 
 - 항목 `{sso_url, secret, client, strip_headers?}` — `strip_headers` 는 서비스 계정 설정에만 맞는 헤더를 사람별 호출에서 뺀다(RA 의 `X-Workspace-Slug`: 서비스 부서가 남으면 남의 부서로 읽고 쓴다).
 - 발급 요청은 호출자를 `X-Heax-User-Email` 과 `X-Hwax-Delegate-Email` 둘에 싣는다. Caddy 경로로 발급받는 앱(`auth: heax` — hwax_risk)은 forward_auth 가 앞의 것을 지우고 서비스 토큰 주인(heax 첫 관리자)으로 다시 실으므로, 앱은 뒤의 것(Caddy 가 건드리지 않는다)을 먼저 읽는다. 값은 게이트웨이가 확인한 신원뿐이다 — 클라이언트가 보낸 같은 이름 헤더는 `/mcp`(인증 미들웨어)와 `/api/`(REST 프록시) 모두 버린다. 받은 단언이 리스크 앱 꼴(`rrsso_`)이면 그 이메일이 보낸 사람인지 본다. 다를 때(위임이 접혔다) 거부하는 것은 **앱이 위임을 아는 판일 때뿐이다** — 그 앱은 위임 헤더로 발급한 단언에만 표지 `d` 를 싣는다(HWAXRisk 2eecb36). `d` 가 있는데 남의 이메일이면 위임 헤더가 앱에 닿기 전에 바뀐 것이라 발급 실패로 거부한다. `d` 가 없으면(위임 헤더를 모르는 옛 앱 — HWAXRisk main) 종전 동작대로 그 단언으로 부르고, 발급 때 경고 로그 한 줄과 MCP 도구 호출마다 감사 `note=folded-old-app` 만 남긴다(REST 다리 길은 경고 로그뿐이다). 접힌 신원의 쓰기는 위임을 아는 앱이 `d` 없는 단언을 받지 않아 스스로 막는다. 그래서 게이트웨이를 앱보다 먼저 내도 hwax_risk 사람별 호출이 거부되지 않는다(종전처럼 접힌 신원으로 돈다) — 옛 앱이 남은 동안 감사에 `folded-old-app` 이 보이면 HWAXRisk 새 판 배포가 필요하다는 뜻이다.
+- `portal_pat_url`(선택 — 지금은 hwax_risk) — 발급 응답에 `portal_pat_wanted`(앱이 그 사람의 포털 PAT 가 없거나 곧 끝난다고 보는 것)가 실리면, 게이트웨이가 호출자 본인의 포털 PAT 로 포털 `POST /auth/pat/exchange` 를 불러(본문은 `portal_pat_wanted` 그대로) 같은 사람의 더 좁은 PAT 를 받고 이 주소로 넘긴다 — 성공이면 `{pat}`, 교환 실패면 `{error, message}`, 헤더는 발급과 같다(HWAXPortal `docs/risk-credentials` §4.2). **포털 PAT 로 들어온 호출(`via=pat`)에만** 한다 — GW_TOKEN(에이전트 서버)·웹 챗·절차 PAT·요청 문맥 밖의 발급(REST 다리)은 건너뛴다. 발급 직후, 그 도구 호출을 앱에 보내기 전에 같은 잠금 안에서 하고, 전체 8초를 넘기지 않으며 실패해도 도구 호출은 그대로 간다. 한 번 건넨 (앱, 사람)은 5분 동안 다시 하지 않는다(401 뒤 강제 재발급이 또 교환하지 않게). 결과는 그 호출의 감사 `note` 에 접힌다 — `portal-pat:registered` · `portal-pat:exchange-<code>` · `portal-pat:register-<status>`(시간 초과는 `-timeout`) · `portal-pat:skipped-<까닭>`. 토큰 값은 로그·감사 어디에도 적지 않고, 호출자의 원 PAT 는 포털에만 간다.
 - `per_user_sso` 가 포털 등록 연결(`PORTAL_CONN_BACKENDS`, 포털 '개인 토큰 › 외부 연결' 의 RA·TestScope 토큰)보다 **먼저**다 — 위임이 켜진 서비스는 등록 토큰을 쓰지 않는다.
 - `provision-config.sh` 가 env 로 만든다. 순서는 env > 직전 config > 기본값이고, 비밀이 없는 실행은 직전 항목을 지우지 않고 이어받는다. 운영에서는 update-all 이 포털 `infra/.env` 에서 읽어 넘긴다(HWAXPortal `docs/sso-delegation`).
 

@@ -1049,7 +1049,7 @@ def _per_user_kit(monkeypatch, aff_payload, base_headers=None, sso_extra=None,
     monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
     monkeypatch.setattr(gw, "_request_groups", lambda: list(groups))
 
-    async def fake_pat(app_id, email, *, force=False):
+    async def fake_pat(app_id, email, *, force=False, notes=None):
         return "kr_tok"
     monkeypatch.setattr(gw, "_user_pat", fake_pat)
     seen_groups = []
@@ -2246,7 +2246,7 @@ def _remint_kit(monkeypatch, replies: list[str | None]):
         seen["tokens"].append((headers or {}).get("Authorization"))
         return _StubCM((None, None, "sid"))
 
-    async def fake_pat(app_id, email, *, force=False):
+    async def fake_pat(app_id, email, *, force=False, notes=None):
         seen["force"].append(force)
         return "new-tok" if force else "old-tok"
 
@@ -3037,7 +3037,7 @@ def _late_kit(monkeypatch, path, *, hang="call", call_s=0.05, handshake_s=5.0):
         n["shots"] += 1
         return _StubCM((None, None, "sid"))
 
-    async def fake_pat(app_id, email, *, force=False):
+    async def fake_pat(app_id, email, *, force=False, notes=None):
         n["mints"].append(force)
         return "tok"
 
@@ -4805,3 +4805,230 @@ def test_list_tool_apps_앱_상세는_도구_이름을_먼저_싣는다(monkeypa
     assert len(out) > 6000 and [t["name"] for t in entry["tools"]] == names, "설명은 전부 그대로다"
     assert entry["tool_names"] == names
     assert all(f'"{n}"' in out[:6000] for n in names), "6,000자에서 잘려도 40개 이름이 다 남아야 한다"
+
+
+# ── 포털 PAT 건네기 — 리스크 앱 발급 응답이 바라면 호출자 PAT 로 포털에서 바꿔 받아 앱에 넘긴다(HWAXPortal docs/risk-credentials §4.2) ──
+# 앱은 사람이 시작한 잡을 그 사람의 포털 PAT 로만 돌린다(U-3). Claude 로 온 사람은 PAT 를 앱에 등록한 적이 없으니, 앱이 단언 발급
+# 응답에 `portal_pat_wanted` 를 실으면 게이트웨이가 호출자 본인의 포털 PAT 로 `POST /auth/pat/exchange` 를 불러 좁힌 PAT 를 받아
+# `portal_pat_url` 로 넘긴다. 아래 가짜 상류 셋은 앱 SSO · 포털 교환 · 앱 등록이다. 토큰 값은 모양만 흉내 내고 눈에 띄게 둔다 —
+# 로그·감사에 새는지를 글자로 찾는다.
+_PP_WANTED = {"name": "hwax-risk", "audiences": ["mcp-gateway"], "scopes": ["read"], "ttl_days": 90}
+_PP_CALLER_PAT = "eyJ.caller-portal-pat.CALLERSECRET"
+_PP_NEW_PAT = "eyJ.exchanged-pat.NEWSECRET"
+_PP_URL = "http://caddy.invalid/apps/hwax_risk/api/auth/portal-pat"
+_PP_TOOL = "risk_create_project"
+
+
+def _pp_ok(req):
+    return httpx.Response(200, json={"jti": "j-1", "name": "hwax-risk", "audiences": ["mcp-gateway"], "scopes": ["read"],
+                                     "created": 1, "exp": 2, "revoked": False, "token": _PP_NEW_PAT})
+
+
+def _pp_kit(monkeypatch, *, via="pat", auth=f"Bearer {_PP_CALLER_PAT}", wanted=_PP_WANTED, exchange=_pp_ok,
+            register=None, backend_rejects_first=False, user="a@corp.com"):
+    """heax-hwax_risk 하나로 `_call_tool` 을 태운다 — 발급·건네기는 진짜이고 상류 셋은 가짜다. 요청 문맥은 인증 미들웨어가 남기는
+    꼴(Authorization 원본 · via · 확인한 신원)이다. 돌려주는 것 — 결과 · 일어난 순서 · 교환·등록이 받은 요청 · 감사 마지막 줄."""
+    ev, got = [], {"exchange": [], "register": []}
+
+    async def handler(req):
+        u, h = str(req.url), {k.lower(): v for k, v in req.headers.items()}
+        if u == _RISK_SSO["sso_url"]:
+            ev.append("mint")
+            body = {"access_token": _rrsso(h["x-hwax-delegate-email"], delegated=True), "token_type": "bearer",
+                    "expires_in": 900}
+            if wanted is not None:
+                body["portal_pat_wanted"] = wanted
+            return httpx.Response(200, json=body)
+        step, fn = ("exchange", exchange) if u == "http://portal/auth/pat/exchange" else ("register", register)
+        assert step == "exchange" or u == _PP_URL, u
+        ev.append(step)
+        got[step].append({"headers": h, "json": json.loads(req.content)})
+        r = fn(req) if fn else httpx.Response(200, json={"registered": True})
+        return r if isinstance(r, httpx.Response) else await r
+    _mock_http(monkeypatch, handler)
+    calls = {"n": 0}
+
+    class _Sess:
+        async def initialize(self): return None
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            ev.append("call")
+            calls["n"] += 1
+            if backend_rejects_first and calls["n"] == 1:
+                return types.CallToolResult(content=[types.TextContent(
+                    type="text", text=f"Error executing tool {original}: POST /api/x → HTTP 401: expired")], isError=True)
+            return types.CallToolResult(content=[types.TextContent(type="text", text='{"created": true}')], isError=False)
+
+    async def fake_access(email, base_groups, **_kw):
+        return {"keys": [], "affiliation": ""}
+    monkeypatch.setattr(gw, "streamablehttp_client", lambda url, headers=None, **_kw: _StubCM((None, None, "sid")))
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    monkeypatch.setitem(gw.HEAX, "token", "heax-svc-pat")
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"hwax_risk": {**_RISK_SSO, "portal_pat_url": _PP_URL}})
+    monkeypatch.setattr(gw, "_USER_PATS", {})
+    monkeypatch.setattr(gw, "_USER_PAT_LOCKS", {})
+    monkeypatch.setattr(gw, "_PORTAL_PAT_TRIED", {})
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {"heax-hwax_risk": _CallB([_PP_TOOL])})
+    monkeypatch.setattr(gw, "route", {_PP_TOOL: ("heax-hwax_risk", _PP_TOOL)})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    _set_request(monkeypatch, {"authorization": auth, gw.VIA_HEADER: via, gw.USER_HEADER: user.replace("@", "%40")},
+                 "203.0.113.9")
+    res = asyncio.run(asyncio.wait_for(gw._call_tool(_PP_TOOL, {"code": "P1"}), 10))
+    return res, ev, got, _rows()[-1]
+
+
+def test_포털_PAT_를_바라면_호출자_PAT_로_바꿔_받아_도구_호출_전에_앱에_넘긴다(monkeypatch):
+    res, ev, got, row = _pp_kit(monkeypatch)
+    assert not res.isError, res.content[0].text
+    assert ev == ["mint", "exchange", "register", "call"], "등록이 그 도구 호출보다 먼저여야 앱이 이번 호출에 PAT 를 쓴다"
+    ex = got["exchange"][0]
+    assert ex["headers"]["authorization"] == f"Bearer {_PP_CALLER_PAT}", "교환은 호출자가 낸 Authorization 그대로다"
+    assert ex["json"] == _PP_WANTED, "앱이 바란 명세를 그대로 넘긴다"
+    assert "x-heax-gateway-secret" not in ex["headers"] and "heax-svc-pat" not in json.dumps(ex), "포털에 앱 비밀을 보내지 않는다"
+    rg = got["register"][0]
+    assert rg["json"] == {"pat": _PP_NEW_PAT}
+    h = rg["headers"]
+    assert (h["x-heax-gateway-secret"], h["x-heax-user-email"], h[gw.DELEGATE_HEADER.lower()], h["x-heax-client"],
+            h["authorization"]) == ("rs", "a@corp.com", "a@corp.com", "deliberation", "Bearer heax-svc-pat"), \
+        "등록은 단언 발급과 같은 헤더로 간다(Caddy 문 · 앱 비밀 · 위임 이메일)"
+    assert _PP_CALLER_PAT not in json.dumps(got["register"]), "호출자의 원 PAT 는 앱으로 가지 않는다 — 좁힌 PAT 만"
+    assert row["ok"] is True and row["mode"] == "as-user-pat" and row["note"] == "portal-pat:registered", row
+
+
+def test_앱이_바라지_않으면_교환하지_않는다(monkeypatch):
+    res, ev, got, row = _pp_kit(monkeypatch, wanted=None)
+    assert not res.isError and ev == ["mint", "call"], ev
+    assert "note" not in row, row
+
+
+@pytest.mark.parametrize("via, auth", [("gw-token", "Bearer gw-secret"), ("chat", f"Bearer {_PP_CALLER_PAT}"),
+                                       ("procedure", f"Bearer {_PP_CALLER_PAT}"), ("", f"Bearer {_PP_CALLER_PAT}")])
+def test_포털_PAT_로_들어온_호출이_아니면_교환하지_않는다(monkeypatch, via, auth):
+    """GW_TOKEN(에이전트 서버)은 넘길 사람의 PAT 가 없다 — Authorization 이 GW_TOKEN 이다. 웹 챗·절차 PAT 는 포털이 원으로 받지 않으니
+    (기록되지 않은 PAT) 부르지 않는다 — 그 거절을 앱에 알리면 앱이 실패 쉼에 들어 Claude 길의 교환까지 막힌다."""
+    res, ev, got, row = _pp_kit(monkeypatch, via=via, auth=auth)
+    assert not res.isError and ev == ["mint", "call"], ev
+    assert row["note"] == f"portal-pat:skipped-{via or 'no-via'}", row
+
+
+
+def test_건네기가_읽는_Authorization_은_미들웨어가_검증한_그_원본이다(monkeypatch):
+    """건네기는 요청의 Authorization 을 호출자 PAT 로 포털에 보낸다 — PAT 분기가 그 헤더를 바꾸거나 더하지 않아야 포털이 받는 것이
+    게이트웨이가 검증한 바로 그 토큰이다(두 번 실린 요청은 미들웨어가 401 로 막는다). via=pat 도 그 분기만 싣는다(위 시험)."""
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["h"] = list(scope["headers"])
+
+    async def fake_access(email, base, **_kw):
+        return {"keys": []}
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        async def verify(self, token, aud):
+            return {"email": "u@x.io", "groups": []} if token == _PP_CALLER_PAT else None
+    asyncio.run(gw._bearer_gate(app, _V())({"type": "http", "path": "/mcp", "headers": [
+        (b"authorization", f"Bearer {_PP_CALLER_PAT}".encode())]}, None, None))
+    assert [v for k, v in seen["h"] if k.lower() == b"authorization"] == [f"Bearer {_PP_CALLER_PAT}".encode()]
+    assert [v for k, v in seen["h"] if k.lower() == gw.VIA_HEADER.encode()] == [b"pat"]
+
+def test_요청_문맥이_없는_발급은_교환하지_않는다(monkeypatch):
+    """REST 다리(`_rest_mint`)처럼 MCP 요청 밖에서 도는 발급 — 호출자 PAT 를 쥐고 있지 않다."""
+    _pp_kit(monkeypatch)                                     # 상류·설정만 세운다(이 호출의 결과는 보지 않는다)
+    monkeypatch.setattr(gw, "_USER_PATS", {})
+    monkeypatch.setattr(gw, "_PORTAL_PAT_TRIED", {})
+
+    class _NoCtx:
+        @property
+        def request_context(self):
+            raise LookupError
+    monkeypatch.setattr(gw, "_low", _NoCtx())
+    notes: list = []
+    assert asyncio.run(gw._user_pat("hwax_risk", "a@corp.com", notes=notes)).startswith("rrsso_")
+    assert notes == ["portal-pat:skipped-no-request"]
+
+
+def test_교환이_거절되면_앱에_사유를_알리고_도구_호출은_그대로_간다(monkeypatch):
+    def refuse(req):
+        return httpx.Response(403, json={"detail": {"code": "source_not_exchangeable", "message": "기록되지 않은 PAT"}})
+    res, ev, got, row = _pp_kit(monkeypatch, exchange=refuse)
+    assert not res.isError and ev == ["mint", "exchange", "register", "call"], ev
+    assert got["register"][0]["json"] == {"error": "source_not_exchangeable", "message": "기록되지 않은 PAT"}
+    assert row["ok"] is True and row["note"] == "portal-pat:exchange-source_not_exchangeable", row
+
+
+def test_교환_응답이_시간_초과면_그_까닭을_앱에_알린다(monkeypatch):
+    def late(req):
+        raise httpx.ReadTimeout("slow", request=req)
+    res, ev, got, row = _pp_kit(monkeypatch, exchange=late)
+    assert not res.isError and got["register"][0]["json"]["error"] == "timeout"
+    assert row["note"] == "portal-pat:exchange-timeout", row
+
+
+@pytest.mark.parametrize("status, body, want", [
+    (403, {"detail": {"code": "source_not_exchangeable", "message": "m"}}, ("source_not_exchangeable", "m")),
+    (401, {"detail": "invalid_token"}, ("invalid_token", "invalid_token")),
+    (401, {"detail": "토큰이 틀렸다"}, ("http_401", "토큰이 틀렸다")),
+    (422, {"detail": [{"loc": ["body", "ttl_days"], "msg": "x"}]}, ("http_422", "포털이 교환을 거절했다(HTTP 422)")),
+    (502, "<html>bad gateway</html>", ("http_502", "포털이 교환을 거절했다(HTTP 502)")),
+    (403, {"detail": {"code": "a b; c", "message": "m"}}, ("http_403", "m")),
+])
+def test_포털_거절은_코드_꼴만_감사_code_로_쓴다(status, body, want):
+    resp = (httpx.Response(status, json=body) if not isinstance(body, str) else httpx.Response(status, text=body))
+    assert gw._portal_pat_refusal(resp) == want
+
+
+def test_앱_등록이_실패해도_도구_호출은_가고_감사에_남는다(monkeypatch):
+    res, ev, got, row = _pp_kit(monkeypatch, register=lambda req: httpx.Response(422, json={"detail": "pat_invalid"}))
+    assert not res.isError and ev == ["mint", "exchange", "register", "call"], ev
+    assert row["ok"] is True and row["note"] == "portal-pat:register-422", row
+
+
+@pytest.mark.parametrize("hang", ["exchange", "register"])
+def test_교환과_등록은_시간_한도_안에서_끝나고_도구_호출을_붙들지_않는다(monkeypatch, hang):
+    """가짜 전송은 httpx 의 요청 한도를 모른다 — 응답을 끝없이 미루는 상류에서 전체 한도(_PORTAL_PAT_BUDGET_S)만으로 끝나야 한다."""
+    monkeypatch.setattr(gw, "_PORTAL_PAT_BUDGET_S", 0.3)
+
+    async def never(req):
+        await asyncio.sleep(30)
+    t0 = _clock.monotonic()
+    res, ev, got, row = _pp_kit(monkeypatch, **{hang: never})
+    assert _clock.monotonic() - t0 < 5, "건네기가 도구 호출을 한도 넘게 붙들었다"
+    assert not res.isError and ev[-1] == "call" and ev.count("call") == 1, ev
+    assert row["note"] == f"portal-pat:{hang}-timeout", row
+    if hang == "exchange":
+        assert got["register"] == [], "한도를 다 쓴 뒤에는 등록을 보내지 않는다"
+
+
+def test_토큰_재발급이_같은_사람의_교환을_되풀이하지_않는다(monkeypatch):
+    """앱이 캐시 단언을 401 로 거절하면 같은 호출이 한 번 다시 발급한다(종전 규칙). 그 발급도 PAT 를 바라지만 방금 건넸으니 쉰다."""
+    res, ev, got, row = _pp_kit(monkeypatch, backend_rejects_first=True)
+    assert not res.isError, res.content[0].text
+    assert ev == ["mint", "exchange", "register", "call", "mint", "call"], ev
+    assert row["note"] == "re-minted+portal-pat:registered+portal-pat:skipped-cooldown", row
+
+
+def _pp_echo(req):
+    """거절 글에 받은 Authorization(호출자의 원 PAT)을 되울리는 포털 앞단."""
+    return httpx.Response(401, json={"detail": {"code": "invalid_token", "message": f"거절 — {req.headers['authorization']}"}})
+
+
+@pytest.mark.parametrize("exchange, note", [(_pp_ok, "portal-pat:registered"),
+                                            (_pp_echo, "portal-pat:exchange-invalid_token")])
+def test_건네기는_토큰_값을_로그에도_감사에도_적지_않는다(monkeypatch, caplog, exchange, note):
+    """두 토큰(호출자의 원 PAT · 바꿔 받은 PAT) 어느 것도 글자로 남지 않는다. 포털 거절 글이 원 PAT 를 되울려도 앱으로 넘기지 않는다."""
+    import logging
+    caplog.set_level(logging.DEBUG)
+    res, ev, got, row = _pp_kit(monkeypatch, exchange=exchange)
+    assert not res.isError and row["note"] == note, row
+    assert _PP_CALLER_PAT not in json.dumps(got["register"], ensure_ascii=False), got["register"]
+    audit = open(gw.AUDIT_PATH, encoding="utf-8").read()
+    for secret in (_PP_CALLER_PAT, _PP_NEW_PAT):
+        assert secret not in caplog.text, f"로그에 토큰이 있다: {secret}"
+        assert secret not in audit, f"감사에 토큰이 있다: {secret}"

@@ -108,11 +108,12 @@ def _bypass_proxy_for(urls) -> list[str]:
 
 
 GW, BACKENDS, REST, PORTAL, HEAX = _load_config()
-# 클라이언트를 하나라도 만들기 **전에** 환경을 세운다. 게이트웨이가 직접 부르는 주소 전부다 — 백엔드 · 사람별 위임(sso_url) ·
+# 클라이언트를 하나라도 만들기 **전에** 환경을 세운다. 게이트웨이가 직접 부르는 주소 전부다 — 백엔드 · 사람별 위임(sso_url·portal_pat_url) ·
 # REST 사이트 · 포털 · heax 레지스트리(앱 주소는 base + 경로라 base 하나로 덮인다. 뒤늦게 발견되는 앱은 _discover_heax 가 더한다).
 if not _bypass_proxy_for(
         [v.get("url") for v in BACKENDS.values()]
-        + [v.get("sso_url") for v in (HEAX.get("per_user_sso") or {}).values() if isinstance(v, dict)]
+        + [v.get(k) for v in (HEAX.get("per_user_sso") or {}).values() if isinstance(v, dict)
+           for k in ("sso_url", "portal_pat_url")]
         + [v.get("base") for v in REST.values() if isinstance(v, dict)]
         + [PORTAL.get(k) for k in ("api_base", "jwks_url", "revoked_url")]
         + [HEAX.get(k) for k in ("servers_url", "base")]):
@@ -238,9 +239,10 @@ def _aff_proof(secret: str, email: str, aff: str, now: float | None = None) -> s
     msg = f"v1|{email}|{aff}|{exp}"
     sig = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"v1.{exp}.{sig}"
-# 백엔드별 사용자 위임 설정 — {app_id: {sso_url, secret, client, base?, token_header?, strip_headers?}}.
+# 백엔드별 사용자 위임 설정 — {app_id: {sso_url, secret, client, base?, token_header?, strip_headers?, portal_pat_url?}}.
 # strip_headers — 서비스 계정 설정에만 맞는 헤더를 사람별 호출에서 뺀다(RA 의 X-Workspace-Slug: 서비스 부서가 남으면
 # 남의 부서로 읽고 쓴다. 사람별 부서는 앱이 그 사람 기준으로 정한다 — docs/sso-delegation).
+# portal_pat_url — 발급 응답이 `portal_pat_wanted` 를 실으면 호출자 PAT 로 포털에서 바꿔 받은 PAT 를 여기로 넘긴다(_portal_pat_handoff).
 # 값이 있는 백엔드만 사용자별 자격증명으로 호출한다(나머지는 종전대로 서비스 계정).
 PER_USER_SSO: dict[str, dict] = {k: v for k, v in (HEAX.get("per_user_sso") or {}).items()
                                  if isinstance(v, dict) and v.get("sso_url") and v.get("secret")}
@@ -2930,8 +2932,8 @@ _USER_PATS: dict[tuple[str, str], tuple[str, float]] = {}
 _USER_PAT_LOCKS: dict[tuple[str, str], anyio.Lock] = {}
 
 
-async def _mint_user_pat(conf: dict, email: str) -> tuple[str, object]:
-    """백엔드의 게이트웨이 SSO 로 이 사용자의 PAT 를 발급받는다 → (토큰, 토큰 옆의 expires_in). 실패 시 예외."""
+def _sso_headers(conf: dict, email: str) -> dict:
+    """위임 발급 요청의 헤더. 포털 PAT 등록(`portal_pat_url`)도 같은 것을 싣는다 — 같은 Caddy 문·같은 비밀·같은 위임 이메일."""
     headers = {
         "X-Heax-Gateway-Secret": conf["secret"],
         "X-Heax-User-Email": email,
@@ -2944,6 +2946,13 @@ async def _mint_user_pat(conf: dict, email: str) -> tuple[str, object]:
     # 그래서 sso_url 을 Caddy 경로로 두고, 그 라우트의 forward_auth 를 서비스 토큰으로 통과한다.
     if conf.get("auth") == "heax" and HEAX.get("token"):
         headers["Authorization"] = f"Bearer {HEAX['token']}"
+    return headers
+
+
+async def _mint_user_pat(conf: dict, email: str) -> tuple[str, object, object]:
+    """백엔드의 게이트웨이 SSO 로 이 사용자의 PAT 를 발급받는다 → (토큰, 토큰 옆의 expires_in, 응답의 portal_pat_wanted).
+    실패 시 예외."""
+    headers = _sso_headers(conf, email)
     async with httpx.AsyncClient(timeout=15) as cli:
         resp = await cli.post(conf["sso_url"], headers=headers)
     if resp.status_code != 200:
@@ -2983,7 +2992,8 @@ async def _mint_user_pat(conf: dict, email: str) -> tuple[str, object]:
         log.warning("SSO 단언 접힘(위임 표지 d 없음): %s 로 청했는데 %s 의 단언이 왔다(%s) — 리스크 앱이 위임을 아는 판이 아니다"
                     "(또는 위임 헤더가 도중에 지워졌다). 종전대로 그 단언으로 부르고 감사에 %s 로 적는다 — HWAXRisk 새 판 배포가 필요하다",
                     email, who, conf.get("sso_url"), _SSO_FOLD_NOTE)
-    return got
+    # 리스크 앱은 그 사람의 포털 PAT 가 없거나 곧 끝나면 봉투 맨 위에 이것을 싣는다(HWAXPortal docs/risk-credentials §4.3).
+    return got[0], got[1], (data.get("portal_pat_wanted") if isinstance(data, dict) else None)
 
 
 _SSO_ASSERTION_PREFIX = "rrsso_"
@@ -3020,15 +3030,133 @@ def _sso_fold_note(tok: str, email: str) -> str | None:
     return None
 
 
-async def _user_pat(app_id: str, email: str, *, force: bool = False) -> str:
-    """캐시된 사용자 PAT (없거나 force 면 발급). 사용자 단위로 직렬화한다."""
+# ── 포털 PAT 건네기 — 위임 발급 응답의 `portal_pat_wanted` 에 토큰 교환을 대신 건다(HWAXPortal docs/risk-credentials §4.2·C-2) ──
+# 리스크 앱은 사람이 시작한 잡을 그 사람의 포털 PAT 로만 돌린다(U-3). Claude 로 온 사람은 그 PAT 를 앱에 등록한 적이 없다 — 그래서
+# 앱이 바란다고 하면, 호출자가 **직접 낸** 포털 PAT 를 증거로 포털 `POST /auth/pat/exchange` 에서 같은 사람의 더 좁은 PAT 를 받아
+# 앱의 `portal_pat_url` 에 넘긴다. 호출자의 PAT 는 포털에만 가고 앱은 좁힌 PAT 만 받는다.
+# 최선 노력이다 — 도구 호출을 실패시키지 않고, _PORTAL_PAT_BUDGET_S 넘게 붙들지 않고, 되풀이하지 않는다. 토큰 값은 어디에도 적지 않는다.
+_PORTAL_PAT_BUDGET_S = 8.0     # 교환 + 등록 전체
+_PORTAL_PAT_STEP_S = 4.0       # 요청 하나 — 교환이 시간을 다 써도 실패를 알릴 몫이 남는다
+# 한 번 건넨 (앱, 사람)은 이 동안 다시 하지 않는다 — 401 뒤 강제 재발급(같은 호출의 둘째 시도)이 또 교환하지 않게.
+_PORTAL_PAT_COOLDOWN_S = 300.0
+_PORTAL_PAT_TRIED: dict[tuple[str, str], float] = {}
+_PORTAL_PAT_CODE = re.compile(r"[A-Za-z0-9_.:-]{1,40}")
+
+
+def _portal_pat_refusal(resp) -> tuple[str, str]:
+    """포털 거절의 (code, message). 거절은 `{detail:{code, message}}` 지만 앞단(nginx·FastAPI 기본)은 다른 꼴로 답할 수 있다 —
+    detail.code → detail 문자열 → `http_<status>` 순으로 읽고, 코드 꼴이 아닌 글은 code 로 쓰지 않는다(감사 note 에 실린다)."""
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        body = None
+    detail = body.get("detail") if isinstance(body, dict) else None
+    code, msg = "", ""
+    if isinstance(detail, dict):
+        code, msg = str(detail.get("code") or ""), str(detail.get("message") or "")
+    elif isinstance(detail, str):
+        code = msg = detail
+    if not _PORTAL_PAT_CODE.fullmatch(code):
+        code = f"http_{resp.status_code}"
+    return code, msg or f"포털이 교환을 거절했다(HTTP {resp.status_code})"
+
+
+async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> str:
+    """앱이 바란 포털 PAT 를 교환해 넘기고 감사 note(`portal-pat:…`)를 돌려준다. **던지지 않는다.**
+
+    교환은 **포털 PAT 로 들어온 호출**(인증 미들웨어가 via=pat 를 실은 요청)에만 한다. 그 요청의 Authorization 이 호출자 본인의
+    PAT 다 — 미들웨어는 PAT 분기에서 이 헤더를 그대로 두고, 두 번 실린 요청은 401 로 막는다. GW_TOKEN(에이전트 서버)은 넘길 사람의
+    PAT 가 없고, 웹 챗·절차 PAT 는 포털이 원으로 받지 않는다(기록되지 않은 PAT — 수명 늘리기 방지). 그 실패를 앱에 알리면 앱이
+    실패 쉼에 들어 그동안 Claude 길의 교환까지 바라지 않으므로 건너뛴다. 요청 문맥이 없는 발급(REST 다리)도 건너뛴다.
+    ⚠ 요청 상태는 `_low.request_context` 에서 읽는다 — ContextVar 로 옮기지 마라(_request_ip 주석, D-3)."""
+    try:
+        url = conf.get("portal_pat_url")
+        if not url:
+            return "portal-pat:skipped-no-url"
+        if not isinstance(wanted, dict):
+            return "portal-pat:skipped-bad-wanted"
+        try:
+            req = _low.request_context.request
+        except LookupError:
+            req = None
+        if req is None:
+            return "portal-pat:skipped-no-request"
+        via = _request_via()
+        if via != "pat":
+            return f"portal-pat:skipped-{via or 'no-via'}"
+        if _request_user() != email:
+            return "portal-pat:skipped-identity-mismatch"
+        auth = req.headers.get("authorization") or ""
+        caller_pat = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+        if not caller_pat:
+            return "portal-pat:skipped-no-bearer"
+        base = _portal_api_base()
+        if not base:
+            return "portal-pat:skipped-no-portal"
+        key = (app_id, email)
+        last = _PORTAL_PAT_TRIED.get(key)
+        if last is not None and time.monotonic() - last < _PORTAL_PAT_COOLDOWN_S:
+            return "portal-pat:skipped-cooldown"
+        _PORTAL_PAT_TRIED[key] = time.monotonic()
+
+        stage, notes = "exchange", []
+        with anyio.move_on_after(_PORTAL_PAT_BUDGET_S) as scope:
+            async with httpx.AsyncClient(timeout=_PORTAL_PAT_STEP_S) as cli:
+                body: dict | None = None
+                try:
+                    r = await cli.post(f"{base}/auth/pat/exchange", headers={"Authorization": auth}, json=wanted)
+                except httpx.TimeoutException:
+                    code, msg = "timeout", f"포털 교환이 {_PORTAL_PAT_STEP_S:g}초 안에 답하지 않았다"
+                except httpx.HTTPError as exc:
+                    code, msg = "unreachable", f"포털에 닿지 못했다({type(exc).__name__})"
+                else:
+                    if r.status_code == 200:
+                        try:
+                            new = r.json().get("token")
+                        except Exception:  # noqa: BLE001
+                            new = None
+                        if isinstance(new, str) and new:
+                            body = {"pat": new}
+                            code, msg = "", ""
+                        else:
+                            code, msg = "bad_response", "포털 교환 응답에 token 이 없다"
+                    else:
+                        code, msg = _portal_pat_refusal(r)
+                if body is None:
+                    notes.append(f"portal-pat:exchange-{code}")
+                    # 거절 글이 무엇을 되울리든 호출자 PAT 는 앱으로 넘기지 않는다.
+                    body = {"error": code, "message": _clip(msg.replace(caller_pat, "…"), 200)}
+                stage = "register"
+                try:
+                    r2 = await cli.post(url, headers=_sso_headers(conf, email), json=body)
+                except httpx.TimeoutException:
+                    notes.append("portal-pat:register-timeout")
+                except httpx.HTTPError:
+                    notes.append("portal-pat:register-unreachable")
+                else:
+                    if r2.status_code != 200:
+                        notes.append(f"portal-pat:register-{r2.status_code}")
+                    elif "pat" in body:
+                        notes.append("portal-pat:registered")
+        if scope.cancelled_caught:
+            notes.append(f"portal-pat:{stage}-timeout")
+        return "+".join(notes)
+    except Exception as exc:  # noqa: BLE001 — 건네기 실패가 도구 호출을 막지 않는다(값은 적지 않는다)
+        log.warning("portal PAT handoff for %s on %s failed: %s", email, app_id, type(exc).__name__)
+        return "portal-pat:skipped-error"
+
+
+async def _user_pat(app_id: str, email: str, *, force: bool = False, notes: list | None = None) -> str:
+    """캐시된 사용자 PAT (없거나 force 면 발급). 사용자 단위로 직렬화한다.
+    발급 응답이 포털 PAT 를 바라면 같은 잠금 안에서 건넨다 — 같은 사람의 다른 호출은 등록이 끝난 뒤에 앱에 닿는다.
+    그 감사 note 는 `notes` 에 덧붙인다(주지 않으면 로그에만 남는다)."""
     key = (app_id, email)
     lock = _USER_PAT_LOCKS.setdefault(key, anyio.Lock())
     async with lock:
         hit = _USER_PATS.get(key)
         if hit and not force and hit[1] > time.monotonic():
             return hit[0]
-        tok, exp = await _mint_user_pat(PER_USER_SSO[app_id], email)
+        tok, exp, wanted = await _mint_user_pat(PER_USER_SSO[app_id], email)
         # 토큰 제 수명을 넘겨 쓰지 않는다 — RA 위임 JWT 는 12시간이라 캐시와 같다. 2분 먼저 버린다.
         # 값이 없거나 이상하면(bool·문자열·0 이하) 종전대로 캐시 수명만 쓴다.
         ttl = USER_PAT_TTL_S
@@ -3043,6 +3171,12 @@ async def _user_pat(app_id: str, email: str, *, force: bool = False) -> str:
                             "토큰이 끝날 수 있다. 그 앱의 위임 토큰 수명을 호출 한도보다 길게 둔다", app_id, exp, CALL_TIMEOUT_S)
         _USER_PATS[key] = (tok, time.monotonic() + ttl)
         log.info("user PAT minted for %s on %s", email, app_id)
+        if wanted:
+            pp = await _portal_pat_handoff(app_id, PER_USER_SSO[app_id], email, wanted)
+            (log.info if pp == "portal-pat:registered" or pp.startswith("portal-pat:skipped-") else log.warning)(
+                "portal PAT handoff for %s on %s: %s", email, app_id, pp)
+            if notes is not None:
+                notes.append(pp)
         return tok
 
 
@@ -3359,9 +3493,10 @@ async def _call_tool(name: str, arguments: dict):
             for h in _strip if isinstance(_strip, list) else []:   # 문자열이면 글자로 쪼개지 않는다
                 if isinstance(h, str) and h:
                     extra[h] = None   # None 이면 _call_as_user 가 서비스 헤더를 지운다
+            pp_notes: list[str] = []   # 포털 PAT 건네기(발급 응답이 바랄 때만) — 이 호출의 감사 줄에 접는다
             for attempt in (0, 1):   # 폐기된 캐시 토큰은 1회 재발급 후 재시도
                 try:
-                    tok = await _user_pat(app_id, email, force=bool(attempt))
+                    tok = await _user_pat(app_id, email, force=bool(attempt), notes=pp_notes)
                     res = await _call_as_user(
                         b, original, arguments, tok, CALL_TIMEOUT_S, extra_headers=extra,
                         token_header=PER_USER_SSO[app_id].get("token_header"))
@@ -3374,7 +3509,7 @@ async def _call_tool(name: str, arguments: dict):
                                     name, exc)
                         continue
                     _audit(name, backend_key, False, f"per-user: {exc!r}",
-                           round((time.monotonic() - t0) * 1000))
+                           round((time.monotonic() - t0) * 1000), note="+".join(pp_notes) or None)
                     # 서비스 계정으로 조용히 강등하지 않는다 — 그러면 '내 모델 0건'이라는
                     # 사실과 다른 답이 나가고, 실패가 정상 응답과 구분되지 않는다.
                     return types.CallToolResult(
@@ -3389,7 +3524,7 @@ async def _call_tool(name: str, arguments: dict):
                 _audit(name, backend_key, not getattr(res, "isError", False), None,
                        round((time.monotonic() - t0) * 1000),
                        caller=email, mode="as-user-pat", corr=_request_corr(),
-                       note="+".join(n for n in ("re-minted" if attempt else None, _sso_fold_note(tok, email)) if n)
+                       note="+".join(n for n in ("re-minted" if attempt else None, _sso_fold_note(tok, email), *pp_notes) if n)
                        or None, res=res)
                 return _cache_put(ckey, _evid_keep(name, res))
     elif backend_key in PORTAL_CONN_BACKENDS:

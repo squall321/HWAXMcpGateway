@@ -1,4 +1,5 @@
 # 게이트웨이 그룹 인가 순수 로직 단위 테스트 (네트워크·백엔드 불필요).
+import base64
 import json
 
 import mcp.types as types
@@ -4898,6 +4899,29 @@ def test_포털_PAT_를_바라면_호출자_PAT_로_바꿔_받아_도구_호출_
         "등록은 단언 발급과 같은 헤더로 간다(Caddy 문 · 앱 비밀 · 위임 이메일)"
     assert _PP_CALLER_PAT not in json.dumps(got["register"]), "호출자의 원 PAT 는 앱으로 가지 않는다 — 좁힌 PAT 만"
     assert row["ok"] is True and row["mode"] == "as-user-pat" and row["note"] == "portal-pat:registered", row
+
+
+def _pp_jwt(aud) -> str:
+    seg = base64.urlsafe_b64encode(json.dumps({"aud": aud, "email": "a@corp.com"}).encode()).decode().rstrip("=")
+    return f"eyJhbGciOiJSUzI1NiJ9.{seg}.SIGNATURE"
+
+
+@pytest.mark.parametrize("caller_aud, sent", [(["mcp-gateway", "heax-hub"], ["mcp-gateway"]),
+                                              (["mcp-gateway", "step-forge"], ["mcp-gateway", "step-forge"])])
+def test_바란_청중은_호출자_PAT_의_청중과_겹치는_것만_교환에_싣는다(monkeypatch, caller_aud, sent):
+    """앱은 REST 다리(step-forge)까지 바란다. step-forge 가 없는 옛 PAT 로 그대로 부르면 포털이 widen_audience 로 통째 거절한다 —
+    겹치는 청중만 실어 교환은 되게 한다(context-notes C-10). 둘 다 있으면 둘 다 싣는다."""
+    res, ev, got, row = _pp_kit(monkeypatch, auth=f"Bearer {_pp_jwt(caller_aud)}",
+                                wanted={**_PP_WANTED, "audiences": ["mcp-gateway", "step-forge"]})
+    assert not res.isError and ev == ["mint", "exchange", "register", "call"], ev
+    assert got["exchange"][0]["json"]["audiences"] == sent, got["exchange"][0]["json"]
+
+
+def test_겹치는_청중이_없으면_교환하지_않는다(monkeypatch):
+    res, ev, got, row = _pp_kit(monkeypatch, auth=f"Bearer {_pp_jwt('heax-hub')}",
+                                wanted={**_PP_WANTED, "audiences": ["mcp-gateway"]})
+    assert not res.isError and ev == ["mint", "call"], ev
+    assert row["note"] == "portal-pat:skipped-no-audience", row
 
 
 def test_앱이_바라지_않으면_교환하지_않는다(monkeypatch):

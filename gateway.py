@@ -3043,6 +3043,19 @@ _PORTAL_PAT_TRIED: dict[tuple[str, str], float] = {}
 _PORTAL_PAT_CODE = re.compile(r"[A-Za-z0-9_.:-]{1,40}")
 
 
+def _pat_audiences(token: str) -> list[str] | None:
+    """인증 미들웨어가 이미 검증한 호출자 PAT 의 aud(서명은 다시 보지 않는다 — 넓히기 판정은 포털이 한다). 못 읽으면 None."""
+    try:
+        seg = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+    except Exception:  # noqa: BLE001
+        return None
+    aud = claims.get("aud") if isinstance(claims, dict) else None
+    if isinstance(aud, str):
+        return [aud]
+    return [a for a in aud if isinstance(a, str)] if isinstance(aud, list) else None
+
+
 def _portal_pat_refusal(resp) -> tuple[str, str]:
     """포털 거절의 (code, message). 거절은 `{detail:{code, message}}` 지만 앞단(nginx·FastAPI 기본)은 다른 꼴로 답할 수 있다 —
     detail.code → detail 문자열 → `http_<status>` 순으로 읽고, 코드 꼴이 아닌 글은 code 로 쓰지 않는다(감사 note 에 실린다)."""
@@ -3090,6 +3103,15 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
         caller_pat = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         if not caller_pat:
             return "portal-pat:skipped-no-bearer"
+        # 앱이 바란 청중을 호출자 PAT 의 청중과 겹치는 것으로 좁힌다(context-notes C-10). 앱은 REST 다리(step-forge)까지 바라지만
+        # 그 청중이 없는 옛 PAT 로도 교환이 widen_audience 로 통째 실패하지 않게 — 그 사람은 다리 없이 MCP 만 쓴다. 포털은 그대로
+        # 넓히기를 거절한다(이 줄은 좁히기만 한다).
+        have = _pat_audiences(caller_pat)
+        if have is not None and isinstance(wanted.get("audiences"), list):
+            narrowed = [a for a in wanted["audiences"] if a in have]
+            if not narrowed:
+                return "portal-pat:skipped-no-audience"
+            wanted = {**wanted, "audiences": narrowed}
         base = _portal_api_base()
         if not base:
             return "portal-pat:skipped-no-portal"

@@ -5155,13 +5155,18 @@ def test_앱이_받았거나_받은_새_PAT_가_없으면_폐기하지_않는다
 @pytest.mark.parametrize("hang", ["exchange", "register"])
 def test_교환과_등록은_시간_한도_안에서_끝나고_도구_호출을_붙들지_않는다(monkeypatch, hang):
     """가짜 전송은 httpx 의 요청 한도를 모른다 — 응답을 끝없이 미루는 상류에서 전체 한도(_PORTAL_PAT_BUDGET_S)만으로 끝나야 한다.
-    등록이 한도를 다 써도 교환으로 받은 새 PAT 는 남은 몫(_PORTAL_PAT_REVOKE_SHARE) 안에서 폐기한다."""
+    등록이 한도를 다 써도 교환으로 받은 새 PAT 는 남은 몫(_PORTAL_PAT_REVOKE_SHARE) 안에서 폐기한다 — 폐기도 실제 왕복처럼 잠깐
+    걸리게 둔다(곧바로 답하는 가짜는 이벤트 루프에 양보하지 않아 0초 몫으로도 통과한다 — 변이로 확인)."""
     monkeypatch.setattr(gw, "_PORTAL_PAT_BUDGET_S", 0.8)
 
     async def never(req):
         await asyncio.sleep(30)
+
+    async def revoke(req):
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, json={"revoked": "j-1"})
     t0 = _clock.monotonic()
-    res, ev, got, row = _pp_kit(monkeypatch, **{hang: never})
+    res, ev, got, row = _pp_kit(monkeypatch, revoke=revoke, **{hang: never})
     assert _clock.monotonic() - t0 < 5, "건네기가 도구 호출을 한도 넘게 붙들었다"
     assert not res.isError and ev[-1] == "call" and ev.count("call") == 1, ev
     if hang == "exchange":

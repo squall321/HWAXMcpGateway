@@ -3037,8 +3037,9 @@ def _sso_fold_note(tok: str, email: str) -> str | None:
 # 앱이 바란다고 하면, 호출자가 **직접 낸** 포털 PAT 를 증거로 포털 `POST /auth/pat/exchange` 에서 같은 사람의 더 좁은 PAT 를 받아
 # 앱의 `portal_pat_url` 에 넘긴다. 호출자의 PAT 는 포털에만 가고 앱은 좁힌 PAT 만 받는다.
 # 최선 노력이다 — 도구 호출을 실패시키지 않고, _PORTAL_PAT_BUDGET_S 넘게 붙들지 않고, 되풀이하지 않는다. 토큰 값은 어디에도 적지 않는다.
-_PORTAL_PAT_BUDGET_S = 8.0     # 교환 + 등록 전체
+_PORTAL_PAT_BUDGET_S = 8.0     # 교환 + 등록 + (등록 실패 때) 새 PAT 폐기 전체
 _PORTAL_PAT_STEP_S = 4.0       # 요청 하나 — 교환이 시간을 다 써도 실패를 알릴 몫이 남는다
+_PORTAL_PAT_REVOKE_SHARE = 0.25  # 전체 한도에서 폐기에 남겨 두는 몫 — 교환 + 등록은 나머지 안에서 끝낸다
 # 한 번 건넨 (앱, 사람)은 이 동안 다시 하지 않는다 — 401 뒤 강제 재발급(같은 호출의 둘째 시도)이 또 교환하지 않게.
 _PORTAL_PAT_COOLDOWN_S = 300.0
 _PORTAL_PAT_TRIED: dict[tuple[str, str], float] = {}
@@ -3185,7 +3186,11 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
         _PORTAL_PAT_TRIED[key] = time.monotonic()
 
         stage, notes = "exchange", []
-        with anyio.move_on_after(_PORTAL_PAT_BUDGET_S) as scope:
+        minted: str | None = None      # 포털이 내준 새 PAT — 앱이 받지 못하면 아래에서 폐기한다
+        registered = False
+        deadline = anyio.current_time() + _PORTAL_PAT_BUDGET_S
+        # 교환 + 등록은 전체 한도에서 폐기 몫을 뺀 안에서 한다 — 등록이 한도를 다 써도 폐기할 시간이 남는다.
+        with anyio.move_on_after(_PORTAL_PAT_BUDGET_S * (1 - _PORTAL_PAT_REVOKE_SHARE)) as scope:
             async with httpx.AsyncClient(timeout=_PORTAL_PAT_STEP_S) as cli:
                 body: dict | None = None
                 try:
@@ -3201,6 +3206,7 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
                         except Exception:  # noqa: BLE001
                             new = None
                         if isinstance(new, str) and new:
+                            minted = new
                             body = {"pat": new}
                             code, msg = "", ""
                         else:
@@ -3222,9 +3228,23 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
                     if r2.status_code != 200:
                         notes.append(f"portal-pat:register-{r2.status_code}")
                     elif "pat" in body:
+                        registered = True
                         notes.append("portal-pat:registered")
         if scope.cancelled_caught:
             notes.append(f"portal-pat:{stage}-timeout")
+        # 앱이 받지 못한 새 PAT 는 아무도 쥐지 않은 채 원 PAT 만큼(최대 90일) 살아 있다 — 그 PAT 스스로 폐기한다(포털
+        # `/auth/pat/revoke-self`, 그 PAT 를 Bearer 로). 시간 초과는 앱이 실은 받았을 수도 있지만, 그러면 앱이 다음 단언에서 폐기된
+        # PAT 를 보고(revoked) 다시 바란다 — 주인 없는 토큰을 남기는 것보다 낫다. 최선 노력이고 남은 한도 안에서만 한다.
+        if minted is not None and not registered:
+            ok = False
+            with anyio.move_on_after(max(0.0, deadline - anyio.current_time())):
+                async with httpx.AsyncClient(timeout=_PORTAL_PAT_STEP_S) as cli:
+                    try:
+                        r3 = await cli.post(f"{base}/auth/pat/revoke-self", headers={"Authorization": f"Bearer {minted}"})
+                        ok = r3.status_code == 200
+                    except httpx.HTTPError:
+                        pass
+            notes.append("portal-pat:revoked-unused" if ok else "portal-pat:revoke-failed")
         return "+".join(notes)
     except Exception as exc:  # noqa: BLE001 — 건네기 실패가 도구 호출을 막지 않는다(값은 적지 않는다)
         log.warning("portal PAT handoff for %s on %s failed: %s", email, app_id, type(exc).__name__)

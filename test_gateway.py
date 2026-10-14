@@ -4828,10 +4828,12 @@ def _pp_ok(req):
 
 
 def _pp_kit(monkeypatch, *, via="pat", auth=f"Bearer {_PP_CALLER_PAT}", wanted=_PP_WANTED, exchange=_pp_ok,
-            register=None, backend_rejects_first=False, user="a@corp.com", spec=_PP_SPEC):
+            register=None, backend_rejects_first=False, user="a@corp.com", spec=_PP_SPEC, revoke=None):
     """heax-hwax_risk 하나로 `_call_tool` 을 태운다 — 발급·건네기는 진짜이고 상류 셋은 가짜다. 요청 문맥은 인증 미들웨어가 남기는
     꼴(Authorization 원본 · via · 확인한 신원)이다. 돌려주는 것 — 결과 · 일어난 순서 · 교환·등록이 받은 요청 · 감사 마지막 줄."""
-    ev, got = [], {"exchange": [], "register": []}
+    ev, got = [], {"exchange": [], "register": [], "revoke": []}
+    steps = {"http://portal/auth/pat/exchange": ("exchange", exchange), _PP_URL: ("register", register),
+             "http://portal/auth/pat/revoke-self": ("revoke", revoke)}
 
     async def handler(req):
         u, h = str(req.url), {k.lower(): v for k, v in req.headers.items()}
@@ -4842,11 +4844,10 @@ def _pp_kit(monkeypatch, *, via="pat", auth=f"Bearer {_PP_CALLER_PAT}", wanted=_
             if wanted is not None:
                 body["portal_pat_wanted"] = wanted
             return httpx.Response(200, json=body)
-        step, fn = ("exchange", exchange) if u == "http://portal/auth/pat/exchange" else ("register", register)
-        assert step == "exchange" or u == _PP_URL, u
+        step, fn = steps[u]
         ev.append(step)
-        got[step].append({"headers": h, "json": json.loads(req.content)})
-        r = fn(req) if fn else httpx.Response(200, json={"registered": True})
+        got[step].append({"headers": h, "json": json.loads(req.content) if req.content else None})
+        r = fn(req) if fn else httpx.Response(200, json={"revoked": "j-1"} if step == "revoke" else {"registered": True})
         return r if isinstance(r, httpx.Response) else await r
     _mock_http(monkeypatch, handler)
     calls = {"n": 0}
@@ -5088,14 +5089,59 @@ def test_포털_거절은_코드_꼴만_감사_code_로_쓴다(status, body, wan
 
 def test_앱_등록이_실패해도_도구_호출은_가고_감사에_남는다(monkeypatch):
     res, ev, got, row = _pp_kit(monkeypatch, register=lambda req: httpx.Response(422, json={"detail": "pat_invalid"}))
-    assert not res.isError and ev == ["mint", "exchange", "register", "call"], ev
-    assert row["ok"] is True and row["note"] == "portal-pat:register-422", row
+    assert not res.isError and ev == ["mint", "exchange", "register", "revoke", "call"], ev
+    assert row["ok"] is True and row["note"] == "portal-pat:register-422+portal-pat:revoked-unused", row
+
+
+def _pp_raise(exc_type):
+    def f(req):
+        raise exc_type("x", request=req)
+    return f
+
+
+@pytest.mark.parametrize("register, note", [
+    (lambda req: httpx.Response(503, text="down"), "portal-pat:register-503"),
+    (_pp_raise(httpx.ReadTimeout), "portal-pat:register-timeout"),
+    (_pp_raise(httpx.ConnectError), "portal-pat:register-unreachable"),
+])
+def test_앱이_새_PAT_를_받지_못하면_그_PAT_스스로_폐기한다(monkeypatch, register, note):
+    """교환은 됐는데 앱 등록이 실패하면 새 PAT 는 아무도 쥐지 않은 채 원 PAT 만큼(최대 90일) 산다(SEC-1). 포털
+    `/auth/pat/revoke-self` 를 **그 새 PAT** 를 Bearer 로 불러 스스로 폐기한다 — 호출자의 원 PAT 를 쓰면 원이 폐기된다."""
+    res, ev, got, row = _pp_kit(monkeypatch, register=register)
+    assert not res.isError and ev == ["mint", "exchange", "register", "revoke", "call"], ev
+    rv = got["revoke"][0]
+    assert rv["headers"]["authorization"] == f"Bearer {_PP_NEW_PAT}", "폐기는 새 PAT 자신으로 한다"
+    assert _PP_CALLER_PAT not in json.dumps(rv), "호출자의 원 PAT 로 폐기하면 원이 죽는다"
+    assert row["ok"] is True and row["note"] == f"{note}+portal-pat:revoked-unused", row
+
+
+async def _pp_never(req):
+    await asyncio.sleep(30)
+
+
+@pytest.mark.parametrize("revoke", [lambda req: httpx.Response(401, json={"detail": {"code": "invalid_token", "message": "m"}}),
+                                    _pp_raise(httpx.ConnectError), _pp_raise(httpx.ReadTimeout), _pp_never])
+def test_폐기가_실패하면_그렇다고_감사에_남기고_한도_안에서_끝난다(monkeypatch, revoke):
+    monkeypatch.setattr(gw, "_PORTAL_PAT_BUDGET_S", 0.8)
+    t0 = _clock.monotonic()
+    res, ev, got, row = _pp_kit(monkeypatch, register=lambda req: httpx.Response(503, text="down"), revoke=revoke)
+    assert _clock.monotonic() - t0 < 5, "폐기가 도구 호출을 한도 넘게 붙들었다"
+    assert not res.isError and ev[-1] == "call" and ev.count("revoke") == 1, ev
+    assert row["note"] == "portal-pat:register-503+portal-pat:revoke-failed", row
+
+
+@pytest.mark.parametrize("exchange, register", [(_pp_ok, None),
+                                                (_pp_raise(httpx.ReadTimeout), lambda req: httpx.Response(503, text="x"))])
+def test_앱이_받았거나_받은_새_PAT_가_없으면_폐기하지_않는다(monkeypatch, exchange, register):
+    res, ev, got, row = _pp_kit(monkeypatch, exchange=exchange, register=register)
+    assert "revoke" not in ev and got["revoke"] == [], ev
 
 
 @pytest.mark.parametrize("hang", ["exchange", "register"])
 def test_교환과_등록은_시간_한도_안에서_끝나고_도구_호출을_붙들지_않는다(monkeypatch, hang):
-    """가짜 전송은 httpx 의 요청 한도를 모른다 — 응답을 끝없이 미루는 상류에서 전체 한도(_PORTAL_PAT_BUDGET_S)만으로 끝나야 한다."""
-    monkeypatch.setattr(gw, "_PORTAL_PAT_BUDGET_S", 0.3)
+    """가짜 전송은 httpx 의 요청 한도를 모른다 — 응답을 끝없이 미루는 상류에서 전체 한도(_PORTAL_PAT_BUDGET_S)만으로 끝나야 한다.
+    등록이 한도를 다 써도 교환으로 받은 새 PAT 는 남은 몫(_PORTAL_PAT_REVOKE_SHARE) 안에서 폐기한다."""
+    monkeypatch.setattr(gw, "_PORTAL_PAT_BUDGET_S", 0.8)
 
     async def never(req):
         await asyncio.sleep(30)
@@ -5103,9 +5149,12 @@ def test_교환과_등록은_시간_한도_안에서_끝나고_도구_호출을_
     res, ev, got, row = _pp_kit(monkeypatch, **{hang: never})
     assert _clock.monotonic() - t0 < 5, "건네기가 도구 호출을 한도 넘게 붙들었다"
     assert not res.isError and ev[-1] == "call" and ev.count("call") == 1, ev
-    assert row["note"] == f"portal-pat:{hang}-timeout", row
     if hang == "exchange":
-        assert got["register"] == [], "한도를 다 쓴 뒤에는 등록을 보내지 않는다"
+        assert row["note"] == "portal-pat:exchange-timeout", row
+        assert got["register"] == [] and got["revoke"] == [], "한도를 다 쓴 뒤에는 등록을 보내지 않고, 받은 PAT 가 없으니 폐기도 없다"
+    else:
+        assert row["note"] == "portal-pat:register-timeout+portal-pat:revoked-unused", row
+        assert got["revoke"][0]["headers"]["authorization"] == f"Bearer {_PP_NEW_PAT}"
 
 
 def test_토큰_재발급이_같은_사람의_교환을_되풀이하지_않는다(monkeypatch):
@@ -5121,13 +5170,22 @@ def _pp_echo(req):
     return httpx.Response(401, json={"detail": {"code": "invalid_token", "message": f"거절 — {req.headers['authorization']}"}})
 
 
-@pytest.mark.parametrize("exchange, note", [(_pp_ok, "portal-pat:registered"),
-                                            (_pp_echo, "portal-pat:exchange-invalid_token")])
-def test_건네기는_토큰_값을_로그에도_감사에도_적지_않는다(monkeypatch, caplog, exchange, note):
-    """두 토큰(호출자의 원 PAT · 바꿔 받은 PAT) 어느 것도 글자로 남지 않는다. 포털 거절 글이 원 PAT 를 되울려도 앱으로 넘기지 않는다."""
+@pytest.mark.parametrize("exchange, register, note", [
+    (_pp_ok, None, "portal-pat:registered"),
+    (_pp_echo, None, "portal-pat:exchange-invalid_token"),
+    (_pp_ok, lambda req: httpx.Response(503, text="down"), "portal-pat:register-503+portal-pat:revoked-unused"),
+    (_pp_ok, lambda req: httpx.Response(503, text="down"), "portal-pat:register-503+portal-pat:revoke-failed"),
+])
+def test_건네기는_토큰_값을_로그에도_감사에도_적지_않는다(monkeypatch, caplog, exchange, register, note):
+    """두 토큰(호출자의 원 PAT · 바꿔 받은 PAT) 어느 것도 글자로 남지 않는다. 포털 거절 글이 원 PAT 를 되울려도 앱으로 넘기지 않는다.
+    폐기 길(새 PAT 를 Bearer 로 싣는다)이 실패해도 같다 — 폐기 응답이 그 PAT 를 되울려도 적지 않는다."""
     import logging
     caplog.set_level(logging.DEBUG)
-    res, ev, got, row = _pp_kit(monkeypatch, exchange=exchange)
+
+    def revoke_echo(req):
+        return httpx.Response(401, json={"detail": {"code": "invalid_token", "message": req.headers["authorization"]}})
+    res, ev, got, row = _pp_kit(monkeypatch, exchange=exchange, register=register,
+                                revoke=revoke_echo if note.endswith("revoke-failed") else None)
     assert not res.isError and row["note"] == note, row
     assert _PP_CALLER_PAT not in json.dumps(got["register"], ensure_ascii=False), got["register"]
     audit = open(gw.AUDIT_PATH, encoding="utf-8").read()

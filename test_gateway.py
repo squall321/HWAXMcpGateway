@@ -4904,8 +4904,8 @@ def test_포털_PAT_를_바라면_호출자_PAT_로_바꿔_받아_도구_호출_
     assert row["ok"] is True and row["mode"] == "as-user-pat" and row["note"] == "portal-pat:registered", row
 
 
-def _pp_jwt(aud) -> str:
-    seg = base64.urlsafe_b64encode(json.dumps({"aud": aud, "email": "a@corp.com"}).encode()).decode().rstrip("=")
+def _pp_jwt(aud, **extra) -> str:
+    seg = base64.urlsafe_b64encode(json.dumps({"aud": aud, "email": "a@corp.com", **extra}).encode()).decode().rstrip("=")
     return f"eyJhbGciOiJSUzI1NiJ9.{seg}.SIGNATURE"
 
 
@@ -4968,6 +4968,15 @@ def test_명세가_없거나_겹침이_비면_교환하지_않고_앱에도_알�
     res, ev, got, row = _pp_kit(monkeypatch, spec=spec)
     assert not res.isError and ev == ["mint", "call"], ev
     assert row["note"] == note, row
+
+
+@pytest.mark.parametrize("par", ["j-root", ""])
+def test_교환으로_받은_자식_PAT_로_들어온_호출은_교환하지_않고_앱에도_알리지_않는다(monkeypatch, par):
+    """포털은 교환 PAT 에 `par`(원 jti)를 찍고 그것을 원으로 받지 않는다(포털 C-7). 그 PAT 로 들어온 호출은 대개 앱이 그 사람
+    자격으로 게이트웨이를 다시 부른 것이다 — 교환하면 거절이 앱에 가서 앱이 실패 쉼에 든다(D5). 값이 비어도 칸이 있으면 자식이다."""
+    res, ev, got, row = _pp_kit(monkeypatch, auth=f"Bearer {_pp_jwt(['mcp-gateway', 'step-forge'], par=par)}")
+    assert not res.isError and ev == ["mint", "call"], ev
+    assert row["note"] == "portal-pat:skipped-child", row
 
 
 def test_앱이_바라지_않으면_교환하지_않는다(monkeypatch):

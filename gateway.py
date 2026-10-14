@@ -3045,14 +3045,19 @@ _PORTAL_PAT_TRIED: dict[tuple[str, str], float] = {}
 _PORTAL_PAT_CODE = re.compile(r"[A-Za-z0-9_.:-]{1,40}")
 
 
-def _pat_audiences(token: str) -> list[str] | None:
-    """인증 미들웨어가 이미 검증한 호출자 PAT 의 aud(서명은 다시 보지 않는다 — 넓히기 판정은 포털이 한다). 못 읽으면 None."""
+def _pat_claims(token: str) -> dict | None:
+    """인증 미들웨어가 이미 검증한 호출자 PAT 의 클레임(서명은 다시 보지 않는다 — 넓히기 판정은 포털이 한다). 못 읽으면 None."""
     try:
         seg = token.split(".")[1]
         claims = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
     except Exception:  # noqa: BLE001
         return None
-    aud = claims.get("aud") if isinstance(claims, dict) else None
+    return claims if isinstance(claims, dict) else None
+
+
+def _pat_audiences(claims: dict | None) -> list[str] | None:
+    """클레임의 aud 목록. 못 읽으면 None."""
+    aud = claims.get("aud") if claims is not None else None
     if isinstance(aud, str):
         return [aud]
     return [a for a in aud if isinstance(a, str)] if isinstance(aud, list) else None
@@ -3152,11 +3157,16 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
         caller_pat = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         if not caller_pat:
             return "portal-pat:skipped-no-bearer"
+        claims = _pat_claims(caller_pat)
+        # 교환으로 받은 자식 PAT(포털이 `par` = 원 jti 를 찍는다)은 원이 될 수 없다(포털 C-7). 그 PAT 로 들어온 호출은 대개 앱 자신이
+        # 그 사람 자격으로 게이트웨이를 다시 부른 것이다 — 교환하면 포털 거절을 앱에 알려 앱이 실패 쉼에 든다. 포털도 앱도 부르지 않는다.
+        if claims is not None and "par" in claims:
+            return "portal-pat:skipped-child"
         # 본문은 운영자가 박은 명세 안에서만 만든다(_portal_pat_body) — 앱이 무엇을 바라든 이름·청중·범위·수명이 명세를 넘지
         # 못한다. 청중은 호출자 PAT 의 청중과도 겹친다(context-notes C-10) — 앱은 REST 다리(step-forge)까지 바라지만 그 청중이
         # 없는 옛 PAT 로도 교환이 widen_audience 로 통째 실패하지 않게, 그 사람은 다리 없이 MCP 만 쓴다. 포털은 그대로 넓히기를
         # 거절한다(이 줄은 좁히기만 한다).
-        ask = _portal_pat_body(spec, wanted, _pat_audiences(caller_pat))
+        ask = _portal_pat_body(spec, wanted, _pat_audiences(claims))
         if isinstance(ask, str):
             return f"portal-pat:{ask}"
         base = _portal_api_base()

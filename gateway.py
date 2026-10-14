@@ -3089,6 +3089,12 @@ def _portal_pat_body(spec: dict, wanted: dict, have: list[str] | None) -> dict |
     포털에 맡긴다(포털이 넓히기를 거절한다)."""
     auds = [a for a in _strs(wanted.get("audiences"))
             if a in spec["audiences"] and (have is None or a in have)]
+    # 앱이 '이 청중 때문에' 바란 것이면(예: 등록된 PAT 에 step-forge 가 없다) 그 청중을 줄 수 없는 교환은 하지 않는다 — 받아도
+    # 앱은 여전히 모자라다고 보고 단언을 받을 때마다 다시 바란다(그 사람의 원 PAT 에 그 청중이 없는 한 끝없이). 호출자 청중을
+    # 못 읽으면 줄 수 있는지 모르므로 하지 않는다.
+    need = _strs(wanted.get("require_audiences"))
+    if need and (have is None or not set(need) <= set(auds)):
+        return "skipped-aud-unavailable"
     if not auds:
         return "skipped-no-audience"
     scopes = [s for s in _strs(wanted.get("scopes")) if s in spec["scopes"]]

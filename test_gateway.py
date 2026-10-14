@@ -4970,6 +4970,29 @@ def test_명세가_없거나_겹침이_비면_교환하지_않고_앱에도_알�
     assert row["note"] == note, row
 
 
+@pytest.mark.parametrize("caller_aud, spec_auds, need, note", [
+    (["mcp-gateway"], None, ["step-forge"], "portal-pat:skipped-aud-unavailable"),
+    (None, None, ["step-forge"], "portal-pat:skipped-aud-unavailable"),
+    (["mcp-gateway", "step-forge"], ["mcp-gateway"], ["step-forge"], "portal-pat:skipped-aud-unavailable"),
+    (["mcp-gateway", "step-forge"], None, ["step-forge"], "portal-pat:registered"),
+    (["mcp-gateway"], None, [], "portal-pat:registered"),
+    (None, None, [], "portal-pat:registered"),
+])
+def test_앱이_요구한_청중을_줄_수_없으면_포털을_부르지_않는다(monkeypatch, caller_aud, spec_auds, need, note):
+    """등록된 PAT 에 step-forge 가 없어서 바란 것이면(`require_audiences`), 원 PAT 에 그 청중이 없는 사람의 교환은 아무것도 고치지
+    못하고 단언을 받을 때마다 되풀이된다(BEH-1). 호출자 청중을 못 읽어도(None) 줄 수 있는지 모르므로 하지 않는다. 명세가 그 청중을
+    빼도 같다. 비어 있으면 요구가 없는 것이다."""
+    auth = f"Bearer {_pp_jwt(caller_aud)}" if caller_aud is not None else f"Bearer {_PP_CALLER_PAT}"
+    spec = _PP_SPEC if spec_auds is None else {**_PP_SPEC, "audiences": spec_auds}
+    res, ev, got, row = _pp_kit(monkeypatch, auth=auth, spec=spec,
+                                wanted={**_PP_WANTED, "audiences": ["mcp-gateway", "step-forge"], "require_audiences": need})
+    assert not res.isError and row["note"] == note, row
+    if note.endswith("aud-unavailable"):
+        assert ev == ["mint", "call"], ev
+    else:
+        assert "require_audiences" not in got["exchange"][0]["json"], "포털 계약에 없는 칸이다"
+
+
 @pytest.mark.parametrize("par", ["j-root", ""])
 def test_교환으로_받은_자식_PAT_로_들어온_호출은_교환하지_않고_앱에도_알리지_않는다(monkeypatch, par):
     """포털은 교환 PAT 에 `par`(원 jti)를 찍고 그것을 원으로 받지 않는다(포털 C-7). 그 PAT 로 들어온 호출은 대개 앱이 그 사람

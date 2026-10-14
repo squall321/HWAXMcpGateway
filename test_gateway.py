@@ -4976,14 +4976,34 @@ def test_교환_수명은_바람과_명세의_상한_중_짧은_것이다(monkey
     ({"name": " ", "audiences": ["mcp-gateway"], "scopes": ["read"], "max_ttl_days": 90}, "portal-pat:skipped-bad-spec"),
     ({**_PP_SPEC, "max_ttl_days": True}, "portal-pat:skipped-bad-spec"),
     ({**_PP_SPEC, "scopes": "read"}, "portal-pat:skipped-bad-spec"),
+])
+def test_명세가_없거나_틀리면_교환하지_않고_앱에_설정_탓이라고_알린다(monkeypatch, spec, note):
+    """명세가 없으면 앱이 바란 그대로 보내지 않는다. 그러나 조용히 건너뛰면 앱은 'Claude 에서 부르면 등록된다' 고 계속 안내하고
+    due 는 영영 참이다(반대 검토 R2-4) — 앱에 gateway_misconfigured 를 알린다(포털은 부르지 않는다)."""
+    res, ev, got, row = _pp_kit(monkeypatch, spec=spec)
+    assert not res.isError and ev == ["mint", "register", "call"], ev
+    assert got["exchange"] == [] and got["register"][0]["json"]["error"] == "gateway_misconfigured", got
+    assert "pat" not in got["register"][0]["json"]
+    assert row["note"] == note, row
+
+
+@pytest.mark.parametrize("spec, note", [
     ({**_PP_SPEC, "scopes": ["admin"]}, "portal-pat:skipped-no-scope"),
     ({**_PP_SPEC, "audiences": ["heax-hub"]}, "portal-pat:skipped-no-audience"),
 ])
-def test_명세가_없거나_겹침이_비면_교환하지_않고_앱에도_알리지_않는다(monkeypatch, spec, note):
-    """명세가 없으면 앱이 바란 그대로 보내지 않는다. 범위·청중 겹침이 비어도 포털을 부르지 않는다(넓히기로 거절될 뿐이다)."""
+def test_겹침이_비면_교환하지_않고_앱에도_알리지_않는다(monkeypatch, spec, note):
+    """범위·청중 겹침이 비면 포털을 부르지 않는다(넓히기로 거절될 뿐이다)."""
     res, ev, got, row = _pp_kit(monkeypatch, spec=spec)
     assert not res.isError and ev == ["mint", "call"], ev
     assert row["note"] == note, row
+
+
+def test_명세_없는_앱은_기동에서_경고_목록에_든다(monkeypatch):
+    monkeypatch.setattr(gw, "PER_USER_SSO", {
+        "hwax_risk": {**_RISK_SSO, "portal_pat_url": _PP_URL},
+        "ok_app": {**_RISK_SSO, "portal_pat_url": _PP_URL, "portal_pat_spec": _PP_SPEC},
+        "plain": dict(_RISK_SSO)})
+    assert gw._portal_pat_misconfigured() == ["hwax_risk"]
 
 
 @pytest.mark.parametrize("caller_aud, spec_auds, need, note", [

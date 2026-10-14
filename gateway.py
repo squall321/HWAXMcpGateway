@@ -3080,6 +3080,13 @@ def _portal_pat_spec_ok(spec) -> bool:
             and _pos_int(spec.get("max_ttl_days")))
 
 
+def _portal_pat_misconfigured() -> list[str]:
+    """`portal_pat_url` 은 있는데 명세(`portal_pat_spec`)가 없거나 꼴이 틀린 앱 — 기동 로그에 경고로 남긴다(반대 검토 R2-4).
+    그 앱의 Claude 길 자동 등록은 통째로 꺼지는데(건너뜀), 건너뜀 줄은 INFO 라 아무도 보지 못했다."""
+    return sorted(app for app, conf in PER_USER_SSO.items()
+                  if conf.get("portal_pat_url") and not _portal_pat_spec_ok(conf.get("portal_pat_spec")))
+
+
 def _portal_pat_body(spec: dict, wanted: dict, have: list[str] | None) -> dict | str:
     """교환 본문 — 운영자가 앱마다 박은 명세(`portal_pat_spec`, 꼴은 이미 봤다)와 앱이 바란 것(`portal_pat_wanted`)의 겹침.
     못 만들면 skip 까닭.
@@ -3150,10 +3157,22 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> tu
             return "portal-pat:skipped-bad-wanted", False
         # 교환 본문의 상한은 운영자가 앱마다 박는다(provision-config.sh). 없으면 앱이 바란 그대로 보내지 않고 건너뛴다.
         spec = conf.get("portal_pat_spec")
-        if spec is None:
-            return "portal-pat:skipped-no-spec", False
-        if not _portal_pat_spec_ok(spec):
-            return "portal-pat:skipped-bad-spec", False
+        if spec is None or not _portal_pat_spec_ok(spec):
+            # 앱에도 알린다 — 안 알리면 앱은 'Claude 에서 부르면 등록된다' 고 계속 안내하고 due 는 영영 참이다(R2-4).
+            # 쉼(같은 사람 5분)을 지나야 다시 알린다 — 앱은 이 code 를 최종으로 받아 손잡이만큼 바라지 않는다.
+            why = "no-spec" if spec is None else "bad-spec"
+            key = (app_id, email)
+            last = _PORTAL_PAT_TRIED.get(key)
+            if last is None or time.monotonic() - last >= _PORTAL_PAT_COOLDOWN_S:
+                _PORTAL_PAT_TRIED[key] = time.monotonic()
+                try:
+                    async with httpx.AsyncClient(timeout=_PORTAL_PAT_STEP_S) as cli:
+                        await cli.post(url, headers=_sso_headers(conf, email),
+                                       json={"error": "gateway_misconfigured",
+                                             "message": "게이트웨이 설정에 이 앱의 PAT 명세가 없다"})
+                except httpx.HTTPError:
+                    pass
+            return f"portal-pat:skipped-{why}", False
         try:
             req = _low.request_context.request
         except LookupError:
@@ -3292,7 +3311,9 @@ async def _portal_pat_serve(app_id: str, email: str, wanted: dict, notes: list |
         _PORTAL_PAT_PENDING.pop(key, None)
     if cached and keep and pp.startswith("portal-pat:skipped-"):
         return
-    (log.info if pp == "portal-pat:registered" or pp.startswith("portal-pat:skipped-") else log.warning)(
+    _quiet = pp == "portal-pat:registered" or (pp.startswith("portal-pat:skipped-")
+                                                and pp not in ("portal-pat:skipped-no-spec", "portal-pat:skipped-bad-spec"))
+    (log.info if _quiet else log.warning)(
         "portal PAT handoff for %s on %s%s: %s", email, app_id, " (남은 바람)" if cached else "", pp)
     if notes is not None:
         notes.append(pp)
@@ -4145,6 +4166,9 @@ def main():
         proxy = RestProxy(REST, PORTAL, _audit, allow=_rest_allowed, mint=_rest_mint, deny_text=_rest_deny_text)
         star.router.routes[:0] = proxy.routes()
         log.info("REST proxy enabled: %d sites (%s)", len(REST), ", ".join(REST))
+    for app in _portal_pat_misconfigured():
+        log.warning("per_user_sso.%s 에 portal_pat_url 은 있는데 portal_pat_spec 이 없거나 꼴이 틀렸다 — 그 앱의 Claude 길 PAT 자동 등록이"
+                    " 꺼진다. provision-config.sh 를 그 앱의 비밀과 함께 다시 돌린다(HWAXPortal docs/risk-credentials C-18)", app)
     # streamable_http_app 의 lifespan 은 세션매니저 run() 만 돈다. 백엔드 집계 lifespan 을 함께 묶는다.
     sm_lifespan = star.router.lifespan_context
 

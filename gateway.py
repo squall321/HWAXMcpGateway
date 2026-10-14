@@ -25,7 +25,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 # 메서드 허용 규칙의 정본. REST 프록시 라우트와 MCP 다리가 **같은 함수**를 봐야 한다.
 # (rest_proxy 는 gateway 를 import 하지 않으므로 이 방향은 순환이 아니다.)
-from rest_proxy import EXPIRED_BODY, JWKS_TIMEOUT_S, PatExpired, allowed_methods, credential_mode
+from rest_proxy import EXPIRED_BODY, JWKS_TIMEOUT_S, REST_PROXY_UPSTREAM_TIMEOUT_S, PatExpired, allowed_methods, credential_mode
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("hwax-mcp-gateway")
@@ -4123,10 +4123,10 @@ def _limits_line() -> str:
     return ("시간 한도(초) — GATEWAY_CALL_TIMEOUT=%g · GATEWAY_RECONNECT_TIMEOUT=%g · GATEWAY_BACKEND_READ_TIMEOUT=%g · "
             "GATEWAY_BACKEND_HTTP_TIMEOUT=%g · GATEWAY_LIVENESS_TIMEOUT=%g × GATEWAY_LIVENESS_STRIKES=%d(주기 %d) · "
             "GATEWAY_AGG_STALE_ROUNDS=%d · GATEWAY_HEAX_MISS_DROP=%d · GATEWAY_REST_CALL_TIMEOUT=%g · "
-            "GATEWAY_PORTAL_SAVE_TIMEOUT=%g · GATEWAY_JWKS_TIMEOUT=%g" % (
+            "REST_PROXY_UPSTREAM_TIMEOUT_S=%g · GATEWAY_PORTAL_SAVE_TIMEOUT=%g · GATEWAY_JWKS_TIMEOUT=%g" % (
                 CALL_TIMEOUT_S, RECONNECT_TIMEOUT_S, BACKEND_READ_TIMEOUT_S, BACKEND_HTTP_TIMEOUT_S, LIVENESS_TIMEOUT_S,
                 LIVENESS_STRIKES, REVIVE_INTERVAL_S, AGG_STALE_ROUNDS, HEAX_MISS_BEFORE_DROP, REST_CALL_TIMEOUT_S,
-                PORTAL_SAVE_TIMEOUT_S, JWKS_TIMEOUT_S))
+                REST_PROXY_UPSTREAM_TIMEOUT_S, PORTAL_SAVE_TIMEOUT_S, JWKS_TIMEOUT_S))
 
 
 def main():

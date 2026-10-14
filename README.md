@@ -104,6 +104,7 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 | `GATEWAY_AGG_STALE_ROUNDS` · `GATEWAY_HEAX_MISS_DROP` | 10 · 10 | 닿지 않는 백엔드(또는 레지스트리에서 빠진 앱)의 도구를 몇 패스 뒤에 카탈로그에서 빼는가 — 약 10분(종전 3패스) | 남아 있는 동안은 `backend <키> unavailable: … backend session down`, 빠진 뒤에는 `unknown tool`. 수 시간짜리 심의 도중의 앱 재배포가 '도구가 없다' 로 읽히지 않게 길게 둔다 |
 | `GATEWAY_PORTAL_SAVE_TIMEOUT` | 120 | `save_conversation` — 심의 전사 전체를 포털에 올리는 POST 의 답(연결은 8초) | `CONV_UNAVAILABLE: 포털이 120초 안에 저장을 확인하지 않았다(GATEWAY_PORTAL_SAVE_TIMEOUT) — 저장됐을 수 있으니 다시 보내기 전에 대화 목록을 확인하라` |
 | `GATEWAY_REST_CALL_TIMEOUT` | 호출 한도 | `rest_call` 한 건 — read 침묵과 전체 기한 둘 다(연결은 10초). 전용 도구가 없을 때의 다리라 도구 호출과 같은 단위다 | `<사이트> 가 600초 안에 답하지 않았다(GATEWAY_REST_CALL_TIMEOUT)` — 느린 것이다. 연결 시간 초과·거부는 종전대로 `upstream unreachable` |
+| `REST_PROXY_UPSTREAM_TIMEOUT_S` | 110 | REST 프록시(`/api/<site>/`)가 상류를 기다리는 시간 — read 침묵·write·pool 각각이고 전체 기한이 아니다(2GB 업로드·결과 스트림은 상류가 이만큼 말이 없을 때만 끊긴다). 연결은 30초 그대로. 가장 짧은 바깥이 리스크 앱의 원천 호출 120초(HWAXRisk `DEFAULT_SOURCE_CALL_TIMEOUT_S` — 위임 캡처가 `/api/step-forge` 로 큰 트리를 읽는다)라 그 밑이다. `GATEWAY_REST_CALL_TIMEOUT` 은 `rest_call` 의 전체 기한이고 기본 600 이라 이 길에 쓰지 않는다 | 504 `{"error": "upstream timeout", "detail": "<사이트> 가 110초 안에 답하지 않았다(REST_PROXY_UPSTREAM_TIMEOUT_S)"}`(종전 30초에 502 `upstream unreachable`). 연결 실패는 그대로 502 |
 | `GATEWAY_JWKS_TIMEOUT` | 5 | 호출자 토큰(포털 PAT)을 검증할 때의 포털 서명 키 조회 — `/mcp` 와 `/api/<site>/` 둘 다. 스레드에서 돈다(동기 urllib 가 이벤트 루프를 붙잡지 않게) | 검증 실패로 다뤄져 401 `unauthorized`(감사 `unverified-token`). 포털이 매달려도 진행 중인 호출과 ping 은 멈추지 않는다 |
 
 **0 은 '끔' 이 아니다.** 이 표에 0 을 '끔'·'없음' 으로 읽는 손잡이는 없다 — 기한 0 은 상대에 닿기도 전에 걸린다. 엔진의 `MCP_CALL_TIMEOUT_S`·`DELIB_TIMEOUT_S` 가 0=없음이라 같은 뜻으로 적기 쉽다. `GATEWAY_CALL_TIMEOUT` 과 `GATEWAY_RECONNECT_TIMEOUT` 은 0 이하를 **받지 않는다** — 따르면 모든 도구 호출(재연결 한도는 단발 세션의 호출)이 곧바로 실패하므로, 기본값(600 · 30)으로 돌고 기동 로그에 `GATEWAY_CALL_TIMEOUT=0 는 따르지 않는다 …` 를 남긴다. 호출 한도는 끌 수 없다(아래 '층'). 나머지 초 단위 손잡이는 적은 값을 그대로 쓰므로 0 을 적지 않는다 — 그 길이 곧바로 실패한다(`GATEWAY_BACKEND_READ_TIMEOUT` 만 호출 한도보다 크지 않으면 스스로 바로잡는다).
@@ -123,7 +124,7 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 | `EVID_TTL_S` | 1800 | `verify_answer` 의 조회 기록. 지나면 `조회 기록이 만료됐다 … (EVID_TTL_S)` |
 | `ORG_TAX_TTL_S` | 600 | 조직도 라벨 캐시 |
 
-손잡이 없이 리터럴로 남은 것도 있다 — 죽은 상대를 재는 포털 조회 8초(등록 토큰·권한·정책·조직도) · REST 사이트의 OpenAPI 조회 8초 · 사람별 토큰 발급 15초 · 레지스트리 폴 10초 · 폐기 목록 5초, 그리고 심의가 쓰지 않는 길의 `search_conversations` 120초 · REST 스트리밍 프록시(`/api/<site>/`) 30초.
+손잡이 없이 리터럴로 남은 것도 있다 — 죽은 상대를 재는 포털 조회 8초(등록 토큰·권한·정책·조직도) · REST 사이트의 OpenAPI 조회 8초 · 사람별 토큰 발급 15초 · 레지스트리 폴 10초 · 폐기 목록 5초, 그리고 심의가 쓰지 않는 길의 `search_conversations` 120초 · REST 스트리밍 프록시(`/api/<site>/`)의 연결 30초(상류 침묵은 위 `REST_PROXY_UPSTREAM_TIMEOUT_S`).
 
 **만료된 호출자 토큰**은 틀린 토큰과 다르게 답한다 — 401 본문 `{"error": "expired", "detail": "토큰 수명이 끝났다(포털 CHAT_PAT_TTL_S 또는 PAT 만료)"}`, 감사 줄은 `/mcp` 가 `unauthorized: expired`, `/api/` 가 `pat: expired` 다. 서명이 틀린 토큰은 `exp` 가 지났어도 만료로 치지 않는다(주장일 뿐이다). 수 시간짜리 심의에서 시작할 때 받은 챗 토큰이 도중에 끝나면 여기서 거절되고, 엔진은 그것을 보고 서비스 계정으로 넘긴다.
 

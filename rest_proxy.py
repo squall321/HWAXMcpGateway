@@ -35,6 +35,12 @@ log = logging.getLogger("hwax-mcp-gateway")
 # 붙잡았다. 포털이 매달리면 게이트웨이 전체(진행 중인 도구 호출·호출자에게 보내는 ping 까지)가 최대 30초 멈춰, 호출자들의 침묵
 # 한도와 heartbeat 를 한꺼번에 건드린다. 죽은 상대를 재는 값이라 짧게 두고, 조회 자체는 스레드로 뺀다(2026-10-08 결정표 gateway-23).
 JWKS_TIMEOUT_S = float(os.environ.get("GATEWAY_JWKS_TIMEOUT", "5"))
+# 상류를 기다리는 한도(초) — read 침묵·write·pool 각각이고 **전체 기한이 아니다**(2GB 업로드·결과 스트림은 길어도 상류가 이만큼
+# 말이 없을 때만 끊긴다). 연결은 종전 30초 그대로다(죽은 상대를 재는 값). 이 길은 안쪽이라 부르는 쪽 한도보다 짧아야 한다 — 가장
+# 짧은 바깥이 리스크 앱의 원천 호출 120초(HWAXRisk DEFAULT_SOURCE_CALL_TIMEOUT_S, 위임 캡처가 /api/step-forge 로 큰 트리를 읽는다)라
+# 그 밑 110 이다(nginx /mcp-gw/ 는 1시간). 종전 30초는 그 트리를 다리로만 30초에 끊고 502 `upstream unreachable` 이라고 말했다(BEH-3).
+# GATEWAY_REST_CALL_TIMEOUT 은 쓰지 않는다 — 그것은 rest_call(MCP) 한 건의 전체 기한이고 기본이 호출 한도(600)라 이 길의 바깥보다 길다.
+REST_PROXY_UPSTREAM_TIMEOUT_S = float(os.environ.get("REST_PROXY_UPSTREAM_TIMEOUT_S", "110"))
 # 만료된 토큰에 돌려주는 401 본문 — `/mcp` 와 `/api/` 가 같은 말을 한다. 틀린 토큰과 같은 `unauthorized` 로 답하던 때는
 # 수 시간짜리 심의 도중에 자격이 끝난 것을 호출자(엔진)가 원인으로 적을 수 없었다.
 EXPIRED_BODY = {"error": "expired", "detail": "토큰 수명이 끝났다(포털 CHAT_PAT_TTL_S 또는 PAT 만료)"}
@@ -149,7 +155,9 @@ class RestProxy:
         self._revoked_url = portal_conf.get("revoked_url")
         self._revoked: set[str] = set()
         self._revoked_at = 0.0
-        self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(REST_PROXY_UPSTREAM_TIMEOUT_S, connect=min(30.0, REST_PROXY_UPSTREAM_TIMEOUT_S)),
+            follow_redirects=False)
 
     async def _revoked_set(self) -> set[str]:
         """Portal-published revoked-jti denylist, cached 60s. Fail-open (keep last-known)."""
@@ -294,6 +302,13 @@ class RestProxy:
             req = self._client.build_request(request.method, url, params=request.query_params.multi_items(),
                                              content=_body(), headers=headers)
             up = await self._client.send(req, stream=True)
+        except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout):
+            # 느린 것과 안 닿는 것을 가른다(rest_call 과 같은 자세) — 연결 시간 초과(ConnectTimeout)는 아래 502 다. 응답 머리가 온 뒤의
+            # 침묵은 이미 상태를 보낸 스트림 안이라 여기로 오지 않는다.
+            late = f"{site} 가 {REST_PROXY_UPSTREAM_TIMEOUT_S:g}초 안에 답하지 않았다(REST_PROXY_UPSTREAM_TIMEOUT_S)"
+            self.audit(what, site, False, late,
+                       round((time.monotonic() - t0) * 1000), caller=who, ip=ip, via="pat")
+            return JSONResponse({"error": "upstream timeout", "detail": late}, status_code=504)
         except Exception as e:  # noqa: BLE001
             self.audit(what, site, False, f"upstream: {e!r}",
                        round((time.monotonic() - t0) * 1000), caller=who, ip=ip, via="pat")

@@ -2939,7 +2939,7 @@ _LIMITS_SEEN: dict = {}
 # 손잡이를 한꺼번에 바꿔 준 환경 — 시험마다 따로 띄우면 import 가 스무 번이다(부하 걸린 박스에서 스위트가 20초 넘게 는다).
 _KNOBS_SET = dict(GATEWAY_CALL_TIMEOUT="900", GATEWAY_RECONNECT_TIMEOUT="12", GATEWAY_BACKEND_HTTP_TIMEOUT="7",
                   GATEWAY_LIVENESS_STRIKES="3", GATEWAY_AGG_STALE_ROUNDS="4", GATEWAY_HEAX_MISS_DROP="6",
-                  GATEWAY_PORTAL_SAVE_TIMEOUT="300", GATEWAY_JWKS_TIMEOUT="2")
+                  GATEWAY_PORTAL_SAVE_TIMEOUT="300", GATEWAY_JWKS_TIMEOUT="2", REST_PROXY_UPSTREAM_TIMEOUT_S="45")
 
 
 def _limits(tmp_path, names, **env):
@@ -2948,7 +2948,7 @@ def _limits(tmp_path, names, **env):
     key = tuple(sorted(env.items()))
     if key not in _LIMITS_SEEN:
         (tmp_path / "cfg.json").write_text(json.dumps({"_gateway": {"token": "gw-test-token"}}), encoding="utf-8")
-        full = {k: v for k, v in os.environ.items() if not k.startswith("GATEWAY_")}
+        full = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "REST_PROXY_"))}
         full.update(GATEWAY_CONFIG=str(tmp_path / "cfg.json"), GATEWAY_AUDIT=str(tmp_path / "audit.jsonl"),
                     PYTHONDONTWRITEBYTECODE="1", **env)
         run = subprocess.run([sys.executable, "-c", _LIMITS_PROBE], cwd=os.path.dirname(os.path.abspath(gw.__file__)),
@@ -3917,12 +3917,13 @@ def test_기동_로그의_시간_한도_줄은_이_프로세스에_실제로_걸
     for want in ("GATEWAY_CALL_TIMEOUT=600 ", "GATEWAY_RECONNECT_TIMEOUT=30 ", "GATEWAY_BACKEND_READ_TIMEOUT=660 ",
                  "GATEWAY_BACKEND_HTTP_TIMEOUT=30 ", "GATEWAY_LIVENESS_TIMEOUT=10 × GATEWAY_LIVENESS_STRIKES=2(주기 60)",
                  "GATEWAY_AGG_STALE_ROUNDS=10 ", "GATEWAY_HEAX_MISS_DROP=10 ", "GATEWAY_REST_CALL_TIMEOUT=600 ",
-                 "GATEWAY_PORTAL_SAVE_TIMEOUT=120 ", "GATEWAY_JWKS_TIMEOUT=5"):
+                 "REST_PROXY_UPSTREAM_TIMEOUT_S=110 ", "GATEWAY_PORTAL_SAVE_TIMEOUT=120 ", "GATEWAY_JWKS_TIMEOUT=5"):
         assert want in said, f"{want!r} 가 없다: {said}"
     said = _limits(tmp_path, ["_line"], **_KNOBS_SET)[0]["_line"]
     for want in ("GATEWAY_CALL_TIMEOUT=900 ", "GATEWAY_RECONNECT_TIMEOUT=12 ", "GATEWAY_BACKEND_READ_TIMEOUT=960 ",
                  "GATEWAY_BACKEND_HTTP_TIMEOUT=7 ", "GATEWAY_LIVENESS_STRIKES=3(", "GATEWAY_AGG_STALE_ROUNDS=4 ",
-                 "GATEWAY_HEAX_MISS_DROP=6 ", "GATEWAY_REST_CALL_TIMEOUT=900 ", "GATEWAY_PORTAL_SAVE_TIMEOUT=300 "):
+                 "GATEWAY_HEAX_MISS_DROP=6 ", "GATEWAY_REST_CALL_TIMEOUT=900 ", "REST_PROXY_UPSTREAM_TIMEOUT_S=45 ",
+                 "GATEWAY_PORTAL_SAVE_TIMEOUT=300 "):
         assert want in said, f"{want!r} 가 없다: {said}"
     assert said.endswith("GATEWAY_JWKS_TIMEOUT=2")
 
@@ -5299,3 +5300,51 @@ def test_남은_바람은_상한을_넘으면_오래된_것부터_버린다(monk
     asyncio.run(gw._portal_pat_serve("hwax_risk", "u2@corp.com", dict(_PP_WANTED), None, cached=True))
     asyncio.run(gw._portal_pat_serve("hwax_risk", "u5@corp.com", dict(_PP_WANTED), None, cached=False))
     assert list(gw._PORTAL_PAT_PENDING) == [("hwax_risk", f"u{i}@corp.com") for i in (4, 2, 5)], "손댄 것은 뒤로 간다"
+
+
+# ── REST 프록시의 상류 한도 — 안쪽이 바깥보다 짧다(반대 검토 BEH-3) ─────────────────────────────────────────────────────────
+# 리스크 앱은 원천 호출을 120초 기다린다. 위임 캡처가 게이트웨이 /api/step-forge 로 큰 트리를 읽으면 이 프록시만 30초에 끊고 502
+# `upstream unreachable` 이라고 말했다 — 같은 트리를 앱이 직접 읽으면 통했다.
+def test_REST_프록시_상류_한도의_기본값과_손잡이(tmp_path):
+    assert _limits(tmp_path, ["REST_PROXY_UPSTREAM_TIMEOUT_S"])[0] == {"REST_PROXY_UPSTREAM_TIMEOUT_S": 110.0}
+    assert _limits(tmp_path, ["REST_PROXY_UPSTREAM_TIMEOUT_S"], **_KNOBS_SET)[0] == {"REST_PROXY_UPSTREAM_TIMEOUT_S": 45.0}
+    t = rest_proxy.RestProxy({"s": {"base": "http://upstream.invalid"}}, {"audience_ok": ["s"]}, gw._audit)._client.timeout
+    want = rest_proxy.REST_PROXY_UPSTREAM_TIMEOUT_S
+    assert (t.read, t.write, t.pool, t.connect) == (want, want, want, 30.0), "연결은 죽은 상대를 재는 값이라 종전 30초 그대로다"
+
+
+def test_REST_프록시_상류_한도는_리스크_앱의_원천_호출_한도보다_짧다(tmp_path):
+    """안쪽이 먼저 걸려야 원인을 말하는 쪽이 이 길이다(시간 한도는 층이다). 형제 리포가 있을 때만 본다."""
+    import re
+    from pathlib import Path
+    src = Path(gw.__file__).resolve().parent.parent / "HWAXRisk" / "backend" / "app" / "config.py"
+    if not src.exists():
+        pytest.skip("형제 HWAXRisk 리포가 없다")
+    outer = int(re.search(r"^DEFAULT_SOURCE_CALL_TIMEOUT_S\s*=\s*(\d+)", src.read_text(encoding="utf-8"), re.M).group(1))
+    assert _limits(tmp_path, ["REST_PROXY_UPSTREAM_TIMEOUT_S"])[0]["REST_PROXY_UPSTREAM_TIMEOUT_S"] < outer, \
+        f"리스크 앱이 {outer}초에 먼저 끊는다 — 이 프록시의 기본 상류 한도를 그 밑으로 둔다"
+
+
+@pytest.mark.parametrize("exc, status", [(httpx.ReadTimeout, 504), (httpx.WriteTimeout, 504), (httpx.PoolTimeout, 504),
+                                         (httpx.ConnectTimeout, 502), (httpx.ConnectError, 502)])
+def test_REST_프록시는_상류가_한도_안에_답하지_않으면_504_로_손잡이를_말한다(monkeypatch, exc, status):
+    """느린 것(504, 손잡이와 초)과 안 닿는 것(502)을 가른다 — 종전엔 둘 다 502 `upstream unreachable` 이었다."""
+    from starlette.requests import Request
+    p = rest_proxy.RestProxy({"s": {"base": "http://upstream.invalid"}}, {"audience_ok": ["s"]}, gw._audit)
+    p._verify = lambda token, s: {"sub": "S-1", "email": "u@corp.com", "jti": "j", "groups": []}
+    p._revoked_set = _noop_async(set())
+
+    async def slow(req, stream=False):
+        raise exc("x", request=req)
+    monkeypatch.setattr(p._client, "send", slow)
+    resp = asyncio.run(p.handle(Request({
+        "type": "http", "method": "GET", "path": "/api/s/tree", "headers": [(b"authorization", b"Bearer me")],
+        "query_string": b"", "path_params": {"site": "s", "path": "tree"}, "client": ("203.0.113.5", 0)})))
+    body = json.loads(resp.body)
+    assert resp.status_code == status, body
+    if status == 504:
+        knob = f"{rest_proxy.REST_PROXY_UPSTREAM_TIMEOUT_S:g}초 안에 답하지 않았다(REST_PROXY_UPSTREAM_TIMEOUT_S)"
+        assert body["error"] == "upstream timeout" and knob in body["detail"], body
+        assert knob in _rows()[-1]["error"], "감사에도 손잡이를 남긴다"
+    else:
+        assert body["error"] == "upstream unreachable", body

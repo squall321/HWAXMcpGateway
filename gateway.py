@@ -3193,6 +3193,7 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> tu
         stage, notes = "exchange", []
         minted: str | None = None      # 포털이 내준 새 PAT — 앱이 받지 못하면 아래에서 폐기한다
         registered = False
+        refused = False
         transient = False              # 잠깐의 실패(시간 초과·닿지 않음·5xx)라 나중에 다시 건넬 만하다
         deadline = anyio.current_time() + _PORTAL_PAT_BUDGET_S
         # 교환 + 등록은 전체 한도에서 폐기 몫을 뺀 안에서 한다 — 등록이 한도를 다 써도 폐기할 시간이 남는다.
@@ -3227,6 +3228,10 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> tu
                 stage = "register"
                 try:
                     r2 = await cli.post(url, headers=_sso_headers(conf, email), json=body)
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    notes.append("portal-pat:register-unreachable")
+                    transient = transient or minted is not None
+                    refused = True                    # 앱에 닿지도 않았다 — 앱은 이 PAT 를 모른다
                 except httpx.TimeoutException:
                     notes.append("portal-pat:register-timeout")
                     transient = transient or minted is not None
@@ -3237,16 +3242,19 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> tu
                     if r2.status_code != 200:
                         notes.append(f"portal-pat:register-{r2.status_code}")
                         transient = transient or (minted is not None and r2.status_code >= 500)
+                        refused = 400 <= r2.status_code < 500   # 앱이 검사에서 거절했다 — 저장하지 않았다
                     elif "pat" in body:
                         registered = True
                         notes.append("portal-pat:registered")
         if scope.cancelled_caught:
             notes.append(f"portal-pat:{stage}-timeout")
             transient = transient or stage == "exchange" or minted is not None
-        # 앱이 받지 못한 새 PAT 는 아무도 쥐지 않은 채 원 PAT 만큼(최대 90일) 살아 있다 — 그 PAT 스스로 폐기한다(포털
-        # `/auth/pat/revoke-self`, 그 PAT 를 Bearer 로). 시간 초과는 앱이 실은 받았을 수도 있지만, 그러면 앱이 다음 단언에서 폐기된
-        # PAT 를 보고(revoked) 다시 바란다 — 주인 없는 토큰을 남기는 것보다 낫다. 최선 노력이고 남은 한도 안에서만 한다.
-        if minted is not None and not registered:
+        # 앱이 받지 않은 것이 **확실한** 새 PAT 는 아무도 쥐지 않은 채 원 PAT 만큼(최대 90일) 살아 있다 — 그 PAT 스스로 폐기한다
+        # (포털 `/auth/pat/revoke-self`, 그 PAT 를 Bearer 로). 확실한 것은 앱의 4xx 거절과 앱에 닿지 못한 연결 실패뿐이다.
+        # 시간 초과·5xx·도중 끊김은 앱이 이미 받아 저장하고 옛 PAT 를 폐기했을 수 있다 — 그때 새것까지 폐기하면 둘 다 죽어
+        # 도는 카드 대조가 credential 보류(자동 재개 없음)로 멈춘다(반대 검토 SEC-1 과 같은 꼴). 그래서 결과를 모르면 두고, 남은
+        # 토큰은 원 PAT 수명과 포털의 자식 상한(5)이 묶는다. 최선 노력이고 남은 한도 안에서만 한다.
+        if minted is not None and not registered and refused:
             ok = False
             with anyio.move_on_after(max(0.0, deadline - anyio.current_time())):
                 async with httpx.AsyncClient(timeout=_PORTAL_PAT_STEP_S) as cli:

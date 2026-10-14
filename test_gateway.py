@@ -5115,13 +5115,13 @@ def _pp_raise(exc_type):
 
 
 @pytest.mark.parametrize("register, note", [
-    (lambda req: httpx.Response(503, text="down"), "portal-pat:register-503"),
-    (_pp_raise(httpx.ReadTimeout), "portal-pat:register-timeout"),
+    (lambda req: httpx.Response(409, json={"detail": {"code": "portal_pat_auto_off", "message": "m"}}), "portal-pat:register-409"),
     (_pp_raise(httpx.ConnectError), "portal-pat:register-unreachable"),
 ])
 def test_앱이_새_PAT_를_받지_못하면_그_PAT_스스로_폐기한다(monkeypatch, register, note):
-    """교환은 됐는데 앱 등록이 실패하면 새 PAT 는 아무도 쥐지 않은 채 원 PAT 만큼(최대 90일) 산다(SEC-1). 포털
-    `/auth/pat/revoke-self` 를 **그 새 PAT** 를 Bearer 로 불러 스스로 폐기한다 — 호출자의 원 PAT 를 쓰면 원이 폐기된다."""
+    """교환은 됐는데 앱이 **확실히** 받지 않으면(4xx 거절·앱에 닿지 못한 연결 실패) 새 PAT 는 아무도 쥐지 않은 채 원 PAT 만큼
+    (최대 90일) 산다(SEC-1). 포털 `/auth/pat/revoke-self` 를 **그 새 PAT** 를 Bearer 로 불러 스스로 폐기한다 — 호출자의 원 PAT 를
+    쓰면 원이 폐기된다."""
     res, ev, got, row = _pp_kit(monkeypatch, register=register)
     assert not res.isError and ev == ["mint", "exchange", "register", "revoke", "call"], ev
     rv = got["revoke"][0]
@@ -5139,10 +5139,24 @@ async def _pp_never(req):
 def test_폐기가_실패하면_그렇다고_감사에_남기고_한도_안에서_끝난다(monkeypatch, revoke):
     monkeypatch.setattr(gw, "_PORTAL_PAT_BUDGET_S", 0.8)
     t0 = _clock.monotonic()
-    res, ev, got, row = _pp_kit(monkeypatch, register=lambda req: httpx.Response(503, text="down"), revoke=revoke)
+    res, ev, got, row = _pp_kit(monkeypatch, register=lambda req: httpx.Response(422, text="no"), revoke=revoke)
     assert _clock.monotonic() - t0 < 5, "폐기가 도구 호출을 한도 넘게 붙들었다"
     assert not res.isError and ev[-1] == "call" and ev.count("revoke") == 1, ev
-    assert row["note"] == "portal-pat:register-503+portal-pat:revoke-failed", row
+    assert row["note"] == "portal-pat:register-422+portal-pat:revoke-failed", row
+
+
+@pytest.mark.parametrize("register, note", [
+    (lambda req: httpx.Response(503, text="down"), "portal-pat:register-503"),
+    (lambda req: httpx.Response(500, text="boom"), "portal-pat:register-500"),
+    (_pp_raise(httpx.ReadTimeout), "portal-pat:register-timeout"),
+    (_pp_raise(httpx.RemoteProtocolError), "portal-pat:register-unreachable"),
+])
+def test_앱이_받았는지_모르면_새_PAT_를_폐기하지_않는다(monkeypatch, register, note):
+    """5xx·읽기 시간 초과·도중 끊김은 앱이 이미 받아 저장하고 옛 PAT 를 폐기했을 수 있다. 그때 새것까지 폐기하면 둘 다 죽어
+    도는 카드 대조가 credential 보류(자동 재개 없음)로 멈춘다 — 결과를 모르면 두고, 남은 토큰은 원 PAT 수명과 자식 상한이 묶는다."""
+    res, ev, got, row = _pp_kit(monkeypatch, register=register)
+    assert not res.isError and "revoke" not in ev and got["revoke"] == [], ev
+    assert row["note"] == note, row
 
 
 @pytest.mark.parametrize("exchange, register", [(_pp_ok, None),
@@ -5173,8 +5187,9 @@ def test_교환과_등록은_시간_한도_안에서_끝나고_도구_호출을_
         assert row["note"] == "portal-pat:exchange-timeout", row
         assert got["register"] == [] and got["revoke"] == [], "한도를 다 쓴 뒤에는 등록을 보내지 않고, 받은 PAT 가 없으니 폐기도 없다"
     else:
-        assert row["note"] == "portal-pat:register-timeout+portal-pat:revoked-unused", row
-        assert got["revoke"][0]["headers"]["authorization"] == f"Bearer {_PP_NEW_PAT}"
+        # 등록이 한도를 다 쓰면 앱이 받았는지 모른다 — 폐기하지 않는다(받았다면 새것까지 죽여 둘 다 잃는다).
+        assert row["note"] == "portal-pat:register-timeout", row
+        assert got["revoke"] == [], got["revoke"]
 
 
 def test_토큰_재발급이_같은_사람의_교환을_되풀이하지_않는다(monkeypatch):
@@ -5193,8 +5208,8 @@ def _pp_echo(req):
 @pytest.mark.parametrize("exchange, register, note", [
     (_pp_ok, None, "portal-pat:registered"),
     (_pp_echo, None, "portal-pat:exchange-invalid_token"),
-    (_pp_ok, lambda req: httpx.Response(503, text="down"), "portal-pat:register-503+portal-pat:revoked-unused"),
-    (_pp_ok, lambda req: httpx.Response(503, text="down"), "portal-pat:register-503+portal-pat:revoke-failed"),
+    (_pp_ok, lambda req: httpx.Response(422, text="no"), "portal-pat:register-422+portal-pat:revoked-unused"),
+    (_pp_ok, lambda req: httpx.Response(422, text="no"), "portal-pat:register-422+portal-pat:revoke-failed"),
 ])
 def test_건네기는_토큰_값을_로그에도_감사에도_적지_않는다(monkeypatch, caplog, exchange, register, note):
     """두 토큰(호출자의 원 PAT · 바꿔 받은 PAT) 어느 것도 글자로 남지 않는다. 포털 거절 글이 원 PAT 를 되울려도 앱으로 넘기지 않는다.
@@ -5246,7 +5261,7 @@ def _pp_age_cooldown(email="a@corp.com"):
     ({"exchange": _pp_raise(httpx.ReadTimeout)}, "portal-pat:exchange-timeout"),
     ({"exchange": _pp_raise(httpx.ConnectError)}, "portal-pat:exchange-unreachable"),
     ({"exchange": lambda req: httpx.Response(502, text="bad gateway")}, "portal-pat:exchange-http_502"),
-    ({"register": lambda req: httpx.Response(503, text="down")}, "portal-pat:register-503+portal-pat:revoked-unused"),
+    ({"register": lambda req: httpx.Response(503, text="down")}, "portal-pat:register-503"),
     ({"register": _pp_raise(httpx.ConnectError)}, "portal-pat:register-unreachable+portal-pat:revoked-unused"),
 ])
 def test_잠깐의_실패는_바람을_남겨_쉼이_지난_뒤_캐시_길에서_다시_건넨다(monkeypatch, fail, note):

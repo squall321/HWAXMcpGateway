@@ -3129,8 +3129,13 @@ def _portal_pat_refusal(resp) -> tuple[str, str]:
     return code, msg or f"포털이 교환을 거절했다(HTTP {resp.status_code})"
 
 
-async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> str:
-    """앱이 바란 포털 PAT 를 교환해 넘기고 감사 note(`portal-pat:…`)를 돌려준다. **던지지 않는다.**
+async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> tuple[str, bool]:
+    """앱이 바란 포털 PAT 를 교환해 넘기고 (감사 note `portal-pat:…`, 남겨 둘까)를 돌려준다. **던지지 않는다.**
+
+    둘째 값은 '이 바람이 아직 채워지지 않았고 나중의 포털 PAT 호출이 채울 수 있다' 이다 — 호출자가 포털 PAT 가 아니었거나(GW_TOKEN·
+    챗·절차·요청 문맥 밖·교환 자식) 쉼 안이었거나 잠깐의 실패(시간 초과·닿지 않음·5xx)였다. `_user_pat` 이 그 바람을 남겨 두고
+    캐시된 단언으로 가는 다음 호출에서 다시 건넨다(_PORTAL_PAT_PENDING). 설정 탓·호출자 PAT 의 청중·범위 탓·포털 거절(앱에 알렸다)·
+    등록됨은 남기지 않는다.
 
     교환은 **포털 PAT 로 들어온 호출**(인증 미들웨어가 via=pat 를 실은 요청)에만 한다. 그 요청의 Authorization 이 호출자 본인의
     PAT 다 — 미들웨어는 PAT 분기에서 이 헤더를 그대로 두고, 두 번 실린 요청은 401 로 막는다. GW_TOKEN(에이전트 서버)은 넘길 사람의
@@ -3140,54 +3145,55 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
     try:
         url = conf.get("portal_pat_url")
         if not url:
-            return "portal-pat:skipped-no-url"
+            return "portal-pat:skipped-no-url", False
         if not isinstance(wanted, dict):
-            return "portal-pat:skipped-bad-wanted"
+            return "portal-pat:skipped-bad-wanted", False
         # 교환 본문의 상한은 운영자가 앱마다 박는다(provision-config.sh). 없으면 앱이 바란 그대로 보내지 않고 건너뛴다.
         spec = conf.get("portal_pat_spec")
         if spec is None:
-            return "portal-pat:skipped-no-spec"
+            return "portal-pat:skipped-no-spec", False
         if not _portal_pat_spec_ok(spec):
-            return "portal-pat:skipped-bad-spec"
+            return "portal-pat:skipped-bad-spec", False
         try:
             req = _low.request_context.request
         except LookupError:
             req = None
         if req is None:
-            return "portal-pat:skipped-no-request"
+            return "portal-pat:skipped-no-request", True
         via = _request_via()
         if via != "pat":
-            return f"portal-pat:skipped-{via or 'no-via'}"
+            return f"portal-pat:skipped-{via or 'no-via'}", True
         if _request_user() != email:
-            return "portal-pat:skipped-identity-mismatch"
+            return "portal-pat:skipped-identity-mismatch", True
         auth = req.headers.get("authorization") or ""
         caller_pat = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         if not caller_pat:
-            return "portal-pat:skipped-no-bearer"
+            return "portal-pat:skipped-no-bearer", True
         claims = _pat_claims(caller_pat)
         # 교환으로 받은 자식 PAT(포털이 `par` = 원 jti 를 찍는다)은 원이 될 수 없다(포털 C-7). 그 PAT 로 들어온 호출은 대개 앱 자신이
         # 그 사람 자격으로 게이트웨이를 다시 부른 것이다 — 교환하면 포털 거절을 앱에 알려 앱이 실패 쉼에 든다. 포털도 앱도 부르지 않는다.
         if claims is not None and "par" in claims:
-            return "portal-pat:skipped-child"
+            return "portal-pat:skipped-child", True
         # 본문은 운영자가 박은 명세 안에서만 만든다(_portal_pat_body) — 앱이 무엇을 바라든 이름·청중·범위·수명이 명세를 넘지
         # 못한다. 청중은 호출자 PAT 의 청중과도 겹친다(context-notes C-10) — 앱은 REST 다리(step-forge)까지 바라지만 그 청중이
         # 없는 옛 PAT 로도 교환이 widen_audience 로 통째 실패하지 않게, 그 사람은 다리 없이 MCP 만 쓴다. 포털은 그대로 넓히기를
         # 거절한다(이 줄은 좁히기만 한다).
         ask = _portal_pat_body(spec, wanted, _pat_audiences(claims))
         if isinstance(ask, str):
-            return f"portal-pat:{ask}"
+            return f"portal-pat:{ask}", False
         base = _portal_api_base()
         if not base:
-            return "portal-pat:skipped-no-portal"
+            return "portal-pat:skipped-no-portal", False
         key = (app_id, email)
         last = _PORTAL_PAT_TRIED.get(key)
         if last is not None and time.monotonic() - last < _PORTAL_PAT_COOLDOWN_S:
-            return "portal-pat:skipped-cooldown"
+            return "portal-pat:skipped-cooldown", True
         _PORTAL_PAT_TRIED[key] = time.monotonic()
 
         stage, notes = "exchange", []
         minted: str | None = None      # 포털이 내준 새 PAT — 앱이 받지 못하면 아래에서 폐기한다
         registered = False
+        transient = False              # 잠깐의 실패(시간 초과·닿지 않음·5xx)라 나중에 다시 건넬 만하다
         deadline = anyio.current_time() + _PORTAL_PAT_BUDGET_S
         # 교환 + 등록은 전체 한도에서 폐기 몫을 뺀 안에서 한다 — 등록이 한도를 다 써도 폐기할 시간이 남는다.
         with anyio.move_on_after(_PORTAL_PAT_BUDGET_S * (1 - _PORTAL_PAT_REVOKE_SHARE)) as scope:
@@ -3196,9 +3202,9 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
                 try:
                     r = await cli.post(f"{base}/auth/pat/exchange", headers={"Authorization": auth}, json=ask)
                 except httpx.TimeoutException:
-                    code, msg = "timeout", f"포털 교환이 {_PORTAL_PAT_STEP_S:g}초 안에 답하지 않았다"
+                    code, msg, transient = "timeout", f"포털 교환이 {_PORTAL_PAT_STEP_S:g}초 안에 답하지 않았다", True
                 except httpx.HTTPError as exc:
-                    code, msg = "unreachable", f"포털에 닿지 못했다({type(exc).__name__})"
+                    code, msg, transient = "unreachable", f"포털에 닿지 못했다({type(exc).__name__})", True
                 else:
                     if r.status_code == 200:
                         try:
@@ -3213,6 +3219,7 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
                             code, msg = "bad_response", "포털 교환 응답에 token 이 없다"
                     else:
                         code, msg = _portal_pat_refusal(r)
+                        transient = r.status_code >= 500      # 포털 재기동 중의 앞단 502 등 — 거절(4xx)은 앱에 알리고 끝낸다
                 if body is None:
                     notes.append(f"portal-pat:exchange-{code}")
                     # 거절 글이 무엇을 되울리든 호출자 PAT 는 앱으로 넘기지 않는다.
@@ -3222,16 +3229,20 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
                     r2 = await cli.post(url, headers=_sso_headers(conf, email), json=body)
                 except httpx.TimeoutException:
                     notes.append("portal-pat:register-timeout")
+                    transient = transient or minted is not None
                 except httpx.HTTPError:
                     notes.append("portal-pat:register-unreachable")
+                    transient = transient or minted is not None
                 else:
                     if r2.status_code != 200:
                         notes.append(f"portal-pat:register-{r2.status_code}")
+                        transient = transient or (minted is not None and r2.status_code >= 500)
                     elif "pat" in body:
                         registered = True
                         notes.append("portal-pat:registered")
         if scope.cancelled_caught:
             notes.append(f"portal-pat:{stage}-timeout")
+            transient = transient or stage == "exchange" or minted is not None
         # 앱이 받지 못한 새 PAT 는 아무도 쥐지 않은 채 원 PAT 만큼(최대 90일) 살아 있다 — 그 PAT 스스로 폐기한다(포털
         # `/auth/pat/revoke-self`, 그 PAT 를 Bearer 로). 시간 초과는 앱이 실은 받았을 수도 있지만, 그러면 앱이 다음 단언에서 폐기된
         # PAT 를 보고(revoked) 다시 바란다 — 주인 없는 토큰을 남기는 것보다 낫다. 최선 노력이고 남은 한도 안에서만 한다.
@@ -3245,21 +3256,52 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
                     except httpx.HTTPError:
                         pass
             notes.append("portal-pat:revoked-unused" if ok else "portal-pat:revoke-failed")
-        return "+".join(notes)
+        return "+".join(notes), transient and not registered
     except Exception as exc:  # noqa: BLE001 — 건네기 실패가 도구 호출을 막지 않는다(값은 적지 않는다)
         log.warning("portal PAT handoff for %s on %s failed: %s", email, app_id, type(exc).__name__)
-        return "portal-pat:skipped-error"
+        return "portal-pat:skipped-error", False
+
+
+# 아직 채우지 못한 바람 — {(앱, 사람): 앱이 마지막 발급에서 실은 portal_pat_wanted}. 발급 응답에만 바람이 실리므로, 그 발급의 호출이
+# 건넬 수 없었으면(GW_TOKEN·챗·REST 다리·쉼 안·잠깐의 실패) 캐시된 단언이 사는 동안(최대 USER_PAT_TTL_S) 포털 PAT 로 온 같은 사람의
+# 호출도 건네지 못했다(반대 검토 SEC-3·BEH-5). 그 바람을 여기 남겨 캐시 길에서 건넨다. 다음 발급이 바람을 싣지 않거나 등록되면 지운다.
+# 사람 수만큼만 자라지만 상한을 둔다 — 넘치면 가장 오래 손대지 않은 것부터 버린다(버려도 다음 발급이 다시 싣는다).
+_PORTAL_PAT_PENDING: "OrderedDict[tuple[str, str], dict]" = OrderedDict()
+_PORTAL_PAT_PENDING_MAX = 1024
+
+
+async def _portal_pat_serve(app_id: str, email: str, wanted: dict, notes: list | None, *, cached: bool) -> None:
+    """바람을 건네고(_portal_pat_handoff) 남길지 정한다. 캐시 길에서 바람이 그대로 남는 건너뜀(쉼 안·포털 PAT 가 아닌 호출 등)은
+    로그에도 감사 note 에도 적지 않는다 — 그 사람의 호출마다 같은 줄이 붙는다. 그 바람을 남긴 발급의 줄에 까닭이 이미 있다."""
+    key = (app_id, email)
+    pp, keep = await _portal_pat_handoff(app_id, PER_USER_SSO[app_id], email, wanted)
+    if keep:
+        _PORTAL_PAT_PENDING[key] = wanted
+        _PORTAL_PAT_PENDING.move_to_end(key)
+        while len(_PORTAL_PAT_PENDING) > _PORTAL_PAT_PENDING_MAX:
+            _PORTAL_PAT_PENDING.popitem(last=False)
+    else:
+        _PORTAL_PAT_PENDING.pop(key, None)
+    if cached and keep and pp.startswith("portal-pat:skipped-"):
+        return
+    (log.info if pp == "portal-pat:registered" or pp.startswith("portal-pat:skipped-") else log.warning)(
+        "portal PAT handoff for %s on %s%s: %s", email, app_id, " (남은 바람)" if cached else "", pp)
+    if notes is not None:
+        notes.append(pp)
 
 
 async def _user_pat(app_id: str, email: str, *, force: bool = False, notes: list | None = None) -> str:
     """캐시된 사용자 PAT (없거나 force 면 발급). 사용자 단위로 직렬화한다.
-    발급 응답이 포털 PAT 를 바라면 같은 잠금 안에서 건넨다 — 같은 사람의 다른 호출은 등록이 끝난 뒤에 앱에 닿는다.
-    그 감사 note 는 `notes` 에 덧붙인다(주지 않으면 로그에만 남는다)."""
+    발급 응답이 포털 PAT 를 바라면 같은 잠금 안에서 건넨다 — 같은 사람의 다른 호출은 등록이 끝난 뒤에 앱에 닿는다. 건네지 못한
+    바람은 남겨 두었다가 캐시 길에서 다시 건넨다(_PORTAL_PAT_PENDING). 그 감사 note 는 `notes` 에 덧붙인다(주지 않으면 로그에만 남는다)."""
     key = (app_id, email)
     lock = _USER_PAT_LOCKS.setdefault(key, anyio.Lock())
     async with lock:
         hit = _USER_PATS.get(key)
         if hit and not force and hit[1] > time.monotonic():
+            pend = _PORTAL_PAT_PENDING.get(key)
+            if pend is not None:
+                await _portal_pat_serve(app_id, email, pend, notes, cached=True)
             return hit[0]
         tok, exp, wanted = await _mint_user_pat(PER_USER_SSO[app_id], email)
         # 토큰 제 수명을 넘겨 쓰지 않는다 — RA 위임 JWT 는 12시간이라 캐시와 같다. 2분 먼저 버린다.
@@ -3277,11 +3319,9 @@ async def _user_pat(app_id: str, email: str, *, force: bool = False, notes: list
         _USER_PATS[key] = (tok, time.monotonic() + ttl)
         log.info("user PAT minted for %s on %s", email, app_id)
         if wanted:
-            pp = await _portal_pat_handoff(app_id, PER_USER_SSO[app_id], email, wanted)
-            (log.info if pp == "portal-pat:registered" or pp.startswith("portal-pat:skipped-") else log.warning)(
-                "portal PAT handoff for %s on %s: %s", email, app_id, pp)
-            if notes is not None:
-                notes.append(pp)
+            await _portal_pat_serve(app_id, email, wanted, notes, cached=False)
+        else:
+            _PORTAL_PAT_PENDING.pop(key, None)      # 앱이 더는 바라지 않는다 — 남은 바람은 낡았다
         return tok
 
 

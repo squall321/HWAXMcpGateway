@@ -4827,13 +4827,15 @@ def _pp_ok(req):
                                      "created": 1, "exp": 2, "revoked": False, "token": _PP_NEW_PAT})
 
 
-def _pp_kit(monkeypatch, *, via="pat", auth=f"Bearer {_PP_CALLER_PAT}", wanted=_PP_WANTED, exchange=_pp_ok,
-            register=None, backend_rejects_first=False, user="a@corp.com", spec=_PP_SPEC, revoke=None):
-    """heax-hwax_risk 하나로 `_call_tool` 을 태운다 — 발급·건네기는 진짜이고 상류 셋은 가짜다. 요청 문맥은 인증 미들웨어가 남기는
-    꼴(Authorization 원본 · via · 확인한 신원)이다. 돌려주는 것 — 결과 · 일어난 순서 · 교환·등록이 받은 요청 · 감사 마지막 줄."""
+def _pp_setup(monkeypatch, *, wanted=_PP_WANTED, exchange=_pp_ok, register=None, backend_rejects_first=False, spec=_PP_SPEC,
+              revoke=None):
+    """heax-hwax_risk 하나로 `_call_tool` 을 태울 판을 세운다 — 발급·건네기는 진짜이고 상류 셋(앱 SSO · 포털 교환·폐기 · 앱 등록)은
+    가짜다. 돌려주는 것 — 한 번 부르는 함수 `call(via, auth, user) → (결과, 감사 마지막 줄)` · 일어난 순서 · 상류가 받은 요청 ·
+    상류의 답을 호출 사이에 바꿀 수 있는 `state`(wanted·exchange·register·revoke). 요청 문맥은 인증 미들웨어가 남기는
+    꼴(Authorization 원본 · via · 확인한 신원)이다."""
     ev, got = [], {"exchange": [], "register": [], "revoke": []}
-    steps = {"http://portal/auth/pat/exchange": ("exchange", exchange), _PP_URL: ("register", register),
-             "http://portal/auth/pat/revoke-self": ("revoke", revoke)}
+    state = {"wanted": wanted, "exchange": exchange, "register": register, "revoke": revoke}
+    steps = {"http://portal/auth/pat/exchange": "exchange", _PP_URL: "register", "http://portal/auth/pat/revoke-self": "revoke"}
 
     async def handler(req):
         u, h = str(req.url), {k.lower(): v for k, v in req.headers.items()}
@@ -4841,10 +4843,11 @@ def _pp_kit(monkeypatch, *, via="pat", auth=f"Bearer {_PP_CALLER_PAT}", wanted=_
             ev.append("mint")
             body = {"access_token": _rrsso(h["x-hwax-delegate-email"], delegated=True), "token_type": "bearer",
                     "expires_in": 900}
-            if wanted is not None:
-                body["portal_pat_wanted"] = wanted
+            if state["wanted"] is not None:
+                body["portal_pat_wanted"] = state["wanted"]
             return httpx.Response(200, json=body)
-        step, fn = steps[u]
+        step = steps[u]
+        fn = state[step]
         ev.append(step)
         got[step].append({"headers": h, "json": json.loads(req.content) if req.content else None})
         r = fn(req) if fn else httpx.Response(200, json={"revoked": "j-1"} if step == "revoke" else {"registered": True})
@@ -4874,6 +4877,7 @@ def _pp_kit(monkeypatch, *, via="pat", auth=f"Bearer {_PP_CALLER_PAT}", wanted=_
     monkeypatch.setattr(gw, "_USER_PATS", {})
     monkeypatch.setattr(gw, "_USER_PAT_LOCKS", {})
     monkeypatch.setattr(gw, "_PORTAL_PAT_TRIED", {})
+    monkeypatch.setattr(gw, "_PORTAL_PAT_PENDING", gw.OrderedDict())
     gw._RESP_CACHE.clear()
     monkeypatch.setattr(gw, "backends", {"heax-hwax_risk": _CallB([_PP_TOOL])})
     monkeypatch.setattr(gw, "route", {_PP_TOOL: ("heax-hwax_risk", _PP_TOOL)})
@@ -4881,10 +4885,20 @@ def _pp_kit(monkeypatch, *, via="pat", auth=f"Bearer {_PP_CALLER_PAT}", wanted=_
     monkeypatch.setattr(gw, "POLICY", {})
     monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
     monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
-    _set_request(monkeypatch, {"authorization": auth, gw.VIA_HEADER: via, gw.USER_HEADER: user.replace("@", "%40")},
-                 "203.0.113.9")
-    res = asyncio.run(asyncio.wait_for(gw._call_tool(_PP_TOOL, {"code": "P1"}), 10))
-    return res, ev, got, _rows()[-1]
+
+    def call(*, via="pat", auth=f"Bearer {_PP_CALLER_PAT}", user="a@corp.com"):
+        _set_request(monkeypatch, {"authorization": auth, gw.VIA_HEADER: via, gw.USER_HEADER: user.replace("@", "%40")},
+                     "203.0.113.9")
+        res = asyncio.run(asyncio.wait_for(gw._call_tool(_PP_TOOL, {"code": "P1"}), 10))
+        return res, _rows()[-1]
+    return call, ev, got, state
+
+
+def _pp_kit(monkeypatch, *, via="pat", auth=f"Bearer {_PP_CALLER_PAT}", user="a@corp.com", **kw):
+    """`_pp_setup` 의 한 번 부르기 — 결과 · 일어난 순서 · 상류가 받은 요청 · 감사 마지막 줄."""
+    call, ev, got, _ = _pp_setup(monkeypatch, **kw)
+    res, row = call(via=via, auth=auth, user=user)
+    return res, ev, got, row
 
 
 def test_포털_PAT_를_바라면_호출자_PAT_로_바꿔_받아_도구_호출_전에_앱에_넘긴다(monkeypatch):
@@ -5192,3 +5206,96 @@ def test_건네기는_토큰_값을_로그에도_감사에도_적지_않는다(m
     for secret in (_PP_CALLER_PAT, _PP_NEW_PAT):
         assert secret not in caplog.text, f"로그에 토큰이 있다: {secret}"
         assert secret not in audit, f"감사에 토큰이 있다: {secret}"
+
+
+# ── 건네지 못한 바람은 캐시된 단언 뒤에 묻히지 않는다(반대 검토 SEC-3·BEH-5) ──────────────────────────────────────────────
+# 앱은 발급 응답에만 바람을 싣는다. 그 발급이 GW_TOKEN·챗·REST 다리·쉼 안·잠깐의 실패로 건네지 못하면, 단언이 캐시에 사는 동안
+# (hwax_risk 900초 − 2분) 포털 PAT 로 온 같은 사람의 호출도 발급을 거치지 않아 건네지 못했다.
+@pytest.mark.parametrize("via, auth", [("gw-token", "Bearer gw-secret"), ("chat", f"Bearer {_PP_CALLER_PAT}")])
+def test_건네지_못한_바람은_캐시된_단언으로_가는_다음_포털_PAT_호출이_건넨다(monkeypatch, via, auth):
+    call, ev, got, _ = _pp_setup(monkeypatch)
+    _, row = call(via=via, auth=auth)
+    assert ev == ["mint", "call"] and row.get("note") == f"portal-pat:skipped-{via}", (ev, row)
+    del ev[:]
+    _, row = call(via=via, auth=auth)
+    assert ev == ["call"] and row.get("note") is None, "포털 PAT 가 아닌 호출은 남은 바람을 조용히 둔다(호출마다 같은 줄을 붙이지 않는다)"
+    del ev[:]
+    _, row = call(auth=f"Bearer {_pp_jwt(['mcp-gateway'], par='j-root')}")
+    assert ev == ["call"] and row.get("note") is None, "교환 자식으로 온 호출도 건네지 않고 바람을 남긴다"
+    del ev[:]
+    _, row = call()
+    assert ev == ["exchange", "register", "call"], "캐시된 단언 그대로(발급 없이) 남은 바람을 건넨다"
+    assert row.get("note") == "portal-pat:registered" and got["register"][-1]["json"] == {"pat": _PP_NEW_PAT}
+    del ev[:]
+    _, row = call()
+    assert ev == ["call"] and row.get("note") is None, "등록됐으면 바람을 지운다"
+    assert not gw._PORTAL_PAT_PENDING
+
+
+def _pp_age_cooldown(email="a@corp.com"):
+    gw._PORTAL_PAT_TRIED[("hwax_risk", email)] -= gw._PORTAL_PAT_COOLDOWN_S + 1
+
+
+@pytest.mark.parametrize("fail, note", [
+    ({"exchange": _pp_raise(httpx.ReadTimeout)}, "portal-pat:exchange-timeout"),
+    ({"exchange": _pp_raise(httpx.ConnectError)}, "portal-pat:exchange-unreachable"),
+    ({"exchange": lambda req: httpx.Response(502, text="bad gateway")}, "portal-pat:exchange-http_502"),
+    ({"register": lambda req: httpx.Response(503, text="down")}, "portal-pat:register-503+portal-pat:revoked-unused"),
+    ({"register": _pp_raise(httpx.ConnectError)}, "portal-pat:register-unreachable+portal-pat:revoked-unused"),
+])
+def test_잠깐의_실패는_바람을_남겨_쉼이_지난_뒤_캐시_길에서_다시_건넨다(monkeypatch, fail, note):
+    call, ev, got, state = _pp_setup(monkeypatch, **fail)
+    _, row = call()
+    assert row.get("note") == note, row
+    del ev[:]
+    _, row = call()
+    assert ev == ["call"] and row.get("note") is None, "쉼(5분) 안에는 다시 하지 않고 줄도 붙이지 않는다"
+    state.update(exchange=_pp_ok, register=None)
+    _pp_age_cooldown()
+    del ev[:]
+    _, row = call()
+    assert ev == ["exchange", "register", "call"] and row.get("note") == "portal-pat:registered", (ev, row)
+
+
+@pytest.mark.parametrize("fail", [
+    {"exchange": lambda req: httpx.Response(403, json={"detail": {"code": "source_not_exchangeable", "message": "m"}})},
+    {"exchange": lambda req: httpx.Response(409, json={"detail": {"code": "too_many_children", "message": "m"}})},
+    {"register": lambda req: httpx.Response(422, json={"detail": "pat_invalid"})},
+    {"spec": {**_PP_SPEC, "scopes": ["admin"]}},
+])
+def test_거절이나_설정_탓이면_바람을_남기지_않는다(monkeypatch, fail):
+    """포털 거절은 앱에 알렸고(앱이 실패 쉼에 든다) 다시 해도 같다. 앱의 등록 거절(4xx)·명세 밖도 같다."""
+    call, ev, got, _ = _pp_setup(monkeypatch, **fail)
+    call()
+    assert not gw._PORTAL_PAT_PENDING
+    if ("hwax_risk", "a@corp.com") in gw._PORTAL_PAT_TRIED:
+        _pp_age_cooldown()                         # 쉼 때문에 안 하는 것이 아니다
+    del ev[:]
+    _, row = call()
+    assert ev == ["call"] and row.get("note") is None, (ev, row)
+
+
+def test_다음_발급이_바람을_싣지_않으면_남은_바람을_지운다(monkeypatch):
+    call, ev, got, state = _pp_setup(monkeypatch)
+    call(via="gw-token", auth="Bearer gw-secret")
+    assert list(gw._PORTAL_PAT_PENDING) == [("hwax_risk", "a@corp.com")]
+    state["wanted"] = None
+    gw._USER_PATS[("hwax_risk", "a@corp.com")] = ("old", 0.0)     # 단언 캐시가 끝났다 — 다음 호출이 다시 발급한다
+    del ev[:]
+    call(via="gw-token", auth="Bearer gw-secret")
+    assert ev == ["mint", "call"] and not gw._PORTAL_PAT_PENDING
+    del ev[:]
+    _, row = call()
+    assert ev == ["call"] and row.get("note") is None, "앱이 더는 바라지 않는다 — 낡은 바람으로 교환하지 않는다"
+
+
+def test_남은_바람은_상한을_넘으면_오래된_것부터_버린다(monkeypatch):
+    _pp_setup(monkeypatch)
+    monkeypatch.setattr(gw, "_PORTAL_PAT_PENDING_MAX", 3)
+    _set_request(monkeypatch, {"authorization": "Bearer gw-secret", gw.VIA_HEADER: "gw-token"}, "203.0.113.9")
+    for i in range(5):
+        asyncio.run(gw._portal_pat_serve("hwax_risk", f"u{i}@corp.com", dict(_PP_WANTED), None, cached=False))
+    assert list(gw._PORTAL_PAT_PENDING) == [("hwax_risk", f"u{i}@corp.com") for i in (2, 3, 4)]
+    asyncio.run(gw._portal_pat_serve("hwax_risk", "u2@corp.com", dict(_PP_WANTED), None, cached=True))
+    asyncio.run(gw._portal_pat_serve("hwax_risk", "u5@corp.com", dict(_PP_WANTED), None, cached=False))
+    assert list(gw._PORTAL_PAT_PENDING) == [("hwax_risk", f"u{i}@corp.com") for i in (4, 2, 5)], "손댄 것은 뒤로 간다"

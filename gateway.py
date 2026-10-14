@@ -239,10 +239,12 @@ def _aff_proof(secret: str, email: str, aff: str, now: float | None = None) -> s
     msg = f"v1|{email}|{aff}|{exp}"
     sig = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"v1.{exp}.{sig}"
-# 백엔드별 사용자 위임 설정 — {app_id: {sso_url, secret, client, base?, token_header?, strip_headers?, portal_pat_url?}}.
+# 백엔드별 사용자 위임 설정 — {app_id: {sso_url, secret, client, base?, token_header?, strip_headers?, portal_pat_url?,
+# portal_pat_spec?}}.
 # strip_headers — 서비스 계정 설정에만 맞는 헤더를 사람별 호출에서 뺀다(RA 의 X-Workspace-Slug: 서비스 부서가 남으면
 # 남의 부서로 읽고 쓴다. 사람별 부서는 앱이 그 사람 기준으로 정한다 — docs/sso-delegation).
 # portal_pat_url — 발급 응답이 `portal_pat_wanted` 를 실으면 호출자 PAT 로 포털에서 바꿔 받은 PAT 를 여기로 넘긴다(_portal_pat_handoff).
+# portal_pat_spec — 그 교환 본문의 상한 {name, audiences, scopes, max_ttl_days}. 없으면 건너뛴다(_portal_pat_body).
 # 값이 있는 백엔드만 사용자별 자격증명으로 호출한다(나머지는 종전대로 서비스 계정).
 PER_USER_SSO: dict[str, dict] = {k: v for k, v in (HEAX.get("per_user_sso") or {}).items()
                                  if isinstance(v, dict) and v.get("sso_url") and v.get("secret")}
@@ -3056,6 +3058,47 @@ def _pat_audiences(token: str) -> list[str] | None:
     return [a for a in aud if isinstance(a, str)] if isinstance(aud, list) else None
 
 
+def _strs(v) -> list[str]:
+    """목록의 문자열만, 처음 나온 순서대로 한 번씩. 목록이 아니면 빈 목록."""
+    return list(dict.fromkeys(x for x in v if isinstance(x, str))) if isinstance(v, list) else []
+
+
+def _pos_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def _portal_pat_spec_ok(spec) -> bool:
+    """`per_user_sso.<app>.portal_pat_spec` 의 꼴 — {name: 빈 아닌 str, audiences: [..], scopes: [..], max_ttl_days: 양의 int}."""
+    return (isinstance(spec, dict) and isinstance(spec.get("name"), str) and bool(spec["name"].strip())
+            and isinstance(spec.get("audiences"), list) and isinstance(spec.get("scopes"), list)
+            and _pos_int(spec.get("max_ttl_days")))
+
+
+def _portal_pat_body(spec: dict, wanted: dict, have: list[str] | None) -> dict | str:
+    """교환 본문 — 운영자가 앱마다 박은 명세(`portal_pat_spec`, 꼴은 이미 봤다)와 앱이 바란 것(`portal_pat_wanted`)의 겹침.
+    못 만들면 skip 까닭.
+
+    앱이 보낸 값은 명세 밖으로 나가지 못한다 — 이름은 명세의 것(바란 이름은 버린다), 청중은 바람 ∩ 명세 ∩ 호출자 PAT 의 청중,
+    범위는 바람 ∩ 명세, 수명은 둘 중 짧은 것이다. 본문은 포털 계약의 칸(`name·audiences·scopes·ttl_days·min_remaining_s`)만
+    싣는다 — 바람의 다른 칸(`reason`·`require_audiences` 등)은 포털로 보내지 않는다. 호출자 청중을 못 읽으면(None) 그 겹침은
+    포털에 맡긴다(포털이 넓히기를 거절한다)."""
+    auds = [a for a in _strs(wanted.get("audiences"))
+            if a in spec["audiences"] and (have is None or a in have)]
+    if not auds:
+        return "skipped-no-audience"
+    scopes = [s for s in _strs(wanted.get("scopes")) if s in spec["scopes"]]
+    if not scopes:
+        return "skipped-no-scope"
+    ttl = wanted.get("ttl_days")
+    body = {"name": spec["name"], "audiences": auds, "scopes": scopes,
+            # 앱이 수명을 말하지 않으면(또는 꼴이 틀리면) 명세의 상한이다 — 포털이 다시 원 PAT 의 만료로 묶는다.
+            "ttl_days": min(ttl, spec["max_ttl_days"]) if _pos_int(ttl) else spec["max_ttl_days"]}
+    mr = wanted.get("min_remaining_s")
+    if isinstance(mr, int) and not isinstance(mr, bool) and mr >= 0:
+        body["min_remaining_s"] = mr
+    return body
+
+
 def _portal_pat_refusal(resp) -> tuple[str, str]:
     """포털 거절의 (code, message). 거절은 `{detail:{code, message}}` 지만 앞단(nginx·FastAPI 기본)은 다른 꼴로 답할 수 있다 —
     detail.code → detail 문자열 → `http_<status>` 순으로 읽고, 코드 꼴이 아닌 글은 code 로 쓰지 않는다(감사 note 에 실린다)."""
@@ -3088,6 +3131,12 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
             return "portal-pat:skipped-no-url"
         if not isinstance(wanted, dict):
             return "portal-pat:skipped-bad-wanted"
+        # 교환 본문의 상한은 운영자가 앱마다 박는다(provision-config.sh). 없으면 앱이 바란 그대로 보내지 않고 건너뛴다.
+        spec = conf.get("portal_pat_spec")
+        if spec is None:
+            return "portal-pat:skipped-no-spec"
+        if not _portal_pat_spec_ok(spec):
+            return "portal-pat:skipped-bad-spec"
         try:
             req = _low.request_context.request
         except LookupError:
@@ -3103,15 +3152,13 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
         caller_pat = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         if not caller_pat:
             return "portal-pat:skipped-no-bearer"
-        # 앱이 바란 청중을 호출자 PAT 의 청중과 겹치는 것으로 좁힌다(context-notes C-10). 앱은 REST 다리(step-forge)까지 바라지만
-        # 그 청중이 없는 옛 PAT 로도 교환이 widen_audience 로 통째 실패하지 않게 — 그 사람은 다리 없이 MCP 만 쓴다. 포털은 그대로
-        # 넓히기를 거절한다(이 줄은 좁히기만 한다).
-        have = _pat_audiences(caller_pat)
-        if have is not None and isinstance(wanted.get("audiences"), list):
-            narrowed = [a for a in wanted["audiences"] if a in have]
-            if not narrowed:
-                return "portal-pat:skipped-no-audience"
-            wanted = {**wanted, "audiences": narrowed}
+        # 본문은 운영자가 박은 명세 안에서만 만든다(_portal_pat_body) — 앱이 무엇을 바라든 이름·청중·범위·수명이 명세를 넘지
+        # 못한다. 청중은 호출자 PAT 의 청중과도 겹친다(context-notes C-10) — 앱은 REST 다리(step-forge)까지 바라지만 그 청중이
+        # 없는 옛 PAT 로도 교환이 widen_audience 로 통째 실패하지 않게, 그 사람은 다리 없이 MCP 만 쓴다. 포털은 그대로 넓히기를
+        # 거절한다(이 줄은 좁히기만 한다).
+        ask = _portal_pat_body(spec, wanted, _pat_audiences(caller_pat))
+        if isinstance(ask, str):
+            return f"portal-pat:{ask}"
         base = _portal_api_base()
         if not base:
             return "portal-pat:skipped-no-portal"
@@ -3126,7 +3173,7 @@ async def _portal_pat_handoff(app_id: str, conf: dict, email: str, wanted) -> st
             async with httpx.AsyncClient(timeout=_PORTAL_PAT_STEP_S) as cli:
                 body: dict | None = None
                 try:
-                    r = await cli.post(f"{base}/auth/pat/exchange", headers={"Authorization": auth}, json=wanted)
+                    r = await cli.post(f"{base}/auth/pat/exchange", headers={"Authorization": auth}, json=ask)
                 except httpx.TimeoutException:
                     code, msg = "timeout", f"포털 교환이 {_PORTAL_PAT_STEP_S:g}초 안에 답하지 않았다"
                 except httpx.HTTPError as exc:

@@ -397,6 +397,8 @@ def test_리스크_위임은_포털_PAT_등록_주소를_sso_url_에서_유도�
     risk = _run_provision(tmp_path, env)["heax_registry"]["per_user_sso"]["hwax_risk"]
     assert risk["sso_url"] == "https://hub.example:8443/apps/hwax_risk/api/auth/sso"
     assert risk["portal_pat_url"] == "https://hub.example:8443/apps/hwax_risk/api/auth/portal-pat", "sso_url 과 같은 Caddy 문 뒤다"
+    assert risk["portal_pat_spec"] == {"name": "hwax-risk", "audiences": ["mcp-gateway", "step-forge"], "scopes": ["read"],
+                                       "max_ttl_days": 90}, "게이트웨이는 이 명세가 없으면 건네지 않는다"
     _force_backup(tmp_path)
     again = _run_provision(tmp_path, env)["heax_registry"]["per_user_sso"]["hwax_risk"]
     assert again == risk, "--force 재생성이 항목을 다시 쓰며 칸을 잃었다"

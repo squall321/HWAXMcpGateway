@@ -4814,6 +4814,8 @@ def test_list_tool_apps_앱_상세는_도구_이름을_먼저_싣는다(monkeypa
 # `portal_pat_url` 로 넘긴다. 아래 가짜 상류 셋은 앱 SSO · 포털 교환 · 앱 등록이다. 토큰 값은 모양만 흉내 내고 눈에 띄게 둔다 —
 # 로그·감사에 새는지를 글자로 찾는다.
 _PP_WANTED = {"name": "hwax-risk", "audiences": ["mcp-gateway"], "scopes": ["read"], "ttl_days": 90}
+# 운영자가 앱마다 박는 교환 본문의 상한(provision-config.sh 가 hwax_risk 에 적는 것과 같다).
+_PP_SPEC = {"name": "hwax-risk", "audiences": ["mcp-gateway", "step-forge"], "scopes": ["read"], "max_ttl_days": 90}
 _PP_CALLER_PAT = "eyJ.caller-portal-pat.CALLERSECRET"
 _PP_NEW_PAT = "eyJ.exchanged-pat.NEWSECRET"
 _PP_URL = "http://caddy.invalid/apps/hwax_risk/api/auth/portal-pat"
@@ -4826,7 +4828,7 @@ def _pp_ok(req):
 
 
 def _pp_kit(monkeypatch, *, via="pat", auth=f"Bearer {_PP_CALLER_PAT}", wanted=_PP_WANTED, exchange=_pp_ok,
-            register=None, backend_rejects_first=False, user="a@corp.com"):
+            register=None, backend_rejects_first=False, user="a@corp.com", spec=_PP_SPEC):
     """heax-hwax_risk 하나로 `_call_tool` 을 태운다 — 발급·건네기는 진짜이고 상류 셋은 가짜다. 요청 문맥은 인증 미들웨어가 남기는
     꼴(Authorization 원본 · via · 확인한 신원)이다. 돌려주는 것 — 결과 · 일어난 순서 · 교환·등록이 받은 요청 · 감사 마지막 줄."""
     ev, got = [], {"exchange": [], "register": []}
@@ -4866,7 +4868,8 @@ def _pp_kit(monkeypatch, *, via="pat", auth=f"Bearer {_PP_CALLER_PAT}", wanted=_
     monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
     monkeypatch.setattr(gw, "_portal_access", fake_access)
     monkeypatch.setitem(gw.HEAX, "token", "heax-svc-pat")
-    monkeypatch.setattr(gw, "PER_USER_SSO", {"hwax_risk": {**_RISK_SSO, "portal_pat_url": _PP_URL}})
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"hwax_risk": {**_RISK_SSO, "portal_pat_url": _PP_URL,
+                                                          **({"portal_pat_spec": spec} if spec is not None else {})}})
     monkeypatch.setattr(gw, "_USER_PATS", {})
     monkeypatch.setattr(gw, "_USER_PAT_LOCKS", {})
     monkeypatch.setattr(gw, "_PORTAL_PAT_TRIED", {})
@@ -4889,7 +4892,7 @@ def test_포털_PAT_를_바라면_호출자_PAT_로_바꿔_받아_도구_호출_
     assert ev == ["mint", "exchange", "register", "call"], "등록이 그 도구 호출보다 먼저여야 앱이 이번 호출에 PAT 를 쓴다"
     ex = got["exchange"][0]
     assert ex["headers"]["authorization"] == f"Bearer {_PP_CALLER_PAT}", "교환은 호출자가 낸 Authorization 그대로다"
-    assert ex["json"] == _PP_WANTED, "앱이 바란 명세를 그대로 넘긴다"
+    assert ex["json"] == _PP_WANTED, "바람이 명세 안이면 본문은 바란 것과 같다"
     assert "x-heax-gateway-secret" not in ex["headers"] and "heax-svc-pat" not in json.dumps(ex), "포털에 앱 비밀을 보내지 않는다"
     rg = got["register"][0]
     assert rg["json"] == {"pat": _PP_NEW_PAT}
@@ -4922,6 +4925,49 @@ def test_겹치는_청중이_없으면_교환하지_않는다(monkeypatch):
                                 wanted={**_PP_WANTED, "audiences": ["mcp-gateway"]})
     assert not res.isError and ev == ["mint", "call"], ev
     assert row["note"] == "portal-pat:skipped-no-audience", row
+
+
+def test_교환_본문은_명세_안에서만_만들고_바람의_다른_칸은_포털에_보내지_않는다(monkeypatch):
+    """앱이 넓게 바라도(남의 이름·명세 밖 청중·쓰기 범위·10년) 본문은 운영자가 박은 명세를 넘지 못한다(D1). 바람의 `reason`·
+    `require_audiences`·모르는 칸은 포털 계약에 없다 — 보내지 않는다. `min_remaining_s` 는 0 이상 정수일 때만 싣는다."""
+    wide = {"name": "evil-admin", "audiences": ["mcp-gateway", "step-forge", "heax-hub", "mcp-gateway"],
+            "scopes": ["read", "write"], "ttl_days": 3650, "min_remaining_s": 3600, "reason": "absent",
+            "require_audiences": [], "extra": {"x": 1}}
+    res, ev, got, row = _pp_kit(monkeypatch, auth=f"Bearer {_pp_jwt(['mcp-gateway', 'step-forge', 'heax-hub'])}",
+                                wanted=wide)
+    assert not res.isError and ev == ["mint", "exchange", "register", "call"], ev
+    assert got["exchange"][0]["json"] == {"name": "hwax-risk", "audiences": ["mcp-gateway", "step-forge"], "scopes": ["read"],
+                                          "ttl_days": 90, "min_remaining_s": 3600}
+    assert row["note"] == "portal-pat:registered", row
+
+
+@pytest.mark.parametrize("ttl, mr, want_ttl, has_mr", [(30, 0, 30, True), (None, -1, 90, False), (0, True, 90, False),
+                                                       ("30", "60", 90, False), (True, 1.5, 90, False)])
+def test_교환_수명은_바람과_명세의_상한_중_짧은_것이다(monkeypatch, ttl, mr, want_ttl, has_mr):
+    wanted = {**_PP_WANTED, "min_remaining_s": mr}
+    if ttl is None:
+        del wanted["ttl_days"]
+    else:
+        wanted["ttl_days"] = ttl
+    res, ev, got, row = _pp_kit(monkeypatch, wanted=wanted)
+    body = got["exchange"][0]["json"]
+    assert body["ttl_days"] == want_ttl and ("min_remaining_s" in body) == has_mr, body
+
+
+@pytest.mark.parametrize("spec, note", [
+    (None, "portal-pat:skipped-no-spec"),
+    ({"name": "hwax-risk", "audiences": ["mcp-gateway"], "scopes": ["read"]}, "portal-pat:skipped-bad-spec"),
+    ({"name": " ", "audiences": ["mcp-gateway"], "scopes": ["read"], "max_ttl_days": 90}, "portal-pat:skipped-bad-spec"),
+    ({**_PP_SPEC, "max_ttl_days": True}, "portal-pat:skipped-bad-spec"),
+    ({**_PP_SPEC, "scopes": "read"}, "portal-pat:skipped-bad-spec"),
+    ({**_PP_SPEC, "scopes": ["admin"]}, "portal-pat:skipped-no-scope"),
+    ({**_PP_SPEC, "audiences": ["heax-hub"]}, "portal-pat:skipped-no-audience"),
+])
+def test_명세가_없거나_겹침이_비면_교환하지_않고_앱에도_알리지_않는다(monkeypatch, spec, note):
+    """명세가 없으면 앱이 바란 그대로 보내지 않는다. 범위·청중 겹침이 비어도 포털을 부르지 않는다(넓히기로 거절될 뿐이다)."""
+    res, ev, got, row = _pp_kit(monkeypatch, spec=spec)
+    assert not res.isError and ev == ["mint", "call"], ev
+    assert row["note"] == note, row
 
 
 def test_앱이_바라지_않으면_교환하지_않는다(monkeypatch):

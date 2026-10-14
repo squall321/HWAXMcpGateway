@@ -648,6 +648,11 @@ if e.get("HWAXRISK_SSO_SECRET"):
     _hr_sso = per_user["hwax_risk"]["sso_url"]
     _hr_ppu = e.get("HWAXRISK_PORTAL_PAT_URL") or (
         _hr_sso[:-len("/api/auth/sso")] + "/api/auth/portal-pat" if _hr_sso.endswith("/api/auth/sso") else "")
+    # 교환 본문의 상한 — 게이트웨이는 앱이 무엇을 바라든 이 안에서만 교환을 청한다(이 칸이 없으면 건너뛴다). 앱의 바람
+    # (HWAXRisk routes.PORTAL_PAT_WANTED)과 같은 값이고, 청중 step-forge 는 위임 캡처의 REST 다리 몫이다(context-notes C-10).
+    # portal_pat_url 과 같이 항목을 다시 쓸 때마다 적는다 — 비밀 없이 이어받는 실행은 직전 항목을 칸째 이어받는다.
+    per_user["hwax_risk"]["portal_pat_spec"] = {"name": "hwax-risk", "audiences": ["mcp-gateway", "step-forge"],
+                                                "scopes": ["read"], "max_ttl_days": 90}
     if _hr_ppu:
         per_user["hwax_risk"]["portal_pat_url"] = _hr_ppu
     else:

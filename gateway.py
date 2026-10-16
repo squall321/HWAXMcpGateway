@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+from array import array
 from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -109,14 +110,16 @@ def _bypass_proxy_for(urls) -> list[str]:
 
 GW, BACKENDS, REST, PORTAL, HEAX = _load_config()
 # 클라이언트를 하나라도 만들기 **전에** 환경을 세운다. 게이트웨이가 직접 부르는 주소 전부다 — 백엔드 · 사람별 위임(sso_url·portal_pat_url) ·
-# REST 사이트 · 포털 · heax 레지스트리(앱 주소는 base + 경로라 base 하나로 덮인다. 뒤늦게 발견되는 앱은 _discover_heax 가 더한다).
+# REST 사이트 · 포털 · heax 레지스트리(앱 주소는 base + 경로라 base 하나로 덮인다. 뒤늦게 발견되는 앱은 _discover_heax 가 더한다) ·
+# search_tools 의미 순위의 임베더(켰을 때만 — TOOL_SEARCH_EMBED_URL 은 아래에서 같은 env 를 읽는다).
 if not _bypass_proxy_for(
         [v.get("url") for v in BACKENDS.values()]
         + [v.get(k) for v in (HEAX.get("per_user_sso") or {}).values() if isinstance(v, dict)
            for k in ("sso_url", "portal_pat_url")]
         + [v.get("base") for v in REST.values() if isinstance(v, dict)]
         + [PORTAL.get(k) for k in ("api_base", "jwks_url", "revoked_url")]
-        + [HEAX.get(k) for k in ("servers_url", "base")]):
+        + [HEAX.get(k) for k in ("servers_url", "base")]
+        + [os.environ.get("GATEWAY_TOOL_SEARCH_EMBED_URL")]):
     log.info("NO_PROXY — 더할 내부 목적지가 없다(이미 들어 있거나 `*`)")
 GW_TOKEN = GW["token"]
 HOST = GW.get("host", "127.0.0.1")
@@ -881,6 +884,8 @@ async def _aggregate():
         _arg_score_refresh()
     except Exception as exc:  # noqa: BLE001
         log.warning("인자 설명 점수판을 세지 못했다 — 카탈로그는 그대로 낸다: %r", exc)
+    # search_tools 의미 순위의 색인 — 켜져 있을 때만, 뒤에서 돈다(재집계도 검색도 기다리게 하지 않는다).
+    _tool_index_schedule()
 
 
 HEAX_PREFIX = "heax-"  # 자동탐지된 heax-hub MCP 앱 백엔드 키 프리픽스
@@ -1932,6 +1937,150 @@ _INVOKE_DENY_EXACT = frozenset({
 })
 
 
+# ── search_tools 의미 순위(선택, 기본 꺼짐) ─────────────────────────────────────────
+# 부분문자열 순위에 AIDataHub 임베딩 순위를 RRF 로 **더한다**(갈아 끼우지 않는다). 한국어 업무어는 조사 탓에 낱말 경계가 흐려
+# 부분문자열이 이기는 사례가 있어, 임베딩으로 바꾸면 그것을 잃는다(HWAXPortal docs/improvement-1015 §2 4).
+#  · 켜기 — GATEWAY_TOOL_SEARCH_EMBED_URL 에 AIDataHub `/api/embed` 의 주소. 비면 꺼짐이고, 그때 search_tools 의 답은 종전과
+#    바이트 단위로 같으며 임베더를 부르지도 않는다(시험이 건다).
+#  · e5 의 `query: `·`passage: ` 접두는 AIDataHub 가 kind 를 보고 붙인다 — 여기서 붙이면 두 번 붙는다.
+#  · 순위만 쓴다. 코사인 값으로 거르거나 섞지 않는다 — e5 는 무관한 문장끼리도 0.89 남짓이라 절대값에 뜻이 없다.
+#  · 색인 — 도구마다 '앱 라벨 · 이름: 설명' 글의 sha256 을 열쇠로 벡터를 둔다. 재집계 뒤 뒤에서 새 글만 임베딩하고 사라진 글의
+#    벡터는 버린다. 검색은 색인을 기다리지 않는다.
+#  · 못 섞으면(색인이 덜 찼거나 임베더가 오류·시간 초과) 그 호출은 부분문자열 순위로 답하고 결과의 mode·mode_reason 이 말한다.
+#  · 호출 수 가중은 없다 — 게이트웨이는 도구별 호출 수를 세어 두지 않는다(감사 원장에 줄로만 남는다).
+# 평가셋·견주기 러너·결과는 tool_search_eval/ 에 있다.
+TOOL_SEARCH_EMBED_URL = os.environ.get("GATEWAY_TOOL_SEARCH_EMBED_URL", "").strip()
+# 질의 한 건의 임베딩 한도(초) — 넘으면 그 호출은 부분문자열 순위로 답한다. 실측은 tool_search_eval/README.md.
+TOOL_SEARCH_EMBED_TIMEOUT_S = float(os.environ.get("GATEWAY_TOOL_SEARCH_EMBED_TIMEOUT", "2"))
+if TOOL_SEARCH_EMBED_TIMEOUT_S <= 0:
+    # 다른 시간 한도와 같은 규칙이다 — 0 은 '끔' 이 아니라 매 검색의 즉시 강등이다. 끄는 길은 주소를 비우는 것 하나다.
+    log.warning("GATEWAY_TOOL_SEARCH_EMBED_TIMEOUT=%g 는 따르지 않는다 — 0 이하는 '끔' 이 아니라 매 검색의 즉시 강등이다"
+                "(끄려면 GATEWAY_TOOL_SEARCH_EMBED_URL 을 비운다). 기본값 2 로 돈다", TOOL_SEARCH_EMBED_TIMEOUT_S)
+    TOOL_SEARCH_EMBED_TIMEOUT_S = 2.0
+_TOOL_RRF_K = 60            # RRF 상수 — 관례값이고 에이전트 서버 `_rrf` 와 같다
+_TOOL_EMBED_DEPTH = 20      # 임베딩 순위로만 후보에 드는 깊이 — limit 상한과 같다. 순위로 자르는 것이지 코사인 문턱이 아니다
+_TOOL_EMBED_BATCH = 64      # 색인 요청 하나의 글 수 — 에이전트 서버 EMBED_BATCH 와 같다(GPU 가 붐빌 때 큰 묶음이 터졌다)
+_TOOL_EMBED_INDEX_TIMEOUT_S = 120.0     # 색인 요청 하나의 한도 — dev 실측(CPU 임베딩) 64개 8~13초
+_TOOL_VEC: dict[str, tuple[array, float]] = {}     # 글 sha256 → (벡터, 노름). float 객체 목록의 4분의 1 크기다
+_TOOL_VEC_JOB = {"running": False, "again": False}
+
+
+def _tool_doc(t: types.Tool) -> str:
+    """임베딩할 글 — '앱 라벨 · 이름: 설명'. 설명은 자르지 않는다 — 모델 입력 한도(e5 512 토큰)에서 넘친 수는 색인 줄이 말한다."""
+    return f"{_app_meta(route.get(t.name, ('_gateway',))[0])['label']} · {t.name}: {(t.description or '').strip()}"
+
+
+def _doc_key(doc: str) -> str:
+    return hashlib.sha256(doc.encode("utf-8")).hexdigest()
+
+
+async def _embed_texts(texts: list[str], kind: str, timeout_s: float) -> tuple[list[list[float]], int]:
+    """AIDataHub `/api/embed` — (벡터들, 모델 입력 한도를 넘은 글 수). 꼴이 틀린 답은 예외다(조용히 빈 순위가 되지 않게)."""
+    async with httpx.AsyncClient(timeout=timeout_s) as cli:
+        resp = await cli.post(TOOL_SEARCH_EMBED_URL, json={"texts": texts, "kind": kind})
+    resp.raise_for_status()
+    body = resp.json()
+    raw = body.get("vectors") if isinstance(body, dict) else None
+    if not isinstance(raw, list) or len(raw) != len(texts):
+        raise ValueError(f"임베더 답의 vectors 가 글 {len(texts)}개와 맞지 않는다")
+    vecs = [[float(x) for x in v] for v in raw]
+    if any(not v or len(v) != len(vecs[0]) for v in vecs):
+        raise ValueError("임베더 답의 벡터 길이가 고르지 않다")
+    return vecs, len(body.get("over_limit") or [])
+
+
+def _tool_index_schedule() -> None:
+    """켜져 있으면 색인 갱신을 뒤에서 건다 — 재집계 끝과, 색인이 덜 찬 것을 본 검색이 부른다. 수명주기 밖(시험·평가 러너)에서는
+    아무것도 하지 않는다 — 그쪽은 `_tool_index_refresh` 를 직접 기다린다."""
+    tg = _task_group_holder.get("tg")
+    if TOOL_SEARCH_EMBED_URL and tg is not None:
+        tg.start_soon(_tool_index_refresh)
+
+
+async def _tool_index_refresh() -> None:
+    """색인을 지금 카탈로그(백엔드 도구 + 로컬 도구)에 맞춘다 — 새 글만 임베딩하고 사라진 글의 벡터는 버린다. 한 번에 하나만 돈다
+    (도는 중에 또 불리면 끝난 뒤 한 번 더 돈다). 실패는 경고 한 줄이다 — 검색은 부분문자열로 답하고 다음 검색이 다시 건다."""
+    if _TOOL_VEC_JOB["running"]:
+        _TOOL_VEC_JOB["again"] = True
+        return
+    _TOOL_VEC_JOB["running"] = True
+    try:
+        while True:
+            _TOOL_VEC_JOB["again"] = False
+            docs = {_doc_key(d): d for d in (_tool_doc(t) for t in list(exposed_tools) + _local_tools())}
+            for k in [k for k in _TOOL_VEC if k not in docs]:
+                del _TOOL_VEC[k]
+            todo = [(k, d) for k, d in docs.items() if k not in _TOOL_VEC]
+            t0, over = time.monotonic(), 0
+            for i in range(0, len(todo), _TOOL_EMBED_BATCH):
+                part = todo[i:i + _TOOL_EMBED_BATCH]
+                with anyio.fail_after(_TOOL_EMBED_INDEX_TIMEOUT_S):
+                    vecs, n_over = await _embed_texts([d for _, d in part], "passage", _TOOL_EMBED_INDEX_TIMEOUT_S)
+                over += n_over
+                for (k, _), v in zip(part, vecs):
+                    _TOOL_VEC[k] = (array("d", v), sum(x * x for x in v) ** 0.5 or 1.0)
+            if todo:
+                log.info("search_tools 의미 색인 — 도구 %d개 중 %d개를 새로 임베딩했다(%.1f초). 그중 %d개는 모델 입력 한도를 넘어 "
+                         "설명 뒤쪽이 벡터에 들지 않았다", len(docs), len(todo), time.monotonic() - t0, over)
+            if not _TOOL_VEC_JOB["again"]:
+                return
+    except Exception as exc:  # noqa: BLE001 — 색인 실패가 게이트웨이를 흔들면 안 된다
+        log.warning("search_tools 의미 색인을 채우지 못했다 — 검색은 부분문자열 순위로 답하고 다음 검색이 다시 건다: %r", exc)
+    finally:
+        _TOOL_VEC_JOB["running"] = False
+
+
+async def _tool_embed_order(raw_q: str, tools: list[types.Tool]) -> tuple[list[types.Tool] | None, str]:
+    """도구를 질의와의 코사인 내림차순(같으면 이름 차례)으로 — (순서, '') 또는 못 하면 (None, 까닭). 값은 버리고 순서만 낸다."""
+    keyed = [(t, _doc_key(_tool_doc(t))) for t in tools]
+    if not keyed or any(k not in _TOOL_VEC for _, k in keyed):
+        _tool_index_schedule()
+        return None, "도구 색인이 아직 다 차지 않았다(뒤에서 채우는 중)"
+    try:
+        with anyio.fail_after(TOOL_SEARCH_EMBED_TIMEOUT_S):
+            (qv,), _ = await _embed_texts([raw_q], "query", TOOL_SEARCH_EMBED_TIMEOUT_S)
+    except (TimeoutError, httpx.TimeoutException):
+        log.warning("search_tools 임베더가 %g초 안에 답하지 않았다 — 이 검색은 부분문자열 순위로 답한다", TOOL_SEARCH_EMBED_TIMEOUT_S)
+        return None, f"임베더가 {TOOL_SEARCH_EMBED_TIMEOUT_S:g}초 안에 답하지 않았다(GATEWAY_TOOL_SEARCH_EMBED_TIMEOUT)"
+    except Exception as exc:  # noqa: BLE001 — 임베더가 무엇으로 실패하든 검색은 답한다
+        log.warning("search_tools 임베딩 실패 — 이 검색은 부분문자열 순위로 답한다: %r", exc)
+        return None, f"임베더 오류({type(exc).__name__})"
+    if any(len(_TOOL_VEC[k][0]) != len(qv) for _, k in keyed):
+        _TOOL_VEC.clear()                    # 임베더 모델이 바뀌었다 — 옛 벡터와는 견줄 수 없다
+        _tool_index_schedule()
+        return None, "임베더 차원이 색인과 다르다(모델이 바뀌었다 — 색인을 다시 채운다)"
+    qn = sum(x * x for x in qv) ** 0.5 or 1.0
+    sims = []
+    for t, k in keyed:
+        v, vn = _TOOL_VEC[k]
+        sims.append((sum(a * b for a, b in zip(qv, v)) / (qn * vn), t.name, t))
+    sims.sort(key=lambda s: (-s[0], s[1]))
+    return [t for _, _, t in sims], ""
+
+
+async def _tool_rank_fused(raw_q: str, rows: list, tools: list[types.Tool]) -> tuple[list, dict]:
+    """부분문자열 순위(rows — 정렬된 (점수, 이름, 앱, 설명, 도구))에 임베딩 순위를 RRF 로 섞는다 — (새 rows, 결과에 붙일 mode 칸).
+    · 후보 — 부분문자열이 맞힌 도구 전부 + 임베딩 순위 상위 _TOOL_EMBED_DEPTH 개(순위로 자른다 — 코사인 문턱이 아니다).
+    · 점수 — Σ 1/(k + 순위). 부분문자열 순위는 점수가 같으면 같은 순위로 친다 — 이름 차례가 섞기에 끼어들지 않게.
+    · 못 섞으면 rows 를 그대로 두고 까닭을 단다."""
+    order, why = await _tool_embed_order(raw_q, tools)
+    if order is None:
+        return rows, {"mode": "substring", "mode_reason": why}
+    lex, prev = {}, None
+    for i, r in enumerate(rows, 1):
+        lex[r[1]] = lex[prev[1]] if prev is not None and r[0] == prev[0] else i
+        prev = r
+    emb = {t.name: i for i, t in enumerate(order, 1)}
+    cand = {r[1]: r for r in rows}
+    for t in order[:_TOOL_EMBED_DEPTH]:
+        if t.name not in cand:
+            cand[t.name] = (0, t.name, route.get(t.name, ("_gateway",))[0], (t.description or "").strip(), t)
+    fused = [(1 / (_TOOL_RRF_K + emb[n]) + (1 / (_TOOL_RRF_K + lex[n]) if n in lex else 0.0), n, a, d, t)
+             for n, (_, _, a, d, t) in cand.items()]
+    fused.sort(key=lambda r: (-r[0], r[1]))
+    return fused, {"mode": "rrf"}
+
+
 SEARCH_TOOLS_TOOL = types.Tool(
     name="search_tools",
     description=(
@@ -1953,9 +2102,11 @@ SEARCH_TOOLS_TOOL = types.Tool(
 
 async def _search_tools(arguments: dict) -> types.CallToolResult:
     """도구 검색 안내대 — 351개 평면 노출의 선택 비용을 줄이는 입구(실측: 상위 40개가
-    호출의 79%, 30%는 한 번도 안 불림 — 롱테일은 검색으로 찾게 한다). 임베딩 없이
-    부분문자열 매칭(한국어는 조사 탓에 토큰 경계가 흐려 substring 이 더 잘 맞는다)."""
-    q = str((arguments or {}).get("query") or "").strip().lower()
+    호출의 79%, 30%는 한 번도 안 불림 — 롱테일은 검색으로 찾게 한다). 기본은 임베딩 없이
+    부분문자열 매칭(한국어는 조사 탓에 토큰 경계가 흐려 substring 이 더 잘 맞는다). 켜면 임베딩 순위를 RRF 로
+    더한다(TOOL_SEARCH_EMBED_URL — 기본 꺼짐)."""
+    raw_q = str((arguments or {}).get("query") or "").strip()     # 임베딩에는 대소문자를 살린 원문을 준다
+    q = raw_q.lower()
     limit = max(1, min(20, int((arguments or {}).get("limit") or 8)))
     if len(q) < 2:
         return types.CallToolResult(content=[types.TextContent(
@@ -1993,8 +2144,9 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
     }
     expand = {w: (w,) + tuple(s for k, ss in _SYN.items() if k in w for s in ss) for w in terms}
     groups = _request_groups()
+    visible = _visible_tools(groups)
     rows = []
-    for t in _visible_tools(groups):
+    for t in visible:
         name = t.name.lower()
         desc = (t.description or "").lower()
         app = route.get(t.name, ("_gateway",))[0]
@@ -2013,6 +2165,10 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
             rows.append((score * (1 + covered / max(1, len(terms))),
                          t.name, app, (t.description or "").strip(), t))
     rows.sort(key=lambda r: (-r[0], r[1]))
+    # 의미 순위(선택) — 켜져 있으면 임베딩 순위를 RRF 로 섞는다. 꺼져 있으면 이 아래는 종전과 한 글자도 다르지 않다.
+    mode = None
+    if TOOL_SEARCH_EMBED_URL:
+        rows, mode = await _tool_rank_fused(raw_q, rows, visible)
 
     def _args_summary(t) -> dict:
         """invoke_tool 로 바로 부를 수 있게 인자 계약을 붙인다 — 이게 없으면 모델이
@@ -2036,7 +2192,11 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
     # ⚠ 순서가 뜻이다 — 이름 순위·안내를 먼저, 설명·스키마 전문(matches)을 맨 뒤에 둔다. 작은 창의 소비자(dev 웹 챗
     #   TOOL_RESULT_MAX=6,000)는 앞에서부터 글자로 자르므로, 전문이 앞서면 6~8위 도구는 이름조차 사라져 '없다' 로 읽혔다(gw-adh GA-7,
     #   리스크 앱 도구 실측 8건 7,000~8,400자). 게이트웨이는 자르지 않는다 — 잘려도 순위가 남게 놓을 뿐이다.
-    payload = {"query": q, "match_count": len(rows), "ranked": [m["tool"] for m in matches]}
+    payload = {"query": q}
+    if mode:
+        payload.update(mode)        # 어느 순위로 답했나 — rrf, 또는 못 섞었으면 substring 과 그 까닭(mode_reason)
+    payload["match_count"] = len(rows)
+    payload["ranked"] = [m["tool"] for m in matches]
     if len(rows) > limit:
         # 순위 목록이라 건수는 둔다 — 다만 더 맞은 도구가 있다는 것을 match_count 숫자로만 두지 않는다.
         payload["truncated"] = (f"{len(rows)}건 중 상위 {limit}건만 보였다 — limit 를 올리거나(최대 20) 질의를 좁혀라. "
@@ -4312,6 +4472,9 @@ def main():
     for app in _portal_pat_misconfigured():
         log.warning("per_user_sso.%s 에 portal_pat_url 은 있는데 portal_pat_spec 이 없거나 꼴이 틀렸다 — 그 앱의 Claude 길 PAT 자동 등록이"
                     " 꺼진다. provision-config.sh 를 그 앱의 비밀과 함께 다시 돌린다(HWAXPortal docs/risk-credentials C-18)", app)
+    if TOOL_SEARCH_EMBED_URL:
+        log.info("search_tools 의미 순위 켬 — 임베더 %s · 질의 한도 %g초(GATEWAY_TOOL_SEARCH_EMBED_URL·_TIMEOUT). 색인은 재집계 "
+                 "뒤 뒤에서 채우고, 그 전과 임베더 실패 때는 부분문자열 순위로 답한다", TOOL_SEARCH_EMBED_URL, TOOL_SEARCH_EMBED_TIMEOUT_S)
     # streamable_http_app 의 lifespan 은 세션매니저 run() 만 돈다. 백엔드 집계 lifespan 을 함께 묶는다.
     sm_lifespan = star.router.lifespan_context
 

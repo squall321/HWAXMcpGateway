@@ -5411,6 +5411,7 @@ def _fresh_scores(monkeypatch):
     """점수판·'이미 본 앱' 은 프로세스 상태다 — 시험마다 새로 두고, 로컬 도구 수가 설정에 따라 달라지지 않게 REST 를 비운다."""
     monkeypatch.setattr(gw, "_ARG_SCORE", {})
     monkeypatch.setattr(gw, "_ARG_JUDGED", set())
+    monkeypatch.setattr(gw, "_ARG_BOOTED", False)
     monkeypatch.setattr(gw, "ARG_DESC_WARN_RATIO", 0.3)
     monkeypatch.setattr(gw, "REST", {})
     monkeypatch.setattr(gw, "POLICY", {})
@@ -5526,8 +5527,9 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
 
 
 def test_기준_미만으로_처음_붙는_앱만_한_번_경고하고_막지_않는다(monkeypatch, caplog, _fresh_scores):
-    """앱이 이 프로세스에 처음 붙을 때 설명 비율이 기준 **미만**이면 한 줄 — 앱 이름·비율·가장 나쁜 도구를 말한다. 같은 앱은
-    다시 말하지 않고(재집계는 60초마다 돈다), 기준과 같으면 말하지 않으며, 0 이면 끈다. 도구는 막지도 숨기지도 않는다."""
+    """기동(첫 재집계) 때는 기준 **미만** 앱 수를 요약 한 줄로 — 거의 모든 앱이 기준 아래라 앱마다 한 줄이면 기동마다 열댓 줄이 쌓인다.
+    그 뒤 새로 붙는 앱은 붙을 때 한 줄(앱 이름·비율·가장 나쁜 도구). 같은 앱은 다시 말하지 않고(재집계는 60초마다 돈다), 기준과
+    같으면 말하지 않으며, 0 이면 끈다. 도구는 막지도 숨기지도 않는다."""
     low = [_stool("low_big", {**{f"a{i}": None for i in range(9)}, "z": "설명"}), _stool("low_small", {"q": None})]
     edge = [_stool("edge_t", {f"a{i}": ("설명" if i < 3 else None) for i in range(10)})]     # 정확히 30%
     good = [_stool("good_t", {"a": "설명", "b": None})]
@@ -5542,8 +5544,8 @@ def test_기준_미만으로_처음_붙는_앱만_한_번_경고하고_막지_�
         _aggregate_tools(monkeypatch, spec)
         first = warned()
         assert len(first) == 1, first
-        assert "— low 의 인자 11개 가운데 설명 있는 것이 1개(9.1%)로 기준 30% 미만" in first[0], first[0]
-        assert "가장 나쁜 도구는 low_big(인자 10개 중 설명 1개)" in first[0], first[0]
+        assert "기동 때 붙은 앱 4개 가운데 1개가 기준 30% 미만" in first[0], first[0]      # low · edge · good · _gateway
+        assert "/tools-map 의 arg_scores" in first[0] and "— low 의" not in first[0], first[0]
         assert {"low_big", "low_small"} <= set(gw.route), "경고한 앱의 도구를 숨겼다"
         assert {"low_big", "low_small"} <= {t.name for t in gw._visible_tools([])}
 
@@ -5553,10 +5555,21 @@ def test_기준_미만으로_처음_붙는_앱만_한_번_경고하고_막지_�
 
         caplog.clear()
         _aggregate_tools(monkeypatch, {**spec, "late": [_stool("late_t", {"x": None, "y": None})]})
-        assert len(warned()) == 1 and "— late 의" in warned()[0], "나중에 붙은 앱은 붙을 때 한 번 말한다"
+        assert len(warned()) == 1 and "— late 의 인자 2개 가운데 설명 있는 것이 0개(0.0%)로 기준 30% 미만" in warned()[0], \
+            "나중에 붙은 앱은 붙을 때 한 번, 앱 이름과 비율로 말한다"
+        assert "가장 나쁜 도구는 late_t(인자 2개 중 설명 0개)" in warned()[0], warned()[0]
 
         caplog.clear()
         monkeypatch.setattr(gw, "_ARG_JUDGED", set())
+        monkeypatch.setattr(gw, "_ARG_BOOTED", True)
+        _aggregate_tools(monkeypatch, spec)
+        later = warned()
+        assert len(later) == 1 and "— low 의 인자 11개 가운데 설명 있는 것이 1개(9.1%)로 기준 30% 미만" in later[0], later
+        assert "가장 나쁜 도구는 low_big(인자 10개 중 설명 1개)" in later[0], later[0]
+
+        caplog.clear()
+        monkeypatch.setattr(gw, "_ARG_JUDGED", set())
+        monkeypatch.setattr(gw, "_ARG_BOOTED", False)
         monkeypatch.setattr(gw, "ARG_DESC_WARN_RATIO", 0.0)
         _aggregate_tools(monkeypatch, spec)
         assert warned() == [], "0 이면 경고가 꺼진다"

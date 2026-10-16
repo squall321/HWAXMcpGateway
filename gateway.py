@@ -700,6 +700,7 @@ _ARG_UNIT_RANGE_RE = re.compile(
 _ARG_BOUND_KEYS = ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum")
 _ARG_SCORE: dict = {}             # 마지막 재집계의 점수판 — `/tools-map` 이 그대로 싣는다
 _ARG_JUDGED: set[str] = set()     # 이 프로세스에서 이미 기준을 본 앱(경고는 처음 붙을 때 한 번)
+_ARG_BOOTED = False               # 첫 재집계(기동)를 지났나 — 기동 때는 요약 한 줄, 그 뒤 새로 붙는 앱만 한 줄씩
 
 
 def _arg_schema_range(prop: dict) -> bool:
@@ -771,17 +772,28 @@ def _arg_score_refresh() -> None:
                             + [("_gateway", t) for t in _local_tools()])
     _ARG_SCORE.clear()
     _ARG_SCORE.update(board)
-    for row in board["apps"]:
-        if row["app"] in _ARG_JUDGED:
-            continue
-        _ARG_JUDGED.add(row["app"])
-        if row["args"] and row["described"] / row["args"] < ARG_DESC_WARN_RATIO:
-            w = row["worst"][0] if row["worst"] else {"tool": "(없음)", "args": 0, "described": 0}
-            log.warning("인자 설명 부족 — %s 의 인자 %d개 가운데 설명 있는 것이 %d개(%.1f%%)로 기준 %.0f%% 미만이다. "
-                        "가장 나쁜 도구는 %s(인자 %d개 중 설명 %d개). 막지도 숨기지도 않는다 — 앱이 "
-                        "inputSchema.properties[].description 을 채우면 오른다(GATEWAY_ARG_DESC_WARN_RATIO · /tools-map 의 arg_scores)",
-                        row["app"], row["args"], row["described"], 100 * row["described"] / row["args"],
-                        100 * ARG_DESC_WARN_RATIO, w["tool"], w["args"], w["described"])
+    global _ARG_BOOTED
+    new = [r for r in board["apps"] if r["app"] not in _ARG_JUDGED]
+    _ARG_JUDGED.update(r["app"] for r in new)
+    below = [r for r in new if r["args"] and r["described"] / r["args"] < ARG_DESC_WARN_RATIO]
+    if not _ARG_BOOTED:
+        # 기동(첫 재집계) — 거의 모든 앱이 기준 아래인 지금(2026-09 실측 1%) 앱마다 한 줄씩 쏟으면 기동마다 열댓 줄이 같은 말이라
+        # 아무도 안 읽는다. 요약 한 줄만 내고, 기동 뒤에 새로 붙는 앱만 한 줄씩 말한다(제안 6 '새 앱이 붙을 때').
+        _ARG_BOOTED = True
+        if below:
+            t = board["total"]
+            log.warning("인자 설명 부족 — 기동 때 붙은 앱 %d개 가운데 %d개가 기준 %.0f%% 미만이다(전체 인자 %d개 중 설명 %d개, %.1f%%). "
+                        "앱별 점수와 가장 나쁜 도구는 /tools-map 의 arg_scores — 막지도 숨기지도 않는다(GATEWAY_ARG_DESC_WARN_RATIO)",
+                        len(new), len(below), 100 * ARG_DESC_WARN_RATIO, t["args"], t["described"],
+                        100 * t["described"] / t["args"] if t["args"] else 0.0)
+        return
+    for row in below:
+        w = row["worst"][0] if row["worst"] else {"tool": "(없음)", "args": 0, "described": 0}
+        log.warning("인자 설명 부족 — %s 의 인자 %d개 가운데 설명 있는 것이 %d개(%.1f%%)로 기준 %.0f%% 미만이다. "
+                    "가장 나쁜 도구는 %s(인자 %d개 중 설명 %d개). 막지도 숨기지도 않는다 — 앱이 "
+                    "inputSchema.properties[].description 을 채우면 오른다(GATEWAY_ARG_DESC_WARN_RATIO · /tools-map 의 arg_scores)",
+                    row["app"], row["args"], row["described"], 100 * row["described"] / row["args"],
+                    100 * ARG_DESC_WARN_RATIO, w["tool"], w["args"], w["described"])
 
 
 async def _aggregate():

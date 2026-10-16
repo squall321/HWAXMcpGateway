@@ -162,7 +162,7 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 - 단위·범위 있음은 설명이 있고, 그 글에 단위(`mm`·`MPa`·`Hz`·`%`·`°`, 숫자 뒤의 `N`·`s`·`초`·`분` 등)나 범위(`범위`·`이상`·`이하`·`최소`·`최대`·`min`·`max`·`between`·`default`, 숫자에 붙은 부등호·`1~10`)가 들었거나 스키마가 `enum`·숫자 경계(`minimum`·`maximum`·`exclusive*`)를 가질 때다. 낱말의 정본은 `gateway.py` 의 `_ARG_UNIT_RANGE_RE` 다. 설명 없는 인자는 세지 않으므로 이 수는 설명 있음을 넘지 않는다.
 - 게이트웨이 로컬 도구는 `_gateway` 앱으로 센다 — tools/list 가 붙이는 목록(`_local_tools`) 그대로라 REST 다리 둘은 사이트가 있을 때만 들어간다.
 - 모양은 `{threshold, total: {apps, tools, args, described, unit_or_range, described_ratio, unit_or_range_ratio}, apps: [{app, tools, args, described, unit_or_range, described_ratio, unit_or_range_ratio, worst: [{tool, args, described}]}]}` 다. 앱은 설명 비율이 낮은 순(같으면 설명 없는 인자가 많은 순)이고 인자가 없는 앱(비율 `null`)은 맨 뒤다. `worst` 는 앱마다 최대 다섯 — 설명 없는 인자가 많은 순(같으면 인자가 많은 순)이고 설명이 다 있는 도구는 싣지 않는다. 수만 싣는다(인자 이름·설명·값은 없다).
-- 앱이 이 프로세스에 처음 붙을 때 설명 비율이 `GATEWAY_ARG_DESC_WARN_RATIO`(기본 0.3) **미만**이면 로그에 `인자 설명 부족 — <앱> 의 …` 한 줄이 남는다(앱 이름·비율·가장 나쁜 도구). 앱마다 프로세스당 한 번이고, 재프로비저닝은 게이트웨이를 다시 띄우므로 그때 다시 본다. 0 이면 끈다.
+- 기준은 `GATEWAY_ARG_DESC_WARN_RATIO`(기본 0.3, **미만**이면 부족 · 0 이면 끈다)다. 기동(첫 재집계) 때는 기준 미만 앱 수를 요약 한 줄(`인자 설명 부족 — 기동 때 붙은 앱 N개 가운데 M개가 …`)로만 남긴다 — 거의 모든 앱이 기준 아래라 앱마다 한 줄이면 기동마다 열댓 줄이 쌓인다. 기동 뒤 새로 붙는 앱은 붙을 때 한 줄(`인자 설명 부족 — <앱> 의 …`, 앱 이름·비율·가장 나쁜 도구)이다. 앱마다 프로세스당 한 번이고, 재프로비저닝은 게이트웨이를 다시 띄우므로 그때 다시 본다.
 
 ## 실행
 ```bash

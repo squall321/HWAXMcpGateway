@@ -15,3 +15,5 @@ gateway_config.json.bak-*
 *.pre-move-*
 # 포털 권한 정책 캐시(포털이 잠깐 죽어도 직전 정책으로 돈다) — 실행 산출물
 .access_policy_cache.json
+# search_tools 평가 러너의 로컬 파일 — 카탈로그 스냅샷(내부 도구 설명 전문)·실사용 질의는 추적하지 않는다(tool_search_eval/README.md)
+tool_search_eval/*.local.*

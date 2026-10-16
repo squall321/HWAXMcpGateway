@@ -5597,3 +5597,461 @@ def test_점수판이_터져도_재집계는_막지_않는다(monkeypatch, caplo
         _aggregate_tools(monkeypatch, {"sf": [_stool("sf_q", {"q": None})]})
     assert "sf_q" in gw.route, "점수판이 카탈로그를 막았다"
     assert any("인자 설명 점수판을 세지 못했다" in r.getMessage() for r in caplog.records)
+
+
+# ── search_tools 의미 순위(선택, 기본 꺼짐) — 부분문자열 순위에 임베딩 순위를 RRF 로 더한다(HWAXPortal docs/improvement-1015 §2 4) ──
+# 꺼져 있으면 답이 종전과 바이트 단위로 같아야 하고, 켜져 있어도 임베더가 죽거나 느리면 그 호출은 종전 순위로 답한다.
+# 순위만 쓴다 — 코사인 값으로 거르지 않는다(e5 는 무관한 문장끼리도 0.89 남짓이다).
+@pytest.fixture(autouse=True)
+def _tool_search_embed_off(monkeypatch):
+    """의미 순위는 시험마다 끈 채로 시작한다 — 시험을 돌리는 셸에 GATEWAY_TOOL_SEARCH_EMBED_URL 이 있어도 다른 search_tools 시험이
+    임베더를 부르지 않게. 켜는 시험은 본문에서 다시 건다. 색인과 갱신 상태도 시험마다 새것이다."""
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "")
+    monkeypatch.setattr(gw, "_TOOL_VEC", {})
+    monkeypatch.setattr(gw, "_TOOL_VEC_JOB", {"running": False, "again": False})
+
+
+# master 303f023 의 `_search_tools` 원문 그대로다(고치지 않는다) — 옵션을 끈 답이 이것과 바이트 단위로 같아야 한다.
+_SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.CallToolResult:
+    """도구 검색 안내대 — 351개 평면 노출의 선택 비용을 줄이는 입구(실측: 상위 40개가
+    호출의 79%, 30%는 한 번도 안 불림 — 롱테일은 검색으로 찾게 한다). 임베딩 없이
+    부분문자열 매칭(한국어는 조사 탓에 토큰 경계가 흐려 substring 이 더 잘 맞는다)."""
+    q = str((arguments or {}).get("query") or "").strip().lower()
+    limit = max(1, min(20, int((arguments or {}).get("limit") or 8)))
+    if len(q) < 2:
+        return types.CallToolResult(content=[types.TextContent(
+            type="text", text='{"error": "query 를 2자 이상 주세요"}')], isError=True)
+    terms = [w for w in re.split(r"[\s,;·/()\[\]{}\"']+", q) if len(w) >= 2]
+    # 도구 이름이 전부 영어라 한국어 질의가 이름을 못 맞힌다 — 도메인 동의어로 넓힌다.
+    # (조사가 붙어도 substring 이라 '보고서를'→'보고서' 매칭은 된다.)
+    _SYN = {
+        "보고서": ("report",), "리포트": ("report",), "요약": ("digest", "summary"),
+        "검색": ("search",), "조회": ("get", "list", "search"), "목록": ("list",),
+        "물성": ("material", "property"), "재료": ("material",), "곡선": ("curve",),
+        "잡": ("job",), "작업": ("job",), "상태": ("status", "health"),
+        "슬럼": ("slurm",), "슬럼잡": ("slurm",), "클러스터": ("cluster",),
+        "메쉬": ("mesh",), "메시": ("mesh",), "형상": ("geometry", "shape"),
+        "시험": ("test",), "측정": ("measure",), "업로드": ("upload",),
+        "그래프": ("plot", "chart"), "차트": ("chart", "plot"), "그림": ("plot", "render"),
+        "템플릿": ("template",), "초안": ("draft",), "전문가": ("agent", "expert"),
+        "부품": ("part",), "적층": ("laminate",), "대화": ("conversation",),
+        # 낙하/충격 리포트(DynaForge) 계열 — 도구 이름이 report_angle_stats·report_part_energy·
+        # report_scatter·report_geometry·report_upload_instructions 라 한국어 업무어가 이름을 못 맞힌다.
+        "낙하": ("drop", "impact", "sphere"), "충격": ("impact",), "전각도": ("sphere", "angle"),
+        "방향": ("angle", "direction", "scatter"), "각도": ("angle",), "산포": ("scatter",),
+        "에너지": ("energy",), "소성": ("plastic", "strain"), "변형률": ("strain",),
+        "응력": ("stress",), "속도": ("velocity",), "인테이크": ("intake", "upload"),
+        "반입": ("intake", "upload"), "시각화": ("geometry", "render"),
+        # 심의 계열 — 도구 이름이 deliberate_* 라 한국어 업무 낱말이 이름을 못 맞힌다.
+        # 앱 설명만으로는 app_hit 가산점뿐이라 다른 앱에 밀린다(실측: '안 선택' 이 물성·VOC 에 밀림).
+        # 이름까지 맞히게 이어 준다 — 한 글자 토큰('안')은 위에서 이미 버려지므로 두 글자 이상만.
+        "심의": ("deliberate",), "토의": ("deliberate",), "심사": ("deliberate", "risk"),
+        "규명": ("deliberate",), "원인": ("deliberate",), "불량": ("deliberate",),
+        "선택": ("deliberate",), "대안": ("deliberate",), "판정": ("deliberate",),
+        "신뢰": ("deliberate",), "리스크": ("deliberate", "risk"), "위험": ("deliberate", "risk"),
+        "도출": ("deliberate",), "설계": ("deliberate",), "계획": ("deliberate", "plan"),
+        "전문가심의": ("deliberate",), "회의": ("deliberate", "meeting"),
+    }
+    expand = {w: (w,) + tuple(s for k, ss in _SYN.items() if k in w for s in ss) for w in terms}
+    groups = _request_groups()
+    rows = []
+    for t in _visible_tools(groups):
+        name = t.name.lower()
+        desc = (t.description or "").lower()
+        app = route.get(t.name, ("_gateway",))[0]
+        meta = _app_meta(app) if app != "_gateway" else {"label": "gateway", "description": ""}
+        hay_app = (str(meta.get("label") or "") + " " + str(meta.get("description") or "")).lower()
+        score, covered = 0, 0
+        for w, variants in expand.items():
+            name_hit = any(v in name for v in variants)
+            desc_freq = max(min(desc.count(v), 3) for v in variants)
+            app_hit = any(v in hay_app for v in variants)
+            if name_hit or desc_freq or app_hit:
+                covered += 1
+                score += 4 * name_hit + desc_freq + app_hit
+        if score > 0:
+            # 커버리지 승수 — 질의어를 더 많이 맞힌 도구가 개별 단어 빈도보다 앞선다.
+            rows.append((score * (1 + covered / max(1, len(terms))),
+                         t.name, app, (t.description or "").strip(), t))
+    rows.sort(key=lambda r: (-r[0], r[1]))
+
+    def _args_summary(t) -> dict:
+        """invoke_tool 로 바로 부를 수 있게 인자 계약을 붙인다 — 이게 없으면 모델이
+        스키마를 추측해 넣는다(범용 실행기의 최대 실패 모드).
+
+        ⚠ 요약하지 않는다. 종전엔 인자 12개까지·`type` 만 남겼다 — 13번째부터는 안 보였고(deliberate_start 의
+        save_report·advanced), `anyOf` 인자는 type 이 없어 `any` 로 보였으며 enum·default·설명도 빠졌다. 설명도 220자에서
+        잘라 docstring 의 인자 설명(job 의 값 목록)이 사라졌다. 운영 창이 1,048,576 토큰이라 결과 8~20건의 전체 스키마는
+        묶이지 않는다. 작은 창의 소비자(에이전트 서버 웹 챗)는 자기 쪽 상한(TOOL_RESULT_MAX)으로 자른다."""
+        sch = getattr(t, "inputSchema", None) or {}
+        out = {
+            "required": sch.get("required") or [],
+            "properties": sch.get("properties") or {},
+        }
+        # 모델 인자의 정의 — 속성이 `$ref` 로 가리키는 곳이다. 빼면 참조가 끊긴다(FastMCP 는 `$defs`, 옛 생성기는 `definitions`).
+        for k in ("$defs", "definitions"):
+            if sch.get(k):
+                out[k] = sch[k]
+        return out
+    matches = [{"tool": n, "app": a, "description": d, "args": _args_summary(t)} for _, n, a, d, t in rows[:limit]]
+    # ⚠ 순서가 뜻이다 — 이름 순위·안내를 먼저, 설명·스키마 전문(matches)을 맨 뒤에 둔다. 작은 창의 소비자(dev 웹 챗
+    #   TOOL_RESULT_MAX=6,000)는 앞에서부터 글자로 자르므로, 전문이 앞서면 6~8위 도구는 이름조차 사라져 '없다' 로 읽혔다(gw-adh GA-7,
+    #   리스크 앱 도구 실측 8건 7,000~8,400자). 게이트웨이는 자르지 않는다 — 잘려도 순위가 남게 놓을 뿐이다.
+    payload = {"query": q, "match_count": len(rows), "ranked": [m["tool"] for m in matches]}
+    if len(rows) > limit:
+        # 순위 목록이라 건수는 둔다 — 다만 더 맞은 도구가 있다는 것을 match_count 숫자로만 두지 않는다.
+        payload["truncated"] = (f"{len(rows)}건 중 상위 {limit}건만 보였다 — limit 를 올리거나(최대 20) 질의를 좁혀라. "
+                                "보이지 않는 도구가 없다는 뜻이 아니다.")
+    payload["note"] = ("여기 나온 도구는 현재 목록에 없어도 invoke_tool(name, arguments) 로 즉시 "
+                       "호출할 수 있다(args 의 required 를 채워라). 원하는 게 없으면 질문을 바꿔 "
+                       "다시 검색하거나 list_tool_apps(app='<키>') 로 앱 상세를 보라.")
+    payload["matches"] = matches
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
+    )
+'''
+
+
+def _search_tools_master():
+    """원문을 게이트웨이 모듈의 이름공간에서 정의한다 — monkeypatch 한 카탈로그·요청 문맥을 지금 코드와 똑같이 본다."""
+    ns: dict = {}
+    exec(compile(_SEARCH_TOOLS_MASTER, "master:_search_tools", "exec"), gw.__dict__, ns)
+    return ns["_search_tools"]
+
+
+_SEARCH_SPECS = [
+    ("hwax-deliberation", "deliberate_start", "HWAX 전문가 심의를 시작한다 — 원인 규명·안 선택·리스크 심사·시험 계획."),
+    ("hwax-deliberation", "deliberate_status", "심의가 어디까지 갔는지 본다. 잡 상태와 라운드."),
+    ("heax-web_design_agents", "meeting_start", "회의를 생성한다 — 페르소나 회의체가 시나리오를 심의한다."),
+    ("signalforge", "search_voc", "키워드로 VOC 를 검색합니다. 한국어·영어 모두 가능합니다."),
+    ("signalforge", "get_top_issues", "제품에서 가장 많이 언급된 이슈 TOP N 을 반환합니다."),
+    ("heax-materialtwin_web", "list_materials", "재료 목록을 조회한다 — 이름 부분일치."),
+    ("heax-materialtwin_web", "get_material_properties", "재료의 화·물리 물성값을 도메인별로 전부 반환한다."),
+    ("heax-materialtwin_web", "plot_curve", "시험 1건의 응력-변형률 곡선을 PNG 로 그린다(plot)."),
+    ("heax-step_forge", "mesh_report", "메시 잡 결과 요약 — 파트별 요소 수·품질 지표(mesh quality)."),
+    ("heax-step_forge", "measure_distance", "두 파트 사이 최소거리를 잰다."),
+    ("heax-step_forge", "list_parts", "파트 목록 — 이름·부피·재질. 낙하 덱 전에 본다."),
+    ("heax-laminate_analyzer_mcp", "compute_buckling", "직교이방 판의 좌굴 임계하중."),
+    ("heax-laminate_analyzer_mcp", "analyze_laminate", "적층 정의를 받아 ABD·중립면·지표를 계산한다."),
+    ("smart-twin-mcp", "job_rerun", "실패/미완료 DOE만 재실행. 낙하 충격 해석 잡."),
+    ("ste", "ste_submit_job", "해석 잡을 제출한다(slurm)."),
+    ("mx-white-paper", "export_document", "위키 문서를 docx 로 내보낸다. report 작성에 쓴다."),
+] + [("signalforge", f"report_x{i:02d}", "보고서 report 묶음 — 같은 점수로 겹치는 도구들.") for i in range(12)]
+
+
+def _search_catalog(monkeypatch, specs=None):
+    """search_tools 가 보는 카탈로그를 앉힌다 — 앱 라벨·설명(app_hit)까지 실제와 같은 길로 읽힌다."""
+    specs = specs or _SEARCH_SPECS
+    tools = [types.Tool(name=n, description=d, inputSchema={"type": "object", "properties": {"q": {"type": "string"}}})
+             for _, n, d in specs]
+    monkeypatch.setattr(gw, "exposed_tools", tools)
+    monkeypatch.setattr(gw, "route", {n: (a, n) for a, n, _ in specs})
+    monkeypatch.setattr(gw, "DISCOVERED_META", {
+        "heax-step_forge": {"label": "StepForge", "description": "STEP 어셈블리 점검·메시·K파일 내보내기 도구"},
+        "heax-materialtwin_web": {"label": "MaterialTwin Web", "description": "재료 물성 디지털트윈"}})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    return tools
+
+
+def _no_embed(monkeypatch):
+    async def boom(texts, kind, timeout_s):
+        raise AssertionError("꺼진 길이 임베더를 불렀다")
+    monkeypatch.setattr(gw, "_embed_texts", boom)
+
+
+def test_search_tools_의미_순위를_끄면_답이_master_와_바이트까지_같다(monkeypatch):
+    """옵션을 끈 것이 기본값이다 — 그때 search_tools 는 종전 코드와 글자 하나 다르지 않아야 하고 임베더를 부르지 않는다.
+    질의는 손으로 고른 가장자리(짧음·빈 낱말·대소문자·조사·limit)와 평가셋의 질의 전부다."""
+    from pathlib import Path
+    _search_catalog(monkeypatch)
+    _no_embed(monkeypatch)
+    legacy = _search_tools_master()
+    queries = ["심의", "  리스크 심사  ", "보고서를 요약해줘", "MESH Quality check", "낙하 충격 에너지", "물성 곡선 그래프",
+               "VOC 검색", "잡 상태 조회", "x y", "a", "", "report", "적층 ABD 계산", "안 선택"]
+    pairs = Path(gw.__file__).with_name("tool_search_eval") / "pairs.jsonl"
+    if pairs.exists():
+        queries += [json.loads(line)["query"] for line in pairs.read_text(encoding="utf-8").splitlines() if line.strip()]
+    seen = {"error": 0, "hit": 0, "truncated": 0}
+    for q in queries:
+        for extra in ({}, {"limit": 3}, {"limit": 20}):
+            args = {"query": q, **extra}
+            new, old = asyncio.run(gw._search_tools(args)), asyncio.run(legacy(args))
+            assert (new.isError, new.content[0].text) == (old.isError, old.content[0].text), args
+            seen["error"] += bool(old.isError)
+            seen["hit"] += '"match_count": 0' not in old.content[0].text
+            seen["truncated"] += '"truncated"' in old.content[0].text
+    assert seen["error"] and seen["hit"] > 20 and seen["truncated"], seen          # 전제 — 오류·적중·자름이 모두 지나갔다
+
+
+def _embed_fake(monkeypatch, sims: dict, calls: list | None = None, dim: int = 2):
+    """질의와의 코사인이 sims[도구 이름] 이 되는 가짜 임베더 — 질의는 (1, 0, …), 도구는 (s, √(1-s²), 0, …). 이름은 글에서 읽는다."""
+    async def fake(texts, kind, timeout_s):
+        if calls is not None:
+            calls.append((kind, list(texts)))
+        if kind == "query":
+            return [[1.0] + [0.0] * (dim - 1) for _ in texts], 0
+        out = []
+        for text in texts:
+            s = sims.get(text.split(" · ", 1)[1].split(":", 1)[0], -1.0)
+            out.append([s, (1 - s * s) ** 0.5] + [0.0] * (dim - 2))
+        return out, 0
+    monkeypatch.setattr(gw, "_embed_texts", fake)
+
+
+def _fused_kit(monkeypatch, specs, sims, calls=None):
+    """옵션을 켜고 가짜 임베더로 색인을 채운 search_tools — 돌려주는 것은 질의 → 답(JSON)."""
+    tools = _search_catalog(monkeypatch, specs)
+    monkeypatch.setattr(gw, "_local_tools", lambda: [])
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "http://embedder.invalid/api/embed")
+    _embed_fake(monkeypatch, sims, calls)
+    asyncio.run(gw._tool_index_refresh())
+    assert len(gw._TOOL_VEC) == len(tools)
+
+    def search(q, **kw):
+        return json.loads(asyncio.run(gw._search_tools({"query": q, **kw})).content[0].text)
+    return search
+
+
+_CURVE_SPECS = [("app1", "curve_a", "곡선 곡선 곡선"), ("app1", "plot_b", "곡선"),
+                ("app1", "other_c", "무관"), ("app1", "other_d", "무관")]
+
+
+def test_의미_순위는_두_순위를_RRF_로_섞는다(monkeypatch):
+    """부분문자열은 curve_a(1위)·plot_b(2위)만 맞힌다. 임베딩은 other_c > plot_b > other_d > curve_a. RRF(k=60) —
+    plot_b 1/62+1/62 > curve_a 1/61+1/64 > other_c 1/61 > other_d 1/63. 두 순위에 다 든 도구가 하나에만 든 도구를 앞선다."""
+    search = _fused_kit(monkeypatch, _CURVE_SPECS, {"other_c": 0.99, "plot_b": 0.95, "other_d": 0.90, "curve_a": 0.85})
+    out = search("곡선")
+    assert out["mode"] == "rrf" and "mode_reason" not in out
+    assert out["ranked"] == ["plot_b", "curve_a", "other_c", "other_d"] and out["match_count"] == 4
+    assert list(out)[:4] == ["query", "mode", "match_count", "ranked"], "mode 는 앞에 — 잘려도 남는다"
+    assert list(out)[-1] == "matches" and [m["tool"] for m in out["matches"]] == out["ranked"]
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "")
+    off = search("곡선")
+    assert off["ranked"] == ["curve_a", "plot_b"] and "mode" not in off, "대조군 — 끄면 부분문자열 순위 그대로다"
+
+
+def test_의미_순위는_코사인_문턱을_쓰지_않는다(monkeypatch):
+    """같은 차례면 코사인의 크기와 상관없이 답이 같다 — e5 처럼 다 높아도(0.85~0.99), 다 음수여도, 거의 같아도, 문턱이 있을 법한
+    자리를 사이에 두고 갈려도. 부분문자열에 안 걸린 도구는 코사인이 가장 낮아도(-0.8) 순위로 후보에 든다."""
+    answers = []
+    for sims in ({"other_c": 0.99, "plot_b": 0.95, "other_d": 0.90, "curve_a": 0.85},
+                 {"other_c": -0.5, "plot_b": -0.6, "other_d": -0.7, "curve_a": -0.8},
+                 {"other_c": 0.99994, "plot_b": 0.99993, "other_d": 0.99992, "curve_a": 0.99991},
+                 {"other_c": 0.9, "plot_b": 0.3, "other_d": -0.2, "curve_a": -0.6}):
+        gw._TOOL_VEC.clear()
+        out = _fused_kit(monkeypatch, _CURVE_SPECS, sims)("곡선")
+        answers.append((out["ranked"], out["match_count"], out["mode"]))
+    assert answers == [(["plot_b", "curve_a", "other_c", "other_d"], 4, "rrf")] * 4
+
+
+def test_임베딩만으로_드는_후보는_순위로_자른다(monkeypatch):
+    """부분문자열이 아무것도 못 맞히면 임베딩 순위 상위 20개가 후보다 — 21위는 코사인이 높아도(0.97) 들지 않는다."""
+    specs = [("app1", f"t{i:02d}", "무관") for i in range(25)]
+    search = _fused_kit(monkeypatch, specs, {f"t{i:02d}": 0.99 - 0.001 * i for i in range(25)})
+    out = search("zzqq", limit=20)
+    assert out["match_count"] == 20 == gw._TOOL_EMBED_DEPTH
+    assert out["ranked"] == [f"t{i:02d}" for i in range(20)] and "t20" not in out["ranked"]
+    assert "truncated" not in out
+
+
+def test_부분문자열_점수가_같으면_같은_순위로_섞는다(monkeypatch):
+    """점수가 같은 두 도구를 이름 차례로 1·2위에 두면 그 차례가 섞기에 끼어든다 — 같은 순위로 쳐서 임베딩이 가르게 한다."""
+    specs = [("app1", "plot_x1", "곡선"), ("app1", "plot_x2", "곡선")]
+    search = _fused_kit(monkeypatch, specs, {"plot_x1": 0.8, "plot_x2": 0.9})
+    assert search("곡선")["ranked"] == ["plot_x2", "plot_x1"]
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "")
+    assert search("곡선")["ranked"] == ["plot_x1", "plot_x2"], "전제 — 부분문자열은 동점을 이름 차례로 둔다"
+
+
+def _drop_mode(out: dict) -> dict:
+    return {k: v for k, v in out.items() if k not in ("mode", "mode_reason")}
+
+
+def test_임베더가_실패하면_그_호출은_부분문자열_순위로_답하고_까닭을_말한다(monkeypatch):
+    search = _fused_kit(monkeypatch, _SEARCH_SPECS, {})
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "")
+    off = search("보고서 요약 report")
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "http://embedder.invalid/api/embed")
+
+    async def down(texts, kind, timeout_s):
+        raise httpx.ConnectError("connection refused")
+    monkeypatch.setattr(gw, "_embed_texts", down)
+    out = search("보고서 요약 report")
+    assert out["mode"] == "substring" and out["mode_reason"] == "임베더 오류(ConnectError)"
+    assert _drop_mode(out) == off, "까닭 두 칸 말고는 끈 답과 같다"
+
+
+def test_임베더가_느리면_한도에서_끊고_부분문자열_순위로_답한다(monkeypatch):
+    import time as _t
+    search = _fused_kit(monkeypatch, _SEARCH_SPECS, {})
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "")
+    off = search("물성 곡선")
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "http://embedder.invalid/api/embed")
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_TIMEOUT_S", 0.05)
+
+    async def slow(texts, kind, timeout_s):
+        await asyncio.sleep(5)
+    monkeypatch.setattr(gw, "_embed_texts", slow)
+    t0 = _t.monotonic()
+    out = search("물성 곡선")
+    assert _t.monotonic() - t0 < 2, "한도에서 끊어야 한다 — 임베더를 기다리지 않는다"
+    assert out["mode"] == "substring" and "0.05초" in out["mode_reason"]
+    assert _drop_mode(out) == off
+
+
+def test_색인이_덜_찼으면_기다리지_않고_부분문자열로_답하며_색인을_건다(monkeypatch):
+    calls = []
+    _search_catalog(monkeypatch)
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "http://embedder.invalid/api/embed")
+    _embed_fake(monkeypatch, {}, calls)
+
+    class _TG:
+        def __init__(self):
+            self.started = []
+
+        def start_soon(self, fn, *a):
+            self.started.append(fn)
+    tg = _TG()
+    monkeypatch.setattr(gw, "_task_group_holder", {"tg": tg})
+    out = json.loads(asyncio.run(gw._search_tools({"query": "심의"})).content[0].text)
+    assert out["mode"] == "substring" and "색인" in out["mode_reason"]
+    assert calls == [], "색인이 없으면 질의도 임베딩하지 않는다"
+    assert tg.started == [gw._tool_index_refresh], "다음 검색 전에 색인을 채우게 뒤에서 건다"
+
+
+def test_색인은_글의_해시로_두고_바뀐_것만_다시_임베딩한다(monkeypatch):
+    calls = []
+    tools = _search_catalog(monkeypatch, _CURVE_SPECS + [("app1", "other_e", "무관")])
+    monkeypatch.setattr(gw, "_local_tools", lambda: [])
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "http://embedder.invalid/api/embed")
+    monkeypatch.setattr(gw, "_TOOL_EMBED_BATCH", 2)
+    _embed_fake(monkeypatch, {}, calls)
+    asyncio.run(gw._tool_index_refresh())
+    assert [len(t) for k, t in calls] == [2, 2, 1] and {k for k, _ in calls} == {"passage"}, "묶음으로 나눠 보낸다"
+    assert all(t.startswith("App1 · ") for _, ts in calls for t in ts), "글은 '앱 라벨 · 이름: 설명' 이다"
+    calls.clear()
+    asyncio.run(gw._tool_index_refresh())
+    assert calls == [], "바뀐 것이 없으면 임베더를 부르지 않는다"
+    tools[0] = types.Tool(name="curve_a", description="설명을 고쳤다", inputSchema={"type": "object"})
+    gw.exposed_tools[:] = tools
+    asyncio.run(gw._tool_index_refresh())
+    assert calls == [("passage", ["App1 · curve_a: 설명을 고쳤다"])] and len(gw._TOOL_VEC) == 5, "옛 글의 벡터는 버린다"
+    calls.clear()
+    gw.exposed_tools.pop()
+    asyncio.run(gw._tool_index_refresh())
+    assert calls == [] and len(gw._TOOL_VEC) == 4, "사라진 도구의 벡터도 버린다"
+
+
+def test_색인을_채우는_중에_또_불리면_끝난_뒤_한_번_더_돈다(monkeypatch):
+    """재집계가 잇따르면 갱신이 겹친다 — 둘이 함께 돌지 않고, 도는 중에 바뀐 카탈로그는 다음 바퀴가 마저 채운다."""
+    _search_catalog(monkeypatch, _CURVE_SPECS)
+    monkeypatch.setattr(gw, "_local_tools", lambda: [])
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "http://embedder.invalid/api/embed")
+
+    async def scenario():
+        started, release, n = asyncio.Event(), asyncio.Event(), {"calls": 0}
+
+        async def slow(texts, kind, timeout_s):
+            n["calls"] += 1
+            started.set()
+            await release.wait()
+            return [[1.0, 0.0] for _ in texts], 0
+        monkeypatch.setattr(gw, "_embed_texts", slow)
+        first = asyncio.create_task(gw._tool_index_refresh())
+        await started.wait()
+        gw.exposed_tools.append(types.Tool(name="late", description="도는 중에 붙었다", inputSchema={"type": "object"}))
+        await gw._tool_index_refresh()                                   # 곧바로 돌아온다 — 한 바퀴 더 돌라고만 남긴다
+        assert n["calls"] == 1 and gw._TOOL_VEC_JOB == {"running": True, "again": True}
+        release.set()
+        await first
+        return n["calls"]
+    assert asyncio.run(scenario()) == 2
+    assert all(gw._doc_key(gw._tool_doc(t)) in gw._TOOL_VEC for t in gw.exposed_tools) and len(gw._TOOL_VEC) == 5
+    assert gw._TOOL_VEC_JOB == {"running": False, "again": False}
+
+
+def test_색인이_실패해도_예외를_내지_않고_다음에_다시_건다(monkeypatch, caplog):
+    _search_catalog(monkeypatch, _CURVE_SPECS)
+    monkeypatch.setattr(gw, "_local_tools", lambda: [])
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "http://embedder.invalid/api/embed")
+
+    async def down(texts, kind, timeout_s):
+        raise httpx.ConnectError("connection refused")
+    monkeypatch.setattr(gw, "_embed_texts", down)
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        asyncio.run(gw._tool_index_refresh())
+    assert gw._TOOL_VEC == {} and gw._TOOL_VEC_JOB["running"] is False, "다음 검색이 다시 걸 수 있어야 한다"
+    assert any("의미 색인을 채우지 못했다" in r.getMessage() for r in caplog.records)
+
+
+def test_임베더_차원이_바뀌면_색인을_버리고_다시_채운다(monkeypatch):
+    search = _fused_kit(monkeypatch, _CURVE_SPECS, {})
+    _embed_fake(monkeypatch, {}, dim=3)                                   # 모델이 바뀌어 질의 벡터 길이가 달라졌다
+    out = search("곡선")
+    assert out["mode"] == "substring" and "차원" in out["mode_reason"]
+    assert gw._TOOL_VEC == {}
+
+
+def test_임베더_요청은_접두_없이_kind_로_보내고_꼴이_틀린_답은_예외다(monkeypatch):
+    """e5 의 `query: `·`passage: ` 접두는 AIDataHub 가 kind 를 보고 붙인다 — 게이트웨이가 붙이면 두 번 붙는다."""
+    seen, answer = [], {}
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(answer.get("status", 200), json=answer.get("body"))
+    real = httpx.AsyncClient
+    monkeypatch.setattr(gw.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "http://embedder.invalid/api/embed")
+    answer["body"] = {"vectors": [[0.6, 0.8]], "dim": 2, "over_limit": [0]}
+    vecs, over = asyncio.run(gw._embed_texts(["휨 불량"], "query", 1.0))
+    assert seen == [{"texts": ["휨 불량"], "kind": "query"}] and vecs == [[0.6, 0.8]] and over == 1
+    for status, body in ((500, {"detail": "encode failed"}), (200, {"vectors": []}), (200, {"vectors": [["x"]]}),
+                         (200, {"vectors": [[0.1, 0.2], [0.3]]})):
+        answer.update(status=status, body=body)
+        texts = ["a", "b"] if len(body.get("vectors") or []) == 2 else ["a"]
+        with pytest.raises((httpx.HTTPStatusError, ValueError)):
+            asyncio.run(gw._embed_texts(texts, "passage", 1.0))
+
+
+def test_재집계는_켜져_있을_때만_색인_갱신을_뒤에서_건다(monkeypatch):
+    class _TG:
+        def __init__(self):
+            self.started = []
+
+        def start_soon(self, fn, *a):
+            self.started.append(fn)
+    tg = _TG()
+    monkeypatch.setattr(gw, "_task_group_holder", {"tg": tg})
+    _aggregate_with(monkeypatch, {"signalforge": ["search_voc"]})
+    assert tg.started == [], "꺼져 있으면 아무것도 걸지 않는다"
+    monkeypatch.setattr(gw, "TOOL_SEARCH_EMBED_URL", "http://embedder.invalid/api/embed")
+    _aggregate_with(monkeypatch, {"signalforge": ["search_voc"]})
+    assert tg.started == [gw._tool_index_refresh]
+
+
+_EMBED_PROBE = "import gateway as gw; print(repr(gw.TOOL_SEARCH_EMBED_URL)); print(gw.TOOL_SEARCH_EMBED_TIMEOUT_S)"
+
+
+def test_의미_순위_손잡이는_env_에서_읽고_기본은_꺼짐이다(tmp_path):
+    """상수를 monkeypatch 하는 시험은 env 를 읽는 줄이 사라져도 통과한다 — 실제로 import 해 본다. 0 이하의 한도는 다른 시간 한도와
+    같은 규칙으로 따르지 않는다. 켠 주소의 호스트는 NO_PROXY 에 든다(사내 프록시로 나가지 않는다)."""
+    (tmp_path / "cfg.json").write_text(json.dumps({"_gateway": {"token": "gw-test-token"}}), encoding="utf-8")
+
+    def probe(**env):
+        full = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "REST_PROXY_", "NO_PROXY", "no_proxy"))}
+        full.update(GATEWAY_CONFIG=str(tmp_path / "cfg.json"), GATEWAY_AUDIT=str(tmp_path / "audit.jsonl"),
+                    PYTHONDONTWRITEBYTECODE="1", **env)
+        run = subprocess.run([sys.executable, "-c", _EMBED_PROBE], cwd=os.path.dirname(os.path.abspath(gw.__file__)),
+                             env=full, capture_output=True, text=True, timeout=120)
+        assert run.returncode == 0, run.stderr[-2000:]
+        return run.stdout.split("\n")[:2], run.stderr
+    assert probe()[0] == ["''", "2.0"], "기본은 꺼짐 · 질의 한도 2초"
+    (url, timeout), log_ = probe(GATEWAY_TOOL_SEARCH_EMBED_URL=" http://embedder.corp.example:8001/api/embed ",
+                                 GATEWAY_TOOL_SEARCH_EMBED_TIMEOUT="0.5")
+    assert (url, timeout) == ("'http://embedder.corp.example:8001/api/embed'", "0.5")
+    assert "embedder.corp.example" in log_.split("NO_PROXY 에 내부 목적지", 1)[1].split("\n", 1)[0]
+    (_, timeout), log_ = probe(GATEWAY_TOOL_SEARCH_EMBED_TIMEOUT="0")
+    assert timeout == "2.0" and "GATEWAY_TOOL_SEARCH_EMBED_TIMEOUT=0 " in log_

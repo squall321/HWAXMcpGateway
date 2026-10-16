@@ -164,6 +164,19 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 - 모양은 `{threshold, total: {apps, tools, args, described, unit_or_range, described_ratio, unit_or_range_ratio}, apps: [{app, tools, args, described, unit_or_range, described_ratio, unit_or_range_ratio, worst: [{tool, args, described}]}]}` 다. 앱은 설명 비율이 낮은 순(같으면 설명 없는 인자가 많은 순)이고 인자가 없는 앱(비율 `null`)은 맨 뒤다. `worst` 는 앱마다 최대 다섯 — 설명 없는 인자가 많은 순(같으면 인자가 많은 순)이고 설명이 다 있는 도구는 싣지 않는다. 수만 싣는다(인자 이름·설명·값은 없다).
 - 기준은 `GATEWAY_ARG_DESC_WARN_RATIO`(기본 0.3, **미만**이면 부족 · 0 이면 끈다)다. 기동(첫 재집계) 때는 기준 미만 앱 수를 요약 한 줄(`인자 설명 부족 — 기동 때 붙은 앱 N개 가운데 M개가 …`)로만 남긴다 — 거의 모든 앱이 기준 아래라 앱마다 한 줄이면 기동마다 열댓 줄이 쌓인다. 기동 뒤 새로 붙는 앱은 붙을 때 한 줄(`인자 설명 부족 — <앱> 의 …`, 앱 이름·비율·가장 나쁜 도구)이다. 앱마다 프로세스당 한 번이고, 재프로비저닝은 게이트웨이를 다시 띄우므로 그때 다시 본다.
 
+## search_tools 의미 순위 — 선택, 기본 꺼짐
+
+`search_tools` 의 부분문자열 순위에 AIDataHub 임베딩 순위를 RRF(k=60)로 **더한다**(갈아 끼우지 않는다 — 한국어 업무어는 부분문자열이 이기는 사례가 있다). 켤지는 평가 결과를 보고 정한다 — 평가셋·러너·숫자는 `tool_search_eval/README.md`.
+
+| 손잡이 | 기본 | 뜻 |
+|---|---|---|
+| `GATEWAY_TOOL_SEARCH_EMBED_URL` | 비어 있음(꺼짐) | AIDataHub `/api/embed` 의 주소(예 `http://127.0.0.1:8001/api/embed`). 비면 `search_tools` 의 답은 종전과 바이트 단위로 같고 임베더를 부르지 않는다 |
+| `GATEWAY_TOOL_SEARCH_EMBED_TIMEOUT` | 2 | 질의 한 건의 임베딩 한도(초). 넘거나 임베더가 오류면 그 호출은 부분문자열 순위로 답한다. 0 이하는 따르지 않는다(끄려면 주소를 비운다) |
+
+- 켜면 결과에 `mode` 가 붙는다 — `rrf`, 또는 못 섞었을 때 `substring` 과 까닭 `mode_reason`(색인이 덜 참 · 임베더 오류 · 시간 초과 · 차원이 바뀜).
+- 색인은 도구마다 '앱 라벨 · 이름: 설명' 글의 해시로 두고 재집계 뒤 뒤에서 새 글만 임베딩한다(기동 직후 첫 색인 동안은 부분문자열로 답한다). 순위만 쓰고 코사인 값으로 거르지 않는다.
+- 게이트웨이는 `.env` 를 읽지 않는다 — 띄우는 프로세스의 env 에 있어야 하고, 기동 로그의 `search_tools 의미 순위 켬` 줄로 닿았는지 본다.
+
 ## 실행
 ```bash
 ./start.sh          # 에이전트 venv 파이썬으로 gateway.py 기동 (streamable-http :9110/mcp)

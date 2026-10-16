@@ -5388,3 +5388,199 @@ def test_REST_프록시는_상류가_한도_안에_답하지_않으면_504_로_�
         assert knob in _rows()[-1]["error"], "감사에도 손잡이를 남긴다"
     else:
         assert body["error"] == "upstream unreachable", body
+
+
+# ── 인자 설명 점수판(HWAXPortal docs/improvement-1015 §6) ─────────────────────
+def _stool(name: str, props: dict | None = None) -> types.Tool:
+    """인자 스키마가 있는 가짜 도구. props 의 값은 설명 글(None 이면 설명 없음) 또는 속성 스키마 그대로다."""
+    p = {k: (v if isinstance(v, dict) else {"type": "string", **({"description": v} if v is not None else {})})
+         for k, v in (props or {}).items()}
+    return types.Tool(name=name, description="", inputSchema={"type": "object", "properties": p})
+
+
+def _aggregate_tools(monkeypatch, spec: dict[str, list[types.Tool]]):
+    monkeypatch.setattr(gw, "backends", {k: _B(v) for k, v in spec.items()})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    asyncio.run(gw._aggregate())
+
+
+@pytest.fixture
+def _fresh_scores(monkeypatch):
+    """점수판·'이미 본 앱' 은 프로세스 상태다 — 시험마다 새로 두고, 로컬 도구 수가 설정에 따라 달라지지 않게 REST 를 비운다."""
+    monkeypatch.setattr(gw, "_ARG_SCORE", {})
+    monkeypatch.setattr(gw, "_ARG_JUDGED", set())
+    monkeypatch.setattr(gw, "ARG_DESC_WARN_RATIO", 0.3)
+    monkeypatch.setattr(gw, "REST", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+
+
+def test_인자_점수판은_실측처럼_맨_위_속성만_센다():
+    """실측(HWAXPortal docs/procedures/gaps/hub-arg-descriptions.yaml)은 `inputSchema.properties[].description` 의 유무를
+    셌다. 객체 속성·배열 항목 안으로 내려가면 인자 수가 실측과 다른 눈금이 된다. 공백뿐인 설명·`title`·글이 아닌 설명은
+    설명이 아니고, 스키마가 깨진 속성도 인자로는 센다(세다가 죽지 않는다)."""
+    t = types.Tool(name="t", description="", inputSchema={"type": "object", "properties": {
+        "a": {"type": "string", "description": "부품 이름(글롭)"},
+        "b": {"type": "string", "description": "   "},
+        "c": {"type": "string", "title": "C"},
+        "d": {"type": "object", "properties": {"x": {"type": "number", "description": "안쪽 설명"},
+                                                "y": {"type": "number", "description": "안쪽 설명"}}},
+        "e": {"type": "array", "items": {"type": "object", "properties": {"z": {"description": "항목 설명"}}}},
+        "f": True,
+        "g": {"description": 7, "anyOf": 5, "items": "x"},
+    }})
+    assert gw._arg_counts(t) == (7, 1, 0)
+    assert gw._arg_counts(types.Tool(name="u", description="", inputSchema={"type": "object"})) == (0, 0, 0)
+    assert gw._arg_counts(types.Tool(name="v", description="", inputSchema={"type": "object", "properties": []})) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("desc", [
+    "판 두께 [mm]", "길이(mm)", "10mm 간격", "탄성계수 MPa", "시간 한도 30 s", "30초 뒤 끊는다", "각도 deg", "회전 90°",
+    "가중치 %", "샘플링 주파수 Hz", "이완 시정수 [s]", "온도 ℃", "2시간", "120자까지", "timeout in seconds",
+    "0 이상", "100 이하", "허용 범위", "최소 1", "최대 20", "min 1", "Max 10", "between 1 and 5", "default 8",
+    "Defaults to 10", "포아송비 (-1 < nu < 0.5)", "<= 20", "1~10", "0..1", "기본 8"])
+def test_인자_설명의_단위_범위_낱말을_읽는다(desc):
+    assert gw._ARG_UNIT_RANGE_RE.search(desc), desc
+
+
+@pytest.mark.parametrize("desc", [
+    "user's name", "도구 이름", "N개의 결과", "초기값을 쓴다", "부분 문자열", "items to return", "날짜 YYYY-MM-DD",
+    "name(s) of tools", "Page token", "1st item", "admin account", "max_results 와 같다", "이상치 제거 여부", "검색어"])
+def test_단위_범위가_아닌_설명은_세지_않는다(desc):
+    m = gw._ARG_UNIT_RANGE_RE.search(desc)
+    assert m is None, f"{desc!r} 에서 {m.group(0)!r} 를 단위·범위로 읽었다"
+
+
+def test_허용값을_스키마가_말하면_범위다_다만_설명이_있을_때만():
+    """`enum`·숫자 경계(pydantic 의 ge·gt·le·lt)는 낱말이 없어도 범위다. Optional 은 경계를 anyOf 갈래에, 목록은 항목에 둔다.
+    기준이 '설명에 단위와 범위' 라 설명 없는 인자는 enum 이 있어도 세지 않는다 — 이 수는 '설명 있음' 을 넘지 않는다."""
+    props = {
+        "mode": {"type": "string", "enum": ["fast", "exact"], "description": "계산 방식"},
+        "k": {"anyOf": [{"type": "number", "exclusiveMinimum": 0, "maximum": 1}, {"type": "null"}], "description": "기울기"},
+        "tags": {"type": "array", "items": {"enum": ["a", "b"]}, "description": "고를 꼬리표"},
+        "bare_enum": {"type": "string", "enum": ["x", "y"]},
+        "plain": {"type": "string", "description": "부품 이름"},
+    }
+    assert gw._arg_counts(_stool("t", props)) == (5, 4, 3)
+
+
+def test_가장_나쁜_도구_다섯과_앱_순서():
+    """도구는 설명 없는 인자가 많은 순, 같으면 인자가 많은 순, 그다음 이름이다. 설명이 다 있는 도구는 '나쁜 도구' 가 아니다.
+    앱은 설명 비율이 낮은 순, 같으면 설명 없는 인자가 많은 순이고, 인자가 없는 앱(비율 없음)은 맨 뒤다."""
+    def tool(name, n, d):
+        return _stool(name, {f"a{i}": ("설명" if i < d else None) for i in range(n)})
+    pairs = ([("A", tool(*x)) for x in (("t_full", 3, 3), ("t5of5", 5, 0), ("t5of8", 8, 3), ("t6", 6, 0), ("t1", 2, 1),
+                                        ("t2b", 2, 0), ("t2a", 2, 0), ("t0", 0, 0))]
+             + [("B", tool("b1", 4, 2)), ("C", tool("c0", 0, 0)), ("D", tool("d1", 4, 1))])
+    board = gw._arg_scoreboard(pairs)
+    assert [r["app"] for r in board["apps"]] == ["A", "D", "B", "C"], "A·D 는 둘 다 25% — 설명 없는 인자가 많은 A 가 먼저다"
+    a = board["apps"][0]
+    assert (a["tools"], a["args"], a["described"], a["described_ratio"]) == (8, 28, 7, 0.25)
+    assert a["worst"] == [{"tool": "t6", "args": 6, "described": 0}, {"tool": "t5of8", "args": 8, "described": 3},
+                          {"tool": "t5of5", "args": 5, "described": 0}, {"tool": "t2a", "args": 2, "described": 0},
+                          {"tool": "t2b", "args": 2, "described": 0}]
+    assert board["apps"][-1]["described_ratio"] is None and board["apps"][-1]["worst"] == []
+    assert board["total"] == {"apps": 4, "tools": 11, "args": 36, "described": 10, "unit_or_range": 0,
+                              "described_ratio": 0.278, "unit_or_range_ratio": 0.0}
+
+
+def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monkeypatch, _fresh_scores):
+    """무인증 `/tools-map` 에 `arg_scores` 를 **덧붙인다** — 있던 칸의 이름·순서·뜻은 그대로다. 수만 싣는다: 인자 이름·설명·
+    기본값이 새면 무인증 표면에 스키마 내용이 나간다."""
+    def tools_map():
+        sent = []
+
+        async def send(m): sent.append(m)
+        asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/tools-map", "headers": []}, None, send))
+        assert sent[0]["status"] == 200
+        return json.loads(sent[1]["body"])
+
+    monkeypatch.setattr(gw, "backends", {})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    empty = tools_map()["arg_scores"]            # 첫 재집계 전에도 모양은 같다
+    assert empty["apps"] == [] and empty["total"]["args"] == 0 and empty["total"]["described_ratio"] is None
+
+    leaky = _stool("ra_find", {"workspace_token": {"type": "string", "description": "SECRET-DESC", "default": "SECRET-DEFAULT"},
+                               "q": None})
+    _aggregate_tools(monkeypatch, {"reportarchive": [leaky, _stool("ra_get", {"id": "보고서 id"})]})
+    body = tools_map()
+    assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores"]
+    assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
+    assert body["backends"] == ["_gateway", "reportarchive"]
+    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 8, "reportarchive": 2}
+    sc = body["arg_scores"]
+    assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
+    assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
+                                 "unit_or_range_ratio"]
+    row = {r["app"]: r for r in sc["apps"]}["reportarchive"]
+    assert list(row) == ["app", "tools", "args", "described", "unit_or_range", "described_ratio",
+                         "unit_or_range_ratio", "worst"]
+    assert (row["tools"], row["args"], row["described"]) == (2, 3, 2)
+    assert row["worst"] == [{"tool": "ra_find", "args": 2, "described": 1}]
+    blob = json.dumps(sc, ensure_ascii=False)
+    for leak in ("SECRET-DESC", "SECRET-DEFAULT", "workspace_token", "보고서 id"):
+        assert leak not in blob, f"점수판에 스키마 내용({leak})이 샜다"
+
+
+def test_기준_미만으로_처음_붙는_앱만_한_번_경고하고_막지_않는다(monkeypatch, caplog, _fresh_scores):
+    """앱이 이 프로세스에 처음 붙을 때 설명 비율이 기준 **미만**이면 한 줄 — 앱 이름·비율·가장 나쁜 도구를 말한다. 같은 앱은
+    다시 말하지 않고(재집계는 60초마다 돈다), 기준과 같으면 말하지 않으며, 0 이면 끈다. 도구는 막지도 숨기지도 않는다."""
+    low = [_stool("low_big", {**{f"a{i}": None for i in range(9)}, "z": "설명"}), _stool("low_small", {"q": None})]
+    edge = [_stool("edge_t", {f"a{i}": ("설명" if i < 3 else None) for i in range(10)})]     # 정확히 30%
+    good = [_stool("good_t", {"a": "설명", "b": None})]
+    spec = {"low": low, "edge": edge, "good": good}
+
+    def warned():
+        msgs = [r.getMessage() for r in caplog.records]
+        assert not [m for m in msgs if "세지 못했다" in m], msgs
+        return [m for m in msgs if "인자 설명 부족" in m]
+
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        _aggregate_tools(monkeypatch, spec)
+        first = warned()
+        assert len(first) == 1, first
+        assert "— low 의 인자 11개 가운데 설명 있는 것이 1개(9.1%)로 기준 30% 미만" in first[0], first[0]
+        assert "가장 나쁜 도구는 low_big(인자 10개 중 설명 1개)" in first[0], first[0]
+        assert {"low_big", "low_small"} <= set(gw.route), "경고한 앱의 도구를 숨겼다"
+        assert {"low_big", "low_small"} <= {t.name for t in gw._visible_tools([])}
+
+        caplog.clear()
+        _aggregate_tools(monkeypatch, spec)
+        assert warned() == [], "같은 앱을 재집계마다 다시 말했다"
+
+        caplog.clear()
+        _aggregate_tools(monkeypatch, {**spec, "late": [_stool("late_t", {"x": None, "y": None})]})
+        assert len(warned()) == 1 and "— late 의" in warned()[0], "나중에 붙은 앱은 붙을 때 한 번 말한다"
+
+        caplog.clear()
+        monkeypatch.setattr(gw, "_ARG_JUDGED", set())
+        monkeypatch.setattr(gw, "ARG_DESC_WARN_RATIO", 0.0)
+        _aggregate_tools(monkeypatch, spec)
+        assert warned() == [], "0 이면 경고가 꺼진다"
+
+
+def test_게이트웨이_로컬_도구는_제_앱으로_센다(monkeypatch, _fresh_scores):
+    """로컬 도구는 route 에 없다 — `_gateway` 앱으로 세고, tools/list 가 붙이는 것과 같은 목록이다(REST 다리는 사이트가 있을
+    때만). 목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
+    for rest, n_local in (({}, 8), ({"s": {"base": "http://x"}}, 10)):
+        monkeypatch.setattr(gw, "REST", rest)
+        _aggregate_tools(monkeypatch, {"sf": [_stool("sf_q", {"q": None})]})
+        row = {r["app"]: r for r in gw._ARG_SCORE["apps"]}["_gateway"]
+        assert {t.name for t in gw._visible_tools([])} - {"sf_q"} == {t.name for t in gw._local_tools()}
+        assert row["tools"] == len(gw._local_tools()) == n_local
+        assert row["args"] == sum(gw._arg_counts(t)[0] for t in gw._local_tools())
+        assert gw._ARG_SCORE["total"]["tools"] == n_local + 1
+
+
+def test_점수판이_터져도_재집계는_막지_않는다(monkeypatch, caplog, _fresh_scores):
+    """보고만 하는 기능이 부팅(첫 재집계)을 죽이면 안 된다 — 백엔드가 이상한 스키마를 내도 카탈로그는 그대로 선다."""
+    def boom(pairs):
+        raise RuntimeError("bad schema")
+    monkeypatch.setattr(gw, "_arg_scoreboard", boom)
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        _aggregate_tools(monkeypatch, {"sf": [_stool("sf_q", {"q": None})]})
+    assert "sf_q" in gw.route, "점수판이 카탈로그를 막았다"
+    assert any("인자 설명 점수판을 세지 못했다" in r.getMessage() for r in caplog.records)

@@ -666,6 +666,124 @@ alias_route: dict[str, tuple[str, str]] = {}
 _task_group_holder: dict[str, object] = {}
 
 
+# ── 인자 설명 점수판 ─────────────────────────────────────────────────────────
+# 실측 2026-09-15 — 도구 468종의 인자 1,348개 가운데 설명이 있는 것은 15개(1%)였다(HWAXPortal
+# docs/procedures/gaps/hub-arg-descriptions.yaml). 모델은 인자를 고를 때 도구 산문을 읽어 짐작하고, 절차 변수의 뜻을 적을
+# 근거도 없다. 그래서 재집계마다 앱별로 세어 `/tools-map` 의 `arg_scores` 에 싣고, 기준 아래로 붙은 앱은 로그에 한 줄 남긴다.
+# **보고만 한다** — 막지도 숨기지도 않는다. 기준 모델은 LaminateAnalyzerMCP 의 '각 필드 description 에 단위와 유효 범위' 다
+# (HWAXPortal docs/improvement-1015 §6).
+# 세는 법은 그 실측과 같다.
+#  · 인자 — `inputSchema.properties` 의 **맨 위 키**. 객체 속성·배열 항목 안으로는 내려가지 않는다.
+#  · 설명 있음 — 그 속성의 `description` 이 공백 아닌 글이다(`title` 은 pydantic 이 이름에서 만든 것이라 설명이 아니다).
+#  · 단위·범위 있음 — 설명이 있고, 그 글에 아래 낱말이 들었거나 스키마가 허용값을 직접 말한다(`enum` · 숫자 경계).
+#    기준이 '설명에 단위와 범위' 라 설명 없는 인자는 세지 않는다 — 이 수는 늘 '설명 있음' 이하다.
+# 경고는 앱이 이 프로세스에 **처음 붙을 때** 한 번이다. 재프로비저닝은 게이트웨이를 다시 띄우므로 그때 다시 본다.
+# 기준은 '미만' 이고 0 이면 경고가 꺼진다.
+ARG_DESC_WARN_RATIO = float(os.environ.get("GATEWAY_ARG_DESC_WARN_RATIO", "0.3"))
+# 단위·범위 낱말 — 작게, 다 적어 둔다(넓히면 아무 글에나 맞아 수가 뜻을 잃는다).
+#  · 단위 기호는 대소문자를 가리고 라틴 글자에 붙은 것은 세지 않는다 — `MM` 은 날짜 형식의 달이고 `items` 의 ms 는 단위가 아니다.
+#  · 짧은 기호(N·s·m·K·g·h·B)와 한글 단위(초·분·시간·도·자)는 **숫자 뒤**에서만 읽는다(짧은 기호는 `[s]` 처럼 대괄호 안도) —
+#    `user's` 의 s, `N개` 의 N, `초과`·`초기값` 의 초, `부분` 의 분을 단위로 세지 않는다.
+#  · 범위 — 낱말과, 숫자에 붙은 부등호·물결·점 둘(`0 < x`·`1~10`·`0..1`). 하이픈은 날짜·id 와 가를 수 없어 뺀다.
+#    `이상치`(outlier)는 범위가 아니라 뺀다.
+_ARG_UNIT_RANGE_RE = re.compile(
+    r"(?<![A-Za-z])(?:mm|cm|[µμ]m|um|nm|kPa|MPa|GPa|Pa|kN|kHz|Hz|ms|deg|rad|px|KB|MB|GB|kg)(?![A-Za-z])"
+    r"|[°℃%]"
+    r"|\d\s*(?:N|s|m|K|g|h|B)(?![A-Za-z])|\[(?:N|s|m|K|g|h|B)\]"
+    r"|\d\s*(?:밀리초|초|분|시간|도|자)|밀리초|바이트|퍼센트"
+    r"|(?i:\b(?:(?:milli)?seconds?|minutes?|hours?|degrees?|percent|bytes?|pixels?)\b)"
+    r"|범위|이상(?!치)|이하|미만|초과|이내|최소|최대|상한|하한|기본값|기본\s*[-+]?\d"
+    r"|(?i:\b(?:min|max|minimum|maximum|between|range|defaults?|at least|at most|up to)\b)"
+    r"|<=|>=|[≤≥]|[<>]\s*[-+]?\d|\d\s*[<>]"
+    r"|\d\s*(?:~|～|\.\.|–)\s*[-+]?\d")
+# 스키마가 허용값을 직접 말하는 칸 — pydantic 의 ge·gt·le·lt 가 이것을 만든다.
+_ARG_BOUND_KEYS = ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum")
+_ARG_SCORE: dict = {}             # 마지막 재집계의 점수판 — `/tools-map` 이 그대로 싣는다
+_ARG_JUDGED: set[str] = set()     # 이 프로세스에서 이미 기준을 본 앱(경고는 처음 붙을 때 한 번)
+
+
+def _arg_schema_range(prop: dict) -> bool:
+    """비지 않은 `enum` 이나 숫자 경계가 있는가. Optional 이 만드는 anyOf 갈래와 배열 항목은 한 겹까지 본다(경계가 거기 붙는다)."""
+    subs = [prop, prop.get("items")]
+    for k in ("anyOf", "oneOf", "allOf"):
+        if isinstance(prop.get(k), list):
+            subs += prop[k]
+    return any(isinstance(s, dict) and (bool(s.get("enum")) or any(s.get(b) is not None for b in _ARG_BOUND_KEYS))
+               for s in subs)
+
+
+def _arg_counts(tool: types.Tool) -> tuple[int, int, int]:
+    """도구 하나의 (인자, 설명 있는 인자, 단위·범위가 든 인자) — 세는 법은 위 머리말."""
+    props = tool.inputSchema.get("properties") if isinstance(tool.inputSchema, dict) else None
+    if not isinstance(props, dict):
+        return 0, 0, 0
+    described = unit_range = 0
+    for p in props.values():
+        desc = p.get("description") if isinstance(p, dict) else None
+        if not isinstance(desc, str) or not desc.strip():
+            continue
+        described += 1
+        if _ARG_UNIT_RANGE_RE.search(desc) or _arg_schema_range(p):
+            unit_range += 1
+    return len(props), described, unit_range
+
+
+def _arg_ratio(part: int, whole: int) -> float | None:
+    return round(part / whole, 3) if whole else None
+
+
+def _arg_scoreboard(pairs) -> dict:
+    """(앱 키, 도구) 쌍으로 점수판을 만든다. 수만 싣는다 — 인자 이름·설명·값은 싣지 않는다.
+
+    · 앱 줄은 가장 나쁜 앱부터 — 설명 비율이 낮은 순, 같으면 설명 없는 인자가 많은 순. 인자가 없는 앱(비율 없음)은 맨 뒤다.
+    · 앱마다 가장 나쁜 도구 다섯 — 설명 없는 인자가 많은 순, 같으면 인자가 많은 순. 설명이 다 있는 도구는 싣지 않는다.
+    """
+    acc: dict[str, dict] = {}
+    for app, tool in pairs:
+        n, d, u = _arg_counts(tool)
+        a = acc.setdefault(app, {"tools": 0, "args": 0, "described": 0, "unit_or_range": 0, "bad": []})
+        a["tools"] += 1
+        a["args"] += n
+        a["described"] += d
+        a["unit_or_range"] += u
+        if n > d:
+            a["bad"].append({"tool": tool.name, "args": n, "described": d})
+    rows = []
+    for app, a in acc.items():
+        worst = sorted(a.pop("bad"), key=lambda w: (w["described"] - w["args"], -w["args"], w["tool"]))[:5]
+        rows.append({"app": app, **a,
+                     "described_ratio": _arg_ratio(a["described"], a["args"]),
+                     "unit_or_range_ratio": _arg_ratio(a["unit_or_range"], a["args"]),
+                     "worst": worst})
+    rows.sort(key=lambda r: (r["args"] == 0, r["described"] / r["args"] if r["args"] else 0,
+                             r["described"] - r["args"], r["app"]))
+    tot = {k: sum(r[k] for r in rows) for k in ("tools", "args", "described", "unit_or_range")}
+    return {"threshold": ARG_DESC_WARN_RATIO,
+            "total": {"apps": len(rows), **tot,
+                      "described_ratio": _arg_ratio(tot["described"], tot["args"]),
+                      "unit_or_range_ratio": _arg_ratio(tot["unit_or_range"], tot["args"])},
+            "apps": rows}
+
+
+def _arg_score_refresh() -> None:
+    """재집계 끝에 부른다 — 점수판을 새로 세고, 이 프로세스에 처음 붙은 앱이 기준 미만이면 한 줄 경고한다."""
+    board = _arg_scoreboard([(route[t.name][0], t) for t in exposed_tools]
+                            + [("_gateway", t) for t in _local_tools()])
+    _ARG_SCORE.clear()
+    _ARG_SCORE.update(board)
+    for row in board["apps"]:
+        if row["app"] in _ARG_JUDGED:
+            continue
+        _ARG_JUDGED.add(row["app"])
+        if row["args"] and row["described"] / row["args"] < ARG_DESC_WARN_RATIO:
+            w = row["worst"][0] if row["worst"] else {"tool": "(없음)", "args": 0, "described": 0}
+            log.warning("인자 설명 부족 — %s 의 인자 %d개 가운데 설명 있는 것이 %d개(%.1f%%)로 기준 %.0f%% 미만이다. "
+                        "가장 나쁜 도구는 %s(인자 %d개 중 설명 %d개). 막지도 숨기지도 않는다 — 앱이 "
+                        "inputSchema.properties[].description 을 채우면 오른다(GATEWAY_ARG_DESC_WARN_RATIO · /tools-map 의 arg_scores)",
+                        row["app"], row["args"], row["described"], 100 * row["described"] / row["args"],
+                        100 * ARG_DESC_WARN_RATIO, w["tool"], w["args"], w["described"])
+
+
 async def _aggregate():
     """모든 백엔드에서 list_tools 수집, 충돌 도구만 프리픽스, exposed_tools/route 구축."""
     collected: list[tuple[str, types.Tool]] = []  # (backend_key, tool)
@@ -746,6 +864,11 @@ async def _aggregate():
              len(exposed_tools), len(set(route)), len(alias_route))
     # 다음 initialize 부터 바뀐 카탈로그의 지침이 실린다(이미 붙은 세션은 그때 받은 것을 쓴다).
     _low.instructions = _instructions()
+    # 인자 설명 점수판 — 보고만 한다. 세다가 무엇이 터져도 재집계(부팅 포함)를 막지 않는다.
+    try:
+        _arg_score_refresh()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("인자 설명 점수판을 세지 못했다 — 카탈로그는 그대로 낸다: %r", exc)
 
 
 HEAX_PREFIX = "heax-"  # 자동탐지된 heax-hub MCP 앱 백엔드 키 프리픽스
@@ -2811,7 +2934,9 @@ async def _rest_call(args: dict) -> types.CallToolResult:
     return _evid_keep("rest_call", _rest_text(payload))
 
 
-def _visible_tools(groups: list[str]) -> list[types.Tool]:
+def _local_tools() -> list[types.Tool]:
+    """tools/list 가 백엔드 도구 뒤에 늘 붙이는 게이트웨이 로컬 도구. 인자 설명 점수판도 이 목록을 `_gateway` 앱으로 센다 —
+    목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
              BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL]
@@ -2819,10 +2944,14 @@ def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
         local += [REST_CATALOG_TOOL, REST_CALL_TOOL]
+    return local
+
+
+def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 사용자가 포털에서 끈 앱은 개인 PAT 의 tools/list·search_tools 에서 뺀다(숨김만 — 호출은 막지 않는다)
     muted = _request_muted()
     return [t for t in exposed_tools
-            if _backend_allowed(route[t.name][0], groups) and route[t.name][0] not in muted] + local
+            if _backend_allowed(route[t.name][0], groups) and route[t.name][0] not in muted] + _local_tools()
 
 
 def _request_groups() -> list[str]:
@@ -3901,6 +4030,8 @@ def _bearer_gate(app, pat_verifier=None):
                 "areas": _areas,
                 "area_meta": [{**m, "tool_count": _acnt.get(m["area"], 0)} for m in _area_meta()],
                 "unclassified": sorted(n for n, a in _areas.items() if not a),
+                # 인자 설명 점수판 — 재집계 때 센 것(_arg_score_refresh)을 덧붙인다. 위 칸들은 그대로다.
+                "arg_scores": _ARG_SCORE or _arg_scoreboard([]),
             }, ensure_ascii=False).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

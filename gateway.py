@@ -28,7 +28,22 @@ from mcp.server.transport_security import TransportSecuritySettings
 # (rest_proxy 는 gateway 를 import 하지 않으므로 이 방향은 순환이 아니다.)
 from rest_proxy import EXPIRED_BODY, JWKS_TIMEOUT_S, REST_PROXY_UPSTREAM_TIMEOUT_S, PatExpired, allowed_methods, credential_mode
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# 쿼리에 실린 비밀(…/mcp?token=…)이 로그에 평문으로 남지 않게 한다. ODB 는 토큰을 주소 쿼리로 받고(provision-config.sh),
+# httpx 는 INFO 로 요청마다 주소를 통째로 찍었다 — cae00 gateway.log 26,275줄(10-17 리뷰 G1), dev 는 이메일 쿼리도 실렸다.
+# 요청 줄은 WARNING 아래로 내리고, 다른 길(예외 문구 · 트레이스백)로 찍히는 주소도 형식기에서 가린다.
+_SECRET_QUERY = re.compile(r"(?i)([?&](?:token|access_token|api_key|apikey|key|secret|password|pat)=)[^&\s'\"<>]+")
+
+
+class _MaskSecretsFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return _SECRET_QUERY.sub(r"\1***", super().format(record))
+
+
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(_MaskSecretsFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("hwax-mcp-gateway")
 
 CONFIG_PATH = os.environ.get("GATEWAY_CONFIG", str(Path(__file__).with_name("gateway_config.json")))

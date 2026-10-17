@@ -6055,3 +6055,43 @@ def test_의미_순위_손잡이는_env_에서_읽고_기본은_꺼짐이다(tmp
     assert "embedder.corp.example" in log_.split("NO_PROXY 에 내부 목적지", 1)[1].split("\n", 1)[0]
     (_, timeout), log_ = probe(GATEWAY_TOOL_SEARCH_EMBED_TIMEOUT="0")
     assert timeout == "2.0" and "GATEWAY_TOOL_SEARCH_EMBED_TIMEOUT=0 " in log_
+
+
+_LOG_PROBE = ("import logging, gateway as gw; r = logging.getLogger(); "
+              "print(type(r.handlers[0].formatter).__name__ if r.handlers else '-'); "
+              "print(logging.getLogger('httpx').getEffectiveLevel(), logging.getLogger('httpcore').getEffectiveLevel()); "
+              "logging.getLogger('httpx').warning('HTTP Request: POST http://odb.example:8000/mcp?token=s3cr3t-Value')")
+
+
+def test_로그는_쿼리의_비밀을_가리고_httpx_요청_줄은_찍지_않는다(tmp_path):
+    """ODB 는 토큰을 주소 쿼리로 받는다 — httpx 의 INFO 요청 줄이 그 주소를 통째로 찍어 cae00 gateway.log 에 26,275줄이
+    남았다(10-17 리뷰 G1). 요청 줄은 끄고, 예외 문구 · 트레이스백으로 찍히는 주소도 형식기가 가린다. 기동 꼴은 새 프로세스로 본다 —
+    pytest 는 루트 로거에 먼저 처리기를 달아 import 시 basicConfig 가 아무것도 하지 않는다."""
+    import logging
+    import sys as _sys
+
+    (tmp_path / "cfg.json").write_text(json.dumps({"_gateway": {"token": "gw-test-token"}}), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GATEWAY_")}
+    env.update(GATEWAY_CONFIG=str(tmp_path / "cfg.json"), GATEWAY_AUDIT=str(tmp_path / "audit.jsonl"), PYTHONDONTWRITEBYTECODE="1")
+    run = subprocess.run([sys.executable, "-c", _LOG_PROBE], cwd=os.path.dirname(os.path.abspath(gw.__file__)),
+                         env=env, capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    kind, levels = run.stdout.split("\n")[:2]
+    assert kind == "_MaskSecretsFormatter", kind
+    assert all(int(x) >= logging.WARNING for x in levels.split()), levels
+    assert "s3cr3t-Value" not in run.stderr and "?token=***" in run.stderr, run.stderr[-500:]
+
+    fmt = gw._MaskSecretsFormatter("%(message)s")
+    rec = logging.LogRecord("hwax-mcp-gateway", logging.WARNING, __file__, 1,
+                            "연결 실패 %s", ("http://odb.example:8000/mcp?token=s3cr3t-Value&x=1",), None)
+    out = fmt.format(rec)
+    assert "s3cr3t-Value" not in out and "?token=***&x=1" in out
+    try:
+        raise RuntimeError("Client error for url 'http://odb.example:8000/mcp?api_key=abc123'")
+    except RuntimeError:
+        rec = logging.LogRecord("httpx", logging.ERROR, __file__, 1, "실패", (), _sys.exc_info())
+    out = fmt.format(rec)
+    assert "abc123" not in out and "api_key=***" in out, out
+    # 비밀이 아닌 쿼리(email · groups)는 그대로다 — 가리는 범위를 넓히면 진단이 어려워진다.
+    rec = logging.LogRecord("x", logging.INFO, __file__, 1, "GET /internal/access/entitlements?email=a@b.c", (), None)
+    assert "email=a@b.c" in fmt.format(rec)

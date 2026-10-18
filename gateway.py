@@ -11,7 +11,7 @@ import time
 from array import array
 from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -2108,6 +2108,56 @@ async def _tool_rank_fused(raw_q: str, rows: list, tools: list[types.Tool]) -> t
     return fused, {"mode": "rrf"}
 
 
+# ── search_tools 실사용 질의 모으기(HWAXPortal docs/followups-1017 결정 21 — 10-18 사용자 결정 '30일') ────────────
+# 평가셋(tool_search_eval/pairs.jsonl)에 실사용 질의가 없다 — 감사 원장은 search_tools 를 남기지 않는다(로컬 도구라 감사 밖).
+# 이름 · 주소 없이 날짜(KST) · 질의 원문 · 순위 방식 · 상위 다섯(평가셋 정답과 같은 '앱키:원래 이름')만 한 줄씩 덧붙인다.
+# 첫 줄 날짜부터 30일이 지나면 저절로 멈춘다 — 다시 모으려면 파일을 옮기고 재기동. 끄기 — GATEWAY_TOOL_QUERY_LOG=0.
+# 파일은 추적하지 않는다(.gitignore 의 tool_search_eval/*.local.*). 남기다 실패해도 검색은 그대로 답한다.
+TOOL_QUERY_LOG = Path(__file__).with_name("tool_search_eval") / "queries.local.jsonl"
+TOOL_QUERY_LOG_ON = os.environ.get("GATEWAY_TOOL_QUERY_LOG", "1").strip() != "0"
+TOOL_QUERY_LOG_DAYS = 30
+_KST = timezone(timedelta(hours=9))
+_QLOG: dict = {"first": None, "stopped": False}
+
+
+def _eval_name(name: str) -> str:
+    """노출 이름 → 평가셋 꼴 '앱키:원래 이름' — 노출 이름은 같은 이름의 다른 앱이 떠 있느냐에 따라 접두가 붙었다 떨어진다."""
+    b = route.get(name)
+    return f"{b[0]}:{b[1]}" if b else f"_gateway:{name}"
+
+
+def _log_tool_query(q: str, mode: str, ranked: list[str]) -> None:
+    if not TOOL_QUERY_LOG_ON or _QLOG["stopped"]:
+        return
+    try:
+        today = datetime.now(_KST).date()
+        if _QLOG["first"] is None:
+            first = today
+            head = ""
+            if TOOL_QUERY_LOG.exists():
+                with open(TOOL_QUERY_LOG, encoding="utf-8") as f:
+                    head = f.readline().strip()
+            if head:
+                try:
+                    first = date.fromisoformat(json.loads(head)["d"])
+                except Exception:  # noqa: BLE001 — 시작 날짜를 모르면 30일을 셀 수 없다 → 모으지 않는 쪽으로
+                    _QLOG["stopped"] = True
+                    log.warning("search_tools 질의 모으기 — %s 첫 줄의 날짜를 못 읽어 멈춘다(30일을 셀 수 없다)", TOOL_QUERY_LOG)
+                    return
+            _QLOG["first"] = first
+        if (today - _QLOG["first"]).days >= TOOL_QUERY_LOG_DAYS:
+            _QLOG["stopped"] = True
+            log.info("search_tools 질의 모으기 — 첫 줄(%s)부터 %d일이 지나 멈췄다(%s). 다시 모으려면 파일을 옮기고 재기동",
+                     _QLOG["first"], TOOL_QUERY_LOG_DAYS, TOOL_QUERY_LOG)
+            return
+        TOOL_QUERY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(TOOL_QUERY_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"d": today.isoformat(), "q": q, "mode": mode, "top": [_eval_name(n) for n in ranked[:5]]},
+                               ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001 — 모으기가 검색을 막지 않는다
+        log.warning("search_tools 질의를 남기지 못했다(%r) — 검색은 그대로 답한다", exc)
+
+
 SEARCH_TOOLS_TOOL = types.Tool(
     name="search_tools",
     description=(
@@ -2216,6 +2266,7 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
                 out[k] = sch[k]
         return out
     matches = [{"tool": n, "app": a, "description": d, "args": _args_summary(t)} for _, n, a, d, t in rows[:limit]]
+    _log_tool_query(raw_q, (mode or {}).get("mode") or "substring", [m["tool"] for m in matches])
     # ⚠ 순서가 뜻이다 — 이름 순위·안내를 먼저, 설명·스키마 전문(matches)을 맨 뒤에 둔다. 작은 창의 소비자(dev 웹 챗
     #   TOOL_RESULT_MAX=6,000)는 앞에서부터 글자로 자르므로, 전문이 앞서면 6~8위 도구는 이름조차 사라져 '없다' 로 읽혔다(gw-adh GA-7,
     #   리스크 앱 도구 실측 8건 7,000~8,400자). 게이트웨이는 자르지 않는다 — 잘려도 순위가 남게 놓을 뿐이다.

@@ -19,6 +19,9 @@ def _no_prod_audit(monkeypatch, tmp_path):
     `AUDIT_PATH` 를 직접 거는 시험은 이 뒤에 다시 걸므로 그대로 돈다.
     """
     monkeypatch.setattr(gw, "AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+    # search_tools 질의 모으기도 같다 — 안 걸면 시험 질의가 실사용 질의 파일(tool_search_eval/queries.local.jsonl)에 쌓인다.
+    monkeypatch.setattr(gw, "TOOL_QUERY_LOG", tmp_path / "queries.local.jsonl")
+    monkeypatch.setattr(gw, "_QLOG", {"first": None, "stopped": False})
 
 
 @pytest.fixture(autouse=True)
@@ -6238,3 +6241,73 @@ def test_신원_전달_심의_호출에_포털의_지금_소속을_싣는다(mon
     assert not res.isError and shots[0].get(gw.AFF_FWD_HEADER) == "CAEG"
     res, b, shots, row = _recon_kit(monkeypatch, "hwax-deliberation", session="none", aff="")
     assert gw.AFF_FWD_HEADER not in shots[0], "소속을 모르면 싣지 않는다"
+
+
+# ── search_tools 실사용 질의 모으기(HWAXPortal docs/followups-1017 결정 21 — 30일) ─────────────────────────────────────
+# 평가셋에 실사용 질의가 없었다(감사 원장은 search_tools 를 남기지 않는다). 이름 · 주소 없이 날짜 · 질의 · 방식 · 상위 다섯만,
+# 첫 줄 날짜부터 30일이 지나면 저절로 멈춘다. 시험 질의는 autouse `_no_prod_audit` 가 tmp 로 돌린다.
+def _qlog_kit(monkeypatch):
+    tools = [_tool("report_digest"), _tool("report_list")]
+    monkeypatch.setattr(gw, "exposed_tools", tools)
+    monkeypatch.setattr(gw, "route", {"report_digest": ("signalforge", "digest"), "report_list": ("signalforge", "list")})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    monkeypatch.setattr(gw, "_request_user", lambda: "someone@example.com")
+
+
+def _qlog_lines():
+    p = gw.TOOL_QUERY_LOG
+    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()] if p.exists() else []
+
+
+def test_search_tools_질의를_이름_없이_남긴다(monkeypatch):
+    _qlog_kit(monkeypatch)
+    out = json.loads(asyncio.run(gw._search_tools({"query": "Report 요약"})).content[0].text)
+    assert out["ranked"][0] == "report_digest"
+    [line] = _qlog_lines()
+    assert set(line) == {"d", "q", "mode", "top"}, "이름 · 주소 · 결과 전문은 남기지 않는다"
+    assert line["q"] == "Report 요약", "질의는 원문(대소문자 그대로 — 임베딩에 주는 글)"
+    assert line["mode"] == "substring" and line["top"][0] == "signalforge:digest", "정답은 평가셋 꼴(앱키:원래 이름)"
+    assert line["d"] == gw.datetime.now(gw._KST).date().isoformat()
+    asyncio.run(gw._search_tools({"query": "x"}))                      # 2자 미만은 검색 오류 — 남기지 않는다
+    assert len(_qlog_lines()) == 1
+
+
+def test_search_tools_질의_모으기는_첫_줄부터_30일_뒤_멈춘다(monkeypatch):
+    _qlog_kit(monkeypatch)
+    today = gw.datetime.now(gw._KST).date()
+    for age, writes in ((29, True), (30, False)):
+        gw.TOOL_QUERY_LOG.write_text(json.dumps({"d": (today - gw.timedelta(days=age)).isoformat(), "q": "옛", "mode": "substring",
+                                                 "top": []}) + "\n", encoding="utf-8")
+        monkeypatch.setattr(gw, "_QLOG", {"first": None, "stopped": False})
+        asyncio.run(gw._search_tools({"query": "report"}))
+        assert (len(_qlog_lines()) == 2) is writes, f"첫 줄이 {age}일 전"
+    asyncio.run(gw._search_tools({"query": "report"}))
+    assert len(_qlog_lines()) == 1 and gw._QLOG["stopped"], "멈춘 뒤로는 파일을 다시 열지도 않는다"
+
+
+def test_search_tools_질의_모으기는_끌_수_있고_못_남겨도_검색은_답한다(monkeypatch, tmp_path):
+    _qlog_kit(monkeypatch)
+    monkeypatch.setattr(gw, "TOOL_QUERY_LOG_ON", False)
+    asyncio.run(gw._search_tools({"query": "report"}))
+    assert not gw.TOOL_QUERY_LOG.exists(), "GATEWAY_TOOL_QUERY_LOG=0"
+    monkeypatch.setattr(gw, "TOOL_QUERY_LOG_ON", True)
+    monkeypatch.setattr(gw, "TOOL_QUERY_LOG", tmp_path)                 # 디렉터리라 덧붙이기가 실패한다
+    out = json.loads(asyncio.run(gw._search_tools({"query": "report"})).content[0].text)
+    assert out["ranked"], "남기기 실패가 검색을 막지 않는다"
+
+
+def test_search_tools_질의_모으기는_첫_줄_날짜를_모르면_멈춘다(monkeypatch):
+    _qlog_kit(monkeypatch)
+    gw.TOOL_QUERY_LOG.write_text("{깨진 줄\n", encoding="utf-8")
+    asyncio.run(gw._search_tools({"query": "report"}))
+    assert gw.TOOL_QUERY_LOG.read_text(encoding="utf-8") == "{깨진 줄\n" and gw._QLOG["stopped"], "30일을 셀 수 없으면 모으지 않는 쪽"
+
+
+def test_평가_러너는_실사용_질의_파일에_쓰지_않는다():
+    src = (gw.Path(gw.__file__).parent / "tool_search_eval" / "run.py").read_text(encoding="utf-8")
+    i = src.index("def _import_gateway")
+    body = src[i:src.index("import gateway as gw", i)]
+    assert 'os.environ["GATEWAY_TOOL_QUERY_LOG"] = "0"' in body, "142쌍 평가 질의가 실사용 질의에 섞인다"

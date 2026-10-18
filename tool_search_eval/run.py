@@ -87,6 +87,7 @@ def _import_gateway(tmp: Path):
     os.environ["GATEWAY_CONFIG"] = str(cfg)
     os.environ["GATEWAY_AUDIT"] = str(tmp / "audit.jsonl")
     os.environ.pop("GATEWAY_TOOL_SEARCH_EMBED_URL", None)
+    os.environ["GATEWAY_TOOL_QUERY_LOG"] = "0"          # 평가 질의를 실사용 질의 파일(queries.local.jsonl)에 섞지 않는다
     sys.path.insert(0, str(ROOT))
     for name in ("hwax-mcp-gateway", "httpx"):                           # import·요청마다의 안내 줄은 평가와 무관하다
         logging.getLogger(name).setLevel(logging.WARNING)

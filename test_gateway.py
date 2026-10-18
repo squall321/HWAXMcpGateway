@@ -6311,3 +6311,32 @@ def test_평가_러너는_실사용_질의_파일에_쓰지_않는다():
     i = src.index("def _import_gateway")
     body = src[i:src.index("import gateway as gw", i)]
     assert 'os.environ["GATEWAY_TOOL_QUERY_LOG"] = "0"' in body, "142쌍 평가 질의가 실사용 질의에 섞인다"
+
+
+def test_검토_표시를_평가셋에_되돌린다(tmp_path):
+    """검토 화면(결정 21)의 표시 — 맞음은 reviewed, 고침은 정답 · 질의를 바꾸고 reviewed, 빼기는 줄을 지운다. 틀린 꼴은 건너뛰고 센다."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("apply_review", gw.Path(gw.__file__).parent / "tool_search_eval" / "apply_review.py")
+    ar = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ar)
+    pairs = [{"id": f"p{i}", "query": f"질의{i}", "gold": [f"app:t{i}"], "source": "auto", "reviewed": False} for i in range(6)]
+    marks_dir = tmp_path / "marks"
+    marks_dir.mkdir()
+    docs = {
+        "p0": {"verdict": "ok", "memo": "  맞다  "},
+        "p1": {"id": "p1", "data": {"verdict": "fix", "gold": ["app:t1", "app:x", "app:x"], "query": "고친 질의"}, "version": 3},
+        "p2": {"verdict": "drop"},
+        "p3": {"verdict": "fix", "gold": ["이름만"]},
+        "p4": {"verdict": "maybe"},
+        "zz": {"verdict": "ok"},
+    }
+    for k, v in docs.items():
+        (marks_dir / f"{k}.json").write_text(json.dumps(v, ensure_ascii=False), encoding="utf-8")
+    new, rep = ar.apply(pairs, ar.load_marks(marks_dir))
+    by = {p["id"]: p for p in new}
+    assert [p["id"] for p in new] == ["p0", "p1", "p3", "p4", "p5"], "빼기는 줄을 지운다"
+    assert by["p0"]["reviewed"] is True and by["p0"]["review_memo"] == "맞다"
+    assert by["p1"] == {**pairs[1], "query": "고친 질의", "gold": ["app:t1", "app:x"], "reviewed": True}, "내려받은 꼴 {id, data, version}"
+    assert by["p3"] == pairs[3] and by["p4"] == pairs[4] and by["p5"] == pairs[5], "틀린 고침 · 모르는 표시 · 표시 없음은 그대로"
+    assert sorted(pid for pid, _ in rep["skipped"]) == ["p3", "p4", "zz"], "건너뛴 것을 센다(평가셋에 없는 id 포함)"
+    assert pairs[1]["reviewed"] is False, "원래 목록은 바꾸지 않는다"

@@ -62,6 +62,16 @@ def credential_mode(conf: dict) -> str:
     return "inject" if conf.get("inject") else "none"
 
 
+def is_read_only(claims: dict) -> bool:
+    """포털 PAT 가 읽기 전용인가 — scopes 에 read 가 있고 write 가 없을 때만. 칸이 없는 옛 PAT 은 포털 기본(read · write)이라 아니다.
+    챗 · 절차 PAT 의 `["chat"]` 은 읽기 전용이 아니다('write 가 없으면 읽기' 로 보면 웹 챗이 막힌다 — HWAXPortal docs/followups-1017 FU-D18)."""
+    raw = (claims or {}).get("scopes")
+    if not isinstance(raw, list):
+        return False
+    s = {str(x).strip().lower() for x in raw}
+    return "read" in s and "write" not in s
+
+
 def allowed_methods(conf: dict) -> list[str] | None:
     """이 사이트에서 허용되는 HTTP 메서드. None = 제한 없음.
 
@@ -241,6 +251,12 @@ class RestProxy:
                  "detail": f"{site} 는 {'/'.join(allowed)} 만 허용한다. 쓰기가 필요하면 "
                            f"게이트웨이 설정의 rest.{site}.methods 에 명시하라."},
                 status_code=405)
+
+        # 읽기 전용 PAT(scopes 에 read 만)는 GET · HEAD 만 — MCP 의 rest_call 과 같은 규칙(HWAXPortal docs/followups-1017 결정 5).
+        if is_read_only(claims) and request.method.upper() not in ("GET", "HEAD"):
+            self.audit(what, site, False, "read-only", 0, caller=who, ip=ip, via="pat")
+            return JSONResponse({"error": "read-only token",
+                                 "detail": "읽기 전용 토큰(scopes 에 read 만)은 GET · HEAD 만 부른다."}, status_code=403)
 
         # ⚠ **자격을 MCP 와 같은 규칙으로 본다.** 여태 PAT 서명·aud·scope·폐기목록까지만
         # 보고 **groups 를 안 봤다** — 그래서 자격 0개인 사람이 MCP 로는 `forbidden:` 을

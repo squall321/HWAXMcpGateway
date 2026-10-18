@@ -17,6 +17,19 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
 
 규칙: 백엔드 `allowed_groups`가 **비었거나 없으면 전체 공개**(기존 동작 보존), 있으면 교집합 필요. 헤더가 없거나 그룹이 비면 제한 백엔드는 숨김(**fail-closed**). 어느 도구가 어느 백엔드인지는 게이트웨이의 `route` 맵만 알기에(에이전트엔 평탄화되어 도착) 필터는 여기서만 가능하다. 헤더는 `_low.request_context.request.headers`로 읽는다(streamable-http가 Starlette Request를 핸들러까지 전달).
 
+## 읽기 전용 포털 PAT — 조회만(HWAXPortal docs/followups-1017 결정 5)
+
+포털 PAT 의 `scopes` 가 `read` 만이면(**`read` 가 있고 `write` 가 없을 때** — 챗 · 절차 PAT 의 `["chat"]` 은 해당 없음, 칸이 없는 옛 PAT 은
+포털 기본 읽기 · 쓰기) 다음만 부른다. 막으면 `read_only: …` 로 까닭과 여는 법을 답하고 감사 원장에 `read-only` 를 남긴다.
+
+- 백엔드 도구 — **`read_tools.json`(추적)의 `백엔드키:원래 이름`**(별칭 · 접두 노출 이름도 원래 이름으로 푼다) 또는 **앱이 그 도구에 단
+  `readOnlyHint`**(재집계마다 다시 읽는다). 처음 목록은 리스크 앱이 읽기 토큰으로 부르는 26종(10-18 대조).
+- 게이트웨이 자체 도구 — 조회(search_tools · list_tool_apps · rest_catalog · search_conversations · browse_experts · use_experts ·
+  verify_answer)는 열고 `save_conversation` 은 막는다. `rest_call` 과 REST 다리(`/api/<site>/`)는 GET · HEAD 만. `invoke_tool` 은 안쪽 도구로 본다.
+- 표지 `x-hwax-readonly` 는 PAT 분기에서만 싣고 클라이언트 사본은 두 분기(GW_TOKEN · PAT) 모두 버린다.
+- 판정 밖 — 읽기 PAT 로 포털 `/agent/chat` · 카드 대조를 부르면 포털이 챗 PAT 를 새로 찍어 심의(RA 초안 저장)가 돈다. 리스크 앱 패널의
+  길이라 그대로 둔다(결정 FU-D17).
+
 ## 설정 — `gateway_config.json` (gitignore, 시크릿)
 **전체 스키마·플레이스홀더는 커밋된 `gateway_config.example.json` 참고** — fresh 배포 시 이걸 복사해 실토큰만 채운다. `gateway_config.json` 자체는 gitignore(600).
 현 `mcp_servers.json`과 동일 JSON 스키마 + 최상위 `_gateway` 블록. 백엔드에 선택적 `allowed_groups`(미지정 = 전체 공개).

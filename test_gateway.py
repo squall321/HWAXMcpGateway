@@ -6095,3 +6095,124 @@ def test_로그는_쿼리의_비밀을_가리고_httpx_요청_줄은_찍지_않�
     # 비밀이 아닌 쿼리(email · groups)는 그대로다 — 가리는 범위를 넓히면 진단이 어려워진다.
     rec = logging.LogRecord("x", logging.INFO, __file__, 1, "GET /internal/access/entitlements?email=a@b.c", (), None)
     assert "email=a@b.c" in fmt.format(rec)
+
+
+# ── 읽기 전용 포털 PAT(결정 5, 10-18) ─────────────────────────────────────────────
+# 포털 PAT 의 scopes 가 read 만이면(read 있고 write 없음) 허용 목록(read_tools.json) · 앱이 단 readOnlyHint · 게이트웨이 자체 조회만.
+# 챗 · 절차 PAT 의 ["chat"] 은 읽기 전용이 아니다. 표지는 게이트웨이가 PAT 분기에서만 싣고 클라이언트 사본은 두 분기 모두 버린다.
+def test_읽기_전용_판정은_read_있고_write_없을_때만():
+    from rest_proxy import is_read_only
+    assert is_read_only({"scopes": ["read"]}) and is_read_only({"scopes": [" READ "]})
+    assert not is_read_only({"scopes": ["read", "write"]}), "포털 기본 범위"
+    assert not is_read_only({"scopes": ["chat"]}), "챗 · 절차 PAT — 'write 가 없으면 읽기' 로 보면 웹 챗이 막힌다"
+    assert not is_read_only({}) and not is_read_only({"scopes": "read"}), "칸이 없거나 꼴이 틀리면 옛 기본(읽기 · 쓰기)"
+
+
+def test_읽기_전용_표지는_PAT_분기에서만_싣고_위조는_버린다(monkeypatch):
+    import asyncio
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["h"] = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+
+    async def no_portal(email, base, **_kw):
+        return None
+    monkeypatch.setattr(gw, "_portal_access", no_portal)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        def __init__(self, claims): self.claims = claims
+        async def verify(self, token, aud): return self.claims
+
+    def run(auth, claims):
+        seen.clear()
+        hdrs = [(b"authorization", auth), (gw.READONLY_HEADER.encode(), b"1")]
+        asyncio.run(gw._bearer_gate(app, _V(claims))({"type": "http", "path": "/mcp", "headers": hdrs}, None, None))
+        return seen.get("h", {})
+    assert run(b"Bearer ro", {"email": "u@x.io", "groups": [], "scopes": ["read"]})[gw.READONLY_HEADER] == "1"
+    assert gw.READONLY_HEADER not in run(b"Bearer rw", {"email": "u@x.io", "groups": [], "scopes": ["read", "write"]}), \
+        "읽기 · 쓰기 PAT 는 위조 표지가 살아남지 않는다"
+    assert gw.READONLY_HEADER not in run(b"Bearer gw-secret", None), "GW_TOKEN 길도 클라이언트 사본을 버린다"
+
+
+def _ro_setup(monkeypatch, headers):
+    import asyncio
+    hinted = types.Tool(name="get_hinted", description="", inputSchema={"type": "object"},
+                        annotations=types.ToolAnnotations(readOnlyHint=True))
+    b = _CallB(["list_parts", "export_step"])
+    b.session._t.append(hinted)                                       # 재집계가 readOnlyHint 를 줍는지까지 본다
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": b})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "tool_readonly_hint", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "READ_TOOLS", frozenset({"heax-step_forge:list_parts"}))
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    asyncio.run(gw._aggregate())
+    _set_request_headers(monkeypatch, headers)
+    return b
+
+
+def test_읽기_전용_토큰은_허용_목록_표시_자체_조회만(monkeypatch):
+    _ro_setup(monkeypatch, {gw.READONLY_HEADER: "1"})
+    assert gw.tool_readonly_hint[("heax-step_forge", "get_hinted")] is True, "재집계가 앱의 readOnlyHint 를 담는다"
+    assert gw._readonly_denial("list_parts", {}) == "", "허용 목록"
+    assert gw._readonly_denial("heaxstep_forge_list_parts", {}) == "", "별칭도 원래 이름으로 푼다"
+    assert gw._readonly_denial("get_hinted", {}) == "", "앱이 단 readOnlyHint"
+    why = gw._readonly_denial("export_step", {})
+    assert why.startswith("read_only:") and "heax-step_forge:export_step" in why and "read_tools.json" in why, why
+    for local in ("search_tools", "list_tool_apps", "rest_catalog", "search_conversations", "verify_answer"):
+        assert gw._readonly_denial(local, {}) == "", local
+    assert gw._readonly_denial("save_conversation", {}).startswith("read_only: save_conversation")
+    assert gw._readonly_denial("rest_call", {"method": "get"}) == "" and gw._readonly_denial("rest_call", {}) == ""
+    assert gw._readonly_denial("rest_call", {"method": "POST"}).startswith("read_only: rest_call POST")
+    assert gw._readonly_denial("no_such_tool", {}) == "", "없는 도구는 'unknown tool' 로 끝난다"
+
+
+def test_읽기_전용이면_call_tool_이_백엔드로_보내지_않고_감사에_남긴다(monkeypatch):
+    import asyncio
+    b = _ro_setup(monkeypatch, {gw.READONLY_HEADER: "1"})
+    r = asyncio.run(gw._call_tool("export_step", {}))
+    assert r.isError and r.content[0].text.startswith("read_only:")
+    r2 = asyncio.run(gw._call_tool("invoke_tool", {"name": "heaxstep_forge_export_step", "arguments": {}}))
+    assert r2.isError and r2.content[0].text.startswith("read_only:"), "invoke_tool 은 안쪽 도구로 본다"
+    assert b.session.calls == [], f"막힌 호출이 백엔드까지 갔다: {b.session.calls}"
+    assert not asyncio.run(gw._call_tool("list_parts", {})).isError and b.session.calls == ["list_parts"]
+    lines = [json.loads(x) for x in open(gw.AUDIT_PATH, encoding="utf-8")]
+    assert sum(1 for x in lines if x.get("error") == "read-only" or x.get("note") == "read-only") >= 2, lines[-3:]
+    _set_request_headers(monkeypatch, {})                              # 읽기 · 쓰기 토큰이면 종전 그대로
+    assert not asyncio.run(gw._call_tool("export_step", {})).isError and b.session.calls[-1] == "export_step"
+
+
+def test_read_tools_파일이_온전하고_리스크_앱_도구를_담는다():
+    data = json.load(open(gw.Path(gw.__file__).with_name("read_tools.json"), encoding="utf-8"))
+    tools = data["tools"]
+    assert tools == sorted(set(tools)) and all(t.count(":") == 1 and all(t.split(":")) for t in tools)
+    for need in ("heax-step_forge:job_status", "heax-kooremapper_mcp:inspect_file", "signalforge:get_top_issues",
+                 "ai-data-hub:recommend_agents", "heax-step_forge:system_status"):
+        assert need in tools, need
+    assert gw.READ_TOOLS == frozenset(tools)
+
+
+def test_REST_다리도_읽기_전용_PAT_는_GET_HEAD_만(monkeypatch):
+    """`/api/<site>/` 는 MCP 를 거치지 않는다 — 같은 규칙을 다리가 따로 건다(rest_proxy.is_read_only)."""
+    import asyncio
+    from starlette.requests import Request
+    from rest_proxy import RestProxy
+
+    async def allow(site, groups, email):
+        return True
+
+    async def no_revoked():
+        return set()
+    p = RestProxy({"s": {"base": "http://upstream.invalid", "methods": ["GET", "HEAD", "POST"]}}, {"audience_ok": ["s"]},
+                  gw._audit, allow=allow)
+    p._verify = lambda token, site: {"sub": "S", "email": "u@x.io", "jti": "j", "groups": [], "scopes": ["read"]}
+    p._revoked_set = no_revoked
+    resp = asyncio.run(p.handle(Request({
+        "type": "http", "method": "POST", "path": "/api/s/x", "headers": [(b"authorization", b"Bearer t")],
+        "query_string": b"", "path_params": {"site": "s", "path": "x"}, "client": ("127.0.0.1", 0)})))
+    assert resp.status_code == 403 and b"read-only token" in resp.body
+    rows = [json.loads(x) for x in open(gw.AUDIT_PATH, encoding="utf-8")]
+    assert rows[-1]["error"] == "read-only" and rows[-1]["via"] == "pat"

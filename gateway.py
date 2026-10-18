@@ -26,7 +26,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 # 메서드 허용 규칙의 정본. REST 프록시 라우트와 MCP 다리가 **같은 함수**를 봐야 한다.
 # (rest_proxy 는 gateway 를 import 하지 않으므로 이 방향은 순환이 아니다.)
-from rest_proxy import EXPIRED_BODY, JWKS_TIMEOUT_S, REST_PROXY_UPSTREAM_TIMEOUT_S, PatExpired, allowed_methods, credential_mode
+from rest_proxy import (EXPIRED_BODY, JWKS_TIMEOUT_S, REST_PROXY_UPSTREAM_TIMEOUT_S, PatExpired, allowed_methods, credential_mode,
+                        is_read_only)
 
 # 쿼리에 실린 비밀(…/mcp?token=…)이 로그에 평문으로 남지 않게 한다. ODB 는 토큰을 주소 쿼리로 받고(provision-config.sh),
 # httpx 는 INFO 로 요청마다 주소를 통째로 찍었다 — cae00 gateway.log 26,275줄(10-17 리뷰 G1), dev 는 이메일 쿼리도 실렸다.
@@ -244,6 +245,9 @@ PROCEDURE_PURPOSE = "procedure"
 # 클라이언트가 보낸 사본은 두 분기 모두 버린다. 박스 안 호출은 IP 가 전부 127.0.0.1 이라 이게 없으면 '웹 챗 경유' 와
 # '박스 안 Claude Code' 를 못 가른다(HWAXPortal docs/gateway-audit-ip D-5).
 VIA_HEADER = "x-hwax-via"
+# 이 PAT 가 읽기 전용인가(scopes 에 read 만) — **게이트웨이가 PAT 분기에서만** '1' 을 싣고, 클라이언트가 보낸 사본은 두 분기 모두 버린다.
+# 읽기 전용이면 허용 목록(read_tools.json) · readOnlyHint · 게이트웨이 자체 조회만 부른다(HWAXPortal docs/followups-1017 결정 5).
+READONLY_HEADER = "x-hwax-readonly"
 AFF_PROOF_TTL_S = int(os.environ.get("GATEWAY_AFF_PROOF_TTL", "120"))
 
 
@@ -681,6 +685,8 @@ route: dict[str, tuple[str, str]] = {}  # exposed_name -> (backend_key, original
 # 별칭을 노출하면 게이트웨이 전체가 한꺼번에 개명되는 것과 같아진다.
 # ⚠ **`route` 를 먼저 본다** — 기존 이름의 뜻은 하나도 바뀌지 않는다.
 alias_route: dict[str, tuple[str, str]] = {}
+# (백엔드키, 원래 이름) → 앱이 도구에 readOnlyHint 를 달았나 — 읽기 전용 토큰의 허용 판정이 본다(재집계마다 다시 채운다).
+tool_readonly_hint: dict[tuple[str, str], bool] = {}
 _task_group_holder: dict[str, object] = {}
 
 
@@ -861,6 +867,9 @@ async def _aggregate():
         log.info("backend %s -> %d tools", key, len(res.tools))
 
     name_counts = Counter(t.name for _, t in collected)
+    tool_readonly_hint.clear()
+    for key, t in collected:
+        tool_readonly_hint[(key, t.name)] = bool(getattr(getattr(t, "annotations", None), "readOnlyHint", False))
     exposed_tools.clear()
     route.clear()
     alias_route.clear()
@@ -3243,6 +3252,48 @@ def _request_via() -> str:
     return (raw or "").strip()[:20]
 
 
+def _request_readonly() -> bool:
+    """이 호출이 읽기 전용 포털 PAT 로 들어왔나(게이트웨이가 PAT 분기에서만 싣는다 — 클라이언트 사본은 버린다)."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return False
+    return bool(req is not None and (req.headers.get(READONLY_HEADER) or "").strip() == "1")
+
+
+def _load_read_tools() -> frozenset:
+    """read_tools.json 의 '백엔드키:원래 이름' 목록. 못 읽으면 빈 목록이다 — 읽기 전용 토큰은 게이트웨이 자체 조회와 readOnlyHint 만
+    부른다(닫힌 쪽으로). 경고는 남긴다."""
+    try:
+        with open(Path(__file__).with_name("read_tools.json"), encoding="utf-8") as f:
+            return frozenset(str(x) for x in (json.load(f).get("tools") or []) if str(x))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("read_tools.json 을 읽지 못했다 — 읽기 전용 토큰은 게이트웨이 자체 조회와 readOnlyHint 도구만 부른다: %r", exc)
+        return frozenset()
+
+
+READ_TOOLS = _load_read_tools()
+
+
+def _readonly_denial(name: str, arguments: dict) -> str:
+    """읽기 전용 토큰이 이 호출을 할 수 없으면 그 까닭(호출자에게 그대로 보인다), 할 수 있으면 ''. invoke_tool 은 안쪽 이름으로 바꾼 뒤에 본다."""
+    if name in _LOCAL_READ:
+        return ""
+    if name == REST_CALL_TOOL.name:
+        m = (str((arguments or {}).get("method") or "GET").strip() or "GET").upper()
+        return "" if m in ("GET", "HEAD") else f"read_only: rest_call {m[:10]} — 읽기 전용 토큰(scopes 에 read 만)은 GET · HEAD 만 부른다."
+    if name == SAVE_CONV_TOOL.name:
+        return "read_only: save_conversation — 읽기 전용 토큰(scopes 에 read 만)은 대화를 저장할 수 없다."
+    resolved = route.get(name) or alias_route.get(name)
+    if resolved is None:
+        return ""      # 아래 'unknown tool' 로 끝난다 — 없는 도구를 읽기 전용 까닭으로 가리지 않는다
+    key, orig = resolved
+    if f"{key}:{orig}" in READ_TOOLS or tool_readonly_hint.get((key, orig)):
+        return ""
+    return (f"read_only: '{name}' — 읽기 전용 토큰(scopes 에 read 만)은 조회 도구만 부른다. 이 도구가 조회라면 운영자가 게이트웨이 "
+            f"read_tools.json 에 '{key}:{orig}' 를 더하거나, 앱이 그 도구에 readOnlyHint 를 단다.")
+
+
 # ── 사용자별 백엔드 자격증명 ────────────────────────────────────────────────
 # {(app_id, email): (token, 만료 monotonic)}. 발급이 '같은 이름의 직전 토큰'을 회수하므로
 # 같은 사용자에 대한 동시 발급은 서로를 무효화한다 — 사용자 단위 락으로 직렬화한다.
@@ -3840,6 +3891,12 @@ async def _list_tools():
     return _visible_tools(_request_groups())
 
 
+# 게이트웨이 자체 도구 가운데 조회만 하는 것 — 읽기 전용 토큰도 부른다. save_conversation(쓰기)은 빠지고, rest_call 은 메서드로,
+# invoke_tool 은 안쪽 도구로 바꾼 뒤 _readonly_denial 이 다시 본다.
+_LOCAL_READ = frozenset({SEARCH_CONV_TOOL.name, LIST_APPS_TOOL.name, SEARCH_TOOLS_TOOL.name, BROWSE_EXPERTS_TOOL.name,
+                         USE_EXPERTS_TOOL.name, VERIFY_TOOL.name, REST_CATALOG_TOOL.name})
+
+
 @_low.call_tool(validate_input=False)
 async def _call_tool(name: str, arguments: dict):
     t0 = time.monotonic()
@@ -3886,6 +3943,13 @@ async def _call_tool(name: str, arguments: dict):
                 type="text", text="invoke_tool: arguments 는 객체여야 합니다.")], isError=True)
         log.info("invoke_tool → %s", inner)
         name, arguments = inner, inner_args
+    # 읽기 전용 포털 PAT — 허용 목록 · readOnlyHint · 게이트웨이 자체 조회만(HWAXPortal docs/followups-1017 결정 5).
+    if _request_readonly():
+        _ro = _readonly_denial(name, arguments or {})
+        if _ro:
+            _audit(name, (route.get(name) or alias_route.get(name) or (None,))[0], False, "read-only", 0,
+                   caller=_request_user() or None, corr=_request_corr())
+            return types.CallToolResult(content=[types.TextContent(type="text", text=_ro)], isError=True)
     if name == SAVE_CONV_TOOL.name:  # 게이트웨이 로컬 도구(백엔드 라우팅 없음)
         return await _save_conversation(arguments or {})
     if name == SEARCH_CONV_TOOL.name:
@@ -4328,7 +4392,7 @@ def _bearer_gate(app, pat_verifier=None):
             # 클라이언트가 실어 보낸 값을 버린다. 안 버리면 GW_TOKEN 을 쥔 쪽이 차단을 면제받는다.
             _kept = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
-                                          DELEGATE_HEADER.lower().encode())]
+                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode())]
             if GROUPS_HEADER.encode() not in headers:
                 _kept.append((GROUPS_HEADER.encode(), SERVICE_GROUP.encode()))
             _kept.append((VIA_HEADER.encode(), b"gw-token"))
@@ -4372,7 +4436,9 @@ def _bearer_gate(app, pat_verifier=None):
             fresh = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (GROUPS_HEADER.encode(), USER_HEADER.encode(),
                                           PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
-                                          DELEGATE_HEADER.lower().encode())]
+                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode())]
+            if is_read_only(claims):
+                fresh.append((READONLY_HEADER.encode(), b"1"))
             # PAT 의 groups 에도 한글이 올 수 있다 — 같은 규칙으로 인코딩해 실어야 헤더가 안 깨진다.
             fresh.append((GROUPS_HEADER.encode(), quote(groups, safe=",").encode("latin-1")))
             _email = str(claims.get("email") or "").strip().lower()

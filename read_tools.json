@@ -1,0 +1,31 @@
+{
+ "_note": "읽기 전용 포털 PAT(scopes 에 read 만 — read 있고 write 없음)가 게이트웨이에서 부를 수 있는 백엔드 도구 — '백엔드키:원래 이름'. 앱이 도구에 readOnlyHint 를 달면 여기 없어도 열린다. 게이트웨이 자체 조회 도구(search_tools 등)는 코드가 연다. 결정 — HWAXPortal docs/followups-1017 결정 5 · FU-D17(10-18). 처음 목록은 리스크 앱(HWAXRisk)이 읽기 토큰으로 부르는 것(대조 10-18).",
+ "tools": [
+  "ai-data-hub:list_agents",
+  "ai-data-hub:recommend_agents",
+  "heax-kooremapper_mcp:compare_reports",
+  "heax-kooremapper_mcp:corpus_summary",
+  "heax-kooremapper_mcp:download_result",
+  "heax-kooremapper_mcp:inspect_file",
+  "heax-kooremapper_mcp:material_usage",
+  "heax-kooremapper_mcp:operation_usage",
+  "heax-kooremapper_mcp:report_energy_flow",
+  "heax-kooremapper_mcp:report_findings",
+  "heax-kooremapper_mcp:report_part_risk",
+  "heax-kooremapper_mcp:report_summary",
+  "heax-kooremapper_mcp:report_worst_cases",
+  "heax-kooremapper_mcp:section_contact_usage",
+  "heax-kooremapper_mcp:system_status",
+  "heax-materialtwin_web:compare_materials",
+  "heax-step_forge:interface_graph",
+  "heax-step_forge:job_status",
+  "heax-step_forge:list_interfaces",
+  "heax-step_forge:list_parts",
+  "heax-step_forge:part_mesh_map",
+  "heax-step_forge:project_tree",
+  "heax-step_forge:system_status",
+  "heax-web_research_mcp:search_scholar",
+  "signalforge:get_top_issues",
+  "signalforge:query_voc"
+ ]
+}

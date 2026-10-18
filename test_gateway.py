@@ -21,6 +21,17 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "AUDIT_PATH", str(tmp_path / "audit.jsonl"))
 
 
+@pytest.fixture(autouse=True)
+def _no_real_portal(monkeypatch):
+    """포털 격리 — 설정 파일(gateway_config.json)의 실제 포털 주소로 시험이 묻지 않게 **모든 시험에 자동으로** 비운다.
+
+    ⚠ 심의 신원 호출이 소속을 포털에 묻게 되자(결정 6, 10-18) 그 길을 타는 시험이 dev 포털의 /internal/access/entitlements
+    를 실제로 불렀다(읽기지만 시험이 박스 상태에 기대게 된다). 포털이 필요한 시험은 본문에서 `PORTAL`·`_portal_api_base` 를 다시
+    건다(종전대로). 권한 캐시도 시험마다 새것이다."""
+    monkeypatch.setattr(gw, "PORTAL", {})
+    monkeypatch.setattr(gw, "_ENT_CACHE", {})
+
+
 def _tool(name: str) -> types.Tool:
     return types.Tool(name=name, description="", inputSchema={"type": "object"})
 
@@ -2399,7 +2410,7 @@ class _ReconB(_CallB):
 
 
 def _recon_kit(monkeypatch, backend, *, session="up", oneshot_fails=0, user="u@corp.com",
-               groups=("mes-user", "feat:chat"), headers=None):
+               groups=("mes-user", "feat:chat"), headers=None, aff="CAEG"):
     """재연결 분기를 실제로 태운다(전송 계층만 막는다). 단발 세션(신원 호출)의 연결은 `oneshot_fails` 번까지 터진다.
     돌려주는 것 — 결과 · 백엔드(상주 세션이 받은 호출·재연결 횟수) · 단발 세션이 연결마다 실은 헤더 · 감사 마지막 줄.
     `headers` 를 주면 신원을 흉내 내지 않고 그 요청 헤더에서 읽는다(인증 미들웨어가 만든 헤더를 그대로 얹을 때)."""
@@ -2429,6 +2440,8 @@ def _recon_kit(monkeypatch, backend, *, session="up", oneshot_fails=0, user="u@c
     monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
     monkeypatch.setattr(gw, "PER_USER_SSO", {})
     monkeypatch.setattr(gw, "IDENTITY_FWD", {"hwax-deliberation"})
+    # 신원 호출은 소속을 포털에 묻는다(결정 6) — 이 시험 묶음의 포털 답
+    monkeypatch.setattr(gw, "_portal_access", _noop_async({"keys": [], "affiliation": aff}))
     monkeypatch.setattr(gw, "_task_group_holder", {"tg": object()})
     monkeypatch.setattr(gw, "_REAGG", {})
     if headers is None:
@@ -6216,3 +6229,12 @@ def test_REST_다리도_읽기_전용_PAT_는_GET_HEAD_만(monkeypatch):
     assert resp.status_code == 403 and b"read-only token" in resp.body
     rows = [json.loads(x) for x in open(gw.AUDIT_PATH, encoding="utf-8")]
     assert rows[-1]["error"] == "read-only" and rows[-1]["via"] == "pat"
+
+
+def test_신원_전달_심의_호출에_포털의_지금_소속을_싣는다(monkeypatch):
+    """심의 백엔드의 같은 소속 열람(결정 6, 10-18)이 이 값과 잡을 열 때 적은 소속을 견준다. 못 읽으면(빈 값) 싣지 않는다 — 빈 소속은
+    누구와도 같은 소속이 아니다(열리지 않는 쪽)."""
+    res, b, shots, row = _recon_kit(monkeypatch, "hwax-deliberation", session="none")
+    assert not res.isError and shots[0].get(gw.AFF_FWD_HEADER) == "CAEG"
+    res, b, shots, row = _recon_kit(monkeypatch, "hwax-deliberation", session="none", aff="")
+    assert gw.AFF_FWD_HEADER not in shots[0], "소속을 모르면 싣지 않는다"

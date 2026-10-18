@@ -248,6 +248,9 @@ VIA_HEADER = "x-hwax-via"
 # 이 PAT 가 읽기 전용인가(scopes 에 read 만) — **게이트웨이가 PAT 분기에서만** '1' 을 싣고, 클라이언트가 보낸 사본은 두 분기 모두 버린다.
 # 읽기 전용이면 허용 목록(read_tools.json) · readOnlyHint · 게이트웨이 자체 조회만 부른다(HWAXPortal docs/followups-1017 결정 5).
 READONLY_HEADER = "x-hwax-readonly"
+# 신원 전달 백엔드(심의)로 싣는 호출자 소속 — 게이트웨이가 포털 원장의 지금 값으로 만든다(클라이언트 값이 닿는 길이 없다 — 단발 세션의
+# 헤더는 게이트웨이가 처음부터 짓는다). 심의 백엔드의 같은 소속 열람이 견준다(결정 6).
+AFF_FWD_HEADER = "x-hwax-affiliation"
 AFF_PROOF_TTL_S = int(os.environ.get("GATEWAY_AFF_PROOF_TTL", "120"))
 
 
@@ -3882,6 +3885,11 @@ async def _call_with_identity(b: "_Backend", original: str, arguments: dict, tim
         hdrs[GROUPS_HEADER] = quote(",".join(groups), safe=",:")
     if user:
         hdrs[USER_HEADER] = quote(user, safe="@.")
+        # 소속 — 심의 백엔드의 같은 소속 열람이 견준다(HWAXPortal docs/followups-1017 결정 6, 10-18). 포털 원장의 **지금** 값이고
+        # 못 읽으면 빈 값이라 싣지 않는다(빈 소속은 누구와도 같은 소속이 아니다 — 열리지 않는 쪽). 관리자 표지는 그룹(ADMIN_GROUP)에 이미 있다.
+        _aff = await _portal_affiliation(user, [g for g in groups if not _is_synthetic(g) and g != ADMIN_GROUP])
+        if _aff:
+            hdrs[AFF_FWD_HEADER] = quote(_aff, safe="")
     return await _oneshot(b, hdrs, original, arguments, timeout_s)
 
 

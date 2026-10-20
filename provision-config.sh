@@ -37,6 +37,8 @@
 #      (예: "newapp:NEWAPP" → NEWAPP_SSO_SECRET · NEWAPP_SSO_URL, 기본 주소 없음). PER_USER_SSO_OFF 로도 꺼진다 —
 #      쌍을 남기고 비밀을 비웠든, 쌍째 지웠든(순회가 쓴 항목의 managed_by 표지로 가린다). 어느 쪽이든 **이름이 와야** 꺼진다 —
 #      목록이 비었다고 스스로 지우지 않는다. 넘기는 쪽은 provision.env 를 읽은 호출자다(update-all, 손으로는 PER_USER_SSO_OFF=<키>).
+#      heax-hub 밖에서 도는 앱(MatNexus 처럼 다른 조직 서버)은 <접두>_MCP_URL 을 더 적으면 MCP 백엔드도 같은 키로 붙는다
+#      (서비스 토큰 없음 — 사람별 호출은 그 위임으로. 주소가 없는 실행은 직전 config 의 백엔드를 그대로 둔다).
 #   9) TestScope: TESTSCOPE_MCP_URL(> 직전 config 주소)이 있으면 testscope 백엔드(서비스 토큰 없음).
 #      사람별 호출은 RA 처럼 두 방식 중 하나다 — 기본은 사람이 포털 '개인 토큰 › 외부 연결' 에 등록한
 #      TestScope 토큰(게이트웨이 PORTAL_CONN_BACKENDS), TESTSCOPE_SSO_SECRET 이 있으면 8)의 위임(게이트웨이에서 먼저 탄다).
@@ -705,6 +707,7 @@ if e.get("TESTSCOPE_SSO_SECRET"):
 # (조용히 건너뛰면 '적었는데 왜 안 켜지나' 를 로그에서 찾을 수 없다). 못 읽은 쌍은 몇 번째인지와 콜론 앞 키만 찍는다 —
 # 값 자리에 비밀을 잘못 적었을 수 있고, 이 출력은 update-all 로그에 그대로 남는다.
 _GENERIC_SSO = {}
+_GENERIC_MCP = {}   # {<키>: (<접두>_MCP_URL 값, 접두)} — heax-hub 밖 앱의 MCP 백엔드
 for _i, _pair in enumerate((e.get("PER_USER_SSO_APPS") or "").split(), 1):
     _k, _sep, _p = _pair.partition(":")
     if not _k or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", _p):
@@ -732,6 +735,8 @@ for _i, _pair in enumerate((e.get("PER_USER_SSO_APPS") or "").split(), 1):
             print(f"  ✓ {_k} 사람별 위임 — {_u}")
         else:
             print(f"  ⚠ {_p}_SSO_SECRET 은 있는데 주소가 없다({_p}_SSO_URL·직전 config 둘 다 없음) — {_k} 위임 생략")
+    if e.get(f"{_p}_MCP_URL"):
+        _GENERIC_MCP[_k] = (e[f"{_p}_MCP_URL"], _p)   # 백엔드는 위임이 다 정해진 뒤(끄기 다음) 만든다 — 아래 MANAGED 옆
 # 끄기 — 위의 '비밀이 없는 실행은 이어받는다' 는 비밀을 **못 읽은** 실행(손으로 돌린 --force 등)을 위한 것이다. 그래서
 # infra/.env 에서 비밀을 비워도 위임이 남아, 포털 화면은 '토큰 등록' 인데 게이트웨이만 위임으로 부르고 거부했다(되돌리기가 안 됐다).
 # update-all 이 infra/.env 를 읽어 비밀이 빈 서비스를 PER_USER_SSO_OFF 로 넘기면 그 항목만 지운다. 비밀이 같이 왔으면 끄지 않고,
@@ -823,6 +828,18 @@ cfg["portal"]["audience_ok"] = sorted(rest)
 MANAGED = {"_gateway", "reportarchive", "signalforge", "mx-white-paper",
            "ai-data-hub", "hwax-deliberation", "smart-twin-mcp", "ste",
            "rest", "portal", "heax_registry", "odb-hub", "arp", "testscope"}
+# 일반 앱의 MCP 백엔드(<접두>_MCP_URL) — heax-hub 밖에서 도는 앱은 레지스트리가 찾아 주지 않아 정적 백엔드로 붙인다. 키가 위임
+# 키와 같아야 게이트웨이가 그 백엔드를 사람별 위임으로 부른다(gateway._delegation_app_id). 서비스 Authorization 은 없다 — 위임이
+# 없으면 토큰 없이 불러 앱이 401 로 막는다(남의 자료를 서비스 자격으로 보지 않는다). 위임이 다 정해진 여기서 만든다(끄기 다음).
+# 이 파일이 만드는 이름은 덮지 않는다 — 덮으면 그 백엔드의 토큰 · 주소가 조용히 바뀐다. 주소가 없는 실행은 만들지 않고, 직전
+# config 의 것은 아래 보존(MANAGED 밖)이 그대로 둔다(TestScope 의 'env > 직전 config' 와 같다). 손으로 붙인 필드는 이어받는다.
+for _k, (_u, _p) in _GENERIC_MCP.items():
+    if _k in MANAGED or _k in cfg:
+        print(f"  ⚠ {_p}_MCP_URL: {_k} — 이 파일이 만드는 백엔드 이름이라 덮지 않는다(건너뛴다). PER_USER_SSO_APPS 의 키를 바꾼다")
+        continue
+    cfg[_k] = {**(_prev_entry(_k) or {}), "url": _u, "transport": "streamable_http"}
+    print(f"  ✓ {_k} — {_u}" + ("(사람별 호출은 위임 토큰으로)" if _k in per_user else
+                                f"(⚠ 위임이 없다 — 토큰 없이 불러 앱이 거절한다. 켜려면 {_p}_SSO_SECRET · {_p}_SSO_URL)"))
 try:
     with open(e["CFG"]) as f:
         prev = json.load(f)

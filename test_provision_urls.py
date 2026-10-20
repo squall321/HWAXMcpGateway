@@ -879,3 +879,44 @@ def test_포털의_방아쇠가_찾는_글자가_이_목록과_같다():
     body = src[src.index("_gw_stale() {"):]
     body = body[:body.index("\n}\n")]
     assert sorted(re.findall(r"grep -qF '([^']+)'", body)) == sorted(_PORTAL_READS)
+
+
+# ── 일반 앱의 MCP 백엔드(<접두>_MCP_URL) — heax-hub 밖 앱(MatNexus 처럼 다른 조직 서버)을 설정만으로 붙인다(HWAXPortal docs/sso-delegation) ──
+def test_일반_앱은_MCP_URL_로_같은_키의_백엔드가_생기고_위임으로_부른다(tmp_path):
+    """위임 키와 백엔드 키가 같아야 게이트웨이가 그 백엔드를 사람별 위임으로 부른다(_delegation_app_id). 서비스 토큰은 싣지 않는다 —
+    위임이 없을 때 서비스 자격으로 남의 자료를 보지 않게. 손으로 붙여 둔 필드(allowed_groups 등)는 이어받는다."""
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({"matnexus": {"url": "http://old:8012/mcp", "allowed_groups": ["x"]}}),
+                                                       encoding="utf-8")
+    log: list = []
+    out = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "matnexus:MATNEXUS", "MATNEXUS_SSO_SECRET": "mnx-secret-xyz",
+                                    "MATNEXUS_SSO_URL": "http://mnx.example:8010/api/auth/sso",
+                                    "MATNEXUS_MCP_URL": "http://mnx.example:8012/mcp"}, log)
+    assert out["matnexus"] == {"url": "http://mnx.example:8012/mcp", "allowed_groups": ["x"], "transport": "streamable_http"}
+    assert out["heax_registry"]["per_user_sso"]["matnexus"]["sso_url"] == "http://mnx.example:8010/api/auth/sso"
+    assert "matnexus — http://mnx.example:8012/mcp(사람별 호출은 위임 토큰으로)" in log[0] and "mnx-secret-xyz" not in log[0]
+    # 주소가 없는 다음 실행 — 만들지 않고, 직전 config 의 백엔드는 보존한다(MANAGED 밖)
+    out = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "matnexus:MATNEXUS"})
+    assert out["matnexus"]["url"] == "http://mnx.example:8012/mcp"
+
+
+def test_일반_앱_MCP_URL_은_위임이_없으면_그렇다고_말한다(tmp_path):
+    log: list = []
+    out = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "matnexus:MATNEXUS", "MATNEXUS_MCP_URL": "http://mnx.example:8012/mcp"}, log)
+    assert out["matnexus"] == {"url": "http://mnx.example:8012/mcp", "transport": "streamable_http"}
+    assert "위임이 없다 — 토큰 없이 불러 앱이 거절한다. 켜려면 MATNEXUS_SSO_SECRET · MATNEXUS_SSO_URL" in log[0]
+    assert "headers" not in out["matnexus"], "서비스 자격을 싣지 않는다"
+
+
+def test_일반_앱_MCP_URL_은_이_파일이_만드는_백엔드를_덮지_않는다(tmp_path):
+    """키를 signalforge 처럼 이미 있는 이름으로 적으면 그 백엔드의 토큰 · 주소가 조용히 바뀐다 — 건너뛰고 말한다."""
+    log: list = []
+    base = _run_provision(tmp_path, {})["signalforge"]
+    (tmp_path / "gateway_config.json").unlink()
+    out = _run_provision(tmp_path, {"PER_USER_SSO_APPS": "signalforge:SIGF", "SIGF_MCP_URL": "http://evil.example/mcp"}, log)
+    assert out["signalforge"] == base
+    assert "SIGF_MCP_URL: signalforge — 이 파일이 만드는 백엔드 이름이라 덮지 않는다" in log[0]
+
+
+def test_일반_앱_MCP_URL_은_목록에_없는_접두면_아무것도_안_만든다(tmp_path):
+    out = _run_provision(tmp_path, {"MATNEXUS_MCP_URL": "http://mnx.example:8012/mcp"})
+    assert "matnexus" not in out

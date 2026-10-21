@@ -761,8 +761,9 @@ for _k in (e.get("PER_USER_SSO_OFF") or "").split():
         print(f"  · {_k} 사람별 위임 끔(PER_USER_SSO_APPS 에서 빠졌다) — 서비스 계정으로")
         continue
     if _k in _SSO_OFF_KEYS and not e.get(_SSO_OFF_KEYS[_k][0]) and per_user.pop(_k, None):
-        # 일반 앱에는 포털 등록 토큰 길(게이트웨이 PORTAL_CONN_BACKENDS)이 없다 — 위임을 끄면 서비스 계정으로 나간다.
-        _to = "서비스 계정으로" if _k in _GENERIC_SSO else "등록 토큰 방식으로"
+        # 일반 앱의 등록 토큰 길은 포털 박스 권한표의 connect: 다(HWAXPortal docs/ext-connect) — 여기서 위임만 끄면 서비스 계정으로 나간다.
+        _to = ("서비스 계정으로(토큰 등록 앱이면 PER_USER_SSO_APPS 에서 빼고 포털 박스 권한표의 connect: 로 붙인다 — 같은 키의 정적 백엔드가 "
+               "있으면 게이트웨이가 그 connect 를 collision 으로 무시한다)") if _k in _GENERIC_SSO else "등록 토큰 방식으로"
         print(f"  · {_SSO_OFF_KEYS[_k][1]} 사람별 위임 끔({_SSO_OFF_KEYS[_k][0]} 비어 있음) — {_to}")
 if per_user:
     cfg.setdefault("heax_registry", {})["per_user_sso"] = per_user
@@ -839,7 +840,9 @@ for _k, (_u, _p) in _GENERIC_MCP.items():
         continue
     cfg[_k] = {**(_prev_entry(_k) or {}), "url": _u, "transport": "streamable_http"}
     print(f"  ✓ {_k} — {_u}" + ("(사람별 호출은 위임 토큰으로)" if _k in per_user else
-                                f"(⚠ 위임이 없다 — 토큰 없이 불러 앱이 거절한다. 켜려면 {_p}_SSO_SECRET · {_p}_SSO_URL)"))
+                                f"(⚠ 위임이 없다 — 토큰 없이 불러 앱이 거절한다. 켜려면 {_p}_SSO_SECRET · {_p}_SSO_URL. 토큰 등록 앱이면 "
+                                "PER_USER_SSO_APPS 에서 빼고 포털 박스 권한표의 connect: 로 붙인다 — 같은 키의 정적 백엔드가 있으면 "
+                                "게이트웨이가 그 connect 를 collision 으로 무시한다)"))
 try:
     with open(e["CFG"]) as f:
         prev = json.load(f)

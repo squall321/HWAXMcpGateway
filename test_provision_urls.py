@@ -920,3 +920,25 @@ def test_일반_앱_MCP_URL_은_이_파일이_만드는_백엔드를_덮지_않�
 def test_일반_앱_MCP_URL_은_목록에_없는_접두면_아무것도_안_만든다(tmp_path):
     out = _run_provision(tmp_path, {"MATNEXUS_MCP_URL": "http://mnx.example:8012/mcp"})
     assert "matnexus" not in out
+
+
+# ── 외부 연결 선언(HWAXPortal docs/ext-connect GW18) — 토큰 등록 앱은 PER_USER_SSO_APPS 가 아니라 포털 박스 권한표의 connect: 로 ──────
+def test_일반_앱의_위임_없음_안내는_connect_길을_말하고_MANAGED_는_그대로다(tmp_path):
+    log: list = []
+    _run_provision(tmp_path, {"PER_USER_SSO_APPS": "matnexus:MATNEXUS", "MATNEXUS_MCP_URL": "http://mnx.example:8012/mcp"}, log)
+    assert ("토큰 등록 앱이면 PER_USER_SSO_APPS 에서 빼고 포털 박스 권한표의 connect: 로 붙인다 — 같은 키의 정적 백엔드가 있으면 "
+            "게이트웨이가 그 connect 를 collision 으로 무시한다") in log[0]
+    src = (HERE / "provision-config.sh").read_text(encoding="utf-8")
+    managed = re.search(r"^MANAGED = \{([^}]*)\}", src, re.M).group(1)
+    assert "matnexus" not in managed and "fmea" not in managed, \
+        "MANAGED 에 넣으면 <P>_MCP_URL 백엔드를 만들지 않고 건너뛴다(10-21 초안 G5 의 잘못)"
+
+
+def test_일반_앱_위임을_끄면_connect_길을_함께_안내한다(tmp_path):
+    prev = {"sso_url": "http://newapp.example:9000/api/auth/sso", "secret": "old", "client": "gateway"}
+    (tmp_path / "gateway_config.json.bak").write_text(json.dumps({"heax_registry": {"per_user_sso": {"newapp": prev}}}),
+                                                       encoding="utf-8")
+    log: list = []
+    _run_provision(tmp_path, {"PER_USER_SSO_APPS": "newapp:NEWAPP", "PER_USER_SSO_OFF": "newapp"}, log)
+    off = [ln for ln in log[0].splitlines() if "사람별 위임 끔" in ln]
+    assert len(off) == 1 and "서비스 계정으로" in off[0] and "포털 박스 권한표의 connect:" in off[0]

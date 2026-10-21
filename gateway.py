@@ -35,9 +35,20 @@ from rest_proxy import (EXPIRED_BODY, JWKS_TIMEOUT_S, REST_PROXY_UPSTREAM_TIMEOU
 _SECRET_QUERY = re.compile(r"(?i)([?&](?:token|access_token|api_key|apikey|key|secret|password|pat)=)[^&\s'\"<>]+")
 
 
+# 외부 연결 선언의 토큰 접두(HWAXPortal docs/ext-connect GW16) — 그 접두 뒤에 8자 이상이 붙고 숫자가 하나라도 든 문자열도 가린다. 선언을 받을
+# 때마다 다시 짓는다(_conn_registry_set). 숫자를 보는 까닭 — 접두가 `fmea_` 처럼 백엔드 키와 같으면 도구 이름(`fmea_list_projects` — GW19 의
+# 접두 이름 · 호출 별칭)까지 가려 로그가 읽히지 않는다. 세 글자보다 짧은 접두는 쓰지 않는다.
+_CONN_TOKEN_MASK: "re.Pattern[str] | None" = None
+
+
+def _mask_conn_token(m: "re.Match[str]") -> str:
+    return m.group(1) + "***" if any(c.isdigit() for c in m.group(2)) else m.group(0)
+
+
 class _MaskSecretsFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        return _SECRET_QUERY.sub(r"\1***", super().format(record))
+        out = _SECRET_QUERY.sub(r"\1***", super().format(record))
+        return _CONN_TOKEN_MASK.sub(_mask_conn_token, out) if _CONN_TOKEN_MASK is not None else out
 
 
 _log_handler = logging.StreamHandler()
@@ -308,6 +319,15 @@ PORTAL_CONN_META: dict[str, dict] = {
     "reportarchive": {"label": "Report Archive", "hint": "rat_…", "workspace_header": "X-Workspace-Slug"},
     "testscope": {"label": "TestScope", "hint": "tsc_pat_…", "workspace_header": None},
 }
+# 내장 둘 — 아래 외부 연결 선언이 덮지도 빼지도 않는다(HWAXPortal docs/ext-connect GW1).
+_BUILTIN_CONN = frozenset(PORTAL_CONN_BACKENDS)
+# 외부 연결 선언 — 포털 /internal/access/policy 의 connections(권한 행과 한 응답, 박스 권한표의 connect:). 검사를 통과한 것만 있다(_conn_validate).
+# 선언 키는 PORTAL_CONN_BACKENDS · PORTAL_CONN_META 에 들어가 위 등록 토큰 길(라우팅 · 미등록 거절 · as-conn 감사)을 그대로 탄다(_conn_reconcile).
+_CONN_REG: dict[str, dict] = {}
+# 선언으로 만든 백엔드 키 — 떼어 낸 뒤에도 **뒤이은 재집계가 경로를 다시 짓기 전까지** 남아, 그동안 _deny_reason 이 닫아 지킨다(GW7).
+_CONN_ACTIVE: set[str] = set()
+# 키 → ok · down · no-list-token · collision · no-policy-row · invalid — /health 의 conn_platforms(키와 상태만 — 주소 · 이메일은 싣지 않는다).
+_CONN_STATUS: dict[str, str] = {}
 PORTAL_CONN_TTL_S = int(os.environ.get("GATEWAY_CONN_TTL", "300"))
 # {(service,email): (conn|None|_ConnLookupError, 만료 monotonic)} — None 은 '등록 없음' 부정 캐시.
 _CONN_CACHE: dict[tuple[str, str], tuple[object, float]] = {}
@@ -428,8 +448,14 @@ def _cache_key(backend_key: str, tool: str, arguments, aff: str = "") -> tuple |
       사이 이동)이 최대 300초 동안 **옛 소속 기준 결과**를 정상 응답으로 준다. 튜플 **끝**에
       붙인다 — `/conn-invalidate` 가 `k[3] == 이메일` 로 고르므로 앞을 밀면 그게 깨진다.
     """
-    if (CACHE_TTL_S <= 0 or tool in _CACHE_DENY or not tool.startswith(_CACHEABLE)
-            or _CACHE_DENY_WORDS.search(tool)):
+    if CACHE_TTL_S <= 0 or tool in _CACHE_DENY or _CACHE_DENY_WORDS.search(tool):
+        return None
+    if backend_key in _CONN_ACTIVE:
+        # 외부 연결 선언 백엔드는 읽기로 표시된 도구(앱 힌트 · 선언의 read_tools)만 담는다 — 이름 접두로 열면 같은 이름의 쓰기가 TTL 안에서
+        # 무음으로 버려진다(HWAXPortal docs/ext-connect GW10).
+        if not tool_readonly_hint.get((backend_key, tool)):
+            return None
+    elif not tool.startswith(_CACHEABLE):
         return None
     try:
         args = json.dumps(arguments or {}, sort_keys=True, ensure_ascii=False)
@@ -607,10 +633,16 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
 class _Backend:
     """백엔드 1개에 대한 영속 ClientSession을 anyio 태스크로 들고 있는 핸들."""
 
-    def __init__(self, key, url, headers):
+    def __init__(self, key, url, headers, list_headers=None, list_only=False):
         self.key = key
         self.url = url
         self.headers = headers or {}
+        # 목록용 자격(외부 연결 선언의 list_auth — HWAXPortal docs/ext-connect GW2). **영속 세션을 열 때만** 싣는다 — self.headers 에 섞으면
+        # 사람별 단발 세션(_call_as_user · _call_with_identity)이 바탕 헤더로 물려받는다. list_only 면 이 세션으로 도구를 부르지 않는다(GW11).
+        self.list_headers = dict(list_headers or {})
+        self.list_only = list_only
+        self.list_fp = ""        # 목록 토큰 sha256 의 앞 12자 — 갈아 끼울지 견준다(토큰은 들고 다니지 않는다)
+        self.spec_fp = ""        # 선언 지문 — 주소 · 목록 토큰은 같고 표시 이름 · read_tools 만 바뀌면 세션은 두고 재집계만 한다
         self.session: ClientSession | None = None
         self._ready = anyio.Event()
         self._stop = anyio.Event()
@@ -624,7 +656,8 @@ class _Backend:
         # 이 시작이 세울 준비 이벤트를 쥐고 들어간다 — reconnect 가 `self._ready` 를 새것으로 갈아 끼워도 기다리는 쪽은 이것을 본다.
         ready = self._ready
         try:
-            async with streamablehttp_client(self.url, headers=self.headers, timeout=BACKEND_HTTP_TIMEOUT_S,
+            async with streamablehttp_client(self.url, headers={**self.headers, **self.list_headers},
+                                             timeout=BACKEND_HTTP_TIMEOUT_S,
                                              sse_read_timeout=BACKEND_READ_TIMEOUT_S) as (read, write, _get_sid):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -870,9 +903,20 @@ async def _aggregate():
         log.info("backend %s -> %d tools", key, len(res.tools))
 
     name_counts = Counter(t.name for _, t in collected)
+    # 이름 겹침 — 선언 백엔드(외부 연결)의 도구만 접두를 단다(HWAXPortal docs/ext-connect GW19). 둘 다 바꾸던 규칙이면 MatNexus 가 붙는 순간
+    # MaterialTwin · SignalForge 의 맨 이름(get_material 등)이 사라져 그 이름을 부르던 절차 · 핀 · 클라이언트가 unknown tool 이 된다.
+    base_counts = Counter(t.name for k, t in collected if k not in _CONN_ACTIVE)
     tool_readonly_hint.clear()
+    declared_read: set[tuple[str, str]] = set()
     for key, t in collected:
-        tool_readonly_hint[(key, t.name)] = bool(getattr(getattr(t, "annotations", None), "readOnlyHint", False))
+        app_hint = getattr(getattr(t, "annotations", None), "readOnlyHint", None)
+        hint = bool(app_hint)
+        # 선언의 read_tools 는 read_tools.json 에 더해지는 박스 목록이다 — 앱이 readOnlyHint=False 를 적었으면 앱이 이긴다(GW9).
+        if (not hint and app_hint is not False and key in _CONN_ACTIVE
+                and t.name in set((_CONN_REG.get(key) or {}).get("read_tools") or ())):
+            hint = True
+            declared_read.add((key, t.name))
+        tool_readonly_hint[(key, t.name)] = hint
     exposed_tools.clear()
     route.clear()
     alias_route.clear()
@@ -886,24 +930,32 @@ async def _aggregate():
             # 안 바꾸고 **보이게만** 한다 — 흔적이 alias 개수 차이뿐이면 아무도 못 본다.
             log.warning("alias collision %s: %s ← %s", _alias, alias_route[_alias], (key, t.name))
         alias_route[_alias] = (key, t.name)
-        if name_counts[t.name] > 1:
+        clash = name_counts[t.name] > 1 if key in _CONN_ACTIVE else base_counts[t.name] > 1
+        if clash:
             prefix = key.replace("-", "")  # mx-white-paper -> mxwhitepaper
             exposed_name = f"{prefix}_{t.name}"
         else:
             exposed_name = t.name
+        ann = getattr(t, "annotations", None)
+        if (key, t.name) in declared_read:
+            # 선언된 읽기 도구 — 노출 사본에 readOnlyHint 를 단다(클라이언트도 읽기로 보게). 앱이 단 다른 표지는 그대로 둔다.
+            ann = ann.model_copy(update={"readOnlyHint": True}) if ann is not None else types.ToolAnnotations(readOnlyHint=True)
         exposed_tools.append(
             types.Tool(
                 name=exposed_name,
                 description=t.description,
                 inputSchema=t.inputSchema,
                 **({"outputSchema": t.outputSchema} if getattr(t, "outputSchema", None) else {}),
-                **({"annotations": t.annotations} if getattr(t, "annotations", None) else {}),
+                **({"annotations": ann} if ann else {}),
                 **({"title": t.title} if getattr(t, "title", None) else {}),
             )
         )
         route[exposed_name] = (key, t.name)
     log.info("AGGREGATED %d exposed tools (unique names: %d, call-only aliases: %d)",
              len(exposed_tools), len(set(route)), len(alias_route))
+    # 떼어 낸 선언 백엔드는 경로를 다시 지은 **뒤에야** 지킴(_CONN_ACTIVE)을 푼다 — 그 전에 남은 경로는 _deny_reason 이 닫는다(GW5 · GW7).
+    for k in [k for k in _CONN_ACTIVE if k not in backends]:
+        _CONN_ACTIVE.discard(k)
     # 다음 initialize 부터 바뀐 카탈로그의 지침이 실린다(이미 붙은 세션은 그때 받은 것을 쓴다).
     _low.instructions = _instructions()
     # 인자 설명 점수판 — 보고만 한다. 세다가 무엇이 터져도 재집계(부팅 포함)를 막지 않는다.
@@ -1047,14 +1099,110 @@ async def _first_connect(tg, key: str, b: _Backend) -> None:
         log.warning("backend %s 첫 연결 %g초 초과 — 다음 패스에서 다시 시도(GATEWAY_LIVENESS_TIMEOUT)", key, LIVENESS_TIMEOUT_S)
 
 
+def _conn_meta_set(key: str, spec: dict) -> None:
+    """선언 키를 등록 토큰 길(PORTAL_CONN_*)과 앱 표시(DISCOVERED_META)에 넣는다 — 내장 둘은 건드리지 않는다."""
+    if key in _BUILTIN_CONN:
+        return
+    PORTAL_CONN_BACKENDS[key] = key
+    PORTAL_CONN_META[key] = {"label": spec["label"] or key, "hint": spec["hint"] or "…",
+                             "workspace_header": spec["workspace_header"]}
+    DISCOVERED_META[key] = {"label": spec["label"], "description": spec["desc"]}
+
+
+def _conn_drop(key: str) -> bool:
+    """선언 백엔드 하나를 뗀다 — 세션을 멈추고 표 · 캐시에서 뺀다. 지킴(_CONN_ACTIVE)은 뒤이은 재집계가 푼다(_aggregate 끝)."""
+    b = backends.pop(key, None)
+    if b is not None:
+        b._stop.set()
+    for d in (DISCOVERED_META, _LAST_TOOLS, _FP, _LIVENESS_MISS):
+        d.pop(key, None)
+    _cache_flush_backend(key)
+    if key not in _BUILTIN_CONN:
+        PORTAL_CONN_BACKENDS.pop(key, None)
+        PORTAL_CONN_META.pop(key, None)
+    if b is not None:
+        log.info("외부 연결 %s 뗌", key)
+    return b is not None
+
+
+async def _conn_reconcile(tg) -> bool:
+    """외부 연결 선언(_CONN_REG)에 맞춰 선언 백엔드를 붙이고 · 갈아 끼우고 · 뗀다(HWAXPortal docs/ext-connect GW5). 바뀌었으면 True.
+
+    목록은 사람 없이 받아 둔다 — list_auth 가 open 이면 자격 없이, registered:<이메일> 이면 그 포털 계정이 그 카드에 등록한 토큰을 **목록 세션
+    에만** 싣는다(list_headers). 호출은 늘 부르는 사람의 등록 토큰으로 단발 세션을 연다. 포털에 물을 수 없으면(_ConnLookupError) 그 키는 이번
+    패스에 건드리지 않는다. 로그에는 키 · 호스트 · 상태만 남긴다(토큰 · 이메일은 남기지 않는다)."""
+    changed = False
+    wanted = dict(_CONN_REG)
+    for key, spec in wanted.items():
+        lh: dict = {}
+        if spec["list_auth"].startswith("registered:"):
+            who = spec["list_auth"].split(":", 1)[1]
+            try:
+                conn = await _portal_connection(key, who)
+            except _ConnLookupError:
+                continue
+            if conn is None:
+                # 목록 계정이 아직 등록하지 않았거나 지웠다 — 백엔드를 만들지 않는다(있던 것은 뗀다 — 지운 토큰으로 목록을 계속 받지 않게).
+                _CONN_STATUS[key] = "no-list-token"
+                if key in _CONN_ACTIVE and key in backends:
+                    changed |= _conn_drop(key)
+                continue
+            lh = {"Authorization": f"Bearer {conn['token']}"}
+        fp = hashlib.sha256(lh["Authorization"].encode("utf-8")).hexdigest()[:12] if lh else ""
+        sfp = hashlib.sha256(json.dumps(spec, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+        b = backends.get(key)
+        if b is not None and key not in _CONN_ACTIVE:
+            # 선언이 아닌 백엔드(정적 · heax · 내장)가 이미 이 키를 쓴다 — 검사(_conn_validate)를 지났어도 덮지 않는다.
+            _CONN_STATUS[key] = "collision"
+            continue
+        if b is not None and b.url == spec["mcp_url"] and b.list_fp == fp:
+            if b.spec_fp != sfp:
+                # 표시 이름 · read_tools · 부서 헤더만 바뀌었다 — 세션은 두고 재집계만 한다(읽기 도구가 재기동 없이 바로 서게, 1-7 ⑨).
+                _conn_meta_set(key, spec)
+                b.spec_fp = sfp
+                changed = True
+            _CONN_STATUS[key] = "ok" if b.session is not None else "down"
+            continue
+        if b is not None:
+            b._stop.set()                         # 주소나 목록 토큰이 바뀌었다 — 그 세션만 갈아 끼운다
+        _conn_meta_set(key, spec)
+        _bypass_proxy_for([spec["mcp_url"]])     # 세션을 열기 **전에** 호스트를 프록시에서 뺀다(heax 합류와 같은 자리)
+        nb = _Backend(key, spec["mcp_url"], {}, list_headers=lh, list_only=True)
+        nb.list_fp, nb.spec_fp = fp, sfp
+        backends[key] = nb
+        # 지킴(_CONN_ACTIVE)은 첫 연결 **전에** 단다 — 첫 연결이 취소 · 실패해도 이 키가 '선언이 아닌 백엔드' 로 읽혀 위의 collision 에 걸리지 않게.
+        _CONN_ACTIVE.add(key)
+        await _first_connect(tg, key, nb)
+        _CONN_STATUS[key] = "ok" if nb.session is not None else "down"
+        changed = True
+        log.info("외부 연결 %s 붙임 — 호스트 %s · 목록 %s · %s", key, urlsplit(spec["mcp_url"]).hostname,
+                 "등록 토큰" if lh else "자격 없이", _CONN_STATUS[key])
+    for key in [k for k in _CONN_ACTIVE if k not in wanted and k in backends]:
+        changed |= _conn_drop(key)
+        _CONN_STATUS.pop(key, None)
+    return changed
+
+
+# 재활 패스 잠금 — 주기 루프와 POST /refresh 가 같은 함수를 부른다. 두 패스가 겹치면 백엔드 표를 돌다 넣고 빼 `dictionary changed size` 가
+# 나거나, 같은 백엔드가 두 번 생겨 세션 태스크가 샌다(HWAXPortal docs/ext-connect GW6 — heax 합류에도 있던 위험이다). anyio.Lock 은 이벤트
+# 루프마다 새로 지을 필요가 없다(anyio 4.14 실측 — 시험의 asyncio.run 여러 번).
+_REVIVE_LOCK = anyio.Lock()
+
+
 async def _revive_once(tg) -> bool:
-    """재활 1회 — 죽은 백엔드 재연결 + heax 앱 재탐지 + 도구 구성 변경 감지 후 재집계.
+    """재활 1회 — 외부 연결 선언 맞추기 + 죽은 백엔드 재연결 + heax 앱 재탐지 + 도구 구성 변경 감지 후 재집계.
 
     주기 루프(_revive_loop)와 수동 트리거(POST /refresh)가 **같은 코드**를 쓴다. 수동
     트리거가 필요한 이유는 배포 자동화 때문이다 — 외부 MCP 를 재배포한 직후 update-all 이
     카탈로그를 검증하는데, 주기가 60초라 그때까지 옛 도구 목록으로 판정하게 된다.
-    변화가 있었으면 True."""
+    변화가 있었으면 True. 두 패스는 겹쳐 돌지 않는다(_REVIVE_LOCK)."""
+    async with _REVIVE_LOCK:
+        return await _revive_once_locked(tg)
+
+
+async def _revive_once_locked(tg) -> bool:
     revived = False
+    revived |= await _conn_reconcile(tg)
     # heax registry 재폴링 — 신규 MCP 앱 합류 / 레지스트리에서 사라진 앱 제거
     if HEAX.get("servers_url"):
         discovered = await _discover_heax()
@@ -1206,6 +1354,12 @@ async def _backends_lifespan():
             backends[key] = b
             POLICY[key] = spec.get("allowed_groups") or []   # heax 앱의 그룹 필터 반영
             await _first_connect(tg, key, b)
+        # 외부 연결 선언 — 디스크 캐시(포털이 늦게 떠도)로 첫 카탈로그에 넣는다. 선언 검사는 권한 행이 있어야 하므로 권한 캐시가 먼저다
+        # (아래 권한 캐시 적재는 종전 그대로 한 번 더 돈다 — 같은 파일을 읽을 뿐이다). registered 목록은 포털이 답할 때 붙는다.
+        _load_access_cache()
+        _load_conn_registry_cache()
+        async with _REVIVE_LOCK:
+            await _conn_reconcile(tg)
         await _aggregate()
         tg.start_soon(_revive_loop, tg)
         # 포털 권한 정책 — 디스크 캐시로 먼저 막고(포털이 늦게 떠도 권한이 풀린 채 돌지 않게),
@@ -1310,6 +1464,11 @@ def _deny_reason(backend_key: str, groups: list[str]) -> str | None:
     if allowed and not (gs & set(allowed)):
         return "gateway_group"
     need = _ACCESS_POLICY.get(backend_key)
+    # 외부 연결 선언 백엔드는 권한 행이 없거나 선언이 지워진 순간부터 닫는다 — 내부 서비스 호출에도(HWAXPortal docs/ext-connect GW7). 표에 없는
+    # 백엔드는 '전체 공개' 라(아래 마지막 줄), 행 없는 순간을 운영 순서에 맡기지 않는다. 사유는 gateway_group 이다 — policy_not_ready 는
+    # '잠시 뒤 다시 부르라' 고 안내해 지운 플랫폼에 틀린 말이 된다.
+    if backend_key in _CONN_ACTIVE and (backend_key not in _CONN_REG or not need):
+        return "gateway_group"
     # 내부 서비스(GW_TOKEN 으로 그룹 헤더 없이 부름)는 사람이 아니다 — 사람 권한 정책을 받지 않는다.
     if SERVICE_GROUP in gs:
         return None
@@ -1384,8 +1543,120 @@ def _load_access_cache() -> None:
         log.warning("권한 정책 캐시를 못 읽었다: %r", exc)
 
 
+_CONN_CACHE_FILE = Path(__file__).resolve().parent / ".conn_registry_cache.json"
+_CONN_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
+_CONN_HOST_RE = re.compile(r"^[a-z0-9._-]+$")
+_CONN_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_CONN_TOOL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_CONN_HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+# 실을 수 없는 헤더 — 포털 권한표 파서와 같은 목록이다(자격 · 연결 · 본문 · MCP 세션 · 포털/허브 신원).
+_CONN_BLOCKED_HEADERS = frozenset(("authorization", "proxy-authorization", "cookie", "host", "accept", "x-csrf-token"))
+_CONN_BLOCKED_PREFIXES = ("content-", "mcp-", "x-hwax-", "x-heax-")
+
+
+def _conn_url_ok(url: object) -> bool:
+    """사람 토큰을 보낼 주소 — http(s) · 계정 · 쿼리 · 조각 없음 · 호스트는 NO_PROXY 에 적을 수 있는 꼴(_bypass_proxy_for 와 같은 규칙)."""
+    if not isinstance(url, str) or not url.strip() or "?" in url or "#" in url:
+        return False
+    try:
+        u = urlsplit(url.strip())
+        u.port  # noqa: B018 — 틀린 포트는 여기서 ValueError
+    except ValueError:
+        return False
+    if u.scheme not in ("http", "https") or "@" in u.netloc or not u.hostname:
+        return False
+    try:
+        return not getattr(ipaddress.ip_address(u.hostname), "scope_id", None)
+    except ValueError:
+        return bool(_CONN_HOST_RE.fullmatch(u.hostname))
+
+
+def _conn_validate(key: str, spec: object, rows: dict) -> tuple[dict | None, str]:
+    """선언 하나 → (쓸 모양, 'ok') 또는 (None, 사유). 사유 — collision(정적 · heax · 내장 · 위임 · 신원 전달 키와 겹친다) · no-policy-row(같은
+    응답의 권한 행에 없다) · invalid(꼴이 틀렸다). 포털이 이미 걸렀지만 게이트웨이도 닫힌 쪽으로 다시 본다(HWAXPortal docs/ext-connect GW3)."""
+    if not isinstance(key, str) or not _CONN_KEY_RE.fullmatch(key):
+        return None, "invalid"
+    if (key in BACKENDS or key.startswith(HEAX_PREFIX) or key in _BUILTIN_CONN or key in PER_USER_SSO
+            or key in IDENTITY_FWD):
+        # 위임 키와 겹치면 위임 분기(if/elif)가 먼저 타 신원 없는 호출을 상주 세션까지 내린다 — 목록 토큰으로 부르게 된다(요청서 1-4 ⑤).
+        return None, "collision"
+    if key not in rows:
+        return None, "no-policy-row"
+    if not isinstance(spec, dict) or not _conn_url_ok(spec.get("mcp_url")):
+        return None, "invalid"
+    texts = {k: spec.get(k) if spec.get(k) is not None else "" for k in
+             ("platform", "label", "desc", "hint", "prefix", "list_auth", "workspace_header")}
+    if not all(isinstance(v, str) for v in texts.values()):
+        return None, "invalid"
+    la = texts["list_auth"].strip() or "open"
+    if la != "open" and not (la.startswith("registered:") and _CONN_EMAIL_RE.fullmatch(la.split(":", 1)[1].strip())):
+        return None, "invalid"
+    wh = texts["workspace_header"].strip()
+    if wh and (not _CONN_HEADER_RE.fullmatch(wh) or wh.lower() in _CONN_BLOCKED_HEADERS
+               or wh.lower().startswith(_CONN_BLOCKED_PREFIXES)):
+        return None, "invalid"
+    rt = spec.get("read_tools") or []
+    if not isinstance(rt, (list, tuple)) or not all(isinstance(t, str) and _CONN_TOOL_RE.fullmatch(t) for t in rt):
+        return None, "invalid"
+    return {"platform": texts["platform"].strip(), "label": texts["label"].strip() or key, "desc": texts["desc"].strip(),
+            "hint": texts["hint"].strip(), "prefix": texts["prefix"].strip(), "mcp_url": spec["mcp_url"].strip(),
+            "list_auth": "open" if la == "open" else "registered:" + la.split(":", 1)[1].strip().lower(),
+            "read_tools": sorted(set(rt)), "workspace_header": wh or None}, "ok"
+
+
+def _conn_registry_set(raw: object, rows: dict, *, persist: bool = True) -> bool:
+    """받은 선언을 검사해 _CONN_REG 를 **한 번에** 바꾼다(await 없이). 바뀌었으면 캐시 파일을 0600 으로 쓴다(토큰은 없다 — 선언뿐이다).
+    버린 선언의 사유는 _CONN_STATUS 에 남기고, 사유가 바뀔 때만 경고한다(60초마다 같은 줄을 찍지 않게)."""
+    global _CONN_TOKEN_MASK
+    reg: dict[str, dict] = {}
+    for k, spec in (raw.items() if isinstance(raw, dict) else ()):
+        got, status = _conn_validate(str(k), spec, rows)
+        if got is None:
+            if _CONN_STATUS.get(str(k)) != status:
+                log.warning("외부 연결 선언 %s 를 받지 않는다 — %s", k, status)
+            _CONN_STATUS[str(k)] = status
+        else:
+            reg[str(k)] = got
+            if _CONN_STATUS.get(str(k)) in ("invalid", "no-policy-row"):
+                _CONN_STATUS.pop(str(k), None)  # 이제 받는다 — 상태는 다음 맞추기가 정한다(검사만 내는 사유라 남기면 틀린 말이다)
+    for k in [k for k in _CONN_STATUS if k not in reg and k not in _CONN_ACTIVE
+              and (not isinstance(raw, dict) or k not in raw)]:
+        _CONN_STATUS.pop(k, None)               # 선언에서 아예 빠진 키의 옛 사유는 지운다
+    changed = reg != _CONN_REG
+    if changed:
+        _CONN_REG.clear()
+        _CONN_REG.update(reg)
+        prefixes = sorted({v["prefix"] for v in reg.values() if len(v["prefix"]) >= 3}, key=len, reverse=True)
+        _CONN_TOKEN_MASK = (re.compile("(" + "|".join(re.escape(p) for p in prefixes) + r")([^\s'\"<>&]{8,})")
+                            if prefixes else None)
+        log.info("외부 연결 선언 — %d개(%s)", len(reg), ", ".join(sorted(reg)) or "없음")
+        if persist:
+            try:
+                fd = os.open(str(_CONN_CACHE_FILE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(reg, f, ensure_ascii=False, sort_keys=True)
+                os.chmod(_CONN_CACHE_FILE, 0o600)
+            except OSError as exc:
+                log.warning("외부 연결 선언 캐시를 못 썼다: %r", exc)
+    return changed
+
+
+def _load_conn_registry_cache() -> None:
+    """외부 연결 선언의 디스크 캐시 — 권한 캐시가 실렸을 때만(선언 검사가 권한 행을 본다). 포털이 늦게 떠도 첫 카탈로그에 넣으려는 것이다."""
+    if not _ACCESS_POLICY_READY:
+        return
+    try:
+        data = json.loads(_CONN_CACHE_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except Exception as exc:  # noqa: BLE001 — 깨진 캐시는 무시(포털에서 다시 받는다)
+        log.warning("외부 연결 선언 캐시를 못 읽었다: %r", exc)
+        return
+    _conn_registry_set(data, _ACCESS_POLICY, persist=False)
+
+
 async def _refresh_access_policy() -> bool:
-    """포털에서 백엔드별 필요 권한을 받아 바꾼다. 실패하면 지금 값을 그대로 둔다(False)."""
+    """포털에서 백엔드별 필요 권한과 외부 연결 선언(같은 응답)을 받아 바꾼다. 실패하면 지금 값을 그대로 둔다(False)."""
     base = _portal_api_base()
     if not base:
         return False
@@ -1396,8 +1667,11 @@ async def _refresh_access_policy() -> bool:
         if resp.status_code == 404:
             return False                      # 권한 기능 이전 포털 — 종전대로(정책 없음)
         resp.raise_for_status()
-        backends = (resp.json() or {}).get("backends") or {}
+        data = resp.json() or {}
+        backends = data.get("backends") or {}
         new = {str(k): [str(x) for x in v] for k, v in backends.items() if isinstance(v, list)}
+        # 외부 연결 선언(HWAXPortal docs/ext-connect) — 없으면 옛 포털이라 선언이 없는 것으로 본다.
+        conns = data.get("connections") if isinstance(data.get("connections"), dict) else {}
     except Exception as exc:  # noqa: BLE001 — 직전 정책 유지(가용성) + 경고
         log.warning("포털 권한 정책 조회 실패 — 직전 정책 유지(백엔드 %d개): %r", len(_ACCESS_POLICY), exc)
         return False
@@ -1411,6 +1685,7 @@ async def _refresh_access_policy() -> bool:
             _ACCESS_CACHE_FILE.write_text(json.dumps(new, ensure_ascii=False, sort_keys=True), encoding="utf-8")
         except OSError as exc:
             log.warning("권한 정책 캐시를 못 썼다: %r", exc)
+    _conn_registry_set(conns, new)
     return True
 
 
@@ -3847,6 +4122,11 @@ def _release_inflight(backend_key: str, why: str) -> int:
 async def _call_shared(b: "_Backend", backend_key: str, original: str, arguments: dict):
     """상주 세션으로 도구 1건. 호출 한도를 넘기면 `_Late("call")` — 세션은 그대로 둔다(같은 세션의 다른 호출이 계속 돈다).
     탐침이 세션을 갈면 `_Late("released")` — 어느 쪽도 다시 부르지 않는다."""
+    if getattr(b, "list_only", False):
+        # 외부 연결의 목록 전용 세션 — 어떤 길로도 도구를 부르지 않는다. 던지지 않고 돌려준다(던지면 재연결 재시도가 다시 이 세션을 부른다).
+        return types.CallToolResult(content=[types.TextContent(type="text", text=(
+            f"{backend_key}: 목록 전용 세션으로는 도구를 부르지 않는다 — 사람이 포털 '외부 연결' 에 등록한 토큰으로만 부른다"))],
+            isError=True)
     sess = b.session
     if sess is None:
         raise RuntimeError("backend session down")
@@ -4046,7 +4326,13 @@ async def _call_tool(name: str, arguments: dict):
             content=[types.TextContent(type="text", text=f"forbidden: {name} — {_deny_text(backend_key, _request_groups())}")],
             isError=True,
         )
-    b = backends[backend_key]
+    b = backends.get(backend_key)
+    if b is None:
+        # 백엔드를 떼어 냈는데 경로는 아직 다음 재집계 전이다(외부 연결 선언 · heax 앱) — KeyError 대신 정돈된 답을 준다.
+        _audit(name, backend_key, False, "backend removed", 0, caller=_request_user() or None, corr=_request_corr())
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=f"backend {backend_key} unavailable: 이 앱은 방금 게이트웨이에서 빠졌다")],
+            isError=True)
     # 사용자 위임 백엔드인가 — **캐시 키에 소속이 들어가야** 하므로 조회보다 먼저 정한다.
     app_id = _delegation_app_id(backend_key)
     _aff = ""
@@ -4146,6 +4432,15 @@ async def _call_tool(name: str, arguments: dict):
         # 보였다(2026-09-29 VOC — "mine 이 personal-5(다른 사람 공간)로 연결된다"). 등록이 없거나 확인이 안 되면
         # 읽기·쓰기 모두 거부하고 등록을 안내한다(사용자 결정). 서비스 계정은 신원 없는 내부 호출에만 쓴다.
         email = _request_user()
+        _declared = backend_key not in _BUILTIN_CONN       # 외부 연결 선언 키(HWAXPortal docs/ext-connect)
+        if not email and _declared:
+            # 선언 키에는 서비스 계정이 없다 — 상주 세션은 목록 전용이다(GW12). 내장 둘은 종전대로 서비스 세션으로 간다.
+            _label = (PORTAL_CONN_META.get(backend_key) or {}).get("label") or backend_key
+            _audit(name, backend_key, False, "refused: no-identity", round((time.monotonic() - t0) * 1000),
+                   caller=None, mode="refused", note="no-identity", corr=_request_corr())
+            return types.CallToolResult(content=[types.TextContent(type="text", text=(
+                f"{_label}: 사람 신원이 없는 호출은 받지 않는다(서비스 계정 없음) — 사람이 포털 '외부 연결' 에 등록한 그쪽 토큰으로만 "
+                "부른다."))], isError=True)
         if not email:
             note = "no-identity"
         else:
@@ -4166,16 +4461,21 @@ async def _call_tool(name: str, arguments: dict):
             if conn is None:
                 _audit(name, backend_key, False, f"refused: {note}", round((time.monotonic() - t0) * 1000),
                        caller=email, mode="refused", note=note, corr=_request_corr())
+                # 끝 문장은 RA 사정(공용 계정 = 실제 사람의 토큰)이라 내장 키에만 붙인다(GW1).
                 return types.CallToolResult(
                     content=[types.TextContent(type="text", text=(
-                        f"{backend_key}: {email} — {why} 공용 계정으로 대신 부르면 다른 사람 명의로 쓰고 "
-                        "남의 비공개 글을 보게 되어 막아 두었습니다."))],
+                        f"{backend_key}: {email} — {why}" + ("" if _declared else
+                                                            " 공용 계정으로 대신 부르면 다른 사람 명의로 쓰고 "
+                                                            "남의 비공개 글을 보게 되어 막아 두었습니다.")))],
                     isError=True,
                 )
             # 사용자 부서가 비어 있으면 헤더를 **지운다**(None) — 서비스 계정의
             # X-Workspace-Slug 가 남으면 그 부서 명의 오류가 사용자에게 뒤집어씌워진다.
             _wh = _cm.get("workspace_header")
             extra = {_wh: conn.get("workspace") or None} if _wh else None
+            if _declared:
+                # 바탕 헤더의 Authorization 을 한 번 더 뗀다 — 그 사람의 Bearer 하나만 나간다(목록 토큰이 섞일 길을 닫는다, GW13).
+                extra = {**(extra or {}), "Authorization": None}
             try:
                 res = await _call_as_user(b, original, arguments, conn["token"],
                                           CALL_TIMEOUT_S, extra_headers=extra)
@@ -4194,9 +4494,11 @@ async def _call_tool(name: str, arguments: dict):
                         "토큰을 다시 등록하세요(만료·폐기 가능성)."))],
                     isError=True,
                 )
+            # 선언 키는 토큰 지문을 단다 — 토큰 없이도 포털 사용자와 그쪽 토큰 주인을 잇는다(주인 확인을 안 하는 길이라, GW14).
             _audit(name, backend_key, not getattr(res, "isError", False), None,
                    round((time.monotonic() - t0) * 1000),
-                   caller=email, mode="as-conn", corr=_request_corr(), res=res)
+                   caller=email, mode="as-conn", corr=_request_corr(), res=res,
+                   note=(f"tok:{hashlib.sha256(conn['token'].encode('utf-8')).hexdigest()[:10]}" if _declared else None))
             return _cache_put(ckey, _evid_keep(name, res))
 
     # 이 호출이 쓰는 세션의 세대. 실패했을 때 "내가 죽었다고 본 그 세션" 을 가리키므로,
@@ -4266,6 +4568,16 @@ async def _call_tool(name: str, arguments: dict):
         )
 
 
+def _conn_platforms() -> dict[str, str]:
+    """외부 연결 플랫폼의 상태 — 붙어 있는 것은 지금 세션으로(ok · down), 나머지는 받을 때 남긴 사유(no-list-token · collision · …)."""
+    out = dict(_CONN_STATUS)
+    for k in _CONN_ACTIVE:
+        b = backends.get(k)
+        if b is not None and out.get(k) in (None, "ok", "down"):
+            out[k] = "ok" if b.session is not None else "down"
+    return dict(sorted(out.items()))
+
+
 def _bearer_gate(app, pat_verifier=None):
     """순수 ASGI 미들웨어: /mcp 인가. Bearer <GW_TOKEN>(내부 에이전트) 또는 포털 PAT(개인 Claude 등).
     PAT 로 들어오면 PAT 의 groups 를 x-hwax-groups 로 강제 주입해 그룹별 도구 필터가 적용된다."""
@@ -4294,6 +4606,8 @@ def _bearer_gate(app, pat_verifier=None):
                 # 통째로 풀린 채 도는 것이고, 그건 프로브가 잡아야 할 사고다. 내용은 가린다.
                 "access_policy_loaded": len(_ACCESS_POLICY),
                 "access_policy_ready": _ACCESS_POLICY_READY,
+                # 외부 연결 플랫폼 — 키와 상태만(주소 · 이메일은 싣지 않는다). 스모크는 이 키를 신원 없이 부르지 않는다(HWAXPortal PX1).
+                "conn_platforms": _conn_platforms(),
                 **({"policy": POLICY, "access_policy": _ACCESS_POLICY} if _detail else {}),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
@@ -4418,6 +4732,8 @@ def _bearer_gate(app, pat_verifier=None):
                 return
             _before = len(exposed_tools)
             try:
+                # 정책 · 외부 연결 선언을 먼저 받는다 — 운영자가 박스 권한표에 적은 새 플랫폼을 이 한 번으로 붙인다(GW15).
+                await _refresh_access_policy()
                 _changed = await _revive_once(_tg)
                 _body = json.dumps({"ok": True, "changed": bool(_changed),
                                     "tools_before": _before, "tools": len(exposed_tools),

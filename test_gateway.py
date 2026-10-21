@@ -6340,3 +6340,565 @@ def test_검토_표시를_평가셋에_되돌린다(tmp_path):
     assert by["p3"] == pairs[3] and by["p4"] == pairs[4] and by["p5"] == pairs[5], "틀린 고침 · 모르는 표시 · 표시 없음은 그대로"
     assert sorted(pid for pid, _ in rep["skipped"]) == ["p3", "p4", "zz"], "건너뛴 것을 센다(평가셋에 없는 id 포함)"
     assert pairs[1]["reviewed"] is False, "원래 목록은 바꾸지 않는다"
+
+
+# ── 외부 연결 선언(HWAXPortal docs/ext-connect) — 포털 박스 권한표의 connect: 로 토큰 등록 플랫폼을 코드 없이 붙인다 ───────────────
+import hashlib  # noqa: E402
+import stat  # noqa: E402
+
+import anyio  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_conn_state(monkeypatch, tmp_path):
+    """선언 상태는 프로세스 전역이다 — 시험마다 새것으로 둔다. 맞추기가 PORTAL_CONN_* 를 고치므로 사본으로 바꿔 끼우고, 선언 캐시는 tmp 에,
+    재활 잠금도 새것이다(앞 시험이 쥔 채 끝나도 다음 시험이 매달리지 않게)."""
+    monkeypatch.setattr(gw, "_CONN_REG", {})
+    monkeypatch.setattr(gw, "_CONN_ACTIVE", set())
+    monkeypatch.setattr(gw, "_CONN_STATUS", {})
+    monkeypatch.setattr(gw, "_CONN_TOKEN_MASK", None)
+    monkeypatch.setattr(gw, "_CONN_CACHE_FILE", tmp_path / "conn_registry_cache.json")
+    monkeypatch.setattr(gw, "PORTAL_CONN_BACKENDS", dict(gw.PORTAL_CONN_BACKENDS))
+    monkeypatch.setattr(gw, "PORTAL_CONN_META", {k: dict(v) for k, v in gw.PORTAL_CONN_META.items()})
+    monkeypatch.setattr(gw, "_REVIVE_LOCK", anyio.Lock())
+
+
+# 포털 `gateway_connections()` 가 내는 꼴 그대로(주소는 예시 도메인).
+_MNX = {"platform": "matnexus", "label": "MatNexus", "desc": "물성 DB", "hint": "mnx_pat_…", "prefix": "mnx_pat_",
+        "mcp_url": "http://mnx.example:8012/mcp", "list_auth": "open", "read_tools": [], "workspace_header": ""}
+_FMEA = {**_MNX, "platform": "fmea", "label": "FMEA Agent", "desc": "FMEA", "hint": "fmea_…", "prefix": "fmea_",
+         "mcp_url": "http://fmea.example:5190/mcp", "list_auth": "registered:list@corp.com"}
+_ROWS = {"matnexus": ["plat:matnexus"], "fmea": ["plat:fmea"]}
+
+
+def _conn_kit(monkeypatch, *, lookup=None):
+    """실제 `_Backend` · `_conn_reconcile` · `_revive_once` · `_aggregate` 를 돌릴 판 — 전송 계층과 목록 계정의 연결 조회만 막는다.
+    상주 세션이 열릴 때 받은 헤더와 그때의 NO_PROXY 를 남긴다(돌려주는 opened). 조회는 `lookup`(없으면 목록 토큰 하나)."""
+    opened: list = []
+
+    class _Sess:
+        def __init__(self, url): self.url = url
+
+        async def initialize(self): return None
+
+        async def list_tools(self):
+            app = "mnx" if "mnx." in self.url else "fmea"
+            return _Res([_tool("get_material" if app == "mnx" else "get_fmea"), _tool(f"list_{app}")])
+
+        async def call_tool(self, *a, **k):
+            raise AssertionError("목록 전용 세션으로 도구를 불렀다")
+
+    def fake_stream(url, headers=None, **_kw):
+        opened.append((url, dict(headers or {}), os.environ.get("NO_PROXY", "")))
+        return _StubCM((url, None, "sid"))
+
+    seen: list = []
+
+    async def fake_lookup(service, email):
+        seen.append((service, email))
+        if lookup is not None:
+            return await lookup(service, email)
+        return {"token": "fmea_list0tok1", "workspace": ""}
+    monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess(read)))
+    monkeypatch.setattr(gw, "_portal_connection", fake_lookup)
+    monkeypatch.setattr(gw, "LIVENESS_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(gw, "HEAX", {})
+    for name in ("backends", "route", "alias_route", "_FP", "_LAST_TOOLS", "_LIVENESS_MISS", "DISCOVERED_META", "POLICY",
+                 "_REAGG", "tool_readonly_hint"):
+        monkeypatch.setattr(gw, name, {})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", dict(_ROWS))
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+    return opened, seen
+
+
+def _in_tg(fn):
+    """fn(tg) 를 태스크 그룹 안에서 돌리고, 끝나면 세션 태스크를 거둔다."""
+    async def go():
+        async with anyio.create_task_group() as tg:
+            try:
+                return await fn(tg)
+            finally:
+                for b in list(gw.backends.values()):
+                    if getattr(b, "_stop", None) is not None:
+                        b._stop.set()
+                tg.cancel_scope.cancel()
+    return asyncio.run(asyncio.wait_for(go(), 10))
+
+
+def _declare(key, spec):
+    """맞추기를 거치지 않고 선언 하나를 붙은 상태로 둔다(호출 경로만 보는 시험)."""
+    got, why = gw._conn_validate(key, dict(spec), {key: [f"plat:{key}"]})
+    assert why == "ok", why
+    gw._CONN_REG[key] = got
+    gw._CONN_ACTIVE.add(key)
+    gw._conn_meta_set(key, got)
+    return got
+
+
+def test_선언_하나로_목록_전용_백엔드가_생기고_목록_토큰은_목록_세션에만_실린다(monkeypatch):
+    opened, seen = _conn_kit(monkeypatch)
+    assert gw._conn_registry_set({"matnexus": dict(_MNX), "fmea": dict(_FMEA)}, _ROWS) is True
+
+    async def go(tg):
+        changed = await gw._conn_reconcile(tg)
+        return changed, {k: (type(b) is gw._Backend, b.headers, b.list_headers, b.list_only, b.session is not None)
+                         for k, b in gw.backends.items()}
+    changed, made = _in_tg(go)
+    assert changed is True
+    assert made == {"matnexus": (True, {}, {}, True, True),
+                    "fmea": (True, {}, {"Authorization": "Bearer fmea_list0tok1"}, True, True)}, \
+        "바탕 헤더는 비어 있다 — 사람별 단발 세션이 목록 자격을 물려받을 수 없게"
+    by = {u: (h, np) for u, h, np in opened}
+    assert not any(k.lower() == "authorization" for k in by[_MNX["mcp_url"]][0]), "open 은 자격 없이 연다"
+    assert by[_FMEA["mcp_url"]][0]["Authorization"] == "Bearer fmea_list0tok1"
+    assert "mnx.example" in by[_MNX["mcp_url"]][1] and "fmea.example" in by[_FMEA["mcp_url"]][1], "세션을 열기 전에 프록시에서 뺀다"
+    assert seen == [("fmea", "list@corp.com")], "목록 계정의 등록만 묻는다(open 은 묻지 않는다)"
+    assert gw.PORTAL_CONN_BACKENDS["fmea"] == "fmea" and gw.PORTAL_CONN_META["fmea"]["label"] == "FMEA Agent"
+    assert gw.DISCOVERED_META["matnexus"] == {"label": "MatNexus", "description": "물성 DB"}, "앱 이름이 'Matnexus' 가 되지 않게"
+    assert gw._CONN_STATUS == {"matnexus": "ok", "fmea": "ok"} and gw._CONN_ACTIVE == {"matnexus", "fmea"}
+
+
+def test_목록_계정이_등록하지_않았으면_백엔드를_만들지_않고_포털을_못_물으면_건드리지_않는다(monkeypatch):
+    async def none(service, email):
+        return None
+    _conn_kit(monkeypatch, lookup=none)
+    gw._conn_registry_set({"fmea": dict(_FMEA)}, _ROWS)
+    assert _in_tg(gw._conn_reconcile) is False
+    assert gw.backends == {} and gw._CONN_STATUS == {"fmea": "no-list-token"}
+
+    async def down(service, email):
+        raise gw._ConnLookupError("503")
+    _conn_kit(monkeypatch, lookup=down)
+    gw._CONN_STATUS.clear()
+    assert _in_tg(gw._conn_reconcile) is False
+    assert gw.backends == {} and gw._CONN_STATUS == {}, "모름은 '없음' 이 아니다 — 이번 패스에는 그 키를 건드리지 않는다"
+
+
+def test_목록_토큰이_바뀌면_그_세션만_갈아_끼우고_목록_계정이_지우면_뗀다(monkeypatch):
+    tokens = {"t": "fmea_list0tok1"}
+
+    async def lookup(service, email):
+        return None if tokens["t"] is None else {"token": tokens["t"], "workspace": ""}
+    _conn_kit(monkeypatch, lookup=lookup)
+    gw._conn_registry_set({"matnexus": dict(_MNX), "fmea": dict(_FMEA)}, _ROWS)
+
+    async def go(tg):
+        await gw._conn_reconcile(tg)
+        mnx, f1 = gw.backends["matnexus"], gw.backends["fmea"]
+        same = await gw._conn_reconcile(tg)
+        tokens["t"] = "fmea_list0tok2"                      # 목록 계정이 카드에서 다시 등록했다(포털이 /conn-invalidate 를 부른다)
+        swapped = await gw._conn_reconcile(tg)
+        f2 = gw.backends["fmea"]
+        out = (same, swapped, mnx is gw.backends["matnexus"], f1 is not f2, f1._stop.is_set(), dict(f2.list_headers))
+        tokens["t"] = None                                  # 목록 계정이 토큰을 지웠다 — 지운 토큰으로 목록을 계속 받지 않는다
+        gone = await gw._conn_reconcile(tg)
+        return (*out, gone, f2._stop.is_set(), "fmea" in gw.backends, gw._CONN_STATUS.get("fmea"))
+    same, swapped, mnx_kept, replaced, old_stopped, lh, gone, new_stopped, left, status = _in_tg(go)
+    assert same is False and swapped is True and mnx_kept and replaced and old_stopped
+    assert lh == {"Authorization": "Bearer fmea_list0tok2"}
+    assert gone is True and new_stopped and not left and status == "no-list-token"
+
+
+def test_재활_패스_둘이_겹치지_않는다_한_패스가_백엔드를_도는_사이에_다른_패스가_선언_백엔드를_넣지_않는다(monkeypatch):
+    """주기 루프와 POST /refresh 가 같은 함수를 부른다. 한 패스가 재연결 루프에서 `backends` 를 돌며 기다리는 사이 다른 패스가 선언
+    백엔드를 넣으면 `dictionary changed size during iteration` 으로 패스가 죽는다 — heax 합류에도 있던 위험이다(HWAXPortal docs/ext-connect
+    GW6). 잠금이 있으면 뒤 패스가 기다렸다가 돌고, 백엔드는 한 번만 생긴다."""
+    _conn_kit(monkeypatch)
+    made: list = []
+    real = gw._Backend
+
+    class _Counting(real):
+        def __init__(self, *a, **k):
+            made.append(a[0])
+            super().__init__(*a, **k)
+
+    class _SlowB(_CallB):
+        """세션이 죽어 재연결 루프가 기다리는 백엔드."""
+        def __init__(self):
+            super().__init__(["slow_tool"])
+            self.session = None
+
+        async def reconnect(self, tg, seen_gen=None):
+            await asyncio.sleep(0.1)
+            self.session = _CallSess([_tool("slow_tool")])
+    monkeypatch.setattr(gw, "_Backend", _Counting)
+    gw.backends["slow"] = _SlowB()
+
+    async def go(tg):
+        first = asyncio.ensure_future(gw._revive_once(tg))         # 주기 패스 — 재연결 루프에서 기다린다
+        await asyncio.sleep(0.02)
+        gw._conn_registry_set({"matnexus": dict(_MNX)}, _ROWS)      # 그 사이 정책 루프가 새 선언을 받았다
+        second = asyncio.ensure_future(gw._revive_once(tg))        # POST /refresh
+        await asyncio.gather(first, second)
+        return sorted(gw.backends), sorted(gw.route)
+    keys, tools = _in_tg(go)
+    assert made == ["matnexus"] and keys == ["matnexus", "slow"]
+    assert tools == ["get_material", "list_mnx", "slow_tool"]
+
+
+def test_선언을_지우면_다음_패스에_세션과_경로가_사라지고_집계_뒤에야_지킴이_풀린다(monkeypatch):
+    _conn_kit(monkeypatch)
+    gw._conn_registry_set({"matnexus": dict(_MNX)}, _ROWS)
+
+    async def go(tg):
+        await gw._revive_once(tg)
+        b = gw.backends["matnexus"]
+        before = (sorted(gw.route), set(gw._CONN_ACTIVE), gw._deny_reason("matnexus", ["plat:matnexus"]))
+        gw._conn_registry_set({}, _ROWS)                    # 박스 파일에서 connect: 를 지웠다 — 행은 남아 있다(추적 행이 되살아남)
+        mid = gw._deny_reason("matnexus", ["plat:matnexus"]), gw._deny_reason("matnexus", [gw.SERVICE_GROUP])
+        changed = await gw._revive_once(tg)
+        return before, mid, changed, b._stop.is_set(), sorted(gw.route), set(gw._CONN_ACTIVE), set(gw.backends)
+    before, mid, changed, stopped, route_after, active, keys = _in_tg(go)
+    assert before == (["get_material", "list_mnx"], {"matnexus"}, None)
+    assert mid == ("gateway_group", "gateway_group"), "패스 전에도 닫힌다 — 내부 서비스 호출에도"
+    assert changed is True and stopped and route_after == [] and active == set() and keys == set()
+    assert set(gw.PORTAL_CONN_BACKENDS) == {"reportarchive", "testscope"} and "matnexus" not in gw._CONN_STATUS
+
+
+def test_선언만_바뀌면_세션은_두고_재집계해_읽기_도구가_바로_선다(monkeypatch):
+    opened, _ = _conn_kit(monkeypatch)
+    gw._conn_registry_set({"matnexus": dict(_MNX)}, _ROWS)
+
+    async def go(tg):
+        await gw._revive_once(tg)
+        b = gw.backends["matnexus"]
+        h0 = gw.tool_readonly_hint.get(("matnexus", "get_material"))
+        gw._conn_registry_set({"matnexus": {**_MNX, "read_tools": ["get_material"], "label": "MatNexus DB"}}, _ROWS)
+        changed = await gw._revive_once(tg)
+        return (h0, changed, b is gw.backends["matnexus"], b._stop.is_set(),
+                gw.tool_readonly_hint.get(("matnexus", "get_material")), len(opened), gw.DISCOVERED_META["matnexus"]["label"])
+    h0, changed, same, stopped, h1, n_open, label = _in_tg(go)
+    assert h0 is False and changed is True and same and not stopped and n_open == 1, "세션을 갈지 않는다"
+    assert h1 is True and label == "MatNexus DB"
+
+
+def test_선언이_아닌_백엔드가_쓰는_키는_맞추기가_덮지_않는다(monkeypatch):
+    opened, _ = _conn_kit(monkeypatch)
+    other = _B([_tool("x")])
+    gw.backends["matnexus"] = other                         # 선언이 아닌 길로 이미 표에 있다
+    gw._CONN_REG["matnexus"] = gw._conn_validate("matnexus", dict(_MNX), _ROWS)[0]
+    assert _in_tg(gw._conn_reconcile) is False
+    assert gw.backends["matnexus"] is other and opened == [] and gw._CONN_STATUS["matnexus"] == "collision"
+    assert "matnexus" not in gw._CONN_ACTIVE and "matnexus" not in gw.PORTAL_CONN_BACKENDS
+
+
+@pytest.mark.parametrize("key", ["signalforge", "heax-step_forge", "testscope", "reportarchive", "newapp", "hwax-deliberation"])
+def test_정적_heax_내장_위임_신원전달_키와_겹치는_선언은_collision(monkeypatch, key):
+    """위임 키와 겹치면 위임 분기(if/elif)가 먼저 타 신원 없는 호출을 상주 세션까지 내린다 — 목록 토큰으로 부르게 된다(요청서 1-4 ⑤)."""
+    _conn_kit(monkeypatch)
+    monkeypatch.setattr(gw, "BACKENDS", {"signalforge": {"url": "http://sf.example/mcp"}})
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"newapp": {"sso_url": "http://newapp.example/sso", "secret": "s"}})
+    monkeypatch.setattr(gw, "IDENTITY_FWD", {"hwax-deliberation"})
+    gw._conn_registry_set({key: dict(_MNX)}, {key: ["plat:x"]})
+    assert gw._CONN_REG == {} and gw._CONN_STATUS == {key: "collision"}
+    assert _in_tg(gw._conn_reconcile) is False and gw.backends == {}
+
+
+_BAD_CONN = {
+    "u-at": {"mcp_url": "http://u@mnx.example/mcp"},
+    "u-query": {"mcp_url": "http://mnx.example/mcp?token=x"},
+    "u-frag": {"mcp_url": "http://mnx.example/mcp#f"},
+    "u-scheme": {"mcp_url": "ftp://mnx.example/mcp"},
+    "u-zone": {"mcp_url": "http://[fe80::1%25eth0]:8012/mcp"},     # NO_PROXY 에 적을 수 없는 호스트
+    "u-port": {"mcp_url": "http://mnx.example:99999/mcp"},
+    "u-none": {"mcp_url": None},
+    "la-email": {"list_auth": "registered:nobody"},
+    "la-kind": {"list_auth": "token:abc"},
+    "wh-auth": {"workspace_header": "Authorization"},
+    "wh-hwax": {"workspace_header": "X-Hwax-User"},
+    "wh-mcp": {"workspace_header": "Mcp-Session-Id"},
+    "wh-shape": {"workspace_header": "X Slug"},
+    "rt-str": {"read_tools": "get_a"},
+    "rt-shape": {"read_tools": ["get a"]},
+    "label-type": {"label": 3},
+}
+
+
+@pytest.mark.parametrize("key", sorted(_BAD_CONN))
+def test_꼴이_틀린_선언은_invalid_이고_나머지는_받는다(monkeypatch, key):
+    _conn_kit(monkeypatch)
+    rows = {key: ["plat:x"], "fmea": ["plat:fmea"]}
+    gw._conn_registry_set({key: {**_MNX, **_BAD_CONN[key]}, "fmea": dict(_FMEA)}, rows)
+    assert set(gw._CONN_REG) == {"fmea"} and gw._CONN_STATUS == {key: "invalid"}
+
+
+def test_권한_행이_없는_선언과_틀린_키는_받지_않고_다시_받으면_옛_사유를_지운다(monkeypatch):
+    _conn_kit(monkeypatch)
+    gw._conn_registry_set({"fmea": dict(_FMEA), "Bad_Key": dict(_MNX)}, {"Bad_Key": ["plat:x"]})
+    assert gw._CONN_REG == {} and gw._CONN_STATUS == {"fmea": "no-policy-row", "Bad_Key": "invalid"}
+    gw._conn_registry_set({"fmea": dict(_FMEA)}, _ROWS)
+    assert set(gw._CONN_REG) == {"fmea"} and gw._CONN_STATUS == {}, "선언에서 빠진 키 · 이제 받는 키의 옛 사유는 남기지 않는다"
+
+
+def test_정책_갱신이_선언을_같은_응답에서_읽고_캐시는_0600_이며_옛_포털이면_선언이_빈다(monkeypatch, tmp_path):
+    monkeypatch.setattr(gw, "_ACCESS_CACHE_FILE", tmp_path / "ap.json")
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    # 응답만 바꿔 끼운다 — _mock_http 를 두 번 걸면 가짜 클라이언트가 겹친다.
+    answer = {"status": 200, "json": {"backends": _ROWS, "connections": {"matnexus": _MNX, "fmea": _FMEA}}}
+    _mock_http(monkeypatch, lambda req: httpx.Response(answer["status"], json=answer["json"]))
+    assert asyncio.run(gw._refresh_access_policy()) is True
+    assert set(gw._CONN_REG) == {"matnexus", "fmea"} and gw._CONN_REG["fmea"]["list_auth"] == "registered:list@corp.com"
+    f = gw._CONN_CACHE_FILE
+    assert stat.S_IMODE(f.stat().st_mode) == 0o600
+    assert set(json.loads(f.read_text(encoding="utf-8"))) == {"matnexus", "fmea"}
+    assert "Bearer" not in f.read_text(encoding="utf-8"), "캐시에는 선언만 — 토큰은 없다"
+    answer.update(status=503, json={})
+    assert asyncio.run(gw._refresh_access_policy()) is False and set(gw._CONN_REG) == {"matnexus", "fmea"}, "못 받으면 직전 선언"
+    answer.update(status=200, json={"backends": _ROWS})        # connections 를 모르는 옛 포털
+    assert asyncio.run(gw._refresh_access_policy()) is True and gw._CONN_REG == {} and gw._ACCESS_POLICY == _ROWS
+
+
+def test_부팅은_두_캐시로_open_선언을_첫_카탈로그에_넣고_registered_는_포털이_답한_뒤에_붙인다(monkeypatch, tmp_path):
+    real_load = gw._load_access_cache
+    _boot_kit(monkeypatch, set())
+    monkeypatch.setattr(gw, "_load_access_cache", real_load)
+    monkeypatch.setattr(gw, "BACKENDS", {})
+    monkeypatch.setattr(gw, "HEAX", {})
+    monkeypatch.setattr(gw, "tool_readonly_hint", {})
+
+    async def nothing():
+        return {}
+    monkeypatch.setattr(gw, "_discover_heax", nothing)
+    monkeypatch.setattr(gw, "_ACCESS_CACHE_FILE", tmp_path / "ap.json")
+    (tmp_path / "ap.json").write_text(json.dumps(_ROWS), encoding="utf-8")
+    gw._CONN_CACHE_FILE.write_text(json.dumps({"matnexus": _MNX, "fmea": _FMEA}), encoding="utf-8")
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", False)
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+    _portal(monkeypatch, 503)                               # 포털이 아직 안 떴다 — registered 의 목록 계정을 못 묻는다
+
+    async def go():
+        async with gw._backends_lifespan():
+            first = sorted({bk for bk, _o in gw.route.values()})
+            _Portal.status, _Portal.payload = 200, {"token": "fmea_list0tok1", "workspace": ""}
+            gw._CONN_CACHE.clear()
+            await gw._revive_once(gw._task_group_holder["tg"])
+            return first, sorted({bk for bk, _o in gw.route.values()}), dict(gw._CONN_STATUS)
+    first, second, status = asyncio.run(asyncio.wait_for(go(), 10))
+    assert first == ["matnexus"], "open 선언은 포털 없이도 첫 카탈로그에 든다"
+    assert second == ["fmea", "matnexus"] and status == {"matnexus": "ok", "fmea": "ok"}
+
+
+def test_사람_호출에는_그_사람의_Bearer_하나만_나가고_감사에_토큰_지문이_남는다(monkeypatch):
+    res, svc, one, row = _decl_call_kit(monkeypatch, base_headers={"authorization": "Bearer someone_put_this", "X-Keep": "1"})
+    assert not res.isError and svc == [], "목록 세션으로 부르지 않는다"
+    auth = [(k, v) for k, v in one["headers"].items() if k.lower() == "authorization"]
+    assert auth == [("Authorization", "Bearer fmea_user0tok9")], "그 사람의 Bearer 하나만 — 목록 토큰 · 바탕 헤더는 섞이지 않는다"
+    assert one["headers"]["X-Keep"] == "1" and one["tool"] == "get_fmea"
+    assert _Portal.seen[0][0].endswith("/internal/connections/fmea") and _Portal.seen[0][1] == {"email": "u@corp.com"}
+    assert row["mode"] == "as-conn" and row["caller"] == "u@corp.com"
+    assert row["note"] == "tok:" + hashlib.sha256(b"fmea_user0tok9").hexdigest()[:10]
+    text = open(gw.AUDIT_PATH, encoding="utf-8").read()
+    assert "fmea_user0tok9" not in text and "fmea_list0tok1" not in text
+
+
+def _decl_call_kit(monkeypatch, *, user="u@corp.com", base_headers=None, conn=None, tool="get_fmea"):
+    """선언 백엔드 하나로 `_call_tool` 을 실제로 태운다(`_call_as_user` 는 진짜, 전송 계층만 막는다). 상주(목록) 세션은 받은 호출을 남긴다."""
+    b = _CallB([tool])
+    b.headers = dict(base_headers or {})
+    b.list_headers, b.list_only = {"Authorization": "Bearer fmea_list0tok1"}, True
+    one: dict = {}
+
+    class _Sess:
+        async def initialize(self): return None
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            one["tool"] = original
+            return types.CallToolResult(content=[types.TextContent(type="text", text="{}")], isError=False)
+
+    def fake_stream(url, headers=None, **_kw):
+        one["headers"] = dict(headers or {})
+        return _StubCM((None, None, "sid"))
+    monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {"fmea": b})
+    monkeypatch.setattr(gw, "route", {tool: ("fmea", tool)})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {"fmea": ["plat:fmea"]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_user", lambda: user)
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["plat:fmea"] if user else [gw.SERVICE_GROUP])
+    _declare("fmea", _FMEA)
+    _portal(monkeypatch, **(conn or {"status": 200, "payload": {"token": "fmea_user0tok9", "workspace": ""}}))
+    res = asyncio.run(gw._call_tool(tool, {}))
+    return res, b.session.calls, one, _rows()[-1]
+
+
+def test_신원_없는_선언_호출은_서비스_세션으로_내리지_않고_거절한다(monkeypatch):
+    res, svc, one, row = _decl_call_kit(monkeypatch, user="")
+    text = res.content[0].text
+    assert res.isError and "FMEA Agent" in text and "사람 신원이 없는 호출은 받지 않는다" in text
+    assert svc == [] and one == {} and _Portal.seen == []
+    assert row["mode"] == "refused" and row["note"] == "no-identity" and row["ok"] is False
+
+
+def test_미등록_사람의_선언_호출은_등록을_안내하고_RA_사정은_말하지_않는다(monkeypatch):
+    res, svc, one, row = _decl_call_kit(monkeypatch, conn={"status": 404})
+    text = res.content[0].text
+    assert res.isError and svc == [] and one == {}
+    assert "FMEA Agent 토큰이 포털에 등록되어 있지 않습니다" in text and "fmea_…" in text and "/tokens?tab=connect" in text
+    assert "공용 계정" not in text
+    assert row["mode"] == "refused" and row["note"] == "no-connection"
+    res, svc, one, row = _decl_call_kit(monkeypatch, conn={"status": 503})
+    assert res.isError and one == {} and row["note"] == "conn-lookup-error", "포털을 못 물으면 다른 자격으로 대신 부르지 않는다"
+
+
+def test_내장_RA_의_감사_줄과_거절_문구는_그대로다(monkeypatch):
+    _res, _svc, _user, row = _ra_kit(monkeypatch, "get_report", status=200, payload={"token": "rat_u", "workspace": "dept"})
+    assert row["mode"] == "as-conn" and "note" not in row, "tok: 지문은 선언 키에만"
+    res, *_ = _ra_kit(monkeypatch, "get_report", status=404)
+    assert "공용 계정으로 대신 부르면" in res.content[0].text
+
+
+def test_목록_전용_세션으로는_어떤_길로도_도구를_부르지_않는다(monkeypatch):
+    b = _ReconB(["get_fmea"])
+    b.list_only = True
+    res = asyncio.run(gw._call_shared(b, "fmea", "get_fmea", {}))
+    assert res.isError and "목록 전용" in res.content[0].text
+    assert b.session.calls == [] and b.reconnects == 0, "던지지 않으니 재연결 재시도도 없다"
+    # 선언 아닌 키에 붙은 목록 전용 세션도 일반 호출 길에서 같은 답이다
+    monkeypatch.setattr(gw, "backends", {"x": b})
+    monkeypatch.setattr(gw, "route", {"get_fmea": ("x", "get_fmea")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    gw._RESP_CACHE.clear()
+    res = asyncio.run(gw._call_tool("get_fmea", {}))
+    assert res.isError and b.session.calls == [] and b.reconnects == 0
+
+
+def test_백엔드를_뗀_뒤_경로만_남은_순간의_호출은_정돈된_오류다(monkeypatch):
+    monkeypatch.setattr(gw, "backends", {})
+    monkeypatch.setattr(gw, "route", {"get_fmea": ("fmea", "get_fmea")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {"fmea": ["plat:fmea"]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["plat:fmea"])
+    gw._CONN_REG["fmea"] = gw._conn_validate("fmea", dict(_FMEA), _ROWS)[0]
+    gw._CONN_ACTIVE.add("fmea")
+    res = asyncio.run(gw._call_tool("get_fmea", {}))
+    assert res.isError and "방금 게이트웨이에서 빠졌다" in res.content[0].text
+    assert _rows()[-1]["error"] == "backend removed"
+
+
+def test_선언_백엔드는_행이_없거나_선언이_지워지면_내부_서비스에도_닫힌다(monkeypatch):
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    gw._CONN_ACTIVE.add("fmea")
+    gw._CONN_REG["fmea"] = gw._conn_validate("fmea", dict(_FMEA), _ROWS)[0]
+    svc, person = [gw.SERVICE_GROUP], ["plat:fmea"]
+    assert gw._deny_reason("fmea", svc) == "gateway_group", "표에 없는 백엔드는 전체 공개라 — 행 없는 순간을 운영 순서에 맡기지 않는다"
+    gw._ACCESS_POLICY["fmea"] = ["plat:fmea"]
+    assert gw._deny_reason("fmea", svc) is None and gw._deny_reason("fmea", person) is None
+    assert gw._deny_reason("fmea", ["feat:chat"]) == "portal_access"
+    gw._CONN_REG.clear()                                    # 선언을 지웠다 — 다음 패스 전
+    assert gw._deny_reason("fmea", svc) == "gateway_group" and gw._deny_reason("fmea", person) == "gateway_group"
+    assert "잠시 뒤" not in gw._deny_text("fmea", person), "지운 플랫폼에 '잠시 뒤 다시 부르라' 고 말하지 않는다"
+    assert gw._deny_reason("free", []) is None, "선언 아닌 백엔드는 종전대로"
+
+
+def test_이름이_겹치면_선언_쪽_도구만_접두가_붙고_기존_맨_이름은_그대로_불린다(monkeypatch):
+    """둘 다 바꾸던 규칙이면 MatNexus 가 붙는 순간 MaterialTwin · SignalForge 의 맨 이름이 사라져 그 이름을 부르던 절차 · 핀 ·
+    클라이언트가 unknown tool 이 된다(요청서 0절 실측)."""
+    monkeypatch.setattr(gw, "tool_readonly_hint", {})
+    gw._CONN_ACTIVE.add("matnexus")
+    _aggregate_with(monkeypatch, {"heax-materialtwin": ["get_material", "how_to_measure"],
+                                  "signalforge": ["get_ontology"],
+                                  "matnexus": ["get_material", "get_ontology", "list_samples"]})
+    assert gw.route["get_material"] == ("heax-materialtwin", "get_material")
+    assert gw.route["get_ontology"] == ("signalforge", "get_ontology")
+    assert gw.route["how_to_measure"] == ("heax-materialtwin", "how_to_measure")
+    assert gw.route["matnexus_get_material"] == ("matnexus", "get_material")
+    assert gw.route["matnexus_get_ontology"] == ("matnexus", "get_ontology")
+    assert gw.route["list_samples"] == ("matnexus", "list_samples"), "겹치지 않으면 맨 이름"
+    assert {t.name for t in gw.exposed_tools} == set(gw.route)
+
+
+def test_선언의_read_tools_가_읽기_힌트와_노출_표지를_세우고_앱이_False_를_적으면_앱이_이긴다(monkeypatch):
+    _declare("fmea", {**_FMEA, "read_tools": ["get_a", "put_b"]})
+    monkeypatch.setattr(gw, "tool_readonly_hint", {})
+    tools = [_tool("get_a"),
+             types.Tool(name="put_b", description="", inputSchema={"type": "object"},
+                        annotations=types.ToolAnnotations(readOnlyHint=False, title="쓰기")),
+             _tool("list_c")]
+    monkeypatch.setattr(gw, "backends", {"fmea": _B(tools), "heax-x": _B([_tool("list_y")])})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    asyncio.run(gw._aggregate())
+    h = gw.tool_readonly_hint
+    assert (h[("fmea", "get_a")], h[("fmea", "put_b")], h[("fmea", "list_c")]) == (True, False, False)
+    ann = {t.name: t.annotations for t in gw.exposed_tools}
+    assert ann["get_a"].readOnlyHint is True and ann["put_b"].readOnlyHint is False and ann["put_b"].title == "쓰기"
+    assert ann.get("list_c") is None
+    assert gw._readonly_denial("get_a", {}) == "" and gw._readonly_denial("list_c", {}).startswith("read_only")
+    monkeypatch.setattr(gw, "READ_TOOLS", frozenset({"fmea:list_c"}))
+    assert gw._readonly_denial("list_c", {}) == "", "read_tools.json 항목도 그대로 통과한다(더하기)"
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    assert gw._cache_key("fmea", "list_c", {}) is None, "선언 백엔드는 이름 접두로 캐시하지 않는다 — 같은 이름의 쓰기가 무음으로 버려진다"
+    assert gw._cache_key("fmea", "put_b", {}) is None
+    assert gw._cache_key("fmea", "get_a", {}) is not None
+    assert gw._cache_key("heax-x", "list_y", {}) is not None, "선언 아닌 백엔드는 종전대로"
+
+
+def test_refresh_는_정책과_선언을_먼저_받고_재활_패스를_돈다(monkeypatch):
+    order: list = []
+
+    async def pol():
+        order.append("policy")
+        return True
+
+    async def rev(tg):
+        order.append("revive")
+        return False
+    monkeypatch.setattr(gw, "_refresh_access_policy", pol)
+    monkeypatch.setattr(gw, "_revive_once", rev)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    monkeypatch.setattr(gw, "_task_group_holder", {"tg": object()})
+    sent: list = []
+
+    async def send(m): sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/refresh", "method": "POST", "query_string": b"",
+                                             "headers": [(b"authorization", b"Bearer gw-secret")]}, None, send))
+    assert sent[0]["status"] == 200 and order == ["policy", "revive"]
+
+
+def test_health_의_conn_platforms_는_키와_상태만_싣는다(monkeypatch):
+    down = _B([])
+    down.session = None
+    monkeypatch.setattr(gw, "backends", {"matnexus": _B([]), "fmea": down, "signalforge": _B([])})
+    _declare("matnexus", _MNX)
+    _declare("fmea", _FMEA)
+    gw._CONN_STATUS.update({"matnexus": "ok", "fmea": "ok", "newapp": "collision", "old": "no-list-token"})
+    sent: list = []
+
+    async def send(m): sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/health", "method": "GET", "query_string": b"",
+                                             "headers": []}, None, send))
+    raw = sent[1]["body"].decode()
+    assert json.loads(raw)["conn_platforms"] == {"fmea": "down", "matnexus": "ok", "newapp": "collision", "old": "no-list-token"}
+    assert "mnx.example" not in raw and "list@corp.com" not in raw, "무인증 응답에 주소 · 이메일을 싣지 않는다"
+
+
+def test_로그는_선언_접두의_토큰을_가리고_도구_이름은_그대로_둔다():
+    gw._conn_registry_set({"fmea": dict(_FMEA), "matnexus": dict(_MNX)}, _ROWS, persist=False)
+    fmt = gw._MaskSecretsFormatter("%(message)s")
+    rec = logging.LogRecord("x", logging.INFO, __file__, 1,
+                            "tok fmea_9f8e7d6c5b4a / Bearer mnx_pat_ab12cd34ef — fmea_list_projects · fmea_ab1", None, None)
+    assert fmt.format(rec) == "tok fmea_*** / Bearer mnx_pat_*** — fmea_list_projects · fmea_ab1"
+    gw._conn_registry_set({}, _ROWS, persist=False)
+    assert gw._CONN_TOKEN_MASK is None, "선언이 없으면 가릴 접두도 없다"

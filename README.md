@@ -99,6 +99,8 @@ MCP fan-out과 같은 패턴("호출자 토큰 1개 → 백엔드별 네이티�
 | `reportarchive` | `rat_…` | 등록한 워크스페이스를 `X-Workspace-Slug` 로(비면 서비스 값을 지운다) |
 | `testscope` | `tsc_pat_…`(TestScope 에서 발급, `/api/auth/me` 를 부르려면 `read` 범위) | 싣지 않는다 |
 
+위 둘은 **내장**이다. 그 밖의 토큰 등록 플랫폼(FMEA · MatNexus 등)은 **선언**으로 붙는다 — 포털 박스 권한표(`backend/config/access.local.yaml`)의 그 플랫폼 항목에 `connect:` 블록을 적으면, 게이트웨이가 포털 `/internal/access/policy` 의 `connections`(권한 행과 한 응답)를 받아 같은 길에 넣고 백엔드를 스스로 붙이고 뗀다(코드 · 빌드 · 재기동 없음, HWAXPortal `docs/ext-connect`). 상주 세션은 **목록 전용**이다(`list_auth: open` 이면 자격 없이, `registered:<포털 이메일>` 이면 그 계정이 등록한 토큰을 목록 세션에만 싣는다). 호출은 언제나 부르는 사람의 등록 토큰으로 가고, 신원 없는 호출은 거절하며(서비스 계정 없음), 권한 행이 없거나 선언이 지워지면 내부 서비스 호출에도 닫힌다. 이름이 겹치면 선언 쪽 도구만 `<키>_` 접두가 붙는다. 선언의 `read_tools` 는 `read_tools.json` 에 더해지는 읽기 목록이다(앱이 `readOnlyHint=False` 를 적었으면 앱이 이긴다). 감사 줄에 `tok:<토큰 sha256 앞 10자>` 를 남기고, 상태는 `/health` 의 `conn_platforms`(키 → ok · down · no-list-token · collision · no-policy-row · invalid)로 본다. 정적 · heax · 내장 · 위임(`per_user_sso`) · 신원 전달 키와 겹치는 선언은 collision 으로 받지 않는다 — 토큰 등록 앱이면 `PER_USER_SSO_APPS` 에서 뺀다. 선언 캐시는 `.conn_registry_cache.json`(0600, 토큰 없음)이다.
+
 TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 방식 중 하나로 붙는다 — TestScope 코드는 여기서 손대지 않는다. **기본(`TESTSCOPE_SSO_SECRET` 없음)** 은 이 등록 토큰 길이고, **비밀이 있으면** `per_user_sso.testscope` 가 생겨 위 우선순위대로 그쪽이 먼저 탄다(등록할 것 없음). 위임은 TestScope 가 `POST /api/auth/sso`(위 계약)를 갖춘 뒤에만 켠다 — 그 전에 비밀이 생기면 발급이 실패해 신원 있는 TestScope 호출이 전부 거부되고 등록 토큰으로 돌아가지 않는다. 그래서 비밀은 자동으로 만들지 않고 사람이 넣는다. 백엔드는 두 방식이 같다 — `provision-config.sh` 가 `TESTSCOPE_MCP_URL`(> 직전 config 주소)로 만든다(`streamable_http`, 서비스 `Authorization` 없음 — tools/list 는 토큰 없이 된다). 기본 호스트가 없어 주소를 모르면 만들지 않는다.
 
 ## 시간 한도 — 손잡이는 프로세스 env, 기본값은 코드

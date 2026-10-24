@@ -195,6 +195,18 @@ if not t: print(f"토큰 없음: {json.dumps(d,ensure_ascii=False)[:200]}", file
 print(t)'
 }
 
+prev_heax_token() {  # 직전 config 의 heax_registry 토큰(없으면 빈 문자열) — 자동 발급이 실패했을 때 잇는다
+  [ -f "$CFG" ] || return 0
+  python3 - "$CFG" <<'PY' 2>/dev/null || true
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+print((d.get("heax_registry") or {}).get("token") or "")
+PY
+}
+
 prev_koorm_token() {  # 직전 config 에 저장된 kr_ PAT (없으면 빈 문자열)
   [ -f "$CFG" ] || return 0
   python3 - "$CFG" <<'PY' 2>/dev/null || true
@@ -292,9 +304,15 @@ if [ -z "${HEAX_MCP_TOKEN:-}" ]; then
     HEAX_MCP_TOKEN="$(mint_heax hwax-gateway-mcp 2>/tmp/heaxmint.$$.err || true)"
     case "${HEAX_MCP_TOKEN:-}" in
       heax_*) echo "  ✓ heax MCP 토큰 (${HEAX_MCP_TOKEN:0:14}…) → heax_registry 활성" ;;
-      *) echo "  ⚠ heax 토큰 자동 발급 실패 — heax_registry 생략(수동: provision.env 에 HEAX_MCP_TOKEN)"
-         [ -s /tmp/heaxmint.$$.err ] && sed 's/^/    /' /tmp/heaxmint.$$.err >&2
-         HEAX_MCP_TOKEN="" ;;
+      *) [ -s /tmp/heaxmint.$$.err ] && sed 's/^/    /' /tmp/heaxmint.$$.err >&2
+         # 발급이 실패하면 앞 config 의 토큰으로 잇는다 — 비우면 heax_registry 가 통째로 빠진 config 가 rc 0 으로 나오고(허브 앱 자동탐지 ·
+         # app_tokens · rest.step-forge 까지), 바로 뒤 재기동이 그것을 싣는다(HWAXPortal docs/gotchas 10-24 · 10-25 cae00 업데이트 점검).
+         HEAX_MCP_TOKEN="$(prev_heax_token)"
+         case "$HEAX_MCP_TOKEN" in
+           heax_*) echo "  ⚠ heax 토큰 자동 발급 실패 — 앞 config 의 토큰(${HEAX_MCP_TOKEN:0:14}…)으로 heax_registry 를 잇는다(고정하려면 provision.env 에 HEAX_MCP_TOKEN)" ;;
+           *) echo "  ⚠ heax 토큰 자동 발급 실패 — 앞 config 에도 토큰이 없어 heax_registry 생략(수동: provision.env 에 HEAX_MCP_TOKEN)"
+              HEAX_MCP_TOKEN="" ;;
+         esac ;;
     esac
     rm -f /tmp/heaxmint.$$.err
   else

@@ -237,6 +237,36 @@ def test_ste_위임은_heax_토큰이_없어도_생긴다(tmp_path):
     assert out["rest"]["ste"]["per_user"] == "ste", "REST 다리도 같은 위임으로 산다"
 
 
+def test_heax_토큰_발급이_실패하면_앞_config_의_토큰으로_잇는다(tmp_path):
+    """자동 발급이 실패하면 heax_registry 가 통째로 빠진 config 가 rc 0 으로 나오고 바로 뒤 재기동이 그것을 실었다 — 허브 앱 자동탐지 ·
+    app_tokens · rest.step-forge 까지(HWAXPortal docs/gotchas 10-24 · 10-25 cae00 업데이트 점검). 앞 config 에 토큰이 있으면 그것으로 잇는다."""
+    src = (HERE / "provision-config.sh").read_text(encoding="utf-8")
+    fn = re.search(r"\nprev_heax_token\(\) \{.*?\n\}\n", src, re.S).group(0)
+    block = re.search(r'\nif \[ -z "\$\{HEAX_MCP_TOKEN:-\}" \]; then\n  if \[ -x "\$PARENT/HEAXHub/backend/\.venv/bin/python" \]; then\n'
+                      r".*?\nfi\n", src, re.S).group(0)
+    parent = tmp_path / "p"
+    venv = parent / "HEAXHub" / "backend" / ".venv" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text("#!/bin/sh\nexit 1\n")
+    (venv / "python").chmod(0o755)
+    cfg = tmp_path / "gateway_config.json"
+
+    def run(prev):
+        if prev is None:
+            cfg.unlink(missing_ok=True)
+        else:
+            cfg.write_text(json.dumps(prev), encoding="utf-8")
+        script = f'mint_heax() {{ echo "발급 거부" >&2; return 1; }}\n{fn}\n{block}\necho "TOKEN=[$HEAX_MCP_TOKEN]"\n'
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                           env={"PATH": os.environ["PATH"], "CFG": str(cfg), "PARENT": str(parent)})
+        assert r.returncode == 0, r.stderr
+        return r.stdout
+    out = run({"heax_registry": {"token": "heax_prev1234567890", "servers_url": "http://hub/api"}})
+    assert "TOKEN=[heax_prev1234567890]" in out and "앞 config 의 토큰" in out, out
+    out = run(None)
+    assert "TOKEN=[]" in out and "heax_registry 생략" in out, out
+
+
 # ── RA·TestScope 두 방식 — 비밀이 있으면 ste 방식 위임, 없으면 등록 토큰(HWAXPortal docs/sso-delegation) ──────────
 def test_RA_위임은_env_로_생기고_부서_헤더를_뺀다(tmp_path):
     out = _run_provision(tmp_path, {"RA_SSO_SECRET": "ra-s", "RA_SSO_URL": "http://10.0.0.3:3000/api/auth/sso"})

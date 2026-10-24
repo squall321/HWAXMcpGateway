@@ -25,7 +25,10 @@ _HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
         "trailers", "transfer-encoding", "upgrade", "host", "content-length", "authorization"}
 # 클라이언트가 실어 보내도 상류로 넘기지 않는 것 — 위임 발급의 호출자 헤더는 게이트웨이만 싣는다(gateway.DELEGATE_HEADER).
 # 앱은 시크릿 대조 뒤 이 값을 그대로 믿고, Caddy 는 이 이름을 지우지 않는다.
-_NEVER_FORWARD = {"x-hwax-delegate-email"}
+_NEVER_FORWARD = {"x-hwax-delegate-email",
+                  # 소속 · plat 증명(gateway AFF_HEADER · PLAT_HEADER) — 사람별 경로에서 게이트웨이가 지은 것만 간다. 클라이언트 사본은
+                  # 서명이 맞을 리 없지만, 같은 이름이 둘 실리면 앱이 어느 쪽을 읽을지 모른다(HWAXPortal docs/mxwp-wiki P4).
+                  "x-heax-user-affiliation", "x-heax-aff-proof", "x-heax-user-plat", "x-heax-plat-proof"}
 
 
 
@@ -147,7 +150,10 @@ class PortalPatVerifier:
 
 
 class RestProxy:
-    def __init__(self, rest_conf: dict, portal_conf: dict, audit, allow=None, mint=None, deny_text=None):
+    def __init__(self, rest_conf: dict, portal_conf: dict, audit, allow=None, mint=None, deny_text=None, proofs=None):
+        # `proofs(app_id, email, pat_groups) -> {헤더: 값}` — per_user 사이트에 실을 소속 · plat 증명(gateway._rest_proofs). MCP 경로와
+        # 같은 규칙을 게이트웨이에서 주입받는다. 없으면 싣지 않는다(앱은 범위 토큰 없음으로 본다 — 닫힌 쪽).
+        self.proofs = proofs
         # ⚠ `allow(site, groups)` 는 **MCP 경로와 같은 규칙**이다(`gateway._backend_allowed`).
         # 없이 두면 이 프록시는 자격 체계를 통째로 우회한다 — 아래 handle() 참조.
         self.allow = allow
@@ -302,6 +308,12 @@ class RestProxy:
                 headers[tok_header] = tok
             else:
                 headers["Authorization"] = f"Bearer {tok}"
+            if self.proofs is not None:
+                try:
+                    headers.update(await self.proofs(str(conf["per_user"]), email,
+                                                     [str(g) for g in (claims.get("groups") or [])]))
+                except Exception:  # noqa: BLE001 — 증명을 못 지으면 싣지 않는다(앱은 범위 토큰 없음으로 본다 — 닫힌 쪽)
+                    log.warning("소속 · plat 증명을 짓지 못했다(%s) — 증명 없이 부른다", site)
         elif mode == "inject":
             headers[conf["inject"]["header"]] = conf["inject"]["value"]  # the site's OWN service credential
         headers["x-forwarded-user"] = email                # identity hint (site may ignore)

@@ -1195,6 +1195,95 @@ def test_plat_권한이_없으면_두_헤더를_아예_안_싣고_서비스_값�
     assert seen["headers"]["X-Keep"] == "1"
 
 
+@pytest.mark.anyio
+async def test_rest_call_사람별_사이트에도_소속_plat_증명이_실린다(_rest, monkeypatch):
+    """MCP 사람별 경로에만 실었더니 같은 사람이 rest_call 로 부르면 앱이 소속 · plat 범위를 못 봤다(HWAXPortal docs/mxwp-wiki P4).
+    서명 · 인코딩은 MCP 경로와 같다. 소속은 그 경로처럼 합성 그룹을 뺀 로그인 그룹으로, 낡은 값 없이 묻는다."""
+    import hashlib
+    import hmac
+    from urllib.parse import unquote
+
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    _Cli.status, _Cli.raw, _Cli.ctype, _Cli.clen = 200, b'{"ok": true}', "application/json", None
+    _rest["mx"] = {"base": "http://127.0.0.1:3", "per_user": "mxapp"}
+    monkeypatch.setattr(gw, "POLICY", {"locked": [], "open": ["analyst"], "mx": []})
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"mxapp": {"sso_url": "http://x", "secret": "app-secret", "send_plat": True}})
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["mes-user", "plat:plmdefect", "plat:mxwhitepaper", "feat:chat"])
+
+    async def fake_pat(app_id, email, *, force=False, notes=None):
+        return "mx_tok"
+    monkeypatch.setattr(gw, "_user_pat", fake_pat)
+    asked = []
+
+    async def fake_access(email, base, *, allow_stale=True):
+        asked.append((email, list(base), allow_stale))
+        return {"keys": [], "affiliation": "CAEG"}
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+
+    res = await gw._rest_call({"site": "mx", "path": "/api/v1/wiki/index"})
+    assert not res.isError
+    h = _Cli.seen["headers"]
+    assert h["Authorization"] == "Bearer mx_tok"
+    assert h[gw.AFF_HEADER] == "CAEG" and unquote(h[gw.PLAT_HEADER]) == "plat:mxwhitepaper,plat:plmdefect"
+    _v, exp, sig = h[gw.AFF_PROOF_HEADER].split(".")
+    assert hmac.compare_digest(sig, hmac.new(b"app-secret", f"v1|me@x.com|CAEG|{exp}".encode(), hashlib.sha256).hexdigest())
+    _v, exp, sig = h[gw.PLAT_PROOF_HEADER].split(".")
+    want = hmac.new(b"app-secret", f"v1|me@x.com|plat:mxwhitepaper,plat:plmdefect|{exp}".encode(), hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(sig, want), "MCP 경로와 같은 서명이어야 앱 검증 하나로 두 길을 다 받는다"
+    assert asked[-1] == ("me@x.com", ["mes-user"], False)
+
+    # 소속이 없고 send_plat 을 켜지 않은 앱이면 증명은 하나도 안 실린다(빈 값을 싣지 않는다)
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"mxapp": {"sso_url": "http://x", "secret": "app-secret"}})
+    monkeypatch.setattr(gw, "_portal_access", _noop_async({"keys": [], "affiliation": ""}))
+    assert not (await gw._rest_call({"site": "mx", "path": "/api/v1/wiki/index"})).isError
+    proofs = {gw.AFF_HEADER, gw.AFF_PROOF_HEADER, gw.PLAT_HEADER, gw.PLAT_PROOF_HEADER}
+    assert not (proofs & set(_Cli.seen["headers"]))
+
+
+def test_REST_프록시_사람별_사이트는_게이트웨이가_지은_증명만_보낸다(monkeypatch):
+    """`/api/<site>/` 는 클라이언트 헤더를 대부분 그대로 넘긴다 — 사람이 직접 실어 보낸 증명 헤더는 떼고(서명이 맞을 리 없지만
+    같은 이름이 둘 가면 앱이 어느 쪽을 읽을지 모른다) 게이트웨이가 포털의 지금 값으로 지은 것만 보낸다."""
+    import hashlib
+    import hmac
+    from urllib.parse import unquote
+    from starlette.requests import Request
+    from rest_proxy import RestProxy
+
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"mxapp": {"sso_url": "http://x", "secret": "app-secret", "send_plat": True}})
+
+    async def fake_pat(app_id, email, *, force=False, notes=None):
+        return "mx_tok"
+    monkeypatch.setattr(gw, "_user_pat", fake_pat)
+    monkeypatch.setattr(gw, "_portal_access",
+                        _noop_async({"keys": ["plat:plmdefect", "plat:mxwhitepaper", "feat:chat"], "affiliation": "CAEG"}))
+    p = RestProxy({"mx": {"base": "http://upstream.invalid", "per_user": "mxapp"}}, {"audience_ok": ["mx"]}, gw._audit,
+                  mint=gw._rest_mint, proofs=gw._rest_proofs)
+    p._verify = lambda token, s: {"sub": "S-1", "email": "u@corp.com", "jti": "j", "groups": ["mes-user"]}
+    p._revoked_set = _noop_async(set())
+    sent = []
+
+    async def fake_send(req, stream=False):
+        sent.append([(k.lower(), v) for k, v in req.headers.items()])
+        return httpx.Response(200, content=b"ok", request=req)
+    monkeypatch.setattr(p._client, "send", fake_send)
+    resp = asyncio.run(p.handle(Request({
+        "type": "http", "method": "GET", "path": "/api/mx/api/v1/wiki/index",
+        "headers": [(b"authorization", b"Bearer me"), (b"x-heax-user-plat", b"plat:everything"),
+                    (b"x-heax-plat-proof", b"v1.0.dead"), (b"x-heax-user-affiliation", b"OTHER")],
+        "query_string": b"", "path_params": {"site": "mx", "path": "api/v1/wiki/index"}, "client": ("203.0.113.5", 0)})))
+    assert resp.status_code == 200
+    (got,) = sent
+    plat = [v for k, v in got if k == "x-heax-user-plat"]
+    aff = [v for k, v in got if k == "x-heax-user-affiliation"]
+    assert len(plat) == 1 and unquote(plat[0]) == "plat:mxwhitepaper,plat:plmdefect", "위조 사본이 떨어지고 포털의 지금 값만 간다"
+    assert aff == ["CAEG"]
+    (proof,) = [v for k, v in got if k == "x-heax-plat-proof"]
+    _v, exp, sig = proof.split(".")
+    assert hmac.compare_digest(sig, hmac.new(b"app-secret", f"v1|u@corp.com|plat:mxwhitepaper,plat:plmdefect|{exp}".encode(),
+                                             hashlib.sha256).hexdigest())
+    assert dict(got)["authorization"] == "Bearer mx_tok"
+
+
 def test_소속이_캐시_키에_들어간다(monkeypatch):
     """앱이 소속으로 읽기를 넓히므로 같은 사람·같은 인자라도 소속이 다르면 다른 답이다.
     키에 없으면 권한 키가 안 바뀌는 소속 변경이 300초 동안 옛 결과를 정상 응답으로 준다."""

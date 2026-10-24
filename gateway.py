@@ -3402,6 +3402,9 @@ async def _rest_call(args: dict) -> types.CallToolResult:
             headers[hdr] = tok
         else:
             headers["Authorization"] = f"Bearer {tok}"
+        # 소속 · plat 증명 — MCP 사람별 경로와 같은 규칙(_proof_headers). 소속은 그 경로처럼 합성 그룹 · 관리자 표지를 뺀 그룹으로 묻는다.
+        headers.update(await _proof_headers(app_id, caller, groups,
+                                            [g for g in groups if not _is_synthetic(g) and g != ADMIN_GROUP]))
     elif mode == "inject":
         inj = conf["inject"]
         headers[inj["header"]] = inj["value"]          # 그 사이트의 자기 서비스 자격
@@ -4894,6 +4897,37 @@ async def _rest_mint(app_id: str, email: str) -> tuple[str, str | None]:
     return await _user_pat(app_id, email), PER_USER_SSO[app_id].get("token_header")
 
 
+async def _proof_headers(app_id: str, email: str, plat_groups: list[str], aff_base: list[str]) -> dict[str, str]:
+    """사람별 위임 호출에 실을 소속 · plat 증명 — **값이 있는 것만**. MCP 사람별 경로(`_call_tool`)와 같은 규칙 · 같은 서명이고
+    REST 다리 둘(`rest_call` · `/api/<site>/`)이 쓴다 — 처음엔 MCP 경로에만 실어, 같은 사람이 REST 로 부르면 앱이 소속 · plat 범위를
+    못 보았다(HWAXPortal docs/mxwp-wiki P4).
+
+    `plat_groups` 는 그 호출자의 **지금** 그룹(합성 포함), `aff_base` 는 그 길이 권한 조회에 준 로그인 그룹이다 — 같은 값을 줘야
+    `_portal_affiliation` 캐시가 한 항목이다(MCP 경로 주석과 같은 까닭)."""
+    conf = PER_USER_SSO.get(app_id) or {}
+    secret = conf.get("secret")
+    if not (email and secret):
+        return {}
+    out: dict[str, str] = {}
+    aff = await _portal_affiliation(email, aff_base)
+    if aff:
+        out[AFF_HEADER] = quote(aff, safe="")
+        out[AFF_PROOF_HEADER] = _aff_proof(secret, email, aff)
+    if conf.get("send_plat") is True:
+        plats = sorted({g for g in plat_groups if g.startswith("plat:")})
+        if plats:
+            out[PLAT_HEADER] = quote(",".join(plats), safe=",:")
+            out[PLAT_PROOF_HEADER] = _plat_proof(secret, email, plats)
+    return out
+
+
+async def _rest_proofs(app_id: str, email: str, pat_groups: list[str]) -> dict[str, str]:
+    """`/api/<site>/` 사람별 경로의 증명 — plat 은 PAT 에 박힌 발급 때 값이 아니라 포털의 지금 값(`_rest_groups`)으로, 소속은
+    `_rest_groups` 가 포털에 묻는 그 로그인 그룹으로 묻는다."""
+    base = [g for g in pat_groups if g != SERVICE_GROUP and not _is_synthetic(g)]
+    return await _proof_headers(app_id, email, await _rest_groups(pat_groups, email), base)
+
+
 async def _rest_allowed(site: str, pat_groups: list[str], email: str) -> bool:
     """REST 프록시의 자격 판정 — **MCP 경로와 같은 규칙**이다(`_backend_allowed`).
 
@@ -4945,7 +4979,8 @@ def main():
     # REST 프록시 라우트(/api/<site>/<path>) 를 MCP 마운트보다 먼저 매칭되게 삽입.
     if REST:
         from rest_proxy import RestProxy
-        proxy = RestProxy(REST, PORTAL, _audit, allow=_rest_allowed, mint=_rest_mint, deny_text=_rest_deny_text)
+        proxy = RestProxy(REST, PORTAL, _audit, allow=_rest_allowed, mint=_rest_mint, deny_text=_rest_deny_text,
+                          proofs=_rest_proofs)
         star.router.routes[:0] = proxy.routes()
         log.info("REST proxy enabled: %d sites (%s)", len(REST), ", ".join(REST))
     for app in _portal_pat_misconfigured():

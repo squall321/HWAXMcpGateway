@@ -87,6 +87,7 @@
     "insert_block": "report", "insert_image_block": "report", "move_block": "report", "update_block": "report",
     "upload_image": "report", "upload_image_base64": "report", "upload_image_from_url": "report",
     "validate_block": "report", "mxwhitepaper_extract_pptx_images": "report",
+    "wiki_submit_source": "data", "wiki_fileback": "data", "wiki_propose": "data", "wiki_add_question": "data",
 
     "search_reports": "knowledge", "reportarchive_list_reports": "knowledge", "get_report": "knowledge",
     "get_report_outline": "knowledge", "get_reports_digest": "knowledge", "list_related_reports": "knowledge",

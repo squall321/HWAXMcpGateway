@@ -215,6 +215,30 @@ koorm_token_alive() {  # kr_ PAT 가 아직 유효한가 — 읽기 전용 엔�
   [ "$code" = "200" ]
 }
 
+prev_mxwp_token() {  # $1=mcp|rest → 직전 config 의 mxwp 서비스 토큰(없으면 빈 문자열)
+  [ -f "$CFG" ] || return 0
+  python3 - "$CFG" "$1" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+if sys.argv[2] == "mcp":
+    v = ((d.get("mx-white-paper") or {}).get("headers") or {}).get("Authorization") or ""
+else:
+    v = (((d.get("rest") or {}).get("mx-white-paper") or {}).get("inject") or {}).get("value") or ""
+print(v.replace("Bearer ", "").strip())
+PY
+}
+
+mxwp_token_alive() {  # mxwp 서비스 토큰이 아직 유효한가 — 그 토큰으로 /api/v1/me 가 200 인가. 토큰은 argv 에 싣지 않는다(-H @-, ps 에 보인다)
+  local tok="$1" base="${MXWP_REST_BASE:-http://127.0.0.1:8800}" code
+  [ -n "$tok" ] || return 1
+  code="$(printf 'Authorization: Bearer %s\n' "$tok" | curl -s -o /dev/null -m 8 -w '%{http_code}' -H @- "$base/api/v1/me" 2>/dev/null)" \
+    || return 1
+  [ "$code" = "200" ]
+}
+
 MXWP_MCP=""; MXWP_REST=""
 # 파이프+조기종료(grep -q)는 pipefail 아래서 SIGPIPE(141) 오판을 만든다 — 목록을 먼저 받는다.
 # 실측: 경합 중 600회 중 88회(14.7%)가 '떠 있는데 없다'로 읽혔다(HEAXHub _common.sh:instance_running 주석).
@@ -236,10 +260,25 @@ if [ "$_has_mxwp" = "1" ]; then
     echo "  ⚠ 컨테이너에서 mxwp 앱 코드(app/routers/api_tokens.py)를 못 찾음 — mx 백엔드 생략"
   else
     echo "  · 앱 경로: $MXAPP | DSN: $(echo "$MXDSN" | sed 's/:[^:@]*@/:***@/')"
-    MXWP_MCP="$(mint_mxwp hwax-gateway-mcp "$MXAPP" "$MXDSN")"
-    MXWP_REST="$(mint_mxwp hwax-gateway-rest "$MXAPP" "$MXDSN")"
-    case "$MXWP_MCP" in mxwp_*) echo "  ✓ MCP용 (${MXWP_MCP:0:13}…)" ;; *) echo "  ⚠ 발급 실패 — 위 에러 참조"; MXWP_MCP="" ;; esac
-    case "$MXWP_REST" in mxwp_*) echo "  ✓ REST용 (${MXWP_REST:0:13}…)" ;; *) MXWP_REST="" ;; esac
+    # 살아 있는 토큰은 잇는다 — DynaForge kr_ PAT 와 같은 규칙(아래 koorm_token_alive). 예전엔 --force 마다 같은 이름 행을 덮어써(회전)
+    # 떠 있는 게이트웨이의 옛 토큰이 그 순간 죽었고(재기동까지 MXWP 호출 401 — 2026-10-24 dev 실측), MXWP 시험이 api_tokens 를 비운
+    # 뒤에는 죽은 토큰을 알아볼 길이 없었다. 명시 회전은 ROTATE_MXWP_TOKENS=1.
+    for _kind in mcp rest; do
+      _prev=""
+      [ "${ROTATE_MXWP_TOKENS:-0}" = 1 ] || _prev="$(prev_mxwp_token "$_kind")"
+      if mxwp_token_alive "$_prev"; then
+        _tok="$_prev"; echo "  ✓ ${_kind^^}용 기존 토큰 유효 — 재발급 생략"
+      else
+        [ -n "$_prev" ] && echo "  · ${_kind^^}용 기존 토큰이 죽었다(지워짐 · 회수 · 검증 불가) — 다시 발급한다"
+        _tok="$(mint_mxwp "hwax-gateway-$_kind" "$MXAPP" "$MXDSN")"
+        case "$_tok" in
+          mxwp_*) echo "  ✓ ${_kind^^}용 (${_tok:0:13}…)" ;;
+          *) echo "  ⚠ ${_kind^^}용 발급 실패 — 위 에러 참조"; _tok="" ;;
+        esac
+      fi
+      if [ "$_kind" = mcp ]; then MXWP_MCP="$_tok"; else MXWP_REST="$_tok"; fi
+    done
+    unset _prev _tok _kind
   fi
 else
   echo "  ⚠ mxwp_api 인스턴스 없음 — mx-white-paper 백엔드 생략됨(뜬 뒤 --force 재실행)"

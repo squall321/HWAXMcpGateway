@@ -589,6 +589,52 @@ def test_MXWP_REST_다리는_위임이_있을_때만_본인_명의로_간다(tmp
     assert rest_proxy.credential_mode(per) == "per_user" and rest_proxy.allowed_methods(per) is None
 
 
+def _provision_fn(name: str) -> str:
+    src = (HERE / "provision-config.sh").read_text(encoding="utf-8")
+    i = src.index(f"{name}() {{")
+    return src[i:src.index("\n}\n", i) + 3]
+
+
+def test_mxwp_서비스_토큰은_살아_있으면_잇고_죽었으면_다시_받는다(tmp_path):
+    """DynaForge kr_ PAT 와 같은 규칙(HWAXPortal docs/mxwp-wiki MW-D14). 예전엔 --force 마다 다시 발급해 떠 있는 게이트웨이의 토큰이
+    그 순간 죽었고, MXWP 시험이 api_tokens 를 비운 뒤에는 죽은 토큰을 알아볼 길이 없었다. 토큰은 argv 에 싣지 않는다(-H @-)."""
+    import http.server
+    import threading
+
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append((self.path, self.headers.get("Authorization")))
+            ok = self.path == "/api/v1/me" and self.headers.get("Authorization") == "Bearer mxwp_alive"
+            self.send_response(200 if ok else 401)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        cfg = tmp_path / "gateway_config.json"
+        cfg.write_text(json.dumps({"mx-white-paper": {"headers": {"Authorization": "Bearer mxwp_alive"}},
+                                   "rest": {"mx-white-paper": {"inject": {"value": "Bearer mxwp_dead"}}}}), encoding="utf-8")
+        script = (f'CFG="{cfg}"; MXWP_REST_BASE="http://127.0.0.1:{srv.server_port}"\n'
+                  + _provision_fn("prev_mxwp_token") + _provision_fn("mxwp_token_alive")
+                  + 'for k in mcp rest; do t="$(prev_mxwp_token $k)"; if mxwp_token_alive "$t"; then echo "$k=alive"; '
+                    'else echo "$k=dead"; fi; done\n'
+                  + 'if mxwp_token_alive ""; then echo empty=alive; else echo empty=dead; fi\n')
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    finally:
+        srv.shutdown()
+    assert r.stdout.split() == ["mcp=alive", "rest=dead", "empty=dead"], r.stdout + r.stderr
+    assert ("/api/v1/me", "Bearer mxwp_alive") in seen, "그 토큰 그대로 · 읽기 전용 엔드포인트로 묻는다"
+    fn = _provision_fn("mxwp_token_alive")
+    assert "-H @-" in fn and "printf 'Authorization: Bearer %s" in fn, "토큰을 curl 인자로 넘기면 ps 에 보인다"
+    loop = (HERE / "provision-config.sh").read_text(encoding="utf-8")
+    assert 'mxwp_token_alive "$_prev"' in loop and "ROTATE_MXWP_TOKENS" in loop, "산 토큰은 잇고 명시 회전 손잡이가 있다"
+
+
 def test_PER_USER_SSO_APPS_의_못_읽은_쌍은_건너뛰되_말한다(tmp_path):
     """조용히 건너뛰면 '적었는데 왜 위임이 안 켜지나' 를 로그에서 찾을 수 없다. 멀쩡한 쌍은 그대로 붙는다."""
     log: list = []

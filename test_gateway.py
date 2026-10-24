@@ -1155,6 +1155,46 @@ def test_소속에_한글이_와도_헤더가_안_깨진다(monkeypatch):
     assert hmac.compare_digest(sig, want)
 
 
+def test_바란_앱에만_plat_권한이_증명과_함께_실린다(monkeypatch):
+    """MX WhitePaper 위키는 plat:plmdefect 같은 플랫폼 권한으로 읽기 범위를 가른다(HWAXPortal docs/mxwp-wiki P4).
+    소속과 같은 까닭으로 평문만으로는 안 되고(앱 정문이 여럿), 바라지 않은 앱에는 권한 목록을 퍼뜨리지 않는다."""
+    import hashlib
+    import hmac
+    from urllib.parse import unquote
+
+    groups = ("mes-user", "plat:plmdefect", "feat:chat", "plat:mxwhitepaper")
+    seen = _per_user_kit(monkeypatch, {"keys": [], "affiliation": "CAEG"}, groups=groups,
+                         sso_extra={"send_plat": True})
+    got = unquote(seen["headers"][gw.PLAT_HEADER])
+    assert got == "plat:mxwhitepaper,plat:plmdefect", "plat: 만, 정렬해서 — feat: · 로그인 그룹은 싣지 않는다"
+    ver, exp, sig = seen["headers"][gw.PLAT_PROOF_HEADER].split(".")
+    assert ver == "v1" and int(exp) > 0
+    want = hmac.new(b"app-secret", f"v1|u@corp.com|plat:mxwhitepaper,plat:plmdefect|{exp}".encode(),
+                    hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(sig, want), "서명이 이메일 · 목록 · 만료에 결속돼야 한다"
+    for other in (f"v1|bob@corp.com|plat:mxwhitepaper,plat:plmdefect|{exp}",      # 남의 호출
+                  f"v1|u@corp.com|plat:mxwhitepaper,plat:plmdefect,plat:x|{exp}",  # 목록에 하나 더
+                  f"v1|u@corp.com|plat:mxwhitepaper|{exp}"):                       # 목록에서 하나 빼기
+        assert sig != hmac.new(b"app-secret", other.encode(), hashlib.sha256).hexdigest()
+    assert seen["headers"][gw.AFF_HEADER] == "CAEG", "소속 헤더는 그대로 같이 간다"
+
+    seen = _per_user_kit(monkeypatch, {"keys": [], "affiliation": "CAEG"}, groups=groups)
+    assert gw.PLAT_HEADER not in seen["headers"] and gw.PLAT_PROOF_HEADER not in seen["headers"], \
+        "send_plat 을 켜지 않은 앱(DynaForge · ste …)에는 싣지 않는다"
+    seen = _per_user_kit(monkeypatch, {"keys": [], "affiliation": "CAEG"}, groups=groups,
+                         sso_extra={"send_plat": "yes"})
+    assert gw.PLAT_HEADER not in seen["headers"], "참(True)일 때만 — 문자열 설정은 켠 것으로 보지 않는다"
+
+
+def test_plat_권한이_없으면_두_헤더를_아예_안_싣고_서비스_값도_지운다(monkeypatch):
+    svc = {gw.PLAT_HEADER: "plat:svc", gw.PLAT_PROOF_HEADER: "v1.0.dead", "X-Keep": "1"}
+    seen = _per_user_kit(monkeypatch, {"keys": [], "affiliation": ""}, base_headers=svc,
+                         groups=("mes-user", "feat:chat"), sso_extra={"send_plat": True})
+    assert gw.PLAT_HEADER not in seen["headers"] and gw.PLAT_PROOF_HEADER not in seen["headers"], \
+        "빈 목록을 싣거나 서비스 계정 설정의 값이 남으면 받는 쪽이 그것을 그 사람의 권한으로 읽는다"
+    assert seen["headers"]["X-Keep"] == "1"
+
+
 def test_소속이_캐시_키에_들어간다(monkeypatch):
     """앱이 소속으로 읽기를 넓히므로 같은 사람·같은 인자라도 소속이 다르면 다른 답이다.
     키에 없으면 권한 키가 안 바뀌는 소속 변경이 300초 동안 옛 결과를 정상 응답으로 준다."""

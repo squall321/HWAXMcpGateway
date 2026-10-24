@@ -553,6 +553,42 @@ def test_목록에서_뺀_일반_앱은_표지가_있는_것만_PER_USER_SSO_OFF
     assert "newapp" not in run({"PER_USER_SSO_APPS": "other:OTHER", "PER_USER_SSO_OFF": "newapp"})
 
 
+def test_일반_앱의_SEND_PLAT_은_적혀_있을_때만_plat_전달을_정한다(tmp_path):
+    """MX WhitePaper 위키가 plat: 범위를 읽으려면 위임 호출에 플랫폼 권한이 실려야 한다(HWAXPortal docs/mxwp-wiki P4).
+    앱별로 켠다 — 안 적은 실행은 직전 값을 이어받고(손으로 돌린 provision 이 끄지 않게), 0 이면 끈다."""
+    env = {"PER_USER_SSO_APPS": "mx-white-paper:MXWP", "MXWP_SSO_SECRET": "mx-secret-xyz",
+           "MXWP_SSO_URL": "http://127.0.0.1:8800/api/v1/auth/sso"}
+    log: list = []
+    on = _run_provision(tmp_path, {**env, "MXWP_SEND_PLAT": "1"}, log)["heax_registry"]["per_user_sso"]["mx-white-paper"]
+    assert on["send_plat"] is True and on["client"] == "gateway"
+    assert "mx-white-paper 사람별 위임 — http://127.0.0.1:8800/api/v1/auth/sso · plat 권한 전달" in log[0]
+    assert "mx-secret-xyz" not in log[0]
+    _force_backup(tmp_path)
+    kept = _run_provision(tmp_path, env)["heax_registry"]["per_user_sso"]["mx-white-paper"]
+    assert kept["send_plat"] is True, "안 적은 실행은 이어받는다"
+    _force_backup(tmp_path)
+    off = _run_provision(tmp_path, {**env, "MXWP_SEND_PLAT": "0"})["heax_registry"]["per_user_sso"]["mx-white-paper"]
+    assert "send_plat" not in off, "0 이면 끈다"
+    (tmp_path / "gateway_config.json").unlink()
+    (tmp_path / "gateway_config.json.bak").unlink(missing_ok=True)
+    plain = _run_provision(tmp_path, env)["heax_registry"]["per_user_sso"]["mx-white-paper"]
+    assert "send_plat" not in plain, "기본은 끔 — 쓰지 않는 앱에 권한 목록을 보내지 않는다"
+
+
+def test_MXWP_REST_다리는_위임이_있을_때만_본인_명의로_간다(tmp_path):
+    """위임 창구가 없는 MXWP 판에서 REST 를 끊지 않는다 — 위임이 없으면 지금처럼 서비스 토큰 주입(GET · HEAD 만)이다
+    (HWAXPortal docs/mxwp-wiki P2). 위임이 생기면 쓰기도 그 사람 이름으로 열린다(rest_proxy.allowed_methods)."""
+    svc = _run_provision(tmp_path, {"MXWP_REST": "mx-rest-tok"})["rest"]["mx-white-paper"]
+    assert svc == {"base": "http://127.0.0.1:8800", "inject": {"header": "Authorization", "value": "Bearer mx-rest-tok"}}
+    (tmp_path / "gateway_config.json").unlink()
+    per = _run_provision(tmp_path, {"MXWP_REST": "mx-rest-tok", "PER_USER_SSO_APPS": "mx-white-paper:MXWP",
+                                    "MXWP_SSO_SECRET": "mx-secret-xyz",
+                                    "MXWP_SSO_URL": "http://127.0.0.1:8800/api/v1/auth/sso"})["rest"]["mx-white-paper"]
+    assert per == {"base": "http://127.0.0.1:8800", "per_user": "mx-white-paper"}, "주입 토큰이 남으면 안 된다 — per_user 가 이긴다"
+    import rest_proxy
+    assert rest_proxy.credential_mode(per) == "per_user" and rest_proxy.allowed_methods(per) is None
+
+
 def test_PER_USER_SSO_APPS_의_못_읽은_쌍은_건너뛰되_말한다(tmp_path):
     """조용히 건너뛰면 '적었는데 왜 위임이 안 켜지나' 를 로그에서 찾을 수 없다. 멀쩡한 쌍은 그대로 붙는다."""
     log: list = []

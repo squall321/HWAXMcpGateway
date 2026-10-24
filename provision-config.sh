@@ -732,7 +732,15 @@ for _i, _pair in enumerate((e.get("PER_USER_SSO_APPS") or "").split(), 1):
             # managed_by — 이 순회가 쓴 항목이라는 표지다(게이트웨이는 읽지 않는다). 목록에서 뺀 앱을 아래 끄기가 이것으로 가린다.
             per_user[_k] = {**(per_user.get(_k) or {}), "sso_url": _u, "secret": e[f"{_p}_SSO_SECRET"],
                             "client": "gateway", "managed_by": "PER_USER_SSO_APPS"}
-            print(f"  ✓ {_k} 사람별 위임 — {_u}")
+            # <접두>_SEND_PLAT — 위임 호출에 호출자의 plat: 권한을 서명과 함께 싣는다(gateway PLAT_HEADER, HWAXPortal docs/mxwp-wiki P4).
+            # 적혀 있을 때만 이 값이 정한다(1 · true · yes · on 이면 켬, 그 밖의 값이면 끔). 안 적었으면 직전 config 를 이어받는다.
+            _sp = e.get(f"{_p}_SEND_PLAT")
+            if _sp is not None:
+                if _sp.strip().lower() in ("1", "true", "yes", "on"):
+                    per_user[_k]["send_plat"] = True
+                else:
+                    per_user[_k].pop("send_plat", None)
+            print(f"  ✓ {_k} 사람별 위임 — {_u}" + (" · plat 권한 전달" if per_user[_k].get("send_plat") else ""))
         else:
             print(f"  ⚠ {_p}_SSO_SECRET 은 있는데 주소가 없다({_p}_SSO_URL·직전 config 둘 다 없음) — {_k} 위임 생략")
     if e.get(f"{_p}_MCP_URL"):
@@ -805,6 +813,12 @@ if "kooremapper_mcp" in _pu:
                                              _origin((_pu["kooremapper_mcp"] or {}).get("sso_url"),
                                                      "http://127.0.0.1:8700")),
                           "per_user": "kooremapper_mcp"}
+# MX WhitePaper — 사람별 위임(PER_USER_SSO_APPS 의 mx-white-paper)이 있으면 REST 다리도 그 사람 명의로 부른다(쓰기도 본인 이름으로
+# 열린다 — rest_proxy.allowed_methods). 위임이 없으면 위의 서비스 토큰 주입(GET · HEAD 만) 그대로 — 위임 창구가 없는 MXWP 판에서
+# REST 가 끊기지 않게(HWAXPortal docs/mxwp-wiki P2).
+if "mx-white-paper" in _pu:
+    rest["mx-white-paper"] = {"base": _rest_base("MXWP_REST_BASE", "mx-white-paper", "http://127.0.0.1:8800"),
+                              "per_user": "mx-white-paper"}
 if e.get("HEAX_MCP_TOKEN"):
     # StepForge 는 Caddy forward_auth 뒤다 — 문을 통과하려면 이 토큰이어야 한다.
     rest["step-forge"] = {

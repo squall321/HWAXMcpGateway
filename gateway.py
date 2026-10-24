@@ -234,6 +234,12 @@ AFF_HEADER = "X-Heax-User-Affiliation"
 # 이메일과 같을 때만** 소속을 인정한다. 키는 이미 양쪽이 쥔 앱별 게이트웨이 시크릿이다
 # (`per_user_sso.<app>.secret` == 앱의 `heax_gateway_secret` — SSO 발급이 쓰는 그 값).
 AFF_PROOF_HEADER = "X-Heax-Aff-Proof"
+# 호출자의 **플랫폼 권한**(`plat:` 합성 그룹, 쉼표 목록) — 앱이 플랫폼 단위로 읽기 범위를 가를 때 쓴다(MX WhitePaper 위키의
+# `plat:` 범위 — PLM 결함에서 온 지식은 plat:plmdefect 가 있는 사람만, HWAXPortal docs/mxwp-wiki P4). 소속과 같은 까닭으로
+# **서명과 함께** 보내고(`_plat_proof`), 앱이 바랄 때만(`per_user_sso.<앱>.send_plat`) 싣는다 — 쓰지 않는 앱에 권한 목록을
+# 퍼뜨리지 않는다. 값은 게이트웨이가 확인한 그룹(`_request_groups`)에서만 나온다.
+PLAT_HEADER = "X-Heax-User-Plat"
+PLAT_PROOF_HEADER = "X-Heax-Plat-Proof"
 # 위임 발급(SSO) 요청에 싣는 **호출자** 이메일. 리스크 앱처럼 Caddy 경로로 발급받는 앱은 forward_auth 가 X-Heax-User-Email 을
 # 지우고 authz 가 준 이메일 — 게이트웨이 서비스 토큰의 주인(heax 첫 관리자) — 로 다시 싣는다(HEAXHub proxy_manager
 # `_IDENTITY_HEADERS`). 그 헤더만 보내면 게이트웨이를 거친 모든 사람이 한 사람으로 접힌다. 이 이름은 Caddy 가 건드리지 않고
@@ -273,6 +279,17 @@ def _aff_proof(secret: str, email: str, aff: str, now: float | None = None) -> s
     """
     exp = int((now if now is not None else time.time()) + AFF_PROOF_TTL_S)
     msg = f"v1|{email}|{aff}|{exp}"
+    sig = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"v1.{exp}.{sig}"
+
+
+def _plat_proof(secret: str, email: str, plats: list[str], now: float | None = None) -> str:
+    """`v1.<exp>.<hmac>` — 서명 대상은 `v1|email|<정렬해 쉼표로 이은 목록>|exp`. 소속 증명(`_aff_proof`)과 같은 규칙이다.
+
+    목록을 **정렬해서** 잇는다 — 앱은 받은 헤더를 unquote 해 쉼표로 나눈 뒤 같은 순서로 다시 이어 견준다. 항목을 빼거나 더한
+    목록은 서명이 맞지 않는다(남의 권한을 붙여 쓰거나, 증명을 다른 사람의 호출에 옮겨 쓸 수 없다)."""
+    exp = int((now if now is not None else time.time()) + AFF_PROOF_TTL_S)
+    msg = f"v1|{email}|{','.join(sorted(plats))}|{exp}"
     sig = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"v1.{exp}.{sig}"
 # 백엔드별 사용자 위임 설정 — {app_id: {sso_url, secret, client, base?, token_header?, strip_headers?, portal_pat_url?,
@@ -4388,6 +4405,12 @@ async def _call_tool(name: str, arguments: dict):
                 extra = {AFF_HEADER: quote(_aff, safe=""),
                          AFF_PROOF_HEADER: _aff_proof(PER_USER_SSO[app_id]["secret"],
                                                       email, _aff)}
+            # 플랫폼 권한 — 바란 앱에만(PLAT_HEADER 주석). 없으면 두 헤더를 지운다(소속과 같은 자세 — 빈 목록을 싣지 않는다).
+            if PER_USER_SSO[app_id].get("send_plat") is True:
+                _plats = sorted({g for g in _request_groups() if g.startswith("plat:")})
+                extra[PLAT_HEADER] = quote(",".join(_plats), safe=",:") if _plats else None
+                extra[PLAT_PROOF_HEADER] = (_plat_proof(PER_USER_SSO[app_id]["secret"], email, _plats)
+                                            if _plats else None)
             _strip = PER_USER_SSO[app_id].get("strip_headers")
             for h in _strip if isinstance(_strip, list) else []:   # 문자열이면 글자로 쪼개지 않는다
                 if isinstance(h, str) and h:

@@ -71,6 +71,7 @@
     "report_part_energy": "result", "report_part_risk": "result", "report_part_series": "result",
     "report_query": "result", "report_scatter": "result", "report_summary": "result",
     "report_upload_instructions": "result", "report_worst_cases": "result", "update_report_meta": "result",
+    "list_reports": "result", "report_analytics": "result", "report_behavior_clusters": "result", "report_block": "result", "report_blocks": "result", "report_compare": "result", "report_contact_profile": "result", "report_hotspots": "result", "report_image": "result", "report_media": "result", "report_revision": "result", "set_report_revision": "result", "unlink_report_revision": "result",
     "job_postprocess": "result",
 
     "derive_lamina_from_constituents": "material", "homogenize_layer": "material",

@@ -7023,6 +7023,27 @@ def test_health_의_conn_platforms_는_키와_상태만_싣는다(monkeypatch):
     assert "mnx.example" not in raw and "list@corp.com" not in raw, "무인증 응답에 주소 · 이메일을 싣지 않는다"
 
 
+def test_health_의_no_proxy_는_보정_결과를_수로만_싣는다(monkeypatch):
+    """HWAXPortal docs/request-1027 HG-18 · HP-22 — 포털 출구 점검이 게이트웨이 목적지를 이 결과로 판정한다(게이트웨이는 제가 부르는
+    호스트를 스스로 더하므로 포털 셸의 NO_PROXY 로 재면 거짓 경보다). 무인증 응답이라 주소는 싣지 않는다."""
+    _proxy_env(monkeypatch)
+    monkeypatch.setattr(gw, "_NO_PROXY_ADDED", set())
+    monkeypatch.setattr(gw, "_NO_PROXY_UNWRITABLE", set())
+    monkeypatch.setattr(gw, "backends", {})
+    gw._bypass_proxy_for(["http://ra.corp.test:3002/mcp", "http://[fe80::1%25eth0]:9/x"])
+    gw._bypass_proxy_for(["http://ra.corp.test:3002/mcp"])          # 다시 불러도 두 번 세지 않는다
+    sent: list = []
+
+    async def send(m): sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/health", "method": "GET", "query_string": b"",
+                                             "headers": []}, None, send))
+    raw = sent[1]["body"].decode()
+    assert json.loads(raw)["no_proxy"] == {"auto": True, "added": 4, "unwritable": 1, "all": False, "proxy": True}
+    assert "ra.corp.test" not in raw and "fe80" not in raw, "무인증 응답에 주소를 싣지 않는다"
+    monkeypatch.setenv("no_proxy", "*")
+    assert gw._no_proxy_health()["all"] is True
+
+
 def test_로그는_선언_접두의_토큰을_가리고_도구_이름은_그대로_둔다():
     gw._conn_registry_set({"fmea": dict(_FMEA), "matnexus": dict(_MNX)}, _ROWS, persist=False)
     fmt = gw._MaskSecretsFormatter("%(message)s")

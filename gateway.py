@@ -82,6 +82,11 @@ def _load_config():
 
 # 설정에 없어도 늘 프록시를 거치지 않는 주소 — 백엔드 대부분이 이 박스 안에서 돈다.
 _NO_PROXY_ALWAYS = ("127.0.0.1", "localhost", "::1")
+# 아래 보정의 누적 결과 — /health 가 **수만** 싣는다(주소는 싣지 않는다 — 무인증 응답이다). 포털 출구 점검(check-egress --internal)이
+# 게이트웨이 목적지를 이것으로 판정한다 — 게이트웨이는 제가 부르는 호스트를 스스로 더하므로, 포털 셸의 NO_PROXY 로 재면 거짓
+# 경보가 났다(HWAXPortal docs/request-1027 HG-18 · HP-22). 적지 못한 호스트(영역 표기 IPv6 · 이상한 이름)는 프록시 설정을 그대로 따른다.
+_NO_PROXY_ADDED: set[str] = set()
+_NO_PROXY_UNWRITABLE: set[str] = set()
 
 
 def _bypass_proxy_for(urls) -> list[str]:
@@ -118,6 +123,7 @@ def _bypass_proxy_for(urls) -> list[str]:
         if ok:
             hosts.append(h)
         else:
+            _NO_PROXY_UNWRITABLE.add(h)
             log.warning("NO_PROXY 에 적을 수 없는 호스트라 건너뛴다 — 이 주소는 프록시 설정을 그대로 따른다: %s", h)
     added: list[str] = []
     cur = {k: (os.environ.get(k) or "").strip() for k in ("NO_PROXY", "no_proxy")}
@@ -132,7 +138,17 @@ def _bypass_proxy_for(urls) -> list[str]:
             os.environ[key] = ",".join(have)
     if added:
         log.info("NO_PROXY 에 내부 목적지 %d곳을 더했다(사내 프록시를 거치지 않는다): %s", len(added), ", ".join(added))
+    _NO_PROXY_ADDED.update(added)
     return added
+
+
+def _no_proxy_health() -> dict:
+    """/health 의 `no_proxy` — 보정이 있다(auto) · 더한 호스트 수 · 적지 못한 호스트 수 · `*` 하나로 전부 우회인가 · 프록시가 있는가.
+    파이썬(httpx · urllib)이 먼저 읽는 소문자를 본다."""
+    np = [e.strip() for e in (os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or "").split(",") if e.strip()]
+    return {"auto": True, "added": len(_NO_PROXY_ADDED), "unwritable": len(_NO_PROXY_UNWRITABLE), "all": np == ["*"],
+            "proxy": any(os.environ.get(k) for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                                                     "ALL_PROXY", "all_proxy"))}
 
 
 GW, BACKENDS, REST, PORTAL, HEAX = _load_config()
@@ -4634,6 +4650,8 @@ def _bearer_gate(app, pat_verifier=None):
                 "access_policy_ready": _ACCESS_POLICY_READY,
                 # 외부 연결 플랫폼 — 키와 상태만(주소 · 이메일은 싣지 않는다). 스모크는 이 키를 신원 없이 부르지 않는다(HWAXPortal PX1).
                 "conn_platforms": _conn_platforms(),
+                # 프록시 우회 보정 — 수만(주소는 싣지 않는다). 포털 출구 점검이 게이트웨이 목적지를 이것으로 판정한다(HG-18).
+                "no_proxy": _no_proxy_health(),
                 **({"policy": POLICY, "access_policy": _ACCESS_POLICY} if _detail else {}),
             }).encode()
             await send({"type": "http.response.start", "status": 200,

@@ -151,13 +151,16 @@ try:
     user = (db.query(User).filter(User.role == UserRole.ADMIN).order_by(User.created_at.asc()).first()
             or db.query(User).order_by(User.created_at.asc()).first())
     assert user, "users 테이블이 비어 있음"
-    # 재실행 누적 방지 — 같은 이름 기존 토큰 삭제 후 신규 발급(평문 회수 불가라 매번 신규 토큰)
+    # 새것을 먼저 받고, 받은 뒤에 같은 이름의 옛것을 지운다(재실행 누적 방지 — 평문 회수 불가라 매번 새 토큰). 지우고 나서 받다가
+    # 실패하면 앞 config 의 토큰(prev_heax_token 이 잇는 것)이 이미 지워져 heax 앱이 챗에서 한꺼번에 빠졌다(HWAXPortal request-1027 HG-08).
+    # 받기가 실패하면 아무것도 지우지 않는다. 지우기가 실패해도 새 토큰은 이미 찍혔고 옛것도 살아 있어 끊기지 않는다(다음 실행이 치운다).
+    row, tok = pat_service.issue(db, user=user, name=name)
+    print(tok, flush=True)
     db.query(PersonalAccessToken).filter(
         PersonalAccessToken.user_id == user.id,
-        PersonalAccessToken.name == name).delete()
+        PersonalAccessToken.name == name,
+        PersonalAccessToken.id != row.id).delete(synchronize_session=False)
     db.commit()
-    _row, tok = pat_service.issue(db, user=user, name=name)
-    print(tok)
 finally:
     db.close()
 PYEOF

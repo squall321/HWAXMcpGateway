@@ -267,6 +267,68 @@ def test_heax_토큰_발급이_실패하면_앞_config_의_토큰으로_잇는�
     assert "TOKEN=[]" in out and "heax_registry 생략" in out, out
 
 
+
+_FAKE_HUB = {
+    "app/__init__.py": "",
+    "app/db/__init__.py": "",
+    "app/db/base.py": "class _M:\n    def create_all(self, *a, **k):\n        pass\nclass Base:\n    metadata = _M()\n",
+    "app/db/models/__init__.py": "",
+    "app/db/models/_col.py": (
+        "class Col:\n    def __init__(self, n): self.n = n\n"
+        "    def __eq__(self, v): return (self.n, '==', v)\n    def __ne__(self, v): return (self.n, '!=', v)\n"
+        "    def asc(self): return self\n    __hash__ = object.__hash__\n"),
+    "app/db/models/user.py": ("from app.db.models._col import Col\nclass UserRole:\n    ADMIN = 'admin'\n"
+                              "class User:\n    role = Col('role'); created_at = Col('created_at')\n"
+                              "    def __init__(self): self.id = 1\n"),
+    "app/db/models/personal_access_token.py": ("from app.db.models._col import Col\nclass PersonalAccessToken:\n"
+                                               "    __table__ = None\n    user_id = Col('user_id'); name = Col('name'); id = Col('id')\n"),
+    "app/db/session.py": (
+        "import os\nfrom app.db.models.user import User\nengine = None\n"
+        "def log(m):\n    open(os.environ['LOG'], 'a').write(m + '\\n')\n"
+        "class Q:\n    def __init__(self, m): self.m = m; self.c = ()\n"
+        "    def filter(self, *c): self.c = c; return self\n    def order_by(self, *a): return self\n"
+        "    def first(self): return User()\n"
+        "    def delete(self, **k): log('delete ' + repr(self.c)); return 1\n"
+        "class DB:\n    def query(self, m): return Q(m)\n    def commit(self): log('commit')\n    def close(self): pass\n"
+        "def SessionLocal(): return DB()\n"),
+    "app/services/__init__.py": "",
+    "app/services/pat_service.py": (
+        "import os\nfrom app.db.session import log\nclass Row:\n    id = 7\n"
+        "def issue(db, user, name):\n    log('issue ' + name)\n"
+        "    if os.environ.get('FAIL'):\n        raise RuntimeError('발급 실패')\n    return Row(), 'heax_newtoken1234567'\n"),
+}
+
+
+def test_heax_PAT_는_새것을_받은_뒤에_옛것을_지운다(tmp_path):
+    """같은 이름 PAT 를 먼저 지우고 발급하다 실패하면, 앞 config 에서 이어받은 토큰이 이미 지워져 heax 앱이 챗에서 한꺼번에 빠졌다
+    (HWAXPortal request-1027 HG-08). 진짜 mint_heax 를 허브 모듈만 가짜로 두고 돌려 본다 — 받기가 실패하면 아무것도 지우지 않고,
+    받으면 새 행을 뺀 같은 이름의 옛것만 지운다."""
+    src = (HERE / "provision-config.sh").read_text(encoding="utf-8")
+    fn = re.search(r"\nmint_heax\(\) \{.*?\nPYEOF\n\}\n", src, re.S).group(0)
+    hub = tmp_path / "p" / "HEAXHub" / "backend"
+    for rel, body in _FAKE_HUB.items():
+        (hub / rel).parent.mkdir(parents=True, exist_ok=True)
+        (hub / rel).write_text(body, encoding="utf-8")
+    (hub / ".venv/bin").mkdir(parents=True)
+    os.symlink(sys.executable, hub / ".venv/bin/python")
+    log = tmp_path / "calls.log"
+
+    def run(fail):
+        log.unlink(missing_ok=True)
+        env = {"PATH": os.environ["PATH"], "PARENT": str(tmp_path / "p"), "LOG": str(log)}
+        if fail:
+            env["FAIL"] = "1"
+        r = subprocess.run(["bash", "-c", f'{fn}\nmint_heax hwax-gateway-mcp'], capture_output=True, text=True, env=env)
+        return r.stdout.strip(), log.read_text().splitlines()
+
+    out, calls = run(fail=True)
+    assert out == "" and calls == ["issue hwax-gateway-mcp"], ("받기가 실패하면 지우지 않는다", out, calls)
+    out, calls = run(fail=False)
+    assert out == "heax_newtoken1234567", out
+    assert calls[0] == "issue hwax-gateway-mcp" and calls[1].startswith("delete ") and calls[2] == "commit", calls
+    assert "('id', '!=', 7)" in calls[1] and "('name', '==', 'hwax-gateway-mcp')" in calls[1], ("새 행은 지우지 않는다", calls[1])
+
+
 # ── RA·TestScope 두 방식 — 비밀이 있으면 ste 방식 위임, 없으면 등록 토큰(HWAXPortal docs/sso-delegation) ──────────
 def test_RA_위임은_env_로_생기고_부서_헤더를_뺀다(tmp_path):
     out = _run_provision(tmp_path, {"RA_SSO_SECRET": "ra-s", "RA_SSO_URL": "http://10.0.0.3:3000/api/auth/sso"})

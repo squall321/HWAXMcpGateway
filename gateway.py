@@ -4104,15 +4104,17 @@ async def _portal_pat_serve(app_id: str, email: str, wanted: dict, notes: list |
         notes.append(pp)
 
 
-async def _user_pat(app_id: str, email: str, *, force: bool = False, notes: list | None = None) -> str:
-    """캐시된 사용자 PAT (없거나 force 면 발급). 사용자 단위로 직렬화한다.
+async def _user_pat(app_id: str, email: str, *, stale: str | None = None, notes: list | None = None) -> str:
+    """캐시된 사용자 PAT (없거나 만료면 발급). 사용자 단위로 직렬화한다.
+    `stale` — 백엔드가 거절한 토큰. 잠금 안에서 캐시 토큰이 **아직 그것일 때만** 새로 받는다. 같은 사람의 호출 여럿이 한꺼번에 401 을
+    받아도 발급은 한 번이다 — 각자 받던 때는 발급마다 직전 토큰을 폐기하는 앱(SimFlow)에서 서로의 새 토큰을 죽였다(HG-03).
     발급 응답이 포털 PAT 를 바라면 같은 잠금 안에서 건넨다 — 같은 사람의 다른 호출은 등록이 끝난 뒤에 앱에 닿는다. 건네지 못한
     바람은 남겨 두었다가 캐시 길에서 다시 건넨다(_PORTAL_PAT_PENDING). 그 감사 note 는 `notes` 에 덧붙인다(주지 않으면 로그에만 남는다)."""
     key = (app_id, email)
     lock = _USER_PAT_LOCKS.setdefault(key, anyio.Lock())
     async with lock:
         hit = _USER_PATS.get(key)
-        if hit and not force and hit[1] > time.monotonic():
+        if hit and hit[1] > time.monotonic() and (stale is None or hit[0] != stale):
             pend = _PORTAL_PAT_PENDING.get(key)
             if pend is not None:
                 await _portal_pat_serve(app_id, email, pend, notes, cached=True)
@@ -4152,6 +4154,17 @@ def _token_rejected(res) -> bool:
         return False
     text = "".join(getattr(c, "text", "") or "" for c in (getattr(res, "content", None) or []))
     return bool(_TOKEN_REJECTED.match(text.strip()))
+
+
+def _http_401(exc: BaseException) -> bool:
+    """단발 세션이 백엔드의 HTTP 401 로 끝났나. MCP 클라이언트는 `httpx.HTTPStatusError` 를 태스크 그룹의 `ExceptionGroup` 에 싸서
+    올린다(실측 mcp 1.28 — initialize · tools/call 모두 한 겹, 판에 따라 두 겹) — 묶음은 안까지 본다(HG-03)."""
+    try:
+        if getattr(getattr(exc, "response", None), "status_code", None) == 401:
+            return True
+    except Exception:  # noqa: BLE001 — 읽다 터지는 속성은 401 이 아니다
+        return False
+    return any(_http_401(e) for e in (getattr(exc, "exceptions", None) or ()) if isinstance(e, BaseException))
 
 
 class _Late(Exception):
@@ -4488,9 +4501,28 @@ async def _call_tool(name: str, arguments: dict):
                 if isinstance(h, str) and h:
                     extra[h] = None   # None 이면 _call_as_user 가 서비스 헤더를 지운다
             pp_notes: list[str] = []   # 포털 PAT 건네기(발급 응답이 바랄 때만) — 이 호출의 감사 줄에 접는다
-            for attempt in (0, 1):   # 폐기된 캐시 토큰은 1회 재발급 후 재시도
+            stale = None             # 백엔드가 거절한 토큰 — 이것이 아직 캐시에 있을 때만 새로 받는다(_user_pat)
+
+            def _per_user_fail(exc):
+                _audit(name, backend_key, False, f"per-user: {exc!r}",
+                       round((time.monotonic() - t0) * 1000), note="+".join(pp_notes) or None)
+                # 서비스 계정으로 조용히 강등하지 않는다 — 그러면 '내 모델 0건'이라는
+                # 사실과 다른 답이 나가고, 실패가 정상 응답과 구분되지 않는다.
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=(
+                        f"{backend_key}: {email} 자격증명으로 호출하지 못했습니다 ({exc!r}). "
+                        "이 앱은 사용자별 데이터라 서비스 계정 결과로 대체하지 않습니다."))],
+                    isError=True,
+                )
+            # 다시 받는 것은 **백엔드가 우리 토큰을 401 로 거절했을 때뿐**이다(HWAXPortal docs/request-1027 HG-03). 5xx · 연결 오류 ·
+            # 발급 실패에도 다시 받던 때는 발급마다 직전 토큰을 폐기하는 앱(SimFlow)에서 같은 사람의 다른 좌석이 죽었고, 발급
+            # 엔드포인트가 500 이면 한 호출이 발급을 두 번 불렀다(10-16). 발급 실패는 그대로 알린다(다시 받아도 같은 자리다).
+            for attempt in (0, 1):
                 try:
-                    tok = await _user_pat(app_id, email, force=bool(attempt), notes=pp_notes)
+                    tok = await _user_pat(app_id, email, stale=stale, notes=pp_notes)
+                except Exception as exc:  # noqa: BLE001
+                    return _per_user_fail(exc)
+                try:
                     res = await _call_as_user(
                         b, original, arguments, tok, CALL_TIMEOUT_S, extra_headers=extra,
                         token_header=PER_USER_SSO[app_id].get("token_header"))
@@ -4498,22 +4530,14 @@ async def _call_tool(name: str, arguments: dict):
                     # 시간 초과는 토큰 문제가 아니다 — 재발급하면 발급자가 직전 토큰을 폐기해 같은 사람의 다른 좌석이 죽는다.
                     return _late(exc)
                 except Exception as exc:  # noqa: BLE001
-                    if attempt == 0:
-                        log.warning("per-user call %s failed (%r) — 토큰 재발급 후 1회 재시도",
-                                    name, exc)
+                    if attempt == 0 and _http_401(exc):
+                        log.warning("per-user call %s: 백엔드가 토큰을 거절했다(HTTP 401) — 토큰 재발급 후 1회 재시도", name)
+                        stale = tok
                         continue
-                    _audit(name, backend_key, False, f"per-user: {exc!r}",
-                           round((time.monotonic() - t0) * 1000), note="+".join(pp_notes) or None)
-                    # 서비스 계정으로 조용히 강등하지 않는다 — 그러면 '내 모델 0건'이라는
-                    # 사실과 다른 답이 나가고, 실패가 정상 응답과 구분되지 않는다.
-                    return types.CallToolResult(
-                        content=[types.TextContent(type="text", text=(
-                            f"{backend_key}: {email} 자격증명으로 호출하지 못했습니다 ({exc!r}). "
-                            "이 앱은 사용자별 데이터라 서비스 계정 결과로 대체하지 않습니다."))],
-                        isError=True,
-                    )
+                    return _per_user_fail(exc)
                 if attempt == 0 and _token_rejected(res):
                     log.warning("per-user call %s: 백엔드가 토큰을 거절했다(401) — 토큰 재발급 후 1회 재시도", name)
+                    stale = tok
                     continue
                 _audit(name, backend_key, not getattr(res, "isError", False), None,
                        round((time.monotonic() - t0) * 1000),

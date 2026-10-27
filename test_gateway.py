@@ -1064,7 +1064,7 @@ def _per_user_kit(monkeypatch, aff_payload, base_headers=None, sso_extra=None,
     monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
     monkeypatch.setattr(gw, "_request_groups", lambda: list(groups))
 
-    async def fake_pat(app_id, email, *, force=False, notes=None):
+    async def fake_pat(app_id, email, *, stale=None, notes=None):
         return "kr_tok"
     monkeypatch.setattr(gw, "_user_pat", fake_pat)
     seen_groups = []
@@ -1222,7 +1222,7 @@ async def test_rest_call_사람별_사이트에도_소속_plat_증명이_실린�
     monkeypatch.setattr(gw, "PER_USER_SSO", {"mxapp": {"sso_url": "http://x", "secret": "app-secret", "send_plat": True}})
     monkeypatch.setattr(gw, "_request_groups", lambda: ["mes-user", "plat:plmdefect", "plat:mxwhitepaper", "feat:chat"])
 
-    async def fake_pat(app_id, email, *, force=False, notes=None):
+    async def fake_pat(app_id, email, *, stale=None, notes=None):
         return "mx_tok"
     monkeypatch.setattr(gw, "_user_pat", fake_pat)
     asked = []
@@ -1263,7 +1263,7 @@ def test_REST_프록시_사람별_사이트는_게이트웨이가_지은_증명�
 
     monkeypatch.setattr(gw, "PER_USER_SSO", {"mxapp": {"sso_url": "http://x", "secret": "app-secret", "send_plat": True}})
 
-    async def fake_pat(app_id, email, *, force=False, notes=None):
+    async def fake_pat(app_id, email, *, stale=None, notes=None):
         return "mx_tok"
     monkeypatch.setattr(gw, "_user_pat", fake_pat)
     monkeypatch.setattr(gw, "_portal_access",
@@ -2018,7 +2018,8 @@ def test_TestScope_가_발급을_못_하면_거부하고_등록_토큰으로_돌
     res, svc, user, http, row = _ts_kit(monkeypatch, {"testscope": dict(_TS_SSO)}, sso_status=404)
     assert res.isError and svc == [] and user == {}
     assert "자격증명으로 호출하지 못했습니다" in res.content[0].text
-    assert [u for _m, u, _h in http] == ["http://testscope.example/api/auth/sso"] * 2, "1회 재발급 뒤 멈추고 포털은 묻지 않는다"
+    assert [u for _m, u, _h in http] == ["http://testscope.example/api/auth/sso"], \
+        "발급 실패는 다시 받지 않는다(HG-03 — 다시 받아도 같은 자리다) · 포털은 묻지 않는다"
     assert row["ok"] is False
 
 
@@ -2382,11 +2383,11 @@ def test_REST_다리도_주소와_이메일_계정을_남긴다(monkeypatch):
 # ── ste 가 사용자 토큰을 거절한 결과면 1회 재발급(HWAXPortal docs/ste-cae00 D-30) ─────────────────
 def _remint_kit(monkeypatch, replies: list[str | None]):
     """위임 경로를 실제로 태운다(전송 계층만 막는다). `replies` 는 호출마다 백엔드가 돌려줄 결과 — None 이면 성공,
-    문자열이면 그 문구의 isError 결과다. 호출마다 **어느 토큰을 실었는지**와 발급 때의 force 를 돌려준다."""
+    문자열이면 그 문구의 isError 결과다. 호출마다 **어느 토큰을 실었는지**와 발급 때의 stale(거절된 토큰)을 돌려준다."""
     import asyncio
 
     b = _CallB(["cluster_info"])
-    seen = {"tokens": [], "force": [], "calls": 0}
+    seen = {"tokens": [], "stale": [], "calls": 0}
     queue = list(replies)
 
     class _Sess:
@@ -2402,9 +2403,9 @@ def _remint_kit(monkeypatch, replies: list[str | None]):
         seen["tokens"].append((headers or {}).get("Authorization"))
         return _StubCM((None, None, "sid"))
 
-    async def fake_pat(app_id, email, *, force=False, notes=None):
-        seen["force"].append(force)
-        return "new-tok" if force else "old-tok"
+    async def fake_pat(app_id, email, *, stale=None, notes=None):
+        seen["stale"].append(stale)
+        return "new-tok" if stale else "old-tok"
 
     async def fake_access(email, base_groups, **_kw):
         return {"keys": [], "affiliation": ""}
@@ -2434,7 +2435,7 @@ _STE_401 = ('Error executing tool cluster_info: GET /api/cluster → HTTP 401: {
 def test_ste_가_토큰을_거절하면_한_번_다시_받아_부른다(monkeypatch):
     """401 은 예외가 아니라 isError 결과로 온다 — 예외에만 재발급하던 탓에 폐기된 캐시 토큰을 12시간 계속 썼다."""
     seen = _remint_kit(monkeypatch, [_STE_401, None])
-    assert seen["calls"] == 2 and seen["force"] == [False, True]
+    assert seen["calls"] == 2 and seen["stale"] == [None, "old-tok"], "거절된 토큰을 짚어 다시 받는다"
     assert seen["tokens"] == ["Bearer old-tok", "Bearer new-tok"], "두 번째는 새로 받은 토큰이어야 한다"
     assert not seen["result"].isError
     row = _rows()[-1]
@@ -2455,7 +2456,122 @@ def test_다시_받아도_거절되면_두_번에서_멈추고_그대로_알린�
 def test_토큰_거절이_아니면_다시_부르지_않는다(monkeypatch, err):
     """쓰기 도구를 두 번 부를 수 있으니 모양을 좁게 본다."""
     seen = _remint_kit(monkeypatch, [err, None])
-    assert seen["calls"] == 1 and seen["force"] == [False] and seen["result"].isError
+    assert seen["calls"] == 1 and seen["stale"] == [None] and seen["result"].isError
+
+
+# ── 사람별 위임은 백엔드가 401 로 거절했을 때만 다시 받는다(HWAXPortal docs/request-1027 HG-03) ─────────────────────
+# 종전에는 시간 초과만 빼고 어떤 실패에도 다시 받았다 — 발급마다 직전 토큰을 폐기하는 앱(SimFlow)에서 같은 사람의 다른 좌석이 죽었고,
+# 발급 엔드포인트가 500 이면 한 호출이 발급을 두 번 불렀다(10-16). 진짜 `_user_pat` · `_mint_user_pat` · `_call_as_user` · `_oneshot` ·
+# MCP 클라이언트를 태우고 HTTP 만 가짜로 둔다 — 백엔드의 401 이 진짜 꼴(ExceptionGroup 안의 httpx.HTTPStatusError)로 올라온다.
+_HG03_SSO, _HG03_MCP = "http://simflow.example/api/auth/sso", "http://simflow.example/mcp"
+
+
+def _hg03_kit(monkeypatch, decide, *, sso_status=200, calls=1):
+    """`decide(Authorization, n)` 이 tools/call 마다 백엔드의 HTTP 상태를 정한다(200 이면 성공, 예외면 그 예외). `calls` 번을 한꺼번에
+    부른다 → (결과 목록, 센 것 — 발급 · tools/call 이 실은 토큰, 감사 줄)."""
+    n = {"mints": 0, "tokens": []}
+
+    def handler(req):
+        u = str(req.url)
+        if u == _HG03_SSO:
+            n["mints"] += 1
+            if sso_status != 200:
+                return httpx.Response(sso_status, json={"detail": "발급 실패"})
+            return httpx.Response(200, json={"access_token": f"t{n['mints']}", "expires_in": 3600})
+        assert u == _HG03_MCP, u
+        if req.method != "POST":
+            return httpx.Response(405)
+        msg = json.loads(req.content)
+        if msg.get("method") == "initialize":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": msg["id"], "result": {
+                "protocolVersion": msg["params"]["protocolVersion"], "capabilities": {"tools": {}},
+                "serverInfo": {"name": "simflow", "version": "1"}}})
+        if "id" not in msg:
+            return httpx.Response(202)
+        if msg.get("method") == "tools/list":    # 진짜 클라이언트는 tools/call 뒤에 출력 스키마를 보러 목록을 부른다(mcp 1.28)
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [
+                {"name": "list_workflows", "inputSchema": {"type": "object"}}]}})
+        assert msg.get("method") == "tools/call", msg
+        auth = req.headers.get("authorization")
+        n["tokens"].append(auth)
+        code = decide(auth, len(n["tokens"]))
+        if isinstance(code, Exception):
+            raise code
+        if code != 200:
+            return httpx.Response(code, json={"detail": "거절"})
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "content": [{"type": "text", "text": '{"rows": []}'}], "isError": False}})
+    _mock_http(monkeypatch, handler)
+    b = _CallB(["list_workflows"])
+    b.url = _HG03_MCP
+
+    async def fake_access(email, base_groups, **_kw):
+        return {"keys": [], "affiliation": ""}
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {"simflow": b})
+    monkeypatch.setattr(gw, "route", {"list_workflows": ("simflow", "list_workflows")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"simflow": {"sso_url": _HG03_SSO, "secret": "s"}})
+    monkeypatch.setattr(gw, "_USER_PATS", {})
+    monkeypatch.setattr(gw, "_USER_PAT_LOCKS", {})
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+
+    async def run():
+        return await asyncio.gather(*(gw._call_tool("list_workflows", {"q": str(i)}) for i in range(calls)))
+    res = asyncio.run(run())
+    return res, n, [r for r in _rows() if r["tool"] == "list_workflows"]
+
+
+def test_HG03_백엔드가_401_로_거절하면_그_토큰을_짚어_한_번_다시_받는다(monkeypatch):
+    res, n, rows = _hg03_kit(monkeypatch, lambda auth, i: 401 if auth == "Bearer t1" else 200)
+    assert not res[0].isError, res[0].content[0].text
+    assert (n["mints"], n["tokens"]) == (2, ["Bearer t1", "Bearer t2"])
+    assert [(r["ok"], r["mode"], r.get("note")) for r in rows] == [(True, "as-user-pat", "re-minted")]
+
+
+def test_HG03_같은_사람이_한꺼번에_401_을_받아도_발급은_한_번이다(monkeypatch):
+    """각자 받던 때는 발급마다 직전 토큰을 폐기하는 앱에서 서로의 새 토큰을 죽였다 — 거절된 토큰이 아직 캐시에 있을 때만 받는다."""
+    res, n, rows = _hg03_kit(monkeypatch, lambda auth, i: 401 if auth == "Bearer t1" else 200, calls=3)
+    assert [r.isError for r in res] == [False] * 3, [r.content[0].text for r in res]
+    assert n["mints"] == 2, f"t1 을 거절당한 세 호출이 t2 하나를 나눠 써야 한다: 발급 {n['mints']}"
+    assert sorted(n["tokens"]) == ["Bearer t1"] * 3 + ["Bearer t2"] * 3
+
+
+@pytest.mark.parametrize("why", [500, 503, 403, httpx.ConnectError("연결 거부")], ids=["500", "503", "403", "연결-오류"])
+def test_HG03_401_이_아닌_실패에는_다시_받지도_다시_부르지도_않는다(monkeypatch, why):
+    res, n, rows = _hg03_kit(monkeypatch, lambda auth, i: why)
+    assert res[0].isError and "자격증명으로 호출하지 못했습니다" in res[0].content[0].text
+    assert (n["mints"], len(n["tokens"])) == (1, 1), n
+    assert [(r["ok"], r["error"].startswith("per-user: ")) for r in rows] == [(False, True)], rows
+
+
+def test_HG03_발급이_실패하면_다시_받지_않는다(monkeypatch):
+    """10-16 SimFlow `/auth/sso` 500 — 한 호출이 발급을 두 번 불렀다."""
+    res, n, rows = _hg03_kit(monkeypatch, lambda auth, i: 200, sso_status=500)
+    assert res[0].isError and (n["mints"], n["tokens"]) == (1, [])
+    assert rows[-1]["ok"] is False and "SSO 500" in rows[-1]["error"], rows
+
+
+def test_HG03_다시_받은_토큰도_거절되면_두_번에서_멈춘다(monkeypatch):
+    res, n, rows = _hg03_kit(monkeypatch, lambda auth, i: 401)
+    assert res[0].isError and (n["mints"], n["tokens"]) == (2, ["Bearer t1", "Bearer t2"])
+    assert "401" in rows[-1]["error"], rows
+
+
+def test_HG03_http_401_은_묶음을_안까지_본다():
+    from exceptiongroup import ExceptionGroup
+    resp = httpx.Response(401, request=httpx.Request("POST", _HG03_MCP))
+    e401 = httpx.HTTPStatusError("401", request=resp.request, response=resp)
+    resp5 = httpx.Response(500, request=httpx.Request("POST", _HG03_MCP))
+    e500 = httpx.HTTPStatusError("500", request=resp5.request, response=resp5)
+    assert gw._http_401(e401) and gw._http_401(ExceptionGroup("a", [ExceptionGroup("b", [e401])]))
+    assert not gw._http_401(ExceptionGroup("a", [e500])) and not gw._http_401(RuntimeError("SSO 401: x"))
+    assert not gw._http_401(httpx.ConnectError("x"))
 
 
 # ── 위임 토큰 캐시는 토큰 제 수명을 넘기지 않는다(RA 위임 JWT 12시간 = 캐시 12시간, docs/sso-delegation) ──
@@ -3174,7 +3290,7 @@ def _late_kit(monkeypatch, path, *, hang="call", call_s=0.05, handshake_s=5.0):
     """답이 오지 않는 백엔드를 실제 `_call_tool` 로 부른다(전송 계층만 막는다).
     path — shared(상주 세션) · identity(신원 전달) · per-user(사람별 위임) · conn(등록 토큰).
     hang — call(도구가 안 끝난다) · handshake(단발 세션의 initialize 가 안 끝난다).
-    돌려주는 것 — 결과 글 · 걸린 초 · 센 것(도구 호출 · 단발 세션 · 재연결 · 토큰 발급의 force) · 감사 줄 전부.
+    돌려주는 것 — 결과 글 · 걸린 초 · 센 것(도구 호출 · 단발 세션 · 재연결 · 토큰 발급의 stale) · 감사 줄 전부.
     하네스 자체의 상한은 5초다 — 고치기 전의 상주 세션 길은 여기서 끝나지 않았다."""
     import time as _time
     backend = _LATE_BACKEND[path]
@@ -3195,8 +3311,8 @@ def _late_kit(monkeypatch, path, *, hang="call", call_s=0.05, handshake_s=5.0):
         n["shots"] += 1
         return _StubCM((None, None, "sid"))
 
-    async def fake_pat(app_id, email, *, force=False, notes=None):
-        n["mints"].append(force)
+    async def fake_pat(app_id, email, *, stale=None, notes=None):
+        n["mints"].append(stale)
         return "tok"
 
     async def fake_access(email, base_groups, **_kw):
@@ -3239,7 +3355,7 @@ def test_시간_초과는_한_번으로_끝내고_손잡이를_말한다(monkeyp
     assert res.isError and took < 2
     assert n["calls"] == ["slow_tool"], f"도구는 한 번만 불린다(쓰기 도구가 두 번 실행되면 안 된다): {n['calls']}"
     assert n["reconnects"] == 0, "시간 초과는 세션이 죽었다는 뜻이 아니다 — 갈면 같은 세션의 다른 호출이 끊긴다"
-    assert n["mints"] == ([False] if path == "per-user" else []), "재발급하면 같은 사람의 다른 좌석이 쥔 토큰이 폐기된다"
+    assert n["mints"] == ([None] if path == "per-user" else []), "재발급하면 같은 사람의 다른 좌석이 쥔 토큰이 폐기된다"
     assert f"backend {_LATE_BACKEND[path]}: slow_tool 이 0.05초 안에 답하지 않았다(GATEWAY_CALL_TIMEOUT)" in text, text
     assert "다시 보내지 말고" in text
     for wrong in ("unavailable", "TimeoutError", "자격증명으로 호출하지 못했습니다", "다시 등록"):
@@ -4853,7 +4969,7 @@ def test_리스크_위임_단언이_다른_사람으로_접히면_발급을_실�
     assert "a@corp.com" in text and "단언" in text and _FIRST_ADMIN not in text, \
         "누구로 접혔는지(남의 이메일)는 호출자에게 내보이지 않는다 — 로그에만"
     assert "위임을 아는 판" in text and gw.DELEGATE_HEADER in text, "거부 문구에 원인(어느 헤더가 어디서 바뀌었나)이 없다"
-    assert len(reached) == 2, "실패한 발급은 1회 재발급 뒤 끝난다(종전 per-user 규칙)"
+    assert len(reached) == 1, "실패한 발급은 다시 받지 않는다(HG-03 — 발급마다 직전 토큰을 폐기하는 앱이 있다)"
     assert row["ok"] is False and "단언" in row["error"]
 
 

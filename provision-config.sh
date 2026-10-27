@@ -507,9 +507,10 @@ _RAT = _carry("RAT_TOKEN",
               lambda: ((_prev("reportarchive", "headers") or {}).get("Authorization") or "")
                       .replace("Bearer ", "").strip() or None,
               "RAT_TOKEN")
+# odb-hub 는 헤더(Bearer)를 먼저 보고, 없으면 옛 쿼리 꼴(…/mcp?token=…)을 읽는다 — 헤더로 옮기기 전 config 를 든 박스도 잇는다(HG-02).
 _ODB = _carry("ODB_HUB_TOKEN",
-              lambda: (re.search(r'[?&]token=([^&]+)', _prev("odb-hub") or "") or [None, None])[1]
-                      if re.search(r'[?&]token=([^&]+)', _prev("odb-hub") or "") else None,
+              lambda: ((_prev("odb-hub", "headers") or {}).get("Authorization") or "").replace("Bearer ", "").strip()
+                      or (re.search(r'[?&]token=([^&]+)', _prev("odb-hub") or "") or [None, None])[1],
               "ODB_HUB_TOKEN")
 
 # mxwp 토큰은 **떠 있는 컨테이너 안에서** 발급한다. 그 인스턴스가 죽어 있으면 발급이 실패하고,
@@ -609,20 +610,24 @@ cfg["portal"] = {"jwks_url": "http://127.0.0.1:8723/.well-known/jwks.json",
 # 반드시 url 형식이어야 한다 — 게이트웨이는 `"url" in v` 인 항목만 백엔드로 읽는다(gateway.py:42).
 # mcp-remote 의 {"command":"npx","args":[...]} 형식을 그대로 넣으면 에러 없이 조용히 무시된다.
 # mcp-remote 는 그 URL 로 가는 stdio 브리지일 뿐이라, HTTP 를 직접 말하는 이 게이트웨이에는 불필요하다.
-# 토큰이 URL 쿼리에 들어가므로 레포에 박지 않는다 — provision.env 의 ODB_HUB_TOKEN 을 쓴다(RAT_TOKEN 과 동형).
+# 토큰은 레포에 박지 않는다 — provision.env 의 ODB_HUB_TOKEN 을 쓴다(RAT_TOKEN 과 동형).
+# 토큰은 쿼리(?token=)가 아니라 Authorization: Bearer 로 싣는다(HWAXPortal docs/request-1027 HG-02, ODB 는 10-15 에 `/mcp` 가 Bearer 를
+# 받는다고 회신). 쿼리 꼴은 접속 · 프록시 로그에 토큰을 남겼고, 사람별 위임 때 팀 토큰(쿼리)과 그 사람 토큰(헤더)이 한 요청에 같이
+# 가서 ODB 가 쿼리를 먼저 보면 그 사람 호출이 팀 계정으로 찍혔다. 헤더면 단발 세션이 같은 이름의 헤더를 그 사람 토큰으로 갈아 끼운다.
 if _ODB:
     # 호스트는 보존하되 토큰은 항상 env 의 현재 값을 쓴다.
     # URL 통째로 보존하면 .bak 에 박힌 옛 토큰이 되살아나 새 토큰을 덮어쓴다 —
     # 호스트는 '설정'이고 토큰은 '시크릿'이라 수명이 다르다.
-    _odb_prev = _prev("odb-hub")            # 예: http://<ODB 서버>:8000/mcp?token=old
+    _odb_prev = _prev("odb-hub")            # 예: http://<ODB 서버>:8000/mcp (옛 꼴은 …/mcp?token=old — 주소만 쓴다)
     # 주소: env > 직전 config > **없음.** 예전에는 마지막에 사내 주소가 기본값으로 박혀 있었다 — 추적 파일에 내부 IP 를 적지
     # 않고(이 리포는 GitHub 에 있다), 그 주소가 맞는 박스는 하나뿐이라 다른 박스에서는 없는 서버에 토큰을 실어 보낸다.
     # 이미 붙어 있는 박스는 직전 config 가 주소를 알고 있어 아무것도 새로 적지 않아도 그대로 선다.
     _odb_base = e.get("ODB_HUB_BASE") or (_odb_prev.split("/mcp")[0] if _odb_prev else None)
     if _odb_base:
         cfg["odb-hub"] = {
-            "url": f'{_odb_base}/mcp?token={_ODB}',
-            "transport": "streamable_http"}
+            "url": f'{_odb_base}/mcp',
+            "transport": "streamable_http",
+            "headers": {"Authorization": f"Bearer {_ODB}"}}
     else:
         # 토큰만 있고 주소를 모른다 — 지어내지 않는다. 조용히 빠지지 않게 켜는 법과 함께 말한다(토큰은 찍지 않는다).
         print("  ⚠ odb-hub 생략 — ODB_HUB_TOKEN 은 있는데 허브 주소를 모른다(ODB_HUB_BASE·직전 config 둘 다 없음). "
@@ -632,7 +637,7 @@ if _ODB:
 # AI Ready Portal(ARP) — cae00 에서만 도달하는 사내 포탈. 2026-10-01 부터 인증이 켜져 토큰 없이 등재하면 401 → 가짜 DOWN.
 # 그래서 주소와 토큰이 **둘 다** 있을 때만 등재한다. HWAXPortal update-all 의 기대 조건도 같다 — 한쪽만 주소로 판정하면
 # 토큰 없는 박스가 매 실행 arp 를 '빠짐' 으로 보고 재프로비저닝을 헛돌린다(docs/change-request-8-10 D-5).
-# 토큰 모양은 ARP 회신 전이라 Authorization: Bearer 로 둔다 — 쿼리(?token=) 방식이면 위 odb-hub 분기를 따라 바꾼다.
+# 토큰은 odb-hub 와 같이 Authorization: Bearer 로 싣는다 — 쿼리(?token=)는 접속 · 프록시 로그에 토큰을 남긴다(HG-02).
 # ⚠ 클라이언트가 주는 mcp-remote 형식({"command":"npx","args":[...]})을 그대로 넣으면
 # 게이트웨이는 "url" 키가 없는 항목을 백엔드로 읽지 않아 에러 없이 조용히 무시한다(odb-hub 와 같은 함정).
 # mcp-remote 는 HTTP MCP 로 가는 stdio 브리지일 뿐이라, HTTP 를 직접 말하는 여기엔 불필요하다.

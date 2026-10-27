@@ -49,11 +49,13 @@ for ek, k in (("RA_MCP_URL","reportarchive"),("SF_MCP_URL","signalforge"),
 for ek, k in (("AIDH_REST_BASE","ai-data-hub"),("MXWP_REST_BASE","mx-white-paper"),("SF_REST_BASE","signalforge")):
     v = ((d.get("rest") or {}).get(k) or {}).get("base")
     if remote(v): out.append((ek, v))
-# odb-hub 는 토큰이 URL 쿼리에 들어간다 — 여기서 안 뽑으면 --force 마다 이 백엔드가 사라진다.
+# odb-hub — 여기서 안 뽑으면 --force 마다 이 백엔드가 사라진다. 토큰은 헤더(Bearer)를 먼저 보고, 없으면 헤더로 옮기기 전의
+# 옛 쿼리 꼴(…/mcp?token=…)을 읽는다(HWAXPortal docs/request-1027 HG-02).
 odb = (d.get("odb-hub") or {}).get("url") or ""
 if odb:
+    tok = (((d.get("odb-hub") or {}).get("headers") or {}).get("Authorization") or "").replace("Bearer ", "").strip()
     m = re.search(r'[?&]token=([^&]+)', odb)
-    if m: out.append(("ODB_HUB_TOKEN", m.group(1)))
+    if tok or m: out.append(("ODB_HUB_TOKEN", tok or m.group(1)))
     b = re.match(r'(https?://[^/]+)', odb)
     if b: out.append(("ODB_HUB_BASE", b.group(1)))
 for k, v in out:

@@ -29,8 +29,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 from rest_proxy import (EXPIRED_BODY, JWKS_TIMEOUT_S, REST_PROXY_UPSTREAM_TIMEOUT_S, PatExpired, allowed_methods, credential_mode,
                         is_read_only)
 
-# 쿼리에 실린 비밀(…/mcp?token=…)이 로그에 평문으로 남지 않게 한다. ODB 는 토큰을 주소 쿼리로 받고(provision-config.sh),
-# httpx 는 INFO 로 요청마다 주소를 통째로 찍었다 — cae00 gateway.log 26,275줄(10-17 리뷰 G1), dev 는 이메일 쿼리도 실렸다.
+# 쿼리에 실린 비밀(…/mcp?token=…)이 로그에 평문으로 남지 않게 한다. ODB 는 토큰을 주소 쿼리로 받았고(10-27 에 헤더로 옮겼다 —
+# HWAXPortal docs/request-1027 HG-02. 재프로비저닝 전 config 는 아직 쿼리 꼴이다), httpx 는 INFO 로 요청마다 주소를 통째로 찍었다 —
+# cae00 gateway.log 26,275줄(10-17 리뷰 G1), dev 는 이메일 쿼리도 실렸다.
 # 요청 줄은 WARNING 아래로 내리고, 다른 길(예외 문구 · 트레이스백)로 찍히는 주소도 형식기에서 가린다.
 _SECRET_QUERY = re.compile(r"(?i)([?&](?:token|access_token|api_key|apikey|key|secret|password|pat)=)[^&\s'\"<>]+")
 
@@ -4271,11 +4272,11 @@ async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: st
     Caddy forward_auth 뒤에 있는 heax 앱은 Authorization 을 heax 가 아는 토큰으로 지켜야
     문을 통과하므로, 앱 전용 자격은 따로 실어야 한다(안 그러면 Caddy 가 401 로 끊는다).
     """
-    base = dict(b.headers or {})
-    if extra_headers:
-        drop = {k.lower() for k in extra_headers}
-        base = {k: v for k, v in base.items() if k.lower() not in drop}
     auth = {token_header: token} if token_header else {"Authorization": f"Bearer {token}"}
+    # 사람 자격과 같은 이름의 바탕 헤더도 대소문자 무관하게 뗀다 — 서비스 토큰이 `authorization` 처럼 다른 철자로 적혀 있으면
+    # 두 토큰이 한 요청에 같이 가고, 앱이 서비스 쪽을 먼저 읽으면 그 사람 호출이 서비스 계정으로 찍힌다(HG-02 의 ODB 모양).
+    drop = {k.lower() for k in (*(extra_headers or {}), *auth)}
+    base = {k: v for k, v in (b.headers or {}).items() if k.lower() not in drop}
     hdrs = {**base, **auth,
             **{k: v for k, v in (extra_headers or {}).items() if v is not None}}
     return await _oneshot(b, hdrs, original, arguments, timeout_s)

@@ -1113,6 +1113,18 @@ def test_사람별_호출에서는_strip_headers_의_서비스_헤더를_뺀다(
     assert seen["headers"]["X-Workspace-Slug"] == "svc", "목록이 아니면 글자 단위로 쪼개 엉뚱한 헤더를 지우지 않는다"
 
 
+@pytest.mark.parametrize("key", ["Authorization", "authorization", "AUTHORIZATION"])
+def test_사람별_호출은_바탕의_서비스_토큰을_그_사람_토큰_하나로_갈아_끼운다(monkeypatch, key):
+    """ODB 처럼 서비스 토큰을 헤더로 싣는 백엔드(HWAXPortal docs/request-1027 HG-02) — 두 토큰이 한 요청에 같이 가면 앱이 서비스
+    쪽을 먼저 읽어 그 사람 호출이 팀 계정으로 찍힌다. 철자가 달라도 하나만 간다."""
+    seen = _per_user_kit(monkeypatch, None, base_headers={key: "Bearer team-tok", "X-Keep": "1"})
+    auth = [(k, v) for k, v in seen["headers"].items() if k.lower() == "authorization"]
+    assert auth == [("Authorization", "Bearer kr_tok")] and seen["headers"]["X-Keep"] == "1", seen["headers"]
+    # 자격을 다른 헤더로 싣는 앱(Caddy 뒤 heax 앱)은 바탕 Authorization 을 그대로 둔다 — 문을 지나는 자격이다
+    seen = _per_user_kit(monkeypatch, None, base_headers={key: "Bearer heax-svc"}, sso_extra={"token_header": "X-App-Token"})
+    assert seen["headers"][key] == "Bearer heax-svc" and seen["headers"]["X-App-Token"] == "kr_tok"
+
+
 def test_증명은_다른_사람의_호출에는_못_쓴다(monkeypatch):
     """증명을 가로채도 남의 호출에 실으면 안 맞아야 한다 — 그래서 이메일을 서명에 넣는다."""
     import hashlib

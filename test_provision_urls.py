@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -947,24 +948,34 @@ def test_smart_twin_mcp_사람이_옮겨_적은_주소는_이어받는다(tmp_pa
 # ── odb-hub — 주소를 지어내지 않는다(추적 파일에 사내 주소가 기본값으로 박혀 있었다) ──────────────────────────────
 # 이 리포는 GitHub 에 있다. ODB 자동화 허브의 사내 주소가 프로비저너의 기본값으로 두 군데(3단계 안내 줄 · 파이썬 블록의
 # 마지막 폴백) 적혀 있었다. 주소는 env ODB_HUB_BASE > 직전 config > 없음이다 — 모르면 만들지 않고 켜는 법을 말한다.
-ODB_PREV = "http://odb.example:8000/mcp?token=odb-old-token"
+ODB_PREV = "http://odb.example:8000/mcp?token=odb-old-token"          # 옛 쿼리 꼴 — 헤더로 옮기기 전 config(HG-02)
+ODB_HDR = {"url": "http://odb.example:8000/mcp", "transport": "streamable_http",
+           "headers": {"Authorization": "Bearer odb-old-token"}}
 
 
-def _odb_bak(tmp_path) -> None:
+def _odb_bak(tmp_path, entry: dict | None = None) -> None:
     (tmp_path / "gateway_config.json.bak").write_text(json.dumps({
-        "odb-hub": {"url": ODB_PREV, "transport": "streamable_http"}}), encoding="utf-8")
+        "odb-hub": entry or {"url": ODB_PREV, "transport": "streamable_http"}}), encoding="utf-8")
 
 
-def test_odb_hub_는_직전_config_가_주소를_알면_새_env_없이_그대로_선다(tmp_path):
-    """이미 붙어 있는 박스(cae00)는 주소가 config 에 있다 — 기본값을 걷어도 아무것도 새로 적지 않고 계속 돌아야 한다."""
-    _odb_bak(tmp_path)
+def _odb_want(base: str = "http://odb.example:8000", token: str = "odb-old-token") -> dict:
+    return {"url": f"{base}/mcp", "transport": "streamable_http", "headers": {"Authorization": f"Bearer {token}"}}
+
+
+@pytest.mark.parametrize("prev", [None, ODB_HDR], ids=["옛-쿼리꼴", "헤더꼴"])
+def test_odb_hub_는_직전_config_가_주소를_알면_새_env_없이_그대로_선다(tmp_path, prev):
+    """이미 붙어 있는 박스(cae00)는 주소가 config 에 있다 — 기본값을 걷어도 아무것도 새로 적지 않고 계속 돌아야 한다.
+    직전 config 가 옛 쿼리 꼴이어도 토큰을 이어받아 헤더 꼴로 옮긴다(HWAXPortal docs/request-1027 HG-02)."""
+    _odb_bak(tmp_path, prev)
     log: list = []
     out = _run_provision(tmp_path, {}, log)
-    assert out["odb-hub"] == {"url": ODB_PREV, "transport": "streamable_http"}
-    assert "odb-hub 생략" not in log[0]
+    assert out["odb-hub"] == _odb_want()
+    assert "token=" not in json.dumps(out), "토큰을 주소 쿼리에 싣지 않는다 — 접속 · 프록시 로그에 남는다"
+    assert "odb-hub 생략" not in log[0] and "ODB_HUB_TOKEN: env 없음" in log[0]
     # 토큰만 새로 적은 실행 — 주소는 직전 값을 지키고 토큰은 env 의 것으로 바뀐다(옛 토큰이 되살아나지 않는다)
     out = _run_provision(tmp_path, {"ODB_HUB_TOKEN": "odb-new-token"}, log)
-    assert out["odb-hub"]["url"] == "http://odb.example:8000/mcp?token=odb-new-token"
+    assert out["odb-hub"] == _odb_want(token="odb-new-token")
+    assert "odb-old-token" not in json.dumps(out)
     for run in log:
         for leak in ("odb.example", "odb-old-token", "odb-new-token"):
             assert leak not in run, f"{leak} 가 로그에 샜다 — 이 출력은 update-all 로그에 남는다"
@@ -973,7 +984,20 @@ def test_odb_hub_는_직전_config_가_주소를_알면_새_env_없이_그대로
 def test_odb_hub_는_env_주소가_직전_config_를_이긴다(tmp_path):
     _odb_bak(tmp_path)
     out = _run_provision(tmp_path, {"ODB_HUB_BASE": "http://odb2.example:9000", "ODB_HUB_TOKEN": "odb-new-token"})
-    assert out["odb-hub"]["url"] == "http://odb2.example:9000/mcp?token=odb-new-token"
+    assert out["odb-hub"] == _odb_want("http://odb2.example:9000", "odb-new-token")
+
+
+@pytest.mark.parametrize("entry", [ODB_HDR, {"url": ODB_PREV, "transport": "streamable_http"}], ids=["헤더꼴", "옛-쿼리꼴"])
+def test_sync_provision_env_는_odb_토큰을_헤더에서_먼저_건지고_옛_쿼리_꼴도_읽는다(tmp_path, entry):
+    """update-all 은 재프로비저닝 전에 이것을 돌려 provision.env 를 채운다 — 헤더로 옮긴 뒤 쿼리만 보면 다음 --force 에서 토큰을 잃는다."""
+    shutil.copy(HERE / "sync-provision-env.sh", tmp_path / "sync-provision-env.sh")
+    (tmp_path / "gateway_config.json").write_text(json.dumps({"odb-hub": entry}), encoding="utf-8")
+    r = subprocess.run(["bash", str(tmp_path / "sync-provision-env.sh"), "--write"], capture_output=True, text=True,
+                       env={"PATH": os.environ["PATH"]})
+    assert r.returncode == 0, r.stderr
+    assert "odb-old-token" not in r.stdout + r.stderr, "값은 화면에 찍지 않는다"
+    assert (tmp_path / "provision.env").read_text().splitlines() == [
+        "ODB_HUB_TOKEN=odb-old-token", "ODB_HUB_BASE=http://odb.example:8000"]
 
 
 def test_odb_hub_는_토큰만_있고_주소를_모르면_지어내지_않고_켜는_법을_말한다(tmp_path):

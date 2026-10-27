@@ -636,6 +636,14 @@ def test_서버_지침이_비어_있지_않다():
     assert gw.fm.instructions == gw._INSTRUCTIONS, "FastMCP 에 실려야 클라이언트로 간다"
 
 
+def test_지침의_유사도_안내는_임베딩_모델에_묶이지_않는다():
+    """옛 e5 기준 「무관한 문장끼리도 0.87~0.90」 이 남아 있었다 — BGE-M3 는 무관 1위가 0.57 안팎이라 그 숫자를 믿으면 거꾸로 읽는다
+    (HWAXPortal docs/request-1027 HG-13). 모델을 바꿔도 맞는 말만 둔다."""
+    import re
+    assert not re.search(r"0\.\d+\s*[~∼-]\s*0\.\d+", gw._INSTRUCTIONS), "지침에 모델 고유의 유사도 구간이 있다"
+    assert "유사도 점수를 신뢰도로 읽지 마라" in gw._INSTRUCTIONS and "desc_match" in gw._INSTRUCTIONS
+
+
 def test_답변_수치를_조회기록과_대조한다(monkeypatch):
     """MCP 에는 웹의 근거 블록 같은 **코드 검증**이 없어 지침(부탁)뿐이었다. 조회 기록에 없는
     수치를 집어 주면 클로드가 보내기 전에 스스로 잡을 수 있다."""

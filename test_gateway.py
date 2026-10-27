@@ -4143,6 +4143,69 @@ def test_감사_원장에_잘린_글은_원문_길이를_단다(tmp_path, monkey
     assert (short["error"], short["note"], short["corr"]) == ("짧은 실패", "cache-hit", "conv-9"), "짧은 글은 그대로다"
 
 
+# ── 오류 봉투는 isError 가 아니어도 감사에 ok=false(HWAXPortal docs/request-1027 HG-06) ─────────────────────────────
+# 점검기 · 사용 통계가 감사 원장의 ok 로 실패를 센다. 호출부가 `ok=not isError` 만 적어서 200 + {"error": …} 가 성공으로 세였다.
+_ENVELOPE_CASES = [
+    ('{"error": {"code": "APP-GRAPH-0001", "message": "노드가 없다"}}', "envelope: APP-GRAPH-0001 노드가 없다"),
+    ('{"error": "numpy 없음"}', "envelope: numpy 없음"),
+    ('{"ok": false, "message": "x"}', "envelope: ok=false"),
+    ('{"refused": true}', "envelope: refused"),
+    ('{"status": "error", "errors": [{"message": "판 두께가 0"}]}', "envelope: 판 두께가 0"),
+    ('{"exit_code": 2}', "envelope: exit_code=2"),
+    ('{"valid": true, "error": "백엔드 불통"}', "envelope: 백엔드 불통"),      # 단수 error 는 판정 꼴이어도 오류 채널이다
+    ('{"valid": false, "errors": [{"message": "형이 틀렸다"}]}', None),     # 검사기의 산출물이지 고장이 아니다
+    ('{"ok": true, "errors": ["경고 하나"]}', None),
+    ('{"error": null, "rows": [1]}', None),
+    ('{"rows": []}', None),
+    ("결과가 없습니다", None),                                               # 평문은 봉투가 아니다
+    ('{"exit_code": 0, "out": "done"}', None),
+]
+
+
+@pytest.mark.parametrize("body, want", _ENVELOPE_CASES)
+def test_HG06_오류_봉투는_isError_가_아니어도_감사에_ok_false_와_사유로_남는다(monkeypatch, body, want):
+    _result_kit(monkeypatch, body)
+    res = asyncio.run(gw._call_tool("get_big", {}))
+    assert res.content[0].text == body and not res.isError, "호출자가 받는 응답은 그대로다 — 감사만 고친다"
+    row = [r for r in _audit_rows() if r["tool"] == "get_big"][-1]
+    assert (row["ok"], row.get("error")) == (want is None, want), row
+
+
+def test_HG06_isError_와_예외는_종전대로고_구조화_본문만_있어도_본다(tmp_path, monkeypatch):
+    f = tmp_path / "a.jsonl"
+    monkeypatch.setattr(gw, "AUDIT_PATH", str(f))
+    gw._audit("t", "b", False, None, 1, res=types.CallToolResult(
+        content=[types.TextContent(type="text", text="boom")], isError=True))
+    gw._audit("t", "b", False, "per-user: X", 1)
+    gw._audit("t", "b", True, None, 1, res=types.CallToolResult(content=[], structuredContent={"error": "구조화만"}))
+    gw._audit("t", "b", True, None, 1, res=types.CallToolResult(
+        content=[types.TextContent(type="text", text='{"error": "' + "x" * (gw._ENVELOPE_SCAN_MAX + 1) + '"}')]))
+    rows = [json.loads(x) for x in f.read_text(encoding="utf-8").splitlines()]
+    assert [(r["ok"], r.get("error")) for r in rows] == [
+        (False, None), (False, "per-user: X"), (False, "envelope: 구조화만"), (True, None)], rows
+
+
+def test_HG06_판정이_포털_판정기와_같다():
+    """판정기마다 답이 달랐던 사고(포털 W-77)를 되풀이하지 않는다 — 형제 리포의 포털 판정기를 오라클로 견준다."""
+    import importlib.util
+    from pathlib import Path
+    p = Path(__file__).resolve().parent.parent / "HWAXPortal/backend/app/procedures/judge.py"
+    if not p.is_file():
+        pytest.skip("형제 리포 HWAXPortal 이 없다")
+    spec = importlib.util.spec_from_file_location("_portal_judge", p)
+    judge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(judge)
+    extra = ['{"status": "FAILED"}', '{"status": "warning", "errors": ["w"]}', '{"errors": []}', '{"errors": 12}',
+             '{"exit_code": true}', '{"error": ""}', '{"error": {}}', '{"refused": "yes"}', '[{"error": "x"}]']
+    for body in [b for b, _ in _ENVELOPE_CASES] + extra:
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            continue
+        res = types.CallToolResult(content=[types.TextContent(type="text", text=body)])
+        assert (gw._envelope_reason(res) is not None) == (judge._envelope_fail(parsed) is not None), body
+
+
 def _fastmcp_tool(fn) -> types.Tool:
     """백엔드(FastMCP)가 함수에서 도구를 만드는 **실제 경로**로 만든다 — 인자 스키마를 손으로 쓰지 않는다."""
     from mcp.server.fastmcp.tools.base import Tool as _FTool

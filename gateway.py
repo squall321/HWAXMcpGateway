@@ -545,6 +545,53 @@ def _looks_failed(res) -> bool:
     return False
 
 
+def _envelope_reason(res) -> str | None:
+    """감사 원장용 — `isError` 는 아닌데 본문이 실패를 말하면 그 사유, 아니면 None(HWAXPortal docs/request-1027 HG-06).
+
+    `_looks_failed` 와 목적이 다르다. 그쪽은 '캐시해도 되나' 라 넓게 보지만, 감사의 `ok` 는 점검기 · 사용 통계가 **실패를
+    세는** 칸이라 정확해야 한다. 그래서 판정 목록을 포털 `judge._envelope_fail` · 에이전트 서버 `envelope_failed` 와
+    **같게** 둔다 — status · ok · refused · error · errors · exit_code, `errors`(복수)는 판정 꼴(`valid` · `ok: true`)이면
+    산출물로 본다(포털 W-77 — 판정기마다 답이 달랐던 사고). 셋 중 하나를 고치면 나머지도 고친다.
+    오류 봉투를 ok 로 적던 실측 — FailureTrace `[APP-GRAPH-0001]` · SignalForge `{error: numpy 없음}`."""
+    texts = [t for t in (getattr(b, "text", None) for b in getattr(res, "content", None) or []) if isinstance(t, str)]
+    if texts:                               # 첫 글 블록이 본문이다(`_looks_failed` 와 같은 자리)
+        if len(texts[0]) > _ENVELOPE_SCAN_MAX or not texts[0].lstrip().startswith("{"):
+            return None
+        try:
+            obj = json.loads(texts[0])
+        except Exception:  # noqa: BLE001 — JSON 이 아니면 봉투가 아니다
+            return None
+    else:
+        obj = getattr(res, "structuredContent", None)
+    if not isinstance(obj, dict):
+        return None
+    e = obj.get("error")
+    if isinstance(e, dict):
+        msg = f"{e.get('code') or ''} {e.get('message') or ''}".strip() or json.dumps(e, ensure_ascii=False, default=str)
+    elif isinstance(e, str):
+        msg = e
+    else:
+        msg = ""
+    errs = obj.get("errors")
+    if not msg and isinstance(errs, list) and errs:
+        msg = " · ".join(str((x.get("message") or x.get("msg") or x) if isinstance(x, dict) else x) for x in errs[:3])
+    status = str(obj.get("status") or "").lower()
+    if status in ("error", "failed", "failure"):
+        return f"envelope: {msg or 'status=' + status}"
+    if obj.get("ok") is False:
+        return f"envelope: {msg or 'ok=false'}"
+    if obj.get("refused") is True:
+        return f"envelope: {msg or 'refused'}"
+    if isinstance(e, (str, dict)) and e:
+        return f"envelope: {msg}"
+    if not ("valid" in obj or obj.get("ok") is True) and isinstance(errs, list) and errs:
+        return f"envelope: {msg}"
+    code = obj.get("exit_code")
+    if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+        return f"envelope: {msg or f'exit_code={code}'}"
+    return None
+
+
 def _res_bytes(res, stop: int) -> int:
     """결과가 메모리에 쥐는 크기의 근사(바이트) — 본문 글(UTF-8)·바이너리 블록(base64 글)·structuredContent(JSON).
     `stop` 을 넘으면 거기서 그만 센다(그보다 크다는 것만 알면 된다)."""
@@ -627,12 +674,17 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
       via    : 어느 자격으로 들어왔나(gw-token · chat · procedure · pat). 127.0.0.1 을 읽는 열쇠다.
       chars  : 호출자에게 돌려준 도구 결과의 글자 수(`res` 를 준 자리만). 게이트웨이는 결과를 자르지 않는다 —
                이 칸이 '그때 얼마나 컸나' 를 남긴다.
+    `res` 를 준 자리에서 `isError` 는 아닌데 본문이 오류 봉투면 `ok` 를 false 로 고쳐 적고 사유를 `error` 에 싣는다
+    (`_envelope_reason`, HG-06). 호출부의 `ok=not isError` 만으로는 점검기 · 사용 통계가 이 실패를 세지 못했다.
     corr·note·error 는 길이를 둔다(무기한 보존·한 호출 한 줄). 잘렸으면 원문 길이를 붙인다(`_clip`) — 실측으로 오류 1,423줄 중
     200자에 닿은 것은 1줄이었다.
     `caller`·`ip`·`via` 를 안 주면 요청 컨텍스트에서 읽는다 — 호출부마다 넘기게 하면 빠뜨린 자리가 빈 칸이 된다
     (대화 저장·검색 줄이 그래서 계정이 비어 있었다). REST 다리처럼 MCP 컨텍스트가 없는 곳은 직접 넘긴다.
     """
     try:
+        if res is not None and ok and not err:
+            err = _envelope_reason(res)
+            ok = not err
         rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                "tool": tool, "backend": backend, "ok": ok, "ms": ms}
         caller = caller or _request_user()

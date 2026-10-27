@@ -884,6 +884,12 @@ if "kooremapper_mcp" in _pu:
 if "mx-white-paper" in _pu:
     rest["mx-white-paper"] = {"base": _rest_base("MXWP_REST_BASE", "mx-white-paper", "http://127.0.0.1:8800"),
                               "per_user": "mx-white-paper"}
+# SimFlow — 사람별 위임(PER_USER_SSO_APPS 의 simflow)이 있으면 REST 다리도 그 사람 명의로 간다. 주소는 그 sso_url 의 origin 이다(같은
+# 웹 백엔드 — ste 와 같은 유도). 챗 업로드가 이 길로 SimFlow 에 파일을 넣는다(/api/simflow/api/v1/mcp-uploads — HWAXPortal
+# docs/request-1027 HG-04 · HP-15). 종전엔 사이트가 없어 404 였다.
+if "simflow" in _pu and _origin((_pu["simflow"] or {}).get("sso_url"), None):
+    rest["simflow"] = {"base": _rest_base("SIMFLOW_REST_BASE", "simflow", _origin(_pu["simflow"]["sso_url"], None)),
+                       "per_user": "simflow"}
 if e.get("HEAX_MCP_TOKEN"):
     # StepForge 는 Caddy forward_auth 뒤다 — 문을 통과하려면 이 토큰이어야 한다.
     rest["step-forge"] = {

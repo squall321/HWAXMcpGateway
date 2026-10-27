@@ -3448,6 +3448,7 @@ async def _rest_call(args: dict) -> types.CallToolResult:
 
     headers = {"accept": "application/json"}
     mode = credential_mode(conf)
+    tok = hdr = None
     if mode == "per_user":
         app_id = str(conf["per_user"])
         if not caller:
@@ -3486,41 +3487,69 @@ async def _rest_call(args: dict) -> types.CallToolResult:
     #   수 GB 를 삼킨다(120MB 응답에 피크 521MB 실측, 2026-09-24). 이 도구는 **텍스트/JSON 답을 모델에 보이는**
     #   용도라 상한을 두고, 넘치면 스트림을 끊고 error 로 돌려준다(파일은 전용 도구·ste-sync 로 받는다).
     cap = REST_CALL_MAX_BYTES
-    try:
-        with anyio.fail_after(REST_CALL_TIMEOUT_S):
-            async with httpx.AsyncClient(timeout=httpx.Timeout(REST_CALL_TIMEOUT_S, connect=10.0),
-                                         follow_redirects=False) as cli:
-                async with cli.stream(method, conf["base"].rstrip("/") + path,
-                                      # 목록 값은 키를 되풀이해 보낸다(`tags=a&tags=b`) — 종전 str(v) 는 "['a', 'b']" 글자 하나였다.
-                                      params={k: ([str(x) for x in v] if isinstance(v, (list, tuple)) else str(v))
-                                              for k, v in dict(query).items()},
-                                      json=body if isinstance(body, (dict, list)) else None,
-                                      headers=headers) as up:
-                    ctype = (up.headers.get("content-type") or "").lower()
-                    clen = up.headers.get("content-length")
-                    too_big = (clen is not None and clen.isdigit() and int(clen) > cap)
-                    chunks: list[bytes] = []
-                    got = 0
-                    if not too_big:
-                        async for ch in up.aiter_bytes():
-                            chunks.append(ch)
-                            got += len(ch)
-                            if got > cap:
-                                too_big = True
-                                break                       # 스트림을 여기서 끊는다 — 나머지는 안 받는다
-                    status = up.status_code
-                    raw = b"".join(chunks)
-    except (TimeoutError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout):
-        # 느린 것과 안 닿는 것을 가른다 — 연결 시간 초과(ConnectTimeout)는 아래 'unreachable' 로 간다.
-        ms = round((time.monotonic() - t0) * 1000)
-        late = f"{site} 가 {REST_CALL_TIMEOUT_S:g}초 안에 답하지 않았다(GATEWAY_REST_CALL_TIMEOUT)"
-        _audit(f"rest_call {method} {path}", site, False, late, ms, caller=caller)
-        return _rest_text({"error": late, "site": site, "method": method, "path": path,
-                           "detail": "사이트는 아직 일하고 있을 수 있다 — 쓰기였다면 다시 보내기 전에 결과를 조회하라."})
-    except Exception as e:  # noqa: BLE001
-        ms = round((time.monotonic() - t0) * 1000)
-        _audit(f"rest_call {method} {path}", site, False, f"upstream: {e!r}", ms, caller=caller)
-        return _rest_text({"error": "upstream unreachable", "site": site, "detail": _clip(e, 300)})
+    deadline = time.monotonic() + REST_CALL_TIMEOUT_S   # 상류 한 건의 전체 기한 — 다시 보내도 늘지 않는다
+
+    async def _fetch():
+        """→ (status, ctype, raw, too_big), 못 받았으면 호출자에게 줄 오류 결과."""
+        try:
+            with anyio.fail_after(max(0.0, deadline - time.monotonic())):
+                async with httpx.AsyncClient(timeout=httpx.Timeout(REST_CALL_TIMEOUT_S, connect=10.0),
+                                             follow_redirects=False) as cli:
+                    async with cli.stream(method, conf["base"].rstrip("/") + path,
+                                          # 목록 값은 키를 되풀이해 보낸다(`tags=a&tags=b`) — 종전 str(v) 는 "['a', 'b']" 글자 하나였다.
+                                          params={k: ([str(x) for x in v] if isinstance(v, (list, tuple)) else str(v))
+                                                  for k, v in dict(query).items()},
+                                          json=body if isinstance(body, (dict, list)) else None,
+                                          headers=headers) as up:
+                        ctype = (up.headers.get("content-type") or "").lower()
+                        clen = up.headers.get("content-length")
+                        too_big = (clen is not None and clen.isdigit() and int(clen) > cap)
+                        chunks: list[bytes] = []
+                        got = 0
+                        if not too_big:
+                            async for ch in up.aiter_bytes():
+                                chunks.append(ch)
+                                got += len(ch)
+                                if got > cap:
+                                    too_big = True
+                                    break                       # 스트림을 여기서 끊는다 — 나머지는 안 받는다
+                        return up.status_code, ctype, b"".join(chunks), too_big
+        except (TimeoutError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout):
+            # 느린 것과 안 닿는 것을 가른다 — 연결 시간 초과(ConnectTimeout)는 아래 'unreachable' 로 간다.
+            ms = round((time.monotonic() - t0) * 1000)
+            late = f"{site} 가 {REST_CALL_TIMEOUT_S:g}초 안에 답하지 않았다(GATEWAY_REST_CALL_TIMEOUT)"
+            _audit(f"rest_call {method} {path}", site, False, late, ms, caller=caller)
+            return _rest_text({"error": late, "site": site, "method": method, "path": path,
+                               "detail": "사이트는 아직 일하고 있을 수 있다 — 쓰기였다면 다시 보내기 전에 결과를 조회하라."})
+        except Exception as e:  # noqa: BLE001
+            ms = round((time.monotonic() - t0) * 1000)
+            _audit(f"rest_call {method} {path}", site, False, f"upstream: {e!r}", ms, caller=caller)
+            return _rest_text({"error": "upstream unreachable", "site": site, "detail": _clip(e, 300)})
+
+    got = await _fetch()
+    if isinstance(got, types.CallToolResult):
+        return got
+    status, ctype, raw, too_big = got
+    retried = False
+    if mode == "per_user" and status == 401:
+        # 위층이 우리가 실은 토큰을 거절했다 — 캐시에서 버리고(다음 호출도 새 토큰으로 간다) 새로 받아 **한 번만** 다시 보낸다(HG-04).
+        # 401 은 인증 문에서 끊긴 것이라 쓰기도 실행되지 않았다.
+        _forget_user_pat(app_id, caller, tok)
+        try:
+            tok = await _user_pat(app_id, caller, stale=tok)
+        except Exception as e:  # noqa: BLE001
+            _audit(f"rest_call {method} {path}", site, False, f"per-user: {e!r}", round((time.monotonic() - t0) * 1000),
+                   caller=caller, note="token-evicted")
+            return _rest_text({"error": f"{caller} 자격증명을 다시 받지 못했다", "detail": _clip(e, 300)})
+        if hdr:
+            headers[hdr] = tok
+        else:
+            headers["Authorization"] = f"Bearer {tok}"
+        got = await _fetch()
+        if isinstance(got, types.CallToolResult):
+            return got
+        status, ctype, raw, too_big = got
+        retried = True
 
     ms = round((time.monotonic() - t0) * 1000)
     if too_big:
@@ -3532,7 +3561,7 @@ async def _rest_call(args: dict) -> types.CallToolResult:
                            "detail": "목록·조회면 그 사이트가 받는 쿼리(rest_catalog 의 params — limit·page_size·필드 선택 등)로 "
                                      "좁혀 다시 불러라. 파일·아카이브는 전용 도구(예: ste 의 get_job_file·ste-sync)로 받는다. "
                                      "rest_call 은 모델에 보일 텍스트/JSON 답 전용이다."})
-    _audit(f"rest_call {method} {path}", site, status < 400, None, ms, caller=caller)
+    _audit(f"rest_call {method} {path}", site, status < 400, None, ms, caller=caller, note="re-minted" if retried else None)
     try:
         parsed = json.loads(raw.decode("utf-8"))
     except Exception:  # noqa: BLE001 — JSON 이 아니면 본문을 글로 그대로 보인다
@@ -4139,6 +4168,16 @@ async def _user_pat(app_id: str, email: str, *, stale: str | None = None, notes:
         else:
             _PORTAL_PAT_PENDING.pop(key, None)      # 앱이 더는 바라지 않는다 — 남은 바람은 낡았다
         return tok
+
+
+def _forget_user_pat(app_id: str, email: str, tok: str) -> None:
+    """위층이 `tok` 을 401 로 거절했다 — 캐시가 **아직 그 토큰일 때만** 버린다(그 사이 다른 호출이 받아 둔 새 토큰은 둔다).
+    REST 다리 둘(`/api/<site>/` · `rest_call`)이 쓴다. 버리지 않던 때는 위층이 폐기한 토큰을 캐시 수명(12시간) 동안 계속 실었다 —
+    발급할 때마다 직전 토큰을 폐기하는 앱(SimFlow)은 MCP 길이 한 번 다시 받으면 REST 길의 캐시가 그대로 죽는다(HG-04)."""
+    hit = _USER_PATS.get((app_id, email))
+    if hit and hit[0] == tok:
+        _USER_PATS.pop((app_id, email), None)
+        log.info("user PAT on %s for %s: 위층이 거절해 캐시에서 버렸다", app_id, email)
 
 
 # 백엔드가 **우리가 실은 사용자 토큰을 거절했다**는 결과. 예외가 아니라 isError 결과로 온다 — ste MCP 는 REST 의 401 을
@@ -5075,7 +5114,7 @@ def main():
     if REST:
         from rest_proxy import RestProxy
         proxy = RestProxy(REST, PORTAL, _audit, allow=_rest_allowed, mint=_rest_mint, deny_text=_rest_deny_text,
-                          proofs=_rest_proofs)
+                          proofs=_rest_proofs, forget=_forget_user_pat)
         star.router.routes[:0] = proxy.routes()
         log.info("REST proxy enabled: %d sites (%s)", len(REST), ", ".join(REST))
     for app in _portal_pat_misconfigured():

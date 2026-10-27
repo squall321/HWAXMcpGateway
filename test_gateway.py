@@ -2563,6 +2563,109 @@ def test_HG03_다시_받은_토큰도_거절되면_두_번에서_멈춘다(monke
     assert "401" in rows[-1]["error"], rows
 
 
+# ── REST 다리 — 위층이 우리가 실은 사람 토큰을 401 로 거절하면 캐시에서 버린다(HWAXPortal docs/request-1027 HG-04) ─────────────
+# 버리지 않던 때는 위층이 폐기한 토큰을 캐시 수명(12시간) 동안 계속 실었다. SimFlow 는 발급할 때마다 직전 토큰을 폐기한다.
+_HG04_KEY = ("simflow", "u@corp.com")
+
+
+def _hg04_proxy(monkeypatch, conf, status, *, swap_to=None):
+    """`/api/simflow/…` 한 번 — 위층은 `status` 로 답한다. `swap_to` 를 주면 위층이 답하기 전에 다른 호출이 캐시를 그 토큰으로 갈아 둔다."""
+    from starlette.requests import Request
+    from rest_proxy import RestProxy
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"simflow": {"sso_url": _HG03_SSO, "secret": "s"}})
+    monkeypatch.setattr(gw, "_USER_PATS", {_HG04_KEY: ("t1", gw.time.monotonic() + 3600)})
+    monkeypatch.setattr(gw, "_USER_PAT_LOCKS", {})
+    p = RestProxy({"simflow": conf}, {"audience_ok": ["simflow"]}, gw._audit, mint=gw._rest_mint, forget=gw._forget_user_pat)
+    p._verify = lambda token, s: {"sub": "S-1", "email": "u@corp.com", "jti": "j", "groups": []}
+    p._revoked_set = _noop_async(set())
+    sent = []
+
+    async def fake_send(req, stream=False):
+        sent.append(req.headers.get("authorization"))
+        if swap_to:
+            gw._USER_PATS[_HG04_KEY] = (swap_to, gw.time.monotonic() + 3600)
+        return httpx.Response(status, json={"detail": "x"}, request=req)
+    monkeypatch.setattr(p._client, "send", fake_send)
+    resp = asyncio.run(p.handle(Request({
+        "type": "http", "method": "GET", "path": "/api/simflow/api/v1/workflows", "headers": [(b"authorization", b"Bearer me")],
+        "query_string": b"", "path_params": {"site": "simflow", "path": "api/v1/workflows"}, "client": ("203.0.113.5", 0)})))
+    return resp, sent, gw._USER_PATS.get(_HG04_KEY), _rows()[-1]
+
+
+def test_HG04_REST_프록시는_위층_401_이면_쓴_토큰을_버리고_게이트웨이_401_과_가르는_표지를_단다(monkeypatch):
+    resp, sent, cached, row = _hg04_proxy(monkeypatch, {"base": "http://upstream.invalid", "per_user": "simflow"}, 401)
+    assert (resp.status_code, sent) == (401, ["Bearer t1"])
+    assert resp.headers.get("x-gateway-token-evicted") == "1" and cached is None
+    assert (row["ok"], row.get("note")) == (False, "token-evicted")
+
+
+def test_HG04_그_사이_다른_호출이_받아_둔_새_토큰은_버리지_않는다(monkeypatch):
+    resp, _sent, cached, _row = _hg04_proxy(monkeypatch, {"base": "http://upstream.invalid", "per_user": "simflow"}, 401, swap_to="t2")
+    assert resp.headers.get("x-gateway-token-evicted") == "1" and cached[0] == "t2"
+
+
+@pytest.mark.parametrize("conf, status", [({"base": "http://upstream.invalid", "per_user": "simflow"}, 200),
+                                          ({"base": "http://upstream.invalid", "per_user": "simflow"}, 403),
+                                          ({"base": "http://upstream.invalid",
+                                            "inject": {"header": "Authorization", "value": "Bearer svc"}}, 401)],
+                         ids=["200", "403", "inject-401"])
+def test_HG04_사람_토큰의_401_이_아니면_캐시를_두고_표지도_없다(monkeypatch, conf, status):
+    resp, _sent, cached, row = _hg04_proxy(monkeypatch, conf, status)
+    assert "x-gateway-token-evicted" not in resp.headers and cached[0] == "t1" and row.get("note") is None
+
+
+def _hg04_rest_call(monkeypatch, decide):
+    """진짜 `_user_pat` 으로 `rest_call` 한 번 — HTTP 만 가짜다. `decide(Authorization)` 가 위층의 상태를 정한다."""
+    n = {"mints": 0, "auth": []}
+
+    def handler(req):
+        u = str(req.url)
+        if u == _HG03_SSO:
+            n["mints"] += 1
+            return httpx.Response(200, json={"access_token": f"t{n['mints']}", "expires_in": 3600})
+        assert u.startswith("http://simflow.example/api/v1/"), u
+        n["auth"].append(req.headers.get("authorization"))
+        code = decide(req.headers.get("authorization"))
+        return httpx.Response(code, json={"ok": code == 200})
+    _mock_http(monkeypatch, handler)
+
+    async def fake_access(email, base_groups, **_kw):
+        return {"keys": [], "affiliation": ""}
+    monkeypatch.setattr(gw, "REST", {"simflow": {"base": "http://simflow.example", "per_user": "simflow"}})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"simflow": {"sso_url": _HG03_SSO, "secret": "s"}})
+    monkeypatch.setattr(gw, "_USER_PATS", {})
+    monkeypatch.setattr(gw, "_USER_PAT_LOCKS", {})
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    out = _payload(asyncio.run(gw._rest_call({"site": "simflow", "path": "/api/v1/workflows"})))
+    return out, n, [r for r in _rows() if r["tool"].startswith("rest_call")][-1]
+
+
+def test_HG04_rest_call_은_위층_401_이면_토큰을_버리고_새로_받아_한_번_다시_보낸다(monkeypatch):
+    out, n, row = _hg04_rest_call(monkeypatch, lambda auth: 401 if auth == "Bearer t1" else 200)
+    assert (out["status"], "error" in out) == (200, False), out
+    assert (n["mints"], n["auth"]) == (2, ["Bearer t1", "Bearer t2"])
+    assert (row["ok"], row.get("note")) == (True, "re-minted")
+    assert gw._USER_PATS[_HG04_KEY][0] == "t2", "다음 호출도 새 토큰으로 간다"
+
+
+def test_HG04_rest_call_은_다시_보내도_401_이면_두_번에서_멈추고_그대로_알린다(monkeypatch):
+    out, n, row = _hg04_rest_call(monkeypatch, lambda auth: 401)
+    assert out["status"] == 401 and "401" in out["error"]
+    assert (n["mints"], len(n["auth"])) == (2, 2) and row["ok"] is False
+
+
+@pytest.mark.parametrize("code", [403, 500])
+def test_HG04_rest_call_은_401_이_아니면_다시_보내지_않는다(monkeypatch, code):
+    out, n, _row = _hg04_rest_call(monkeypatch, lambda auth: code)
+    assert out["status"] == code and (n["mints"], len(n["auth"])) == (1, 1)
+    assert gw._USER_PATS[_HG04_KEY][0] == "t1", "토큰 문제가 아니면 캐시를 둔다"
+
+
 def test_HG03_http_401_은_묶음을_안까지_본다():
     from exceptiongroup import ExceptionGroup
     resp = httpx.Response(401, request=httpx.Request("POST", _HG03_MCP))

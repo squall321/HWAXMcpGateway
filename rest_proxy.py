@@ -150,7 +150,11 @@ class PortalPatVerifier:
 
 
 class RestProxy:
-    def __init__(self, rest_conf: dict, portal_conf: dict, audit, allow=None, mint=None, deny_text=None, proofs=None):
+    def __init__(self, rest_conf: dict, portal_conf: dict, audit, allow=None, mint=None, deny_text=None, proofs=None, forget=None):
+        # `forget(app_id, email, tok)` — per_user 사이트가 우리가 실은 토큰을 401 로 거절하면 그 토큰을 캐시에서 버린다(gateway._forget_user_pat,
+        # HWAXPortal docs/request-1027 HG-04). 흘려보낸 본문이라 안에서 다시 보내지 않는다 — 응답에 X-Gateway-Token-Evicted 를 달아
+        # 게이트웨이 자신의 401(PAT 거절)과 가른다. 호출자가 다시 보내면 새 토큰으로 간다.
+        self.forget = forget
         # `proofs(app_id, email, pat_groups) -> {헤더: 값}` — per_user 사이트에 실을 소속 · plat 증명(gateway._rest_proofs). MCP 경로와
         # 같은 규칙을 게이트웨이에서 주입받는다. 없으면 싣지 않는다(앱은 범위 토큰 없음으로 본다 — 닫힌 쪽).
         self.proofs = proofs
@@ -288,6 +292,7 @@ class RestProxy:
         headers = {k: v for k, v in request.headers.items() if k.lower() not in _skip}
         email = str(claims.get("email") or "").strip().lower()
         mode = credential_mode(conf)                       # per_user | inject | none
+        tok = None
         if mode == "per_user":
             # 서비스 자격으로 조용히 강등하지 않는다 — 그러면 남의 시야로 200 을 돌려주고,
             # 실패가 정상 응답과 구분되지 않는다(MCP 경로와 같은 자세).
@@ -341,9 +346,15 @@ class RestProxy:
             self.audit(what, site, False, f"upstream: {e!r}",
                        round((time.monotonic() - t0) * 1000), caller=who, ip=ip, via="pat")
             return JSONResponse({"error": "upstream unreachable", "detail": str(e)}, status_code=502)
+        evicted = mode == "per_user" and up.status_code == 401 and self.forget is not None
+        if evicted:
+            self.forget(str(conf["per_user"]), email, tok)
         self.audit(what, site, up.status_code < 400, None,
-                   round((time.monotonic() - t0) * 1000), caller=who, ip=ip, via="pat")
+                   round((time.monotonic() - t0) * 1000), caller=who, ip=ip, via="pat",
+                   note="token-evicted" if evicted else None)
         out_headers = {k: v for k, v in up.headers.items() if k.lower() not in _HOP}
+        if evicted:
+            out_headers["X-Gateway-Token-Evicted"] = "1"
 
         async def _out():
             try:

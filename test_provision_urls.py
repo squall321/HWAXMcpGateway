@@ -150,6 +150,21 @@ def _force_backup(tmp_path) -> None:
     assert r.returncode == 0, r.stderr
 
 
+def test_simflow_위임이_있으면_REST_다리도_그_사람_명의로_간다(tmp_path):
+    """챗 업로드가 이 길로 SimFlow 에 파일을 넣는다(HWAXPortal docs/request-1027 HG-04 · HP-15) — 종전엔 사이트가 없어 404 였다.
+    주소는 그 위임 sso_url 의 origin 이고(ste 와 같은 유도), 허용 청중에도 따라 들어간다."""
+    env = {"PER_USER_SSO_APPS": "simflow:SIMFLOW", "SIMFLOW_SSO_SECRET": "sf-s",
+           "SIMFLOW_SSO_URL": "http://simflow.example:8600/api/v1/auth/sso"}
+    out = _run_provision(tmp_path, env)
+    assert out["rest"]["simflow"] == {"base": "http://simflow.example:8600", "per_user": "simflow"}
+    assert "simflow" in out["portal"]["audience_ok"]
+    import rest_proxy
+    assert rest_proxy.allowed_methods(out["rest"]["simflow"]) is None, "그 사람 명의라 업로드(POST)가 열린다"
+    (tmp_path / "gateway_config.json").unlink()
+    out = _run_provision(tmp_path, {})
+    assert "simflow" not in out["rest"] and "simflow" not in out["portal"]["audience_ok"], "위임이 없으면 사이트도 없다"
+
+
 def test_rest_사이트는_본인_명의로_갈_수_있으면_그렇게_간다(tmp_path):
     out = _run_provision(tmp_path, {
         "HEAX_MCP_TOKEN": "heax-svc", "KOORM_SSO_SECRET": "s1", "STE_SSO_SECRET": "s2",

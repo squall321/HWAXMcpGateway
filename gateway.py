@@ -22,6 +22,7 @@ import mcp.types as types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.fastmcp import FastMCP
+from mcp.shared.exceptions import McpError
 from mcp.server.transport_security import TransportSecuritySettings
 
 # 메서드 허용 규칙의 정본. REST 프록시 라우트와 MCP 다리가 **같은 함수**를 봐야 한다.
@@ -993,6 +994,8 @@ async def _aggregate():
         for t in res.tools:
             collected.append((key, t))
         log.info("backend %s -> %d tools", key, len(res.tools))
+        if any(_ui_uri(t) for t in res.tools):
+            await _collect_ui_resources(key, b)
 
     name_counts = Counter(t.name for _, t in collected)
     # 이름 겹침 — 선언 백엔드(외부 연결)의 도구만 접두를 단다(HWAXPortal docs/ext-connect GW19). 둘 다 바꾸던 규칙이면 MatNexus 가 붙는 순간
@@ -1040,11 +1043,15 @@ async def _aggregate():
                 **({"outputSchema": t.outputSchema} if getattr(t, "outputSchema", None) else {}),
                 **({"annotations": ann} if ann else {}),
                 **({"title": t.title} if getattr(t, "title", None) else {}),
+                # 패널 표지(_meta.ui · 옛 키 "ui/resourceUri")는 옮긴다 — 버리던 때는 게이트웨이에 붙은 Claude Desktop 에서 패널이 안 떴다
+                # (HG-07). 이름을 바꿔도(충돌 접두) resourceUri 는 바꾸지 않는다 — 리소스 표가 그 주소를 이 백엔드로 돌려보낸다.
+                **({"_meta": _ui_meta(t)} if _ui_meta(t) else {}),
             )
         )
         route[exposed_name] = (key, t.name)
     log.info("AGGREGATED %d exposed tools (unique names: %d, call-only aliases: %d)",
              len(exposed_tools), len(set(route)), len(alias_route))
+    _rebuild_ui_resources()
     # 떼어 낸 선언 백엔드는 경로를 다시 지은 **뒤에야** 지킴(_CONN_ACTIVE)을 푼다 — 그 전에 남은 경로는 _deny_reason 이 닫는다(GW5 · GW7).
     for k in [k for k in _CONN_ACTIVE if k not in backends]:
         _CONN_ACTIVE.discard(k)
@@ -1492,7 +1499,8 @@ _INSTRUCTIONS = """HWAX 엔지니어링 허브 — 사내 설계·해석·품질
 신중하게 쓰는 법(이 허브에서 실제로 났던 실패를 막는 순서다):
 
 1. 도구가 수백 개다. 목록을 훑지 말고 `search_tools("하려는 일")` 로 찾아 `invoke_tool` 로
-   불러라. 목록에 안 보이는 도구도 invoke_tool 로 즉시 호출된다.
+   불러라. 목록에 안 보이는 도구도 invoke_tool 로 즉시 호출된다. 단 **패널 도구**(목록의 `_meta.ui` 가 달린 도구 —
+   SimFlow · ARP 의 open_* 등)는 invoke_tool 이 아니라 그 이름으로 직접 불러라 — 그래야 클라이언트가 패널을 띄운다.
 2. **수치·이름·ID 를 기억으로 채우지 마라.** 이 허브의 가장 위험한 실패는 도구를 부르지 않고
    그럴듯한 값을 서술하는 것이다(표면이 완벽해 사용자가 진짜 데이터로 믿는다). 답에 쓰는 값은
    도구 결과에 있던 값이어야 하고, 결과의 record_id·section_id 를 함께 인용하라.
@@ -4472,7 +4480,7 @@ async def _call_shared(b: "_Backend", backend_key: str, original: str, arguments
     raise _Late("released", why) if why else _Late("call")
 
 
-async def _oneshot(b: "_Backend", hdrs: dict, original: str, arguments: dict, timeout_s: float):
+async def _oneshot(b: "_Backend", hdrs: dict, original: str, arguments: dict, timeout_s: float, op=None):
     """이 호출만을 위한 단발 세션 — 핸드셰이크(connect + initialize)와 도구 호출에 기한을 **따로** 준다.
 
     종전에는 바깥 기한과 안쪽 호출 한도가 같은 값이었다. 먼저 출발한 바깥이 늘 이겨 초도 이름도 없는 `TimeoutError()` 만 남았고,
@@ -4493,7 +4501,8 @@ async def _oneshot(b: "_Backend", hdrs: dict, original: str, arguments: dict, ti
                     stage = "call"
                 if stage == "call":
                     with anyio.move_on_after(timeout_s):
-                        res = await sess.call_tool(original, arguments)
+                        # op — 도구 호출이 아닌 단발 요청(resources/read — HG-07). 기한 · 단계 표시는 같다.
+                        res = await (op(sess) if op is not None else sess.call_tool(original, arguments))
                         stage = "done"
     if stage != "done":
         raise _Late(stage)
@@ -4501,7 +4510,7 @@ async def _oneshot(b: "_Backend", hdrs: dict, original: str, arguments: dict, ti
 
 
 async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: str, timeout_s: float,
-                        extra_headers: dict | None = None, token_header: str | None = None):
+                        extra_headers: dict | None = None, token_header: str | None = None, op=None):
     """이 호출만을 위한 단발 세션으로 백엔드를 부른다.
 
     영속 세션은 열 때의 헤더(서비스 계정)를 그대로 물고 있어 호출별 자격증명 교체가 안 된다.
@@ -4522,7 +4531,7 @@ async def _call_as_user(b: "_Backend", original: str, arguments: dict, token: st
     base = {k: v for k, v in (b.headers or {}).items() if k.lower() not in drop}
     hdrs = {**base, **auth,
             **{k: v for k, v in (extra_headers or {}).items() if v is not None}}
-    return await _oneshot(b, hdrs, original, arguments, timeout_s)
+    return await _oneshot(b, hdrs, original, arguments, timeout_s, op=op)
 
 
 
@@ -4554,6 +4563,153 @@ async def _call_with_identity(b: "_Backend", original: str, arguments: dict, tim
         if _aff:
             hdrs[AFF_FWD_HEADER] = quote(_aff, safe="")
     return await _oneshot(b, hdrs, original, arguments, timeout_s)
+
+
+# ── MCP 리소스 중계 — ui:// 패널(HWAXPortal docs/request-1027 HG-07) ────────────────────────────────────────
+# 앱이 도구에 `_meta.ui.resourceUri`(옛 키 "ui/resourceUri")로 패널 HTML 의 ui:// 주소를 달면, 클라이언트(Claude Desktop)는 그 도구를 부를 때
+# resources/read 로 그 HTML 을 받아 패널을 띄운다. 집계가 `_meta` 를 버리고 resources 처리기가 없어, 게이트웨이(/mcp-gw/mcp)에 붙은 Desktop 에서
+# SimFlow · ARP 패널이 뜨지 않았다. 중계는 ui:// 만 한다 — 다른 리소스(앱 내부 자료)는 도구 계약 밖이라 게이트웨이가 넓히지 않는다.
+#  · 표 — 주소 → 백엔드. 패널 도구가 있는 백엔드만 재집계 때 목록을 받는다. 못 받으면 그 백엔드의 직전 목록을 둔다.
+#  · 거르기 — 도구와 같은 규칙(그룹 · 끈 앱은 목록에서). 권한 없는 백엔드의 주소는 없는 주소와 같은 오류다(있다는 사실을 흘리지 않는다).
+#  · 읽기 — 사람별 위임 백엔드는 그 사람 토큰의 단발 세션, 등록 토큰 백엔드는 그 사람이 등록한 토큰, 나머지는 상주 세션. 크기 상한 · 감사.
+#  · 겹침 — 두 백엔드가 같은 주소를 내면 먼저 붙은(키 순) 쪽으로 보내고 경고한다(주소를 바꾸면 앱의 도구가 가리키는 곳이 틀린다).
+RESOURCE_MAX_BYTES = int(os.environ.get("GATEWAY_RESOURCE_MAX_BYTES", str(16 * 1024 * 1024)))
+_UI_RESOURCES: dict[str, tuple[str, types.Resource]] = {}
+_UI_TEMPLATES: list[tuple[str, types.ResourceTemplate]] = []
+_LAST_UI_RES: dict[str, tuple[list, list]] = {}
+_RES_NOT_FOUND = -32002                    # MCP 의 'Resource not found'
+
+
+def _ui_meta(t) -> dict:
+    """도구 `_meta` 에서 패널 표지만 — `ui`(새 키)와 "ui/resourceUri"(옛 키). 다른 칸은 옮기지 않는다."""
+    m = getattr(t, "meta", None) or {}
+    return {k: m[k] for k in ("ui", "ui/resourceUri") if k in m and m[k]} if isinstance(m, dict) else {}
+
+
+def _ui_uri(t) -> str | None:
+    m = _ui_meta(t)
+    ui = m.get("ui") if isinstance(m.get("ui"), dict) else {}
+    u = ui.get("resourceUri") or m.get("ui/resourceUri")
+    return u if isinstance(u, str) and u.startswith("ui://") else None
+
+
+async def _collect_ui_resources(key: str, b) -> None:
+    """패널 도구가 있는 백엔드의 ui:// 리소스 · 템플릿을 받아 둔다. 못 받으면 직전 목록을 그대로 둔다(빈 표로 바꾸지 않는다)."""
+    try:
+        with anyio.fail_after(LIVENESS_TIMEOUT_S):
+            lr = await b.session.list_resources()
+            try:
+                lt = await b.session.list_resource_templates()
+                tmpls = [x for x in lt.resourceTemplates if str(x.uriTemplate).startswith("ui://")]
+            except Exception:  # noqa: BLE001 — 템플릿이 없는 앱이 많다(method not found)
+                tmpls = (_LAST_UI_RES.get(key) or ([], []))[1]
+        _LAST_UI_RES[key] = ([r for r in lr.resources if str(r.uri).startswith("ui://")], tmpls)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("backend %s ui 리소스 목록을 받지 못했다 — 직전 목록(%d)을 둔다: %r", key,
+                    len((_LAST_UI_RES.get(key) or ([], []))[0]), exc)
+
+
+def _rebuild_ui_resources() -> None:
+    _UI_RESOURCES.clear()
+    _UI_TEMPLATES.clear()
+    for key in [k for k in _LAST_UI_RES if k not in backends]:
+        _LAST_UI_RES.pop(key, None)                 # 떼어 낸 백엔드의 주소는 남기지 않는다
+    for key in sorted(_LAST_UI_RES):
+        rs, ts = _LAST_UI_RES[key]
+        for r in rs:
+            u = str(r.uri)
+            if u in _UI_RESOURCES and _UI_RESOURCES[u][0] != key:
+                log.warning("ui 리소스 %s 를 %s 와 %s 가 함께 낸다 — %s 로 보낸다", u, _UI_RESOURCES[u][0], key, _UI_RESOURCES[u][0])
+                continue
+            _UI_RESOURCES[u] = (key, r)
+        _UI_TEMPLATES.extend((key, t) for t in ts)
+
+
+def _res_visible(key: str, groups: list[str], muted: set[str]) -> bool:
+    return _backend_allowed(key, groups) and key not in muted
+
+
+@_low.list_resources()
+async def _list_resources():
+    groups, muted = _request_groups(), _request_muted()
+    return [r for k, r in _UI_RESOURCES.values() if _res_visible(k, groups, muted)]
+
+
+@_low.list_resource_templates()
+async def _list_resource_templates():
+    groups, muted = _request_groups(), _request_muted()
+    return [t for k, t in _UI_TEMPLATES if _res_visible(k, groups, muted)]
+
+
+def _res_bytes_of(res) -> int:
+    n = 0
+    for c in getattr(res, "contents", None) or []:
+        for v in (getattr(c, "text", None), getattr(c, "blob", None)):
+            if isinstance(v, str):
+                n += len(v.encode("utf-8"))
+    return n
+
+
+async def _read_ui_resource(req: types.ReadResourceRequest):
+    """resources/read — 주소의 백엔드에서 그대로 받아 그대로 돌려준다(내용 · 결과의 `_meta` 를 고치지 않는다)."""
+    uri = str(req.params.uri)
+    t0 = time.monotonic()
+    hit = _UI_RESOURCES.get(uri)
+    groups = _request_groups()
+    # 끈 앱도 읽기는 막지 않는다 — 도구 호출과 같다(숨김만). 권한 없는 백엔드는 없는 주소와 같은 말을 한다.
+    if hit is None or not _backend_allowed(hit[0], groups):
+        _audit(f"resources/read {_clip(uri, 160)}", hit[0] if hit else None, False, "not found", 0)
+        raise McpError(types.ErrorData(code=_RES_NOT_FOUND, message=f"Resource not found: {uri}"))
+    key = hit[0]
+    b = backends.get(key)
+    if b is None:
+        raise McpError(types.ErrorData(code=_RES_NOT_FOUND, message=f"Resource not found: {uri}"))
+    email = _request_user()
+    app_id = _delegation_app_id(key)
+
+    async def op(sess):
+        return await sess.read_resource(req.params.uri)
+    mode = "service"
+    try:
+        if app_id in PER_USER_SSO and email:
+            tok = await _user_pat(app_id, email)
+            res = await _call_as_user(b, "", {}, tok, CALL_TIMEOUT_S, token_header=PER_USER_SSO[app_id].get("token_header"), op=op)
+            mode = "as-user-pat"
+        elif key in PORTAL_CONN_BACKENDS and email:
+            conn = await _portal_connection(PORTAL_CONN_BACKENDS[key], email)
+            if conn is None:
+                raise McpError(types.ErrorData(code=types.INVALID_REQUEST, message=(
+                    f"{key}: 이 계정은 그쪽 토큰을 아직 등록하지 않았다 — 포털 '개인 토큰 › 외부 연결'(/tokens?tab=connect)에서 등록한 뒤 연다")))
+            extra = {"Authorization": None} if key not in _BUILTIN_CONN else None
+            res = await _call_as_user(b, "", {}, conn["token"], CALL_TIMEOUT_S, extra_headers=extra, op=op)
+            mode = "as-conn"
+        elif key in _CONN_ACTIVE and key not in _BUILTIN_CONN:
+            raise McpError(types.ErrorData(code=types.INVALID_REQUEST, message=(
+                f"{key}: 사람 신원이 없는 호출은 받지 않는다(서비스 계정 없음)")))
+        else:
+            if b.session is None:
+                raise RuntimeError("backend session down")
+            with anyio.fail_after(CALL_TIMEOUT_S):
+                res = await b.session.read_resource(req.params.uri)
+    except McpError as exc:
+        _audit(f"resources/read {_clip(uri, 160)}", key, False, _clip(exc.error.message, 200),
+               round((time.monotonic() - t0) * 1000), caller=email or None, mode=mode)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _audit(f"resources/read {_clip(uri, 160)}", key, False, repr(exc), round((time.monotonic() - t0) * 1000),
+               caller=email or None, mode=mode)
+        raise McpError(types.ErrorData(code=types.INTERNAL_ERROR, message=f"backend {key} 에서 리소스를 읽지 못했다: {exc!r}")) from None
+    size = _res_bytes_of(res)
+    if size > RESOURCE_MAX_BYTES:
+        _audit(f"resources/read {_clip(uri, 160)}", key, False, f"resource > {RESOURCE_MAX_BYTES}B", round((time.monotonic() - t0) * 1000),
+               caller=email or None, mode=mode)
+        raise McpError(types.ErrorData(code=types.INTERNAL_ERROR, message=(
+            f"리소스가 상한 {RESOURCE_MAX_BYTES:,}바이트(GATEWAY_RESOURCE_MAX_BYTES)를 넘는다({size:,}바이트)")))
+    _audit(f"resources/read {_clip(uri, 160)}", key, True, None, round((time.monotonic() - t0) * 1000), caller=email or None, mode=mode)
+    return types.ServerResult(res)
+
+
+_low.request_handlers[types.ReadResourceRequest] = _read_ui_resource
 
 
 @_low.list_tools()

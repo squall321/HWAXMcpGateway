@@ -7681,3 +7681,187 @@ def test_로그는_선언_접두의_토큰을_가리고_도구_이름은_그대�
     assert fmt.format(rec) == "tok fmea_*** / Bearer mnx_pat_*** — fmea_list_projects · fmea_ab1"
     gw._conn_registry_set({}, _ROWS, persist=False)
     assert gw._CONN_TOKEN_MASK is None, "선언이 없으면 가릴 접두도 없다"
+
+
+# ── MCP 리소스 중계 — ui:// 패널(HWAXPortal docs/request-1027 HG-07) ─────────────────────────────────────────
+# 집계가 도구 `_meta` 를 버리고 resources 처리기가 없어 게이트웨이(/mcp-gw/mcp)에 붙은 Claude Desktop 에서 SimFlow · ARP 패널이 뜨지 않았다.
+_PANEL_HTML = "<!doctype html><title>workflow</title>"
+
+
+class _PanelSess:
+    """패널 도구 · ui:// 리소스를 내는 백엔드 세션 — 받은 읽기를 남긴다. `fail_list` 면 리소스 목록이 터진다."""
+    def __init__(self, tools, resources, templates=(), *, fail_list=False):
+        self._t, self._r, self._tm, self.fail_list, self.reads = tools, resources, list(templates), fail_list, []
+
+    async def list_tools(self):
+        return _Res(self._t)
+
+    async def list_resources(self):
+        if self.fail_list:
+            raise RuntimeError("list_resources down")
+        return types.ListResourcesResult(resources=self._r)
+
+    async def list_resource_templates(self):
+        return types.ListResourceTemplatesResult(resourceTemplates=self._tm)
+
+    async def read_resource(self, uri):
+        self.reads.append(str(uri))
+        return types.ReadResourceResult(contents=[types.TextResourceContents(
+            uri=uri, text=_PANEL_HTML, mimeType="text/html;profile=mcp-app", _meta={"ui": {"prefersBorder": True}})],
+            _meta={"served": "backend"})
+
+
+def _panel_tool(name, uri, *, old_key=False, extra_meta=None):
+    meta = {"ui/resourceUri": uri} if old_key else {"ui": {"resourceUri": uri}}
+    return types.Tool(name=name, description="패널을 연다", inputSchema={"type": "object"}, _meta={**meta, **(extra_meta or {})})
+
+
+def _panel_kit(monkeypatch, sessions: dict, *, policy=None, groups=(), user=""):
+    import asyncio
+    bs = {}
+    for key, sess in sessions.items():
+        b = _CallB([])
+        b.session = sess
+        bs[key] = b
+    monkeypatch.setattr(gw, "backends", bs)
+    for name in ("route", "alias_route", "_FP", "_LAST_TOOLS", "_LIVENESS_MISS", "_REAGG", "tool_readonly_hint", "_LAST_UI_RES",
+                 "_UI_RESOURCES"):
+        monkeypatch.setattr(gw, name, {})
+    monkeypatch.setattr(gw, "_UI_TEMPLATES", [])
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "POLICY", policy or {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_groups", lambda: list(groups))
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    monkeypatch.setattr(gw, "_request_user", lambda: user)
+    asyncio.run(gw._aggregate())
+    return bs
+
+
+def _read(uri):
+    import asyncio
+    req = types.ReadResourceRequest(method="resources/read", params=types.ReadResourceRequestParams(uri=uri))
+    return asyncio.run(gw._read_ui_resource(req))
+
+
+def test_HG07_집계가_패널_표지를_옮기고_이름을_바꿔도_resourceUri_는_그대로다(monkeypatch):
+    sf = _PanelSess([_panel_tool("open_workflow_panel", "ui://simflow/workflow", extra_meta={"internal": "x"}),
+                     _panel_tool("status", "ui://simflow/status", old_key=True)],
+                    [types.Resource(uri="ui://simflow/workflow", name="workflow"), types.Resource(uri="ui://simflow/status", name="s"),
+                     types.Resource(uri="file:///secret.txt", name="secret")])
+    other = _PanelSess([_tool("status")], [])
+    _panel_kit(monkeypatch, {"simflow": sf, "arp": other})
+    by = {t.name: t for t in gw.exposed_tools}
+    assert by["open_workflow_panel"].meta == {"ui": {"resourceUri": "ui://simflow/workflow"}}, "ui 만 옮긴다 — 다른 칸(internal)은 아니다"
+    assert by["simflow_status"].meta == {"ui/resourceUri": "ui://simflow/status"}, "충돌 접두로 이름이 바뀌어도 주소는 그대로다"
+    assert by["arp_status"].meta is None
+    dumped = by["open_workflow_panel"].model_dump(by_alias=True, exclude_none=True)
+    assert dumped["_meta"]["ui"]["resourceUri"] == "ui://simflow/workflow", "클라이언트로 나가는 꼴(_meta)에 실린다"
+    assert sorted(gw._UI_RESOURCES) == ["ui://simflow/status", "ui://simflow/workflow"], "ui:// 만 중계한다"
+
+
+def test_HG07_리소스_목록은_도구와_같은_규칙으로_거르고_권한_없는_주소는_없는_주소와_같은_오류다(monkeypatch):
+    import asyncio
+    sf = _PanelSess([_panel_tool("open_workflow_panel", "ui://simflow/workflow")], [types.Resource(uri="ui://simflow/workflow", name="w")],
+                    [types.ResourceTemplate(uriTemplate="ui://simflow/run/{id}", name="run")])
+    arp = _PanelSess([_panel_tool("open_arp_panel", "ui://arp/board")], [types.Resource(uri="ui://arp/board", name="b")])
+    _panel_kit(monkeypatch, {"simflow": sf, "arp": arp}, policy={"arp": ["arp-users"]})
+    assert [str(r.uri) for r in asyncio.run(gw._list_resources())] == ["ui://simflow/workflow"]
+    assert [t.uriTemplate for t in asyncio.run(gw._list_resource_templates())] == ["ui://simflow/run/{id}"]
+    errs = []
+    for uri in ("ui://arp/board", "ui://nope/x"):
+        with pytest.raises(gw.McpError) as ei:
+            _read(uri)
+        errs.append((ei.value.error.code, ei.value.error.message.replace(uri, "<uri>")))
+    assert errs[0] == errs[1] == (-32002, "Resource not found: <uri>"), "있다는 사실을 흘리지 않는다"
+    assert arp.reads == []
+
+
+def test_HG07_읽기는_백엔드_답을_그대로_돌려주고_감사에_남긴다(monkeypatch):
+    sf = _PanelSess([_panel_tool("open_workflow_panel", "ui://simflow/workflow")], [types.Resource(uri="ui://simflow/workflow", name="w")])
+    _panel_kit(monkeypatch, {"simflow": sf})
+    out = _read("ui://simflow/workflow")
+    res = out.root
+    assert res.contents[0].text == _PANEL_HTML and res.contents[0].mimeType == "text/html;profile=mcp-app"
+    assert res.contents[0].meta == {"ui": {"prefersBorder": True}} and res.meta == {"served": "backend"}, "내용 · 결과의 _meta 를 고치지 않는다"
+    row = [r for r in _rows() if r["tool"].startswith("resources/read")][-1]
+    assert (row["ok"], row["backend"], row["mode"]) == (True, "simflow", "service")
+
+
+def test_HG07_사람별_위임_백엔드는_그_사람_토큰의_단발_세션으로_읽는다(monkeypatch):
+    sf = _PanelSess([_panel_tool("open_workflow_panel", "ui://simflow/workflow")], [types.Resource(uri="ui://simflow/workflow", name="w")])
+    bs = _panel_kit(monkeypatch, {"simflow": sf}, user="u@corp.com")
+    bs["simflow"].headers = {"Authorization": "Bearer svc"}
+    seen = {}
+
+    class _One:
+        async def initialize(self): return None
+
+        async def read_resource(self, uri):
+            seen["uri"] = str(uri)
+            return types.ReadResourceResult(contents=[types.TextResourceContents(uri=uri, text="per-user", mimeType="text/html")])
+
+    def fake_stream(url, headers=None, **_kw):
+        seen["headers"] = dict(headers or {})
+        return _StubCM((None, None, "sid"))
+    monkeypatch.setattr(gw, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_One()))
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"simflow": {"sso_url": "http://x", "secret": "s"}})
+
+    async def fake_pat(app_id, email, *, stale=None, notes=None):
+        return "sf_user_tok"
+    monkeypatch.setattr(gw, "_user_pat", fake_pat)
+    out = _read("ui://simflow/workflow")
+    assert out.root.contents[0].text == "per-user" and seen["uri"] == "ui://simflow/workflow"
+    assert seen["headers"]["Authorization"] == "Bearer sf_user_tok" and sf.reads == [], "상주(서비스) 세션으로 읽지 않는다"
+    assert [r for r in _rows() if r["tool"].startswith("resources/read")][-1]["mode"] == "as-user-pat"
+
+
+def test_HG07_목록을_못_받으면_직전_목록을_두고_겹치는_주소는_먼저_붙은_쪽으로_크면_거절한다(monkeypatch):
+    import asyncio
+    sf = _PanelSess([_panel_tool("open_workflow_panel", "ui://simflow/workflow")], [types.Resource(uri="ui://simflow/workflow", name="w")])
+    _panel_kit(monkeypatch, {"simflow": sf})
+    sf.fail_list = True
+    asyncio.run(gw._aggregate())
+    assert list(gw._UI_RESOURCES) == ["ui://simflow/workflow"], "한 번 못 받았다고 표를 비우지 않는다"
+    dup = _PanelSess([_panel_tool("open_dup", "ui://simflow/workflow")], [types.Resource(uri="ui://simflow/workflow", name="dup")])
+    _panel_kit(monkeypatch, {"zz-copy": dup, "simflow": _PanelSess(sf._t, sf._r)})
+    assert gw._UI_RESOURCES["ui://simflow/workflow"][0] == "simflow", "키 순으로 먼저인 쪽"
+    monkeypatch.setattr(gw, "RESOURCE_MAX_BYTES", 10)
+    with pytest.raises(gw.McpError) as ei:
+        _read("ui://simflow/workflow")
+    assert "GATEWAY_RESOURCE_MAX_BYTES" in ei.value.error.message
+
+
+def test_HG07_지침이_패널_도구는_직접_부르라고_하고_서버가_resources_를_광고한다():
+    from mcp.server.lowlevel.server import NotificationOptions
+    assert "패널 도구" in gw._INSTRUCTIONS and "직접 불러라" in gw._INSTRUCTIONS
+    assert gw._low.request_handlers[types.ReadResourceRequest] is gw._read_ui_resource, "FastMCP 기본 처리기가 이기면 중계가 안 된다"
+    assert gw._low.get_capabilities(NotificationOptions(), {}).resources is not None
+
+
+def test_HG07_진짜_클라이언트가_resources_list_read_와_도구의_meta_를_받는다(monkeypatch):
+    """처리기를 바로 부르는 시험만으로는 등록 · 직렬화(`_meta` 별칭)가 빠져도 초록이다 — 메모리 전송으로 진짜 ClientSession 을 붙인다."""
+    import asyncio
+    from mcp.shared.memory import create_connected_server_and_client_session
+    sf = _PanelSess([_panel_tool("open_workflow_panel", "ui://simflow/workflow")], [types.Resource(uri="ui://simflow/workflow", name="w")])
+    _panel_kit(monkeypatch, {"simflow": sf})
+    monkeypatch.setattr(gw, "_local_tools", lambda: [])
+
+    async def go():
+        async with create_connected_server_and_client_session(gw._low) as client:
+            tools = (await client.list_tools()).tools
+            res = (await client.list_resources()).resources
+            got = await client.read_resource("ui://simflow/workflow")
+            try:
+                await client.read_resource("ui://nope/x")
+                missing = None
+            except gw.McpError as exc:
+                missing = exc.error.code
+            return tools, res, got, missing
+    tools, res, got, missing = asyncio.run(go())
+    assert tools[0].meta == {"ui": {"resourceUri": "ui://simflow/workflow"}}
+    assert [str(r.uri) for r in res] == ["ui://simflow/workflow"]
+    assert got.contents[0].text == _PANEL_HTML and got.meta == {"served": "backend"}
+    assert missing == -32002

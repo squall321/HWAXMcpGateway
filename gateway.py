@@ -2822,7 +2822,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         by_app.setdefault(_k, [])
 
     if str((arguments or {}).get("by") or "").strip() == "area":
-        return _list_by_area(by_app, groups, str((arguments or {}).get("area") or "").strip())
+        return _list_by_area(by_app, groups, str((arguments or {}).get("area") or "").strip(), include=include)
 
     apps = []
     denied = 0
@@ -2903,9 +2903,11 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     )
 
 
-def _list_by_area(by_app: dict, groups: list[str], want_area: str) -> types.CallToolResult:
+def _list_by_area(by_app: dict, groups: list[str], want_area: str, include: bool = True) -> types.CallToolResult:
     """list_tool_apps(by='area') — 앱이 아니라 하는 일로 묶는다. 내 권한으로 못 쓰는 앱의 도구는
-    뺀다(영역 보기는 '무엇을 할 수 있나'가 목적이라, 못 쓰는 걸 늘어놓으면 오답이 된다)."""
+    뺀다(영역 보기는 '무엇을 할 수 있나'가 목적이라, 못 쓰는 걸 늘어놓으면 오답이 된다).
+    include_tools=false 면 요약(영역을 안 고른 판)에 도구 이름을 싣지 않는다 — 앱 요약과 같은 규칙이다. 종전엔 이 판만 그것을 안 봐
+    1,600여 개 이름을 늘 실었다(HWAXPortal docs/request-1027 HG-05). 영역을 고르면 그 영역의 도구 설명을 준다(그것을 물은 것이다)."""
     meta = {m["area"]: m for m in _area_meta()}
     buckets: dict[str, list] = {k: [] for k in meta}
     hidden = 0
@@ -2930,7 +2932,7 @@ def _list_by_area(by_app: dict, groups: list[str], want_area: str) -> types.Call
         entry = {"area": key or "", "label": m["label"], "description": m["description"], "tool_count": len(items)}
         if want_area:
             entry["tools"] = [{"name": t.name, "app": a, "description": t.description or ""} for t, a in items]
-        else:
+        elif include:
             entry["tools"] = sorted(t.name for t, _ in items)
         if items or want_area:
             areas.append(entry)

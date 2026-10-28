@@ -415,6 +415,44 @@ def test_knox_bridge_와_plm_defect_도구는_미분류로_떨어지지_않는�
     assert by["quality"]["label"] == "품질·불량 이력" and "PLM" in by["quality"]["description"]
 
 
+@pytest.mark.parametrize("app, tool, want", [
+    # 코어 허브의 읽기 도구는 '사내 지식 검색' — 10-27 cae00 그 영역(55개)에 코어 허브 도구가 0개였다(HWAXPortal docs/request-1027 HG-05)
+    ("rootdesigndatahub", "rootdesigndatahub_object_resolve", "knowledge"),
+    ("failuretrace", "failuretrace_graph_neighbors", "knowledge"),
+    ("caegroupdatahub", "caegroupdatahub_objects_summary", "knowledge"),
+    ("rootdesigndatahub", "rootdesigndatahub_objects_upsert", "data"),     # 허브의 나머지는 앱 기본값
+    # 미분류 996/1612(61.8%) — 앱 기본값이 없던 것들(외부 연결 선언 플랫폼 포함)
+    ("componentcore", "find_component", "cad"), ("matnexus", "matnexus_search", "material"), ("fmea", "fmea_defect_cases", "quality"),
+    ("odb-hub", "odb_open", "cad"), ("arp", "arp_list", "result"), ("simflow", "open_workflow_panel", "sim"),
+    ("simengbay", "list_engines", "sim"), ("ste", "ste_submit_job", "sim"), ("dynaforge-prod", "dynaforgeprod_whoami", "system"),
+    ("dynaforge-prod", "report_summary", "result"), ("stepforge-prod", "list_parts", "cad"),
+    ("matnexus", "voc_breakdown", "voc"),                                  # voc_* 는 어느 앱이든 VOC
+])
+def test_HG05_코어_허브_읽기는_지식_검색이고_앱_기본값이_미분류를_메운다(monkeypatch, app, tool, want):
+    monkeypatch.setattr(gw, "_AREAS_CACHE", {"mtime": None, "data": {}})     # 추적 파일 그대로
+    assert gw._area_of(tool, app) == want
+
+
+def test_HG05_영역_요약도_include_tools_false_면_도구_이름을_싣지_않는다(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(gw, "_AREAS_CACHE", {"mtime": None, "data": {}})
+
+    class _S:
+        session = object()
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": _S()})
+    monkeypatch.setattr(gw, "exposed_tools", [_tool("find_parts")])
+    monkeypatch.setattr(gw, "route", {"find_parts": ("heax-step_forge", "find_parts")})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    slim = json.loads(asyncio.run(gw._list_tool_apps({"by": "area", "include_tools": False})).content[0].text)
+    assert slim["areas"] and all("tools" not in a for a in slim["areas"]), slim
+    assert {a["area"]: a["tool_count"] for a in slim["areas"]}["cad"] == 1, "개수는 남는다"
+    full = json.loads(asyncio.run(gw._list_tool_apps({"by": "area"})).content[0].text)
+    assert {a["area"]: a for a in full["areas"]}["cad"]["tools"] == ["find_parts"], "기본은 종전대로"
+    one = json.loads(asyncio.run(gw._list_tool_apps({"by": "area", "area": "cad", "include_tools": False})).content[0].text)
+    assert one["areas"][0]["tools"][0]["name"] == "find_parts", "영역을 고르면 그 영역의 도구 설명을 준다"
+
+
 # ── 포털 권한 정책(HWAXPortal docs/access-control) ────────────────────────────
 import asyncio  # noqa: E402
 

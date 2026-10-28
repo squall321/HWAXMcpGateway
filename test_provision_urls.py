@@ -1069,7 +1069,7 @@ def test_추적_파일에_사내_주소가_박혀_있지_않다():
 # HWAXPortal update-all 의 `_gw_stale` 은 `grep -F` 로 이 프로비저너가 '옛 항목을 빼는 판' 인지 본다(옛 프로비저너에 방아쇠를
 # 당기면 매 실행 재프로비저닝이 헛돌고 게이트웨이·에이전트서버가 그때마다 내려갔다 올라온다). 그 줄을 모르고 고쳐 쓰면
 # 방아쇠가 조용히 꺼진다.
-_PORTAL_READS = ["_ST_PREV != _ST_DEFAULT", "if _ARP_BASE and _ARP:"]
+_PORTAL_READS = ["_ST_PREV != _ST_DEFAULT", "if _ARP_BASE and _ARP:", 'f"Bearer {_ODB}"']
 
 
 @pytest.mark.parametrize("literal", _PORTAL_READS)

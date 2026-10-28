@@ -624,10 +624,10 @@ if _ODB:
     # 이미 붙어 있는 박스는 직전 config 가 주소를 알고 있어 아무것도 새로 적지 않아도 그대로 선다.
     _odb_base = e.get("ODB_HUB_BASE") or (_odb_prev.split("/mcp")[0] if _odb_prev else None)
     if _odb_base:
-        cfg["odb-hub"] = {
-            "url": f'{_odb_base}/mcp',
-            "transport": "streamable_http",
-            "headers": {"Authorization": f"Bearer {_ODB}"}}
+        # ⚠ 아래 줄도 **글자 그대로** 읽힌다 — update-all 의 `_gw_stale` 이 `grep -F` 로 찾아 '헤더 꼴을 짓는 판' 인지 가리고(아니면 옛 쿼리 꼴
+        #   odb-hub 를 다시 짓게 당기지 않는다 — HWAXPortal docs/request-1027 HP-28), 고쳐 쓰면 방아쇠가 조용히 꺼진다 — 저쪽과 함께 고친다.
+        _odb_auth = {"Authorization": f"Bearer {_ODB}"}
+        cfg["odb-hub"] = {"url": f'{_odb_base}/mcp', "transport": "streamable_http", "headers": _odb_auth}
     else:
         # 토큰만 있고 주소를 모른다 — 지어내지 않는다. 조용히 빠지지 않게 켜는 법과 함께 말한다(토큰은 찍지 않는다).
         print("  ⚠ odb-hub 생략 — ODB_HUB_TOKEN 은 있는데 허브 주소를 모른다(ODB_HUB_BASE·직전 config 둘 다 없음). "

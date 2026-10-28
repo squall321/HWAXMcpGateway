@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import anyio
+import asyncio
 import httpx
 import uvicorn
 import mcp.types as types
@@ -4843,8 +4844,20 @@ _LOCAL_READ = frozenset({SEARCH_CONV_TOOL.name, LIST_APPS_TOOL.name, SEARCH_TOOL
                          USE_EXPERTS_TOOL.name, VERIFY_TOOL.name, REST_CATALOG_TOOL.name})
 
 
+# 진행 중인 CallTool 수 — 재기동 때 이것이 0 이 될 때까지 짧게 기다린다(_GracefulServer, HG-11).
+_INFLIGHT_CALLS = {"n": 0}
+
+
 @_low.call_tool(validate_input=False)
 async def _call_tool(name: str, arguments: dict):
+    _INFLIGHT_CALLS["n"] += 1
+    try:
+        return await _call_tool_body(name, arguments)
+    finally:
+        _INFLIGHT_CALLS["n"] -= 1
+
+
+async def _call_tool_body(name: str, arguments: dict):
     t0 = time.monotonic()
     # 범용 실행기 — 이름·인자를 안쪽 도구로 바꿔 끼우고 **아래 정상 경로를 그대로 탄다**
     # (인가·캐시·사용자 위임·감사 전부 기존 로직 적용). 재귀·파괴 도구만 여기서 차단.
@@ -5210,6 +5223,14 @@ def _bearer_gate(app, pat_verifier=None):
     async def middleware(scope, receive, send):
         if scope["type"] != "http":
             await app(scope, receive, send)
+            return
+        if (_DRAIN["on"] and scope.get("path") in ("/mcp", "/mcp/") and scope.get("method") == "POST"
+                and not dict(scope.get("headers") or {}).get(b"mcp-session-id")):
+            # 재기동 중 — 열린 연결로 오는 **새 세션**(세션 머리 없는 POST = initialize)은 받지 않는다. 열린 세션의 호출은 그대로 끝까지 간다(HG-11).
+            await send({"type": "http.response.start", "status": 503,
+                        "headers": [(b"content-type", b"application/json"), (b"retry-after", b"1")]})
+            await send({"type": "http.response.body", "body": json.dumps(
+                {"error": "draining", "detail": "게이트웨이가 재기동 중이다 — 잠시 뒤 다시 붙는다"}, ensure_ascii=False).encode()})
             return
         if scope.get("path") == "/health":
             # 무인증 헬스: 오케스트레이터가 MCP 핸드셰이크 없이 싸게 프로브.
@@ -5579,6 +5600,36 @@ def _limits_line() -> str:
                 REST_PROXY_UPSTREAM_TIMEOUT_S, PORTAL_SAVE_TIMEOUT_S, JWKS_TIMEOUT_S))
 
 
+# ── 재기동 때 비우기(graceful shutdown — HWAXPortal docs/request-1027 HG-11) ───────────────────────────────────────
+# 10-25 19:41:15 재기동에 열린 스트림 98건이 'ASGI callable returned without completing response' 로 끊겼다 — 그 순간의 도구 호출이 실패했다.
+# uvicorn 기본은 열린 연결이 다 닫히기를 **한없이** 기다리고(MCP 의 대기 GET 스트림은 스스로 닫히지 않는다), 두 번째 신호가 오면 그 자리에서 전부
+# 끊는다. 순서를 바꾼다 —
+#   ① 리스너부터 닫는다 — start.sh restart 는 포트가 풀리기를 기다렸다가 새 프로세스를 띄운다(늦으면 kill -9 다).
+#   ② 열린 연결로 오는 새 세션은 503(게이트), 진행 중인 CallTool 이 0 이 될 때까지 GATEWAY_DRAIN_TIMEOUT 초까지 기다린다.
+#   ③ 나머지(대기 스트림)는 GATEWAY_SHUTDOWN_TAIL 초 뒤 끊고 종전대로 내린다.
+DRAIN_TIMEOUT_S = float(os.environ.get("GATEWAY_DRAIN_TIMEOUT", "30"))
+SHUTDOWN_TAIL_S = float(os.environ.get("GATEWAY_SHUTDOWN_TAIL", "5"))
+_DRAIN = {"on": False}
+
+
+class _GracefulServer(uvicorn.Server):
+    async def shutdown(self, sockets=None):
+        for server in self.servers:
+            server.close()
+        for sock in sockets or []:
+            sock.close()
+        _DRAIN["on"] = True
+        t0 = time.monotonic()
+        if _INFLIGHT_CALLS["n"]:
+            log.info("재기동 — 진행 중인 도구 호출 %d건이 끝나기를 %g초까지 기다린다(GATEWAY_DRAIN_TIMEOUT)", _INFLIGHT_CALLS["n"],
+                     DRAIN_TIMEOUT_S)
+        while _INFLIGHT_CALLS["n"] > 0 and time.monotonic() - t0 < DRAIN_TIMEOUT_S and not self.force_exit:
+            await asyncio.sleep(0.1)
+        if _INFLIGHT_CALLS["n"]:
+            log.warning("재기동 — %g초가 지나도 도구 호출 %d건이 남아 끊는다(GATEWAY_DRAIN_TIMEOUT)", DRAIN_TIMEOUT_S, _INFLIGHT_CALLS["n"])
+        await super().shutdown(sockets=sockets)
+
+
 def main():
     star = fm.streamable_http_app()
     # REST 프록시 라우트(/api/<site>/<path>) 를 MCP 마운트보다 먼저 매칭되게 삽입.
@@ -5613,7 +5664,8 @@ def main():
     app = _bearer_gate(star, pat_verifier)
     log.info("starting hwax-mcp-gateway on %s:%d (path /mcp), %d backends", HOST, PORT, len(BACKENDS))
     log.info("%s", _limits_line())
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    _GracefulServer(uvicorn.Config(app, host=HOST, port=PORT, log_level="info",
+                                   timeout_graceful_shutdown=SHUTDOWN_TAIL_S)).run()
 
 
 if __name__ == "__main__":

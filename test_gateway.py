@@ -4400,7 +4400,7 @@ def test_기동_로그의_시간_한도_줄은_이_프로세스에_실제로_걸
 def test_기동할_때_그_줄을_남긴다():
     src = open(gw.__file__, encoding="utf-8").read()
     main = src[src.index("\ndef main():"):]
-    assert 'log.info("%s", _limits_line())' in main[:main.index("uvicorn.run(")], "main() 이 기동 전에 시간 한도 줄을 남겨야 한다"
+    assert 'log.info("%s", _limits_line())' in main[:main.index("_GracefulServer(uvicorn.Config(")], "main() 이 기동 전에 시간 한도 줄을 남겨야 한다"
 
 
 # ── 1백만 토큰 창 — 게이트웨이는 도구 결과를 자르지 않고, 남는 절단은 조용하지 않다(리스크 심사 재설계 M1) ─────────
@@ -7917,3 +7917,93 @@ def test_HG20_구조화_본문과_rest_call_도_가리고_health_는_수만_싣�
                                                   "headers": []}, recv, send))
     health = json.loads(b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body"))
     assert health["pii_mask"]["on"] is True and isinstance(health["pii_mask"]["masked"], int) and health["pii_mask"]["masked"] >= 2
+
+
+
+# ── 재기동 때 비우기(HWAXPortal docs/request-1027 HG-11) ─────────────────────────────────────────────────────────
+# 10-25 재기동에 열린 스트림 98건이 응답 없이 끊겼다. 리스너 먼저 → 새 세션 503 → 진행 중인 CallTool 이 0 이 될 때까지(상한) → 나머지.
+class _FakeListener:
+    def __init__(self, ev): self.ev = ev
+
+    def close(self): self.ev.append("listener-closed")
+
+
+def _graceful(monkeypatch, inflight_for: float, drain_s: float = 5.0):
+    """진짜 `_GracefulServer.shutdown` 을 돌린다 — 위 단계(uvicorn 의 종료)만 기록으로 바꾼다. 도구 호출 하나가 `inflight_for` 초 걸린다."""
+    import uvicorn as _uv
+    ev: list = []
+
+    async def fake_super(self, sockets=None):
+        ev.append(("uvicorn-shutdown", gw._INFLIGHT_CALLS["n"]))
+    monkeypatch.setattr(_uv.Server, "shutdown", fake_super)
+    monkeypatch.setattr(gw, "DRAIN_TIMEOUT_S", drain_s)
+    monkeypatch.setattr(gw, "_DRAIN", {"on": False})
+    monkeypatch.setattr(gw, "_INFLIGHT_CALLS", {"n": 0})
+
+    async def slow_body(name, arguments):
+        ev.append(("call-start", gw._DRAIN["on"]))
+        await asyncio.sleep(inflight_for)
+        ev.append("call-done")
+        return types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
+    monkeypatch.setattr(gw, "_call_tool_body", slow_body)
+    import time
+    srv = gw._GracefulServer.__new__(gw._GracefulServer)
+    srv.servers, srv.force_exit = [_FakeListener(ev)], False
+
+    async def go():
+        call = asyncio.ensure_future(gw._call_tool("x", {}))
+        await asyncio.sleep(0.05)
+        t0 = time.monotonic()
+        await srv.shutdown()
+        took = time.monotonic() - t0
+        await call
+        return took
+    took = asyncio.run(go())
+    return ev, took
+
+
+def test_HG11_재기동은_리스너를_먼저_닫고_진행_중인_도구_호출이_끝난_뒤에_내린다(monkeypatch):
+    ev, took = _graceful(monkeypatch, inflight_for=0.6)
+    assert ev == [("call-start", False), "listener-closed", "call-done", ("uvicorn-shutdown", 0)], ev
+    assert 0.4 < took < 3, took
+    assert gw._DRAIN["on"] is True and gw._INFLIGHT_CALLS["n"] == 0
+
+
+def test_HG11_기다림에는_상한이_있다(monkeypatch):
+    ev, took = _graceful(monkeypatch, inflight_for=3.0, drain_s=0.5)
+    assert ev[:3] == [("call-start", False), "listener-closed", ("uvicorn-shutdown", 1)], ev
+    assert took < 2, "상한(GATEWAY_DRAIN_TIMEOUT) 뒤에는 남은 호출을 두고 내린다"
+
+
+def test_HG11_비우는_동안_새_세션은_503_이고_열린_세션의_요청은_지나간다(monkeypatch):
+    monkeypatch.setattr(gw, "_DRAIN", {"on": True})
+    passed = []
+
+    async def app(scope, receive, send):
+        passed.append(dict(scope["headers"]).get(b"mcp-session-id"))
+        await send({"type": "http.response.start", "status": 202, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def recv():
+        return {"type": "http.request", "body": b""}
+
+    def run(headers):
+        sent = []
+
+        async def send(m):
+            sent.append(m)
+        monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+        asyncio.run(gw._bearer_gate(app)({"type": "http", "path": "/mcp", "method": "POST", "query_string": b"",
+                                          "headers": [(b"authorization", b"Bearer gw-secret"), *headers]}, recv, send))
+        return sent[0]["status"], dict(sent[0]["headers"])
+    status, hdrs = run([])
+    assert status == 503 and hdrs[b"retry-after"] == b"1" and passed == []
+    status, _h = run([(b"mcp-session-id", b"s-1")])
+    assert status == 202 and passed == [b"s-1"], "열린 세션의 호출은 끝까지 간다"
+
+
+def test_HG11_기동이_비우기_서버와_대기_스트림_한도로_뜬다():
+    src = open(gw.__file__, encoding="utf-8").read()
+    main = src[src.index("\ndef main():"):]
+    assert "_GracefulServer(uvicorn.Config(app, host=HOST, port=PORT" in main and "timeout_graceful_shutdown=SHUTDOWN_TAIL_S" in main
+    assert "uvicorn.run(" not in main, "uvicorn.run 은 기본(한없이 기다리다 두 번째 신호에 전부 끊는다)으로 돌아간다"

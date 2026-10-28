@@ -7865,3 +7865,55 @@ def test_HG07_진짜_클라이언트가_resources_list_read_와_도구의_meta_�
     assert [str(r.uri) for r in res] == ["ui://simflow/workflow"]
     assert got.contents[0].text == _PANEL_HTML and got.meta == {"served": "backend"}
     assert missing == -32002
+
+
+# ── 나가는 응답의 개인정보 가림(HWAXPortal docs/request-1027 HG-20 · 사용자 결정 D-2 — 기본으로 가린다) ─────────────────────────
+_VOC_ROW = ('{\n  "items": [\n    {"id": 7, "author_name": "Kim Minsu", "handle": "minsu.bsky.social", "text": "배터리 광탈 — IMEI 352099001761481 기기", '
+            '"serial": 3},\n    {"id": 8, "author": "", "detected_by": "홍길동", "serial_number": "R58N12ABCDE", "imei": 352099001761481,\n'
+            '     "score": 0.91}\n  ],\n  "count": 2\n}')
+
+
+def test_HG20_백엔드_결과의_작성자_계정_IMEI_일련번호를_가리고_서식은_그대로다(monkeypatch):
+    _result_kit(monkeypatch, _VOC_ROW)
+    res = asyncio.run(gw._call_tool("get_big", {}))
+    out = res.content[0].text
+    for leak in ("Kim Minsu", "minsu.bsky.social", "352099001761481", "홍길동", "R58N12ABCDE"):
+        assert leak not in out, leak
+    assert '"author_name": "[가림:이름]"' in out and '"handle": "[가림:계정]"' in out and '"detected_by": "[가림:이름]"' in out
+    assert '"serial_number": "[가림:일련번호]"' in out and '"imei": "[가림:IMEI]"' in out and "IMEI [가림:IMEI] 기기" in out
+    assert '"serial": 3' in out and '"author": ""' in out, "차례 번호 · 빈 값은 그대로 둔다"
+    assert out.replace("[가림:이름]", "X").count("\n") == _VOC_ROW.count("\n") and json.loads(out)["count"] == 2, "서식 · 나머지 값은 그대로"
+    again = asyncio.run(gw._call_tool("get_big", {}))
+    assert again.content[0].text == out, "캐시에서 와도 가린 판이다"
+
+
+def test_HG20_가릴_것이_없으면_결과를_바이트까지_그대로_두고_끄면_원문이다(monkeypatch):
+    plain = '{"rows": [{"part": "BRKT-01", "stress": 352.1, "count": 123456789012345}]}'     # Luhn 을 통과 못 하는 15자리
+    _result_kit(monkeypatch, plain)
+    assert asyncio.run(gw._call_tool("get_big", {})).content[0].text == plain
+    monkeypatch.setattr(gw, "PII_MASK_ON", False)
+    _result_kit(monkeypatch, _VOC_ROW)
+    assert asyncio.run(gw._call_tool("get_big", {})).content[0].text == _VOC_ROW, "GATEWAY_PII_MASK=0 이면 원문"
+
+
+def test_HG20_구조화_본문과_rest_call_도_가리고_health_는_수만_싣는다(monkeypatch):
+    res = types.CallToolResult(content=[types.TextContent(type="text", text="ok")],
+                               structuredContent={"rows": [{"nickname": "철수", "note": "IMEI 35-209900-176148-1 교체"}]})
+    out = gw._pii_mask(res)
+    assert out.structuredContent == {"rows": [{"nickname": "[가림:이름]", "note": "IMEI [가림:IMEI] 교체"}]}
+    assert res.structuredContent["rows"][0]["nickname"] == "철수", "원본 객체는 건드리지 않는다(캐시 · 근거 원장이 쥔다)"
+    src = open(gw.__file__, encoding="utf-8").read()
+    assert 'return _evid_keep("rest_call", _pii_mask(_rest_text(payload)))' in src
+    assert src.count("_cache_put(ckey, _evid_keep(name, _pii_mask(res)))") == 5, "백엔드 결과를 돌려주는 자리 다섯이 모두 가린다"
+    assert gw._luhn_ok("352099001761481") and not gw._luhn_ok("352099001761482")
+    sent = []
+
+    async def recv():
+        return {"type": "http.request", "body": b""}
+
+    async def send(m):
+        sent.append(m)
+    asyncio.run(gw._bearer_gate(lambda *a: None)({"type": "http", "path": "/health", "method": "GET", "query_string": b"",
+                                                  "headers": []}, recv, send))
+    health = json.loads(b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body"))
+    assert health["pii_mask"]["on"] is True and isinstance(health["pii_mask"]["masked"], int) and health["pii_mask"]["masked"] >= 2

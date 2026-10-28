@@ -600,6 +600,125 @@ def _envelope_reason(res) -> str | None:
     return None
 
 
+# ── 나가는 응답의 개인정보 가림(HWAXPortal docs/request-1027 HG-20 · 사용자 결정 D-2 — 기본으로 가린다) ─────────────────────────
+# 걸리던 출력 — SignalForge 의 author_name(커뮤니티 작성자) · 계정 핸들, 결함 이력의 검출자 · 작업자, 기기 IMEI · 일련번호. 원문이 필요한 화면은
+# 게이트웨이를 거치지 않고 그 앱에서 본다. 원천에서 가리는 몫(FailureTrace 의 label · content_text 안 이름 — D-4, PLM — 보류)은 그쪽에 있다.
+#  · JSON 은 **칸 이름**으로 가린다 — 본문 서식(들여쓰기 · 순서)을 바꾸지 않게 글자 위에서 값만 바꾼다. 자유 글의 사람 이름은 꼴로 가르지
+#    않는다(오탐이 수치 · 부품명을 지운다).
+#  · IMEI 꼴(15자리, Luhn 검사 통과)은 어느 글에서든 가린다.
+#  · 게이트웨이 자체 도구(대화 · 조직도 · 검색)는 대상이 아니다 — 백엔드 도구 결과와 rest_call 만. 끄기 — GATEWAY_PII_MASK=0(박스 손잡이).
+PII_MASK_ON = os.environ.get("GATEWAY_PII_MASK", "1").strip() != "0"
+_PII_KEYS = {
+    "이름": ("author", "author_name", "writer", "writer_name", "username", "user_name", "nickname", "screen_name", "detector",
+           "detector_name", "detected_by", "inspector", "inspector_name", "reporter", "reporter_name", "worker_name",
+           "작성자", "검출자", "작업자", "보고자"),
+    "계정": ("author_id", "account_id", "account_name", "handle", "user_handle"),
+    "일련번호": ("serial", "serial_no", "serial_number", "sn"),
+    "IMEI": ("imei", "imei1", "imei2", "meid"),
+}
+_PII_KEY_KIND = {k.lower(): kind for kind, ks in _PII_KEYS.items() for k in ks}
+_PII_STR_RX = re.compile(r'("(' + "|".join(re.escape(k) for k in _PII_KEY_KIND) + r')"\s*:\s*)"((?:[^"\\]|\\.)*)"', re.I)
+_PII_NUM_RX = re.compile(r'("(' + "|".join(re.escape(k) for kind in ("일련번호", "IMEI") for k in _PII_KEYS[kind]) + r')"\s*:\s*)(\d{8,})(?![\d.])',
+                         re.I)
+_IMEI_RX = re.compile(r"(?<![\w-])(\d{2}[- ]?\d{6}[- ]?\d{6}[- ]?\d)(?![\w-])")
+_PII_STAT = {"masked": 0}
+
+
+def _luhn_ok(digits: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2:
+            d = d * 2 - 9 if d > 4 else d * 2
+        total += d
+    return total % 10 == 0
+
+
+def _pii_value_ok(kind: str, value: str) -> bool:
+    """가릴 값인가 — 비었거나(이름이 없다) 일련번호 칸의 짧은 값(차례 번호)은 그대로 둔다."""
+    v = value.strip()
+    return bool(v) and (kind not in ("일련번호", "IMEI") or len(v) >= 6)
+
+
+def _pii_mask_text(text: str) -> tuple[str, int]:
+    n = 0
+
+    def _str(m):
+        nonlocal n
+        kind = _PII_KEY_KIND[m.group(2).lower()]
+        if not _pii_value_ok(kind, m.group(3)):
+            return m.group(0)
+        n += 1
+        return f'{m.group(1)}"[가림:{kind}]"'
+
+    def _num(m):
+        nonlocal n
+        n += 1
+        return f'{m.group(1)}"[가림:{_PII_KEY_KIND[m.group(2).lower()]}]"'
+
+    def _imei(m):
+        nonlocal n
+        digits = re.sub(r"\D", "", m.group(1))
+        if len(digits) != 15 or not _luhn_ok(digits):
+            return m.group(0)
+        n += 1
+        return "[가림:IMEI]"
+    out = _PII_STR_RX.sub(_str, text)
+    out = _PII_NUM_RX.sub(_num, out)
+    out = _IMEI_RX.sub(_imei, out)
+    return out, n
+
+
+def _pii_mask_obj(v, n: list):
+    if isinstance(v, dict):
+        out = {}
+        for k, x in v.items():
+            kind = _PII_KEY_KIND.get(str(k).lower())
+            if kind and isinstance(x, str) and _pii_value_ok(kind, x):
+                out[k] = f"[가림:{kind}]"
+                n[0] += 1
+            elif kind in ("일련번호", "IMEI") and isinstance(x, int) and not isinstance(x, bool) and len(str(abs(x))) >= 8:
+                out[k] = f"[가림:{kind}]"
+                n[0] += 1
+            else:
+                out[k] = _pii_mask_obj(x, n)
+        return out
+    if isinstance(v, list):
+        return [_pii_mask_obj(x, n) for x in v]
+    if isinstance(v, str):
+        t, k = _pii_mask_text(v)
+        n[0] += k
+        return t
+    return v
+
+
+def _pii_mask(res):
+    """백엔드 도구 결과의 개인정보를 가린 사본 — 가린 것이 없으면 그 결과 그대로다(서식 · 바이트까지)."""
+    if not PII_MASK_ON or res is None:
+        return res
+    n = [0]
+    blocks, changed = [], False
+    for c in getattr(res, "content", None) or []:
+        txt = getattr(c, "text", None)
+        if isinstance(txt, str):
+            t, k = _pii_mask_text(txt)
+            if k:
+                c, changed = c.model_copy(update={"text": t}), True
+                n[0] += k
+        blocks.append(c)
+    sc = getattr(res, "structuredContent", None)
+    upd = {}
+    if isinstance(sc, dict):
+        before = n[0]
+        new_sc = _pii_mask_obj(sc, n)
+        if n[0] != before:
+            upd["structuredContent"] = new_sc
+    if not changed and not upd:
+        return res
+    _PII_STAT["masked"] += n[0]
+    return res.model_copy(update={"content": blocks, **upd})
+
+
 def _res_bytes(res, stop: int) -> int:
     """결과가 메모리에 쥐는 크기의 근사(바이트) — 본문 글(UTF-8)·바이너리 블록(base64 글)·structuredContent(JSON).
     `stop` 을 넘으면 거기서 그만 센다(그보다 크다는 것만 알면 된다)."""
@@ -3773,7 +3892,7 @@ async def _rest_call(args: dict) -> types.CallToolResult:
         # 실패를 성공처럼 생기게 두지 않는다 — 상태코드만 실으면 모델이 body 를 답으로 읽는다.
         payload["error"] = f"{site} 가 {status} 로 답했다"
     # 근거 원장에도 쌓는다 — 빠져 있어서 rest_call 로 읽은 수치는 verify_answer 가 늘 '조회 결과에 없다' 고 했다(MCP 길과 같은 자세).
-    return _evid_keep("rest_call", _rest_text(payload))
+    return _evid_keep("rest_call", _pii_mask(_rest_text(payload)))
 
 
 def _local_tools() -> list[types.Tool]:
@@ -4930,7 +5049,7 @@ async def _call_tool(name: str, arguments: dict):
                        caller=email, mode="as-user-pat", corr=_request_corr(),
                        note="+".join(n for n in ("re-minted" if attempt else None, _sso_fold_note(tok, email), *pp_notes) if n)
                        or None, res=res)
-                return _cache_put(ckey, _evid_keep(name, res))
+                return _cache_put(ckey, _evid_keep(name, _pii_mask(res)))
     elif backend_key in PORTAL_CONN_BACKENDS:
         # 포털 등록 연결 토큰 위임(RA 등). 신원이 있는 호출은 **본인 토큰으로만** 간다. 서비스 계정(cae00 에선
         # 실제 사람의 RA 토큰)으로 대신 보내면 그 사람 개인 공간에 글이 쌓이고 그 사람의 '내 글' 이 남에게
@@ -5004,7 +5123,7 @@ async def _call_tool(name: str, arguments: dict):
                    round((time.monotonic() - t0) * 1000),
                    caller=email, mode="as-conn", corr=_request_corr(), res=res,
                    note=(f"tok:{hashlib.sha256(conn['token'].encode('utf-8')).hexdigest()[:10]}" if _declared else None))
-            return _cache_put(ckey, _evid_keep(name, res))
+            return _cache_put(ckey, _evid_keep(name, _pii_mask(res)))
 
     # 이 호출이 쓰는 세션의 세대. 실패했을 때 "내가 죽었다고 본 그 세션" 을 가리키므로,
     # 그 사이 다른 호출이 이미 갈아 끼웠다면 새 세션을 또 부수지 않는다. try 밖에서 잡는다 —
@@ -5023,12 +5142,12 @@ async def _call_tool(name: str, arguments: dict):
             _audit(name, backend_key, not getattr(res, "isError", False), None,
                    round((time.monotonic() - t0) * 1000),
                    caller=_u or None, mode="identity-fwd", corr=_request_corr(), res=res)
-            return _cache_put(ckey, _evid_keep(name, res))
+            return _cache_put(ckey, _evid_keep(name, _pii_mask(res)))
         res = await _call_shared(b, backend_key, original, arguments)
         _audit(name, backend_key, not getattr(res, "isError", False), None,
                round((time.monotonic() - t0) * 1000),
                caller=_u or None, mode="service", note=note, corr=_request_corr(), res=res)
-        return _cache_put(ckey, _evid_keep(name, res))
+        return _cache_put(ckey, _evid_keep(name, _pii_mask(res)))
     except _Late as late:
         return _late(late)
     except Exception as e:  # noqa: BLE001
@@ -5059,7 +5178,7 @@ async def _call_tool(name: str, arguments: dict):
                            caller=_u or None, mode="identity-fwd" if _fwd else "service",
                            note="reconnected" + (f"+{note}" if note else ""),
                            corr=_request_corr(), res=res)
-                    return _cache_put(ckey, _evid_keep(name, res))
+                    return _cache_put(ckey, _evid_keep(name, _pii_mask(res)))
         except _Late as late:
             return _late(late)
         except Exception as e2:  # noqa: BLE001 — 재시도 실패도 정돈된 isError 로 (프로토콜 에러 방지)
@@ -5116,6 +5235,7 @@ def _bearer_gate(app, pat_verifier=None):
                 "conn_since": {k: _CONN_SINCE[k] for k in sorted(_CONN_SINCE) if k in _CONN_STATUS},
                 # 프록시 우회 보정 — 수만(주소는 싣지 않는다). 포털 출구 점검이 게이트웨이 목적지를 이것으로 판정한다(HG-18).
                 "no_proxy": _no_proxy_health(),
+                "pii_mask": {"on": PII_MASK_ON, "masked": _PII_STAT["masked"]},     # 수만(HG-20) — 무인증 칸이다
                 **({"policy": POLICY, "access_policy": _ACCESS_POLICY} if _detail else {}),
             }).encode()
             await send({"type": "http.response.start", "status": 200,

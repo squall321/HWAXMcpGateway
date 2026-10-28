@@ -4483,7 +4483,7 @@ def test_search_tools_는_도구_설명과_인자_스키마를_자르지_않는�
     monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
     monkeypatch.setattr(gw, "_request_groups", lambda: [])
     monkeypatch.setattr(gw, "_request_muted", lambda: set())
-    out = json.loads(asyncio.run(gw._search_tools({"query": "deliberate 심의"})).content[0].text)
+    out = json.loads(asyncio.run(gw._search_tools({"query": "deliberate 심의", "detail": True})).content[0].text)
     hit = next(m for m in out["matches"] if m["tool"] == "deliberate_start")
     assert hit["description"] == t.description.strip()
     assert "default(자유 심의)" in hit["description"]
@@ -4491,6 +4491,14 @@ def test_search_tools_는_도구_설명과_인자_스키마를_자르지_않는�
     assert hit["args"]["properties"] == t.inputSchema["properties"], "인자 스키마는 생산자가 준 그대로여야 한다"
     assert hit["args"]["properties"]["modifiers"]["anyOf"][0]["type"] == "array"
     assert "advanced" in hit["args"]["properties"] and "save_report" in hit["args"]["properties"]
+    # 기본은 한 줄 요약과 필수 인자의 스키마 · 선택 인자의 이름이다(HWAXPortal docs/request-1027 HG-12) — 선택 인자를 지우지는 않는다
+    brief = json.loads(asyncio.run(gw._search_tools({"query": "deliberate 심의"})).content[0].text)
+    b = next(m for m in brief["matches"] if m["tool"] == "deliberate_start")
+    assert "\n" not in b["description"] and t.description.strip().startswith(b["description"].rstrip(" …"))
+    assert b["args"]["required"] == ["question"] and list(b["args"]["properties"]) == ["question"]
+    assert b["args"]["properties"]["question"] == t.inputSchema["properties"]["question"]
+    assert set(b["args"]["optional"]) == set(t.inputSchema["properties"]) - {"question"}, "선택 인자 이름은 남는다"
+    assert "detail=true" in brief["note"]
 
 
 def test_search_tools_의_인자_계약은_참조하는_정의까지_싣는다(monkeypatch):
@@ -6058,13 +6066,18 @@ def _tool_search_embed_off(monkeypatch):
     monkeypatch.setattr(gw, "_TOOL_VEC_JOB", {"running": False, "again": False})
 
 
-# master 303f023 의 `_search_tools` 원문 그대로다(고치지 않는다) — 옵션을 끈 답이 이것과 바이트 단위로 같아야 한다.
+# 의미 순위를 끈 `_search_tools` 의 기준본이다 — 옵션을 끈 답이 이것과 바이트 단위로 같아야 한다. 처음엔 master 303f023 원문이었고,
+# 순위 · 응답 꼴을 일부러 바꾼 10-28(HWAXPortal docs/request-1027 HG-01 · HG-12)에 그 판에서 RRF · 질의 기록 줄만 빼고 다시 떴다.
+# 순위를 일부러 바꿀 때만 다시 뜬다 — RRF 를 고치다 끈 길이 바뀌면 이 시험이 잡는다.
 _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.CallToolResult:
     """도구 검색 안내대 — 351개 평면 노출의 선택 비용을 줄이는 입구(실측: 상위 40개가
-    호출의 79%, 30%는 한 번도 안 불림 — 롱테일은 검색으로 찾게 한다). 임베딩 없이
-    부분문자열 매칭(한국어는 조사 탓에 토큰 경계가 흐려 substring 이 더 잘 맞는다)."""
-    q = str((arguments or {}).get("query") or "").strip().lower()
+    호출의 79%, 30%는 한 번도 안 불림 — 롱테일은 검색으로 찾게 한다). 기본은 임베딩 없이
+    부분문자열 매칭(한국어는 조사 탓에 토큰 경계가 흐려 substring 이 더 잘 맞는다). 켜면 임베딩 순위를 RRF 로
+    더한다(TOOL_SEARCH_EMBED_URL — 기본 꺼짐)."""
+    raw_q = str((arguments or {}).get("query") or "").strip()     # 임베딩에는 대소문자를 살린 원문을 준다
+    q = raw_q.lower()
     limit = max(1, min(20, int((arguments or {}).get("limit") or 8)))
+    detail = (arguments or {}).get("detail") is True
     if len(q) < 2:
         return types.CallToolResult(content=[types.TextContent(
             type="text", text='{"error": "query 를 2자 이상 주세요"}')], isError=True)
@@ -6074,7 +6087,7 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
     _SYN = {
         "보고서": ("report",), "리포트": ("report",), "요약": ("digest", "summary"),
         "검색": ("search",), "조회": ("get", "list", "search"), "목록": ("list",),
-        "물성": ("material", "property"), "재료": ("material",), "곡선": ("curve",),
+        "물성": ("material", "property", "material_property"), "재료": ("material",), "곡선": ("curve",),
         "잡": ("job",), "작업": ("job",), "상태": ("status", "health"),
         "슬럼": ("slurm",), "슬럼잡": ("slurm",), "클러스터": ("cluster",),
         "메쉬": ("mesh",), "메시": ("mesh",), "형상": ("geometry", "shape"),
@@ -6093,34 +6106,70 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
         # 앱 설명만으로는 app_hit 가산점뿐이라 다른 앱에 밀린다(실측: '안 선택' 이 물성·VOC 에 밀림).
         # 이름까지 맞히게 이어 준다 — 한 글자 토큰('안')은 위에서 이미 버려지므로 두 글자 이상만.
         "심의": ("deliberate",), "토의": ("deliberate",), "심사": ("deliberate", "risk"),
-        "규명": ("deliberate",), "원인": ("deliberate",), "불량": ("deliberate",),
-        "선택": ("deliberate",), "대안": ("deliberate",), "판정": ("deliberate",),
-        "신뢰": ("deliberate",), "리스크": ("deliberate", "risk"), "위험": ("deliberate", "risk"),
-        "도출": ("deliberate",), "설계": ("deliberate",), "계획": ("deliberate", "plan"),
+        "리스크": ("deliberate", "risk"), "위험": ("deliberate", "risk"),
         "전문가심의": ("deliberate",), "회의": ("deliberate", "meeting"),
+        # 일반 업무 낱말은 심의를 **시작하는 도구 하나**에만 잇는다 — 가족 접두(deliberate)에 이으면 status · result · list ·
+        # transcript … 여덟이 한꺼번에 이름 적중을 받아, '시장 불량 원인 대책' 상위 10 중 8개가 deliberate_* 였다(HG-01).
+        "규명": ("deliberate_start",), "원인": ("deliberate_start",), "불량": ("deliberate_start", "defect", "failure"),
+        "선택": ("deliberate_start",), "대안": ("deliberate_start",), "판정": ("deliberate_start",),
+        "신뢰": ("deliberate_start",), "도출": ("deliberate_start",), "설계": ("deliberate_start",),
+        "계획": ("deliberate_start", "plan"),
+        # 코어 온톨로지 — 허브 읽기 도구(object_resolve · objects_list · graph_neighbors …)와 타입 이름에 잇는다. 코어 질문 16개 중 15개에서
+        # 상위 8에 허브 온톨로지 읽기 도구가 0개였다(온톨로지 시험 C-5).
+        "과제": ("object_resolve", "plm_task", "task"), "고장모드": ("failure_mode",), "고장": ("failure",),
+        "시험항목": ("test_item",), "가상검증": ("sim_capability",), "관리기준": ("criterion",), "기준": ("criterion",),
+        "영률": ("material_property", "modulus", "young"),
+        "전작": ("predecessor", "graph_neighbors"), "후속": ("successor", "graph_neighbors"),
+        "시장": ("market", "voc"), "대책": ("countermeasure",),
     }
     expand = {w: (w,) + tuple(s for k, ss in _SYN.items() if k in w for s in ss) for w in terms}
+    write_intent = any(w in q + " " for w in _WRITE_INTENT)
+    q_flat = re.sub(r"\s+", "", q)
+    quality_n = sum(1 for w in _QUALITY_WORDS if w in q)
     groups = _request_groups()
+    visible = _visible_tools(groups)
     rows = []
-    for t in _visible_tools(groups):
+    for t in visible:
         name = t.name.lower()
         desc = (t.description or "").lower()
-        app = route.get(t.name, ("_gateway",))[0]
+        app, original = route.get(t.name, ("_gateway", t.name))[:2]
         meta = _app_meta(app) if app != "_gateway" else {"label": "gateway", "description": ""}
-        hay_app = (str(meta.get("label") or "") + " " + str(meta.get("description") or "")).lower()
+        label = str(meta.get("label") or "")
+        hay_app = (label + " " + str(meta.get("description") or "")).lower()
+        names = _label_names(label)
         score, covered = 0, 0
         for w, variants in expand.items():
             name_hit = any(v in name for v in variants)
             desc_freq = max(min(desc.count(v), 3) for v in variants)
             app_hit = any(v in hay_app for v in variants)
-            if name_hit or desc_freq or app_hit:
+            # 질의가 앱 이름을 불렀으면(진짜 앱 라벨 적중) 이름 적중과 같은 가중이다 — 종전엔 라벨 · 설명 어디에 맞든 1점이었다(HG-01).
+            named = any(_named(names, v, q_flat) for v in variants)
+            if name_hit or desc_freq or app_hit or named:
                 covered += 1
-                score += 4 * name_hit + desc_freq + app_hit
+                score += 4 * (name_hit or named) + desc_freq + app_hit
         if score > 0:
+            if quality_n and _area_of(t.name, app) in ("quality", "voc"):
+                score += 2 * quality_n          # 품질 질의 — 품질 · VOC 도구를 위로(HG-01)
             # 커버리지 승수 — 질의어를 더 많이 맞힌 도구가 개별 단어 빈도보다 앞선다.
-            rows.append((score * (1 + covered / max(1, len(terms))),
-                         t.name, app, (t.description or "").strip(), t))
-    rows.sort(key=lambda r: (-r[0], r[1]))
+            final = score * (1 + covered / max(1, len(terms)))
+            is_write = _tool_is_write(t, original)
+            if is_write and not write_intent:
+                final *= 0.5                    # 쓰기 낱말이 없는 질문 — 쓰기 · 잡 시작 도구를 내린다(HG-01)
+            rows.append((final, t.name, app, (t.description or "").strip(), t, is_write, original,
+                         1 if _COPY_LABEL.search(label) else 0))
+    rows.sort(key=lambda r: (-r[0], r[7], r[1]))
+    # 같은 도구의 사본 — 원래 이름과 설명이 같으면 첫 줄(점수 · 정본 순) 하나만 올리고 나머지는 same_in 으로 접는다(HG-01).
+    # 접힌 것도 이름으로 부를 수 있다(호출 별칭은 그대로다). 순위에서만 빠진다.
+    folded: dict[tuple, list] = {}
+    kept = []
+    for r in rows:
+        k = (r[6], r[3])
+        if k in folded:
+            folded[k].append({"tool": r[1], "app": r[2]})
+            continue
+        folded[k] = []
+        kept.append(r)
+    rows = kept
 
     def _args_summary(t) -> dict:
         """invoke_tool 로 바로 부를 수 있게 인자 계약을 붙인다 — 이게 없으면 모델이
@@ -6140,18 +6189,47 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
             if sch.get(k):
                 out[k] = sch[k]
         return out
-    matches = [{"tool": n, "app": a, "description": d, "args": _args_summary(t)} for _, n, a, d, t in rows[:limit]]
+    def _args_brief(t) -> dict:
+        """기본 — 필수 인자의 스키마와 선택 인자의 이름만(HG-12). 응답이 도구 설명 전문(각 수천 자)과 스키마를 그대로 실어 LLM 문맥을
+        먹었다(10-25 PLM-23). 선택 인자는 이름을 남긴다 — 빼면 모르는 인자가 된다(종전 13번째부터 안 보이던 사고). 전부는 detail=true."""
+        sch = getattr(t, "inputSchema", None) or {}
+        req = list(sch.get("required") or [])
+        props = sch.get("properties") or {}
+        out = {"required": req, "properties": {k: props[k] for k in req if k in props}}
+        opt = [k for k in props if k not in req]
+        if opt:
+            out["optional"] = opt
+        refs = json.dumps(out["properties"], ensure_ascii=False, default=str)
+        for k in ("$defs", "definitions"):
+            if sch.get(k) and "#/" + k + "/" in refs:
+                out[k] = sch[k]
+        return out
+
+    matches = []
+    for _, n, a, d, t, w, orig, _c in rows[:limit]:
+        m = {"tool": n, "app": a, "description": d if detail else _brief_desc(d),
+             "args": _args_summary(t) if detail else _args_brief(t)}
+        if w:
+            m["write"] = True                    # 쓰기 · 잡 시작 — 사람에게 확인한 뒤 부른다(지침 5)
+        if folded.get((orig, d)):
+            m["same_in"] = folded[(orig, d)]
+        matches.append(m)
     # ⚠ 순서가 뜻이다 — 이름 순위·안내를 먼저, 설명·스키마 전문(matches)을 맨 뒤에 둔다. 작은 창의 소비자(dev 웹 챗
     #   TOOL_RESULT_MAX=6,000)는 앞에서부터 글자로 자르므로, 전문이 앞서면 6~8위 도구는 이름조차 사라져 '없다' 로 읽혔다(gw-adh GA-7,
     #   리스크 앱 도구 실측 8건 7,000~8,400자). 게이트웨이는 자르지 않는다 — 잘려도 순위가 남게 놓을 뿐이다.
-    payload = {"query": q, "match_count": len(rows), "ranked": [m["tool"] for m in matches]}
+    payload = {"query": q}
+    payload["match_count"] = len(rows)
+    payload["ranked"] = [m["tool"] for m in matches]
     if len(rows) > limit:
         # 순위 목록이라 건수는 둔다 — 다만 더 맞은 도구가 있다는 것을 match_count 숫자로만 두지 않는다.
         payload["truncated"] = (f"{len(rows)}건 중 상위 {limit}건만 보였다 — limit 를 올리거나(최대 20) 질의를 좁혀라. "
                                 "보이지 않는 도구가 없다는 뜻이 아니다.")
     payload["note"] = ("여기 나온 도구는 현재 목록에 없어도 invoke_tool(name, arguments) 로 즉시 "
                        "호출할 수 있다(args 의 required 를 채워라). 원하는 게 없으면 질문을 바꿔 "
-                       "다시 검색하거나 list_tool_apps(app='<키>') 로 앱 상세를 보라.")
+                       "다시 검색하거나 list_tool_apps(app='<키>') 로 앱 상세를 보라."
+                       + ("" if detail else " 설명은 한 줄 요약이고 args 는 필수 인자만 스키마를 싣는다 — 선택 인자(optional)까지 "
+                                            "쓰려면 detail=true 로 다시 찾아라.")
+                       + (" same_in 은 설명까지 같은 사본이다 — 위 도구를 먼저 쓴다." if any("same_in" in m for m in matches) else ""))
     payload["matches"] = matches
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
@@ -6207,6 +6285,101 @@ def _no_embed(monkeypatch):
     async def boom(texts, kind, timeout_s):
         raise AssertionError("꺼진 길이 임베더를 불렀다")
     monkeypatch.setattr(gw, "_embed_texts", boom)
+
+
+# ── search_tools 순위 — cae00 모양(허브 셋 · 심의 여덟 · 품질 · VOC)으로 본다(HWAXPortal docs/request-1027 HG-01) ──────────────────────
+# 실측(10-25 · 10-27) — 코어 질문 16개 중 15개에서 상위 8에 허브 온톨로지 읽기 도구가 0개, '시장 불량 원인 대책'(limit 10)은 deliberate_* 8개 ·
+# plm_defect_search · VOC 0개, 조회 질문(OT-16)의 상위 8 중 6개가 쓰기 · 적용 도구, 점수가 같으면 이름순이라 사본 허브가 앞이었다.
+_HUBS = (("heax-designhub_copy", "designhubcopy", "자주검증 Datahub (사본)"), ("heax-failuretrace", "failuretrace", "FailureTrace"),
+         ("heax-rootdesigndatahub", "rootdesigndatahub", "자주검증 Datahub"))
+_HUB_TOOLS = (
+    ("object_resolve", "이름 · 코드 · 별칭으로 코어 객체(part · model · plm_task · failure_mode · test_item · sim_capability · criterion · "
+                       "material_property)를 찾아 id 를 준다."),
+    ("objects_list", "한 타입의 객체 목록 — type 은 part · model · plm_task · failure_mode · test_item · sim_capability · criterion."),
+    ("graph_neighbors", "한 객체의 이웃 — predecessor · successor · uses · verifies 관계를 따라간다."),
+    ("objects_upsert", "객체를 만들거나 고친다(part · model · failure_mode …)."),
+)
+_HG01_SPECS = [(key, f"{pre}_{n}", d) for key, pre, _l in _HUBS for n, d in _HUB_TOOLS] + [
+    ("hwax-deliberation", "deliberate_start", "HWAX 전문가 심의를 시작한다 — 원인 규명 · 불량 원인 분석 · 안 선택 · 리스크 심사 · 시험 계획."),
+    ("hwax-deliberation", "deliberate_continue", "끝난 심의를 이어서 한 번 더 돌린다."),
+    ("hwax-deliberation", "deliberate_status", "심의가 어디까지 갔는지 본다 — 잡 상태와 라운드."),
+    ("hwax-deliberation", "deliberate_result", "심의 결정문을 받는다."),
+    ("hwax-deliberation", "deliberate_list", "내가 돌린 심의 목록."),
+    ("hwax-deliberation", "deliberate_transcript", "심의 라운드마다 좌석이 한 말 원문."),
+    ("hwax-deliberation", "deliberate_jobs", "도는 심의 잡과 줄."),
+    ("hwax-deliberation", "deliberate_cancel", "도는 심의를 멈춘다."),
+    ("plm-search-agent", "plm_defect_search", "PLM 문제점(불량) 사례를 증상 · 모델 · 과제로 찾는다 — 원인 · 대책 · 처리 이력."),
+    ("plm-search-agent", "plm_defect_detail", "문제점 한 건의 상세 — 원인 분석 · 대책 · 첨부."),
+    ("signalforge", "defect_profile", "제품별 결함 프로필 — 시장 커뮤니티 VOC 의 불량 유형 분포."),
+    ("signalforge", "search_voc", "키워드로 VOC 를 검색합니다."),
+    ("heax-step_forge", "list_parts", "파트 목록 — 이름 · 부피 · 재질."),
+    ("heax-step_forge", "set_part_metadata", "파트에 이름 · 재질 같은 메타를 적는다."),
+    ("heax-step_forge", "find_plm_task", "PLM 과제를 과제 코드 · 이름으로 찾는다."),
+]
+
+
+def _hg01(monkeypatch, query: str, limit: int = 10, specs=None) -> dict:
+    specs = specs or _HG01_SPECS
+    _search_catalog(monkeypatch, specs)
+    monkeypatch.setattr(gw, "route", {n: (a, n.split("_", 1)[1] if a.startswith("heax-") and a not in (
+        "heax-step_forge",) else n) for a, n, _ in specs})
+    monkeypatch.setattr(gw, "DISCOVERED_META", {**{k: {"label": l, "description": "코어 온톨로지 허브"} for k, _p, l in _HUBS},
+                                                "heax-step_forge": {"label": "StepForge", "description": "STEP 어셈블리 점검"}})
+    _no_embed(monkeypatch)
+    return json.loads(asyncio.run(gw._search_tools({"query": query, "limit": limit})).content[0].text)
+
+
+def test_HG01_품질_질의는_심의_가족이_아니라_품질_VOC_도구를_올린다(monkeypatch):
+    out = _hg01(monkeypatch, "시장 불량 원인 대책", 10)
+    delib = [t for t in out["ranked"] if t.startswith("deliberate_")]
+    assert len(delib) <= 2, f"심의 가족이 일반 낱말로 한꺼번에 올랐다: {out['ranked']}"
+    assert set(out["ranked"][:4]) == {"plm_defect_search", "plm_defect_detail", "defect_profile", "search_voc"}, out["ranked"]
+
+
+@pytest.mark.parametrize("query, want", [("고장모드 목록", "objects_list"), ("과제코드로 객체 찾기", "object_resolve"),
+                                         ("이 모델의 전작", "graph_neighbors")])
+def test_HG01_온톨로지_낱말이_허브_읽기_도구에_닿고_사본은_정본_밑에_접힌다(monkeypatch, query, want):
+    out = _hg01(monkeypatch, query, 8)
+    hub = [m for m in out["matches"] if m["tool"].endswith("_" + want)]
+    assert len(hub) == 1, f"같은 설명의 허브 셋이 접히지 않았다: {out['ranked']}"
+    top = hub[0]
+    assert out["ranked"].index(top["tool"]) < 3, out["ranked"]
+    assert top["app"] != "heax-designhub_copy", "점수가 같으면 라벨에 사본 표지가 없는 앱이 앞이다"
+    assert sorted(x["app"] for x in top["same_in"]) == sorted(k for k, _p, _l in _HUBS if k != top["app"])
+    assert "same_in" in out["note"]
+
+
+def test_HG01_쓰기_낱말이_없으면_쓰기_도구를_내리고_표지를_단다(monkeypatch):
+    read = _hg01(monkeypatch, "고장모드 객체 보기", 20)
+    names = [x.split("_", 1)[1] if x.split("_", 1)[0] in {p for _k, p, _l in _HUBS} else x for x in read["ranked"]]
+    assert names.index("objects_list") < names.index("objects_upsert"), names
+    up = next(m for m in read["matches"] if m["tool"].endswith("_objects_upsert"))
+    assert up.get("write") is True and not next(m for m in read["matches"] if m["tool"].endswith("_objects_list")).get("write")
+    # 쓰기 낱말이 있으면 감점하지 않는다 — 같은 질의에 '등록' 만 더하면 쓰기 도구가 위로 온다
+    write = _hg01(monkeypatch, "고장모드 객체 등록", 20)
+    names_w = [x.split("_", 1)[1] if x.split("_", 1)[0] in {p for _k, p, _l in _HUBS} else x for x in write["ranked"]]
+    assert names_w.index("objects_upsert") < names.index("objects_upsert"), (names_w, names)
+
+
+def test_HG01_앱_이름을_부르면_이름_적중과_같은_가중이고_라벨_안의_일반_낱말은_아니다():
+    assert gw._label_names("StepForge") == {"stepforge"}
+    assert gw._label_names("시뮬레이션 실행(SmartTwin)") == {"시뮬레이션실행", "smarttwin"}
+    assert gw._label_names("WebDesignAgents — 발표자료·슬라이드 자동 생성") == {"webdesignagents"}
+    assert gw._label_names("자주검증 Datahub (사본)") == {"자주검증datahub"}
+    ai = gw._label_names("AI 데이터 허브")
+    assert gw._named(ai, "데이터", "데이터등록") is False, "라벨 안의 일반 낱말 — 그 앱 도구 전부가 오르면 안 된다"
+    assert gw._named(ai, "데이터", "ai데이터허브에서찾기") is True, "띄어 쓴 이름 전체를 부르면 그 조각도 앱 이름이다"
+    assert gw._named(gw._label_names("Ste"), "steel", "steel") is False and gw._named(gw._label_names("Ste"), "ste", "ste") is True
+
+
+def test_HG01_StepForge_를_부르면_그_앱_도구가_다른_앱의_비슷한_도구보다_앞선다(monkeypatch):
+    """다른 앱의 도구가 설명 적중으로 조금 앞서는 판 — 앱 이름을 부른 가중(4)이 있어야 뒤집힌다(종전 라벨 적중은 1점)."""
+    specs = [("heax-step_forge", "zz_list_parts", "파트 목록을 준다."),
+             ("heax-other_cad", "aa_list_parts", "파트 목록 — 파트 목록 · 파트 목록을 준다.")]
+    out = _hg01(monkeypatch, "StepForge 파트 목록", 10, specs=specs)
+    assert out["ranked"][:2] == ["zz_list_parts", "aa_list_parts"], out["ranked"]
+    out = _hg01(monkeypatch, "파트 목록", 10, specs=specs)
+    assert out["ranked"][:2] == ["aa_list_parts", "zz_list_parts"], "앱을 부르지 않으면 설명 적중대로다"
 
 
 def test_search_tools_의미_순위를_끄면_답이_master_와_바이트까지_같다(monkeypatch):

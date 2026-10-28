@@ -42,7 +42,8 @@
     "heax-hwax_risk": "expert",
     "knox-bridge": "system",
     "_gateway": "system",
-    "plm-defect": "quality"
+    "plm-defect": "quality",
+    "plm-search-agent": "quality"
   },
   "patterns": [
     ["_whoami$", "system"],

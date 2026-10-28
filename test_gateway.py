@@ -453,6 +453,53 @@ def test_HG05_영역_요약도_include_tools_false_면_도구_이름을_싣지_�
     assert one["areas"][0]["tools"][0]["name"] == "find_parts", "영역을 고르면 그 영역의 도구 설명을 준다"
 
 
+def _hg10(monkeypatch, *, user="u@corp.com", conns=None, lookup_fails=(), sso=None):
+    """토큰 등록 앱 둘(fmea · reportarchive)과 위임 앱 하나(testscope — per_user_sso) · 평범한 앱 하나로 list_tool_apps 를 부른다."""
+    import asyncio
+
+    class _S:
+        session = object()
+    keys = ("fmea", "reportarchive", "testscope", "heax-step_forge")
+    monkeypatch.setattr(gw, "backends", {k: _S() for k in keys})
+    monkeypatch.setattr(gw, "exposed_tools", [_tool(f"t_{i}") for i, _k in enumerate(keys)])
+    monkeypatch.setattr(gw, "route", {f"t_{i}": (k, f"t_{i}") for i, k in enumerate(keys)})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_user", lambda: user)
+    monkeypatch.setattr(gw, "PORTAL_CONN_BACKENDS", {"fmea": "fmea", "reportarchive": "reportarchive", "testscope": "testscope"})
+    monkeypatch.setattr(gw, "PER_USER_SSO", sso if sso is not None else {"testscope": {"sso_url": "http://x", "secret": "s"}})
+    asked = []
+
+    async def fake_conn(service, email):
+        asked.append(service)
+        if service in lookup_fails:
+            raise gw._ConnLookupError("포털 불통")
+        return (conns or {}).get(service)
+    monkeypatch.setattr(gw, "_portal_connection", fake_conn)
+    body = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    return {a["app"]: a for a in body["apps"]}, sorted(asked), body
+
+
+def test_HG10_토큰을_등록하지_않은_외부_연결은_needs_connect_와_등록_안내를_싣는다(monkeypatch):
+    """10-25 dynaforge-prod 72 tools ok 인데 같은 사람의 whoami 는 'refused: no-connection'(64 ms)이었다(HWAXPortal docs/request-1027 HG-10)."""
+    by, asked, body = _hg10(monkeypatch, conns={"reportarchive": {"token": "rat_x", "workspace": ""}})
+    assert by["fmea"]["status"] == "needs_connect" and by["fmea"]["needs_connect"] is True
+    assert "/tokens?tab=connect" in by["fmea"]["connect_note"]
+    assert by["reportarchive"]["status"] == "ok" and "needs_connect" not in by["reportarchive"], "등록한 앱은 그대로"
+    assert by["heax-step_forge"]["status"] == "ok"
+    assert asked == ["fmea", "reportarchive"], "위임으로 가는 앱(testscope)은 등록을 묻지 않는다"
+    assert "needs_connect" in body["note"]
+
+
+def test_HG10_신원이_없거나_포털을_못_물으면_표시하지_않는다(monkeypatch):
+    by, asked, _b = _hg10(monkeypatch, user="")
+    assert asked == [] and all("needs_connect" not in a for a in by.values()), "신원 없는 호출은 등록과 상관없다"
+    by, asked, _b = _hg10(monkeypatch, lookup_fails=("fmea",), conns={"reportarchive": {"token": "rat_x"}})
+    assert by["fmea"]["status"] == "ok" and "needs_connect" not in by["fmea"], "모름을 없음으로 읽지 않는다"
+
+
 # ── 포털 권한 정책(HWAXPortal docs/access-control) ────────────────────────────
 import asyncio  # noqa: E402
 

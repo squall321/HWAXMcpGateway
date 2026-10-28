@@ -2803,6 +2803,26 @@ def _denied_entry(key: str, meta: dict, reason: str) -> dict:
     return entry
 
 
+async def _needs_connect(keys) -> set[str]:
+    """이 호출자가 아직 그쪽 토큰을 등록하지 않은 '토큰 등록' 백엔드(포털 '외부 연결' · RA · TestScope) — 부르면 거절된다.
+    신원이 없는 호출 · 사람별 위임(per_user_sso)으로 가는 앱은 등록과 상관없어 뺀다. 포털을 못 물으면 모름이라 표시하지 않는다.
+    종전엔 등록이 없어도 status ok 로 보여, 에이전트가 쓸 수 있다고 믿고 불렀다가 거절당했다(HWAXPortal docs/request-1027 HG-10)."""
+    email = _request_user()
+    cands = [k for k in keys if k in PORTAL_CONN_BACKENDS and _delegation_app_id(k) not in PER_USER_SSO] if email else []
+    out: set[str] = set()
+
+    async def one(k):
+        try:
+            if await _portal_connection(PORTAL_CONN_BACKENDS[k], email) is None:
+                out.add(k)
+        except _ConnLookupError:
+            pass
+    async with anyio.create_task_group() as tg:
+        for k in cands:
+            tg.start_soon(one, k)
+    return out
+
+
 async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     groups = _request_groups()
     want_app = str((arguments or {}).get("app") or "").strip()
@@ -2829,6 +2849,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     denied_apps: list[dict] = []
     muted = _request_muted()
     muted_apps: list[dict] = []
+    need = await _needs_connect([k for k in by_app if (not want_app or k == want_app) and k != "_gateway"
+                                 and _deny_reason(k, groups) is None])
     for key in sorted(by_app, key=lambda k: -len(by_app[k])):
         tools = by_app[key]
         local = key == "_gateway"
@@ -2861,6 +2883,11 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             "status": "ok" if (accessible and reachable) else
                       ("no_access" if not accessible else "backend_down"),
         }
+        if key in need:
+            entry["status"] = "needs_connect"
+            entry["needs_connect"] = True
+            entry["connect_note"] = (f"{meta['label']}: 이 계정은 그쪽 토큰을 아직 등록하지 않았다 — 지금 부르면 거절된다. 포털 '개인 토큰 › "
+                                     "외부 연결'(/tokens?tab=connect)에서 그 앱의 토큰을 등록한 뒤 쓴다.")
         if not local and key in muted:
             entry["muted"] = True
             entry["muted_note"] = ("사용자가 포털에서 꺼 둔 앱이다 — 사용자가 이 앱을 쓰라고 한 경우에만 부른다. "
@@ -2885,7 +2912,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         "denied_apps": denied_apps,
         # 사용자가 포털에서 끈 앱 — 권한 문제가 아니다. 사용자가 그 앱을 원할 때만 list_tool_apps(app='<키>') 로 연다.
         "muted_apps": muted_apps,
-        "note": "여기 있는 앱은 모두 내 권한으로 호출 가능하다(reachable=백엔드 연결 정상). "
+        "note": "여기 있는 앱은 모두 내 권한으로 호출 가능하다(reachable=백엔드 연결 정상). status=needs_connect 는 그 앱의 내 토큰을 "
+                "포털 '외부 연결'(/tokens?tab=connect)에 등록해야 부를 수 있다는 뜻이다. "
                 "권한 없는 앱은 목록에 없고 denied_apps 에 라벨·사유·필요 권한·요청 경로만 있다 — 각 항목의 "
                 "reason/how 를 따른다(portal_access 만 포털 '내 권한' 요청, policy_not_ready 는 잠시 뒤 재시도). "
                 "특정 앱의 도구 설명은 list_tool_apps(app='<키>') 로 조회.",

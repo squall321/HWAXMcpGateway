@@ -8007,3 +8007,49 @@ def test_HG11_기동이_비우기_서버와_대기_스트림_한도로_뜬다():
     main = src[src.index("\ndef main():"):]
     assert "_GracefulServer(uvicorn.Config(app, host=HOST, port=PORT" in main and "timeout_graceful_shutdown=SHUTDOWN_TAIL_S" in main
     assert "uvicorn.run(" not in main, "uvicorn.run 은 기본(한없이 기다리다 두 번째 신호에 전부 끊는다)으로 돌아간다"
+
+
+def test_HG11_start_sh_stop_은_리스너를_닫고_비우는_옛_프로세스를_kill_9_하지_않는다(tmp_path):
+    """update-sites 의 재기동은 down(start.sh stop) → 리스너가 답하지 않을 때까지 → up 이다(HWAXPortal docs/request-1027 HP-25). stop 이
+    포트가 풀리면 바로 돌아오고 옛 프로세스를 끝까지 비우게 두어야 HG-11 이 뜻이 있다 — '프로세스가 끝날 때까지 기다렸다 kill -9' 로
+    바뀌면 비우기가 통째로 꺼진다. 진짜 프로세스 · 진짜 신호로 본다(빈 높은 포트 — 떠 있는 9110 은 건드리지 않는다)."""
+    import shutil
+    import socket
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+    if not shutil.which("ss"):
+        pytest.skip("ss 없음")
+    d = tmp_path / "gw"
+    d.mkdir()
+    shutil.copy(Path(gw.__file__).with_name("start.sh"), d / "start.sh")
+    (d / "gateway.py").write_text(
+        "import signal, socket, sys, time\n"
+        "s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        "s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen()\n"
+        "st = {'t': None}\n"
+        "def term(*_):\n    st['t'] = time.monotonic(); s.close()\n"
+        "signal.signal(signal.SIGTERM, term)\n"
+        "while st['t'] is None or time.monotonic() - st['t'] < 1.5:\n    time.sleep(0.05)\n"
+        "open(sys.argv[2], 'w').write('drained')\n", encoding="utf-8")
+    with socket.socket() as so:
+        so.bind(("127.0.0.1", 0))
+        port = so.getsockname()[1]
+    done = tmp_path / "done.txt"
+    fake = subprocess.Popen([sys.executable, str(d / "gateway.py"), str(port), str(done)])
+    try:
+        for _ in range(100):
+            if subprocess.run(["ss", "-tlnH", f"sport = :{port}"], capture_output=True, text=True).stdout.strip():
+                break
+            time.sleep(0.05)
+        t0 = time.monotonic()
+        r = subprocess.run(["bash", str(d / "start.sh"), "stop"], capture_output=True, text=True, timeout=30,
+                           env={"PATH": os.environ["PATH"], "GATEWAY_PORT": str(port), "GATEWAY_CONFIG": str(tmp_path / "none.json")})
+        took = time.monotonic() - t0
+        assert r.returncode == 0 and took < 1.2, (r.returncode, took, r.stdout, r.stderr)
+        assert fake.poll() is None, "stop 이 돌아온 때 옛 프로세스는 아직 비우고 있어야 한다"
+        assert fake.wait(timeout=10) == 0 and done.read_text() == "drained", "kill -9 없이 스스로 끝났다"
+    finally:
+        if fake.poll() is None:
+            fake.kill()

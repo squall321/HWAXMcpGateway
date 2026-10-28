@@ -7045,6 +7045,8 @@ def _no_conn_state(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "_CONN_REG", {})
     monkeypatch.setattr(gw, "_CONN_ACTIVE", set())
     monkeypatch.setattr(gw, "_CONN_STATUS", {})
+    monkeypatch.setattr(gw, "_CONN_SINCE", {})
+    monkeypatch.setattr(gw, "_CONN_NOLIST_BACKOFF", {})
     monkeypatch.setattr(gw, "_CONN_TOKEN_MASK", None)
     monkeypatch.setattr(gw, "_CONN_CACHE_FILE", tmp_path / "conn_registry_cache.json")
     monkeypatch.setattr(gw, "PORTAL_CONN_BACKENDS", dict(gw.PORTAL_CONN_BACKENDS))
@@ -7165,6 +7167,73 @@ def test_목록_계정이_등록하지_않았으면_백엔드를_만들지_않�
     gw._CONN_STATUS.clear()
     assert _in_tg(gw._conn_reconcile) is False
     assert gw.backends == {} and gw._CONN_STATUS == {}, "모름은 '없음' 이 아니다 — 이번 패스에는 그 키를 건드리지 않는다"
+
+
+def test_HG09_목록_계정이_등록하지_않은_동안은_묻는_간격을_두_배씩_10분까지_늘리고_상태가_바뀔_때만_남긴다(monkeypatch, caplog):
+    """10-25 stepforge-prod 'no-list-token' — 재활 주기(60초)마다 포털에 물어 그 404 가 포털 로그에 하루 약 1,400줄이었다
+    (HWAXPortal docs/request-1027 HG-09). 시계를 갈아 끼워 패스 스무 번(20분)을 돌린다."""
+    import logging
+    state = {"token": None}
+
+    async def lookup(service, email):
+        return None if state["token"] is None else {"token": state["token"], "workspace": ""}
+    _opened, seen = _conn_kit(monkeypatch, lookup=lookup)
+    clk = _Clock()
+    monkeypatch.setattr(gw, "time", clk)
+    gw._conn_registry_set({"fmea": dict(_FMEA)}, _ROWS)
+
+    async def passes(tg, n):
+        for _ in range(n):
+            await gw._conn_reconcile(tg)
+            clk.now += gw.REVIVE_INTERVAL_S
+    with caplog.at_level(logging.INFO, logger=gw.log.name):
+        _in_tg(lambda tg: passes(tg, 20))
+    asked_at = len(seen)
+    assert asked_at == 5, f"60 · 120 · 240 · 480 · 600 간격이면 20분에 다섯 번이다: {asked_at}"
+    assert gw._CONN_STATUS["fmea"] == "no-list-token" and gw._CONN_SINCE["fmea"].endswith("+00:00")
+    assert [r.message for r in caplog.records if "외부 연결 fmea:" in r.message] == ["외부 연결 fmea: (처음) → no-list-token"], \
+        "같은 상태를 패스마다 찍지 않는다"
+    # 목록 계정이 등록했다 — 포털이 /conn-invalidate 를 부르면(또는 /refresh) 다음 패스가 바로 다시 묻고 붙는다
+    state["token"] = "fmea_list0tok1"
+    gw._CONN_NOLIST_BACKOFF.clear()            # /conn-invalidate · /refresh 가 하는 일(아래 시험이 두 길을 본다)
+    _in_tg(lambda tg: passes(tg, 1))
+    assert len(seen) == asked_at + 1 and gw._CONN_STATUS["fmea"] == "ok" and "fmea" not in gw._CONN_NOLIST_BACKOFF
+
+
+def test_HG09_conn_invalidate_와_refresh_가_백오프를_비우고_health_는_since_를_따로_싣는다(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    gw._CONN_NOLIST_BACKOFF["fmea"] = (1e12, 600.0)
+    sent = []
+
+    async def recv():
+        return {"type": "http.request", "body": b""}
+
+    async def send(m):
+        sent.append(m)
+
+    async def app(scope, receive, send_):
+        raise AssertionError("게이트가 처리할 길이다")
+    gate = gw._bearer_gate(app)
+    asyncio.run(gate({"type": "http", "path": "/conn-invalidate", "method": "POST", "query_string": b"email=list%40corp.com",
+                      "headers": [(b"authorization", b"Bearer gw-secret")]}, recv, send))
+    assert sent[0]["status"] == 200 and gw._CONN_NOLIST_BACKOFF == {}
+    # 손으로 부른 /refresh 도 비운다 — 운영자가 목록 계정 등록 뒤 바로 붙이려고 부른다
+    gw._CONN_NOLIST_BACKOFF["fmea"] = (1e12, 600.0)
+    monkeypatch.setattr(gw, "_task_group_holder", {"tg": object()})
+    monkeypatch.setattr(gw, "_refresh_access_policy", _noop_async(True))
+    monkeypatch.setattr(gw, "_revive_once", _noop_async(False))
+    sent.clear()
+    asyncio.run(gate({"type": "http", "path": "/refresh", "method": "POST", "query_string": b"",
+                      "headers": [(b"authorization", b"Bearer gw-secret")]}, recv, send))
+    assert sent[0]["status"] == 200 and gw._CONN_NOLIST_BACKOFF == {}
+    gw._CONN_STATUS.update({"fmea": "no-list-token", "matnexus": "ok"})
+    gw._CONN_SINCE.update({"fmea": "2026-10-28T01:02:03+00:00", "gone": "2026-10-01T00:00:00+00:00"})
+    sent.clear()
+    asyncio.run(gate({"type": "http", "path": "/health", "method": "GET", "query_string": b"", "headers": []}, recv, send))
+    body = json.loads(b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body"))
+    assert body["conn_platforms"]["fmea"] == "no-list-token", "상태 칸은 종전 꼴(글자) 그대로 — update-all · mcp-smoke 가 읽는다"
+    assert body["conn_since"] == {"fmea": "2026-10-28T01:02:03+00:00"}, "지금 상태가 있는 키만"
 
 
 def test_목록_토큰이_바뀌면_그_세션만_갈아_끼우고_목록_계정이_지우면_뗀다(monkeypatch):

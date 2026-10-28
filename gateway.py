@@ -362,6 +362,12 @@ _CONN_REG: dict[str, dict] = {}
 _CONN_ACTIVE: set[str] = set()
 # 키 → ok · down · no-list-token · collision · no-policy-row · invalid — /health 의 conn_platforms(키와 상태만 — 주소 · 이메일은 싣지 않는다).
 _CONN_STATUS: dict[str, str] = {}
+# 키 → 지금 상태가 된 때(UTC ISO 초) — /health 의 conn_since. conn_platforms 는 값이 상태 글자라(update-all · mcp-smoke 가 읽는다) 칸을 따로 둔다(HG-09).
+_CONN_SINCE: dict[str, str] = {}
+# 목록 계정이 그 카드에 토큰을 등록하지 않은 키 → (다시 물을 때 monotonic, 지금 간격). 재활 주기(60초)마다 포털에 묻던 탓에 그 404 가 포털 로그에
+# 하루 약 1,400줄이었다(10-25 stepforge-prod). 간격을 주기에서 두 배씩 CONN_NOLIST_BACKOFF_MAX_S 까지 늘린다. /refresh · /conn-invalidate 가 비운다.
+_CONN_NOLIST_BACKOFF: dict[str, tuple[float, float]] = {}
+CONN_NOLIST_BACKOFF_MAX_S = float(os.environ.get("GATEWAY_CONN_NOLIST_BACKOFF_MAX", "600"))
 PORTAL_CONN_TTL_S = int(os.environ.get("GATEWAY_CONN_TTL", "300"))
 # {(service,email): (conn|None|_ConnLookupError, 만료 monotonic)} — None 은 '등록 없음' 부정 캐시.
 _CONN_CACHE: dict[tuple[str, str], tuple[object, float]] = {}
@@ -1211,6 +1217,15 @@ def _conn_drop(key: str) -> bool:
     return b is not None
 
 
+def _conn_set_status(key: str, status: str) -> None:
+    """선언 플랫폼의 상태를 적는다 — 바뀔 때만 since 를 새로 찍고 한 줄 남긴다(매 패스 같은 줄을 찍지 않는다, HG-09)."""
+    prev = _CONN_STATUS.get(key)
+    _CONN_STATUS[key] = status
+    if prev != status:
+        _CONN_SINCE[key] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        log.info("외부 연결 %s: %s → %s", key, prev or "(처음)", status)
+
+
 async def _conn_reconcile(tg) -> bool:
     """외부 연결 선언(_CONN_REG)에 맞춰 선언 백엔드를 붙이고 · 갈아 끼우고 · 뗀다(HWAXPortal docs/ext-connect GW5). 바뀌었으면 True.
 
@@ -1223,23 +1238,29 @@ async def _conn_reconcile(tg) -> bool:
         lh: dict = {}
         if spec["list_auth"].startswith("registered:"):
             who = spec["list_auth"].split(":", 1)[1]
+            wait = _CONN_NOLIST_BACKOFF.get(key)
+            if wait is not None and time.monotonic() < wait[0]:
+                continue                          # 목록 계정이 아직 등록하지 않았다 — 다시 물을 때까지 포털을 두드리지 않는다
             try:
                 conn = await _portal_connection(key, who)
             except _ConnLookupError:
                 continue
             if conn is None:
                 # 목록 계정이 아직 등록하지 않았거나 지웠다 — 백엔드를 만들지 않는다(있던 것은 뗀다 — 지운 토큰으로 목록을 계속 받지 않게).
-                _CONN_STATUS[key] = "no-list-token"
+                gap = min(CONN_NOLIST_BACKOFF_MAX_S, wait[1] * 2 if wait is not None else float(REVIVE_INTERVAL_S))
+                _CONN_NOLIST_BACKOFF[key] = (time.monotonic() + gap, gap)
+                _conn_set_status(key, "no-list-token")
                 if key in _CONN_ACTIVE and key in backends:
                     changed |= _conn_drop(key)
                 continue
+            _CONN_NOLIST_BACKOFF.pop(key, None)
             lh = {"Authorization": f"Bearer {conn['token']}"}
         fp = hashlib.sha256(lh["Authorization"].encode("utf-8")).hexdigest()[:12] if lh else ""
         sfp = hashlib.sha256(json.dumps(spec, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
         b = backends.get(key)
         if b is not None and key not in _CONN_ACTIVE:
             # 선언이 아닌 백엔드(정적 · heax · 내장)가 이미 이 키를 쓴다 — 검사(_conn_validate)를 지났어도 덮지 않는다.
-            _CONN_STATUS[key] = "collision"
+            _conn_set_status(key, "collision")
             continue
         if b is not None and b.url == spec["mcp_url"] and b.list_fp == fp:
             if b.spec_fp != sfp:
@@ -1247,7 +1268,7 @@ async def _conn_reconcile(tg) -> bool:
                 _conn_meta_set(key, spec)
                 b.spec_fp = sfp
                 changed = True
-            _CONN_STATUS[key] = "ok" if b.session is not None else "down"
+            _conn_set_status(key, "ok" if b.session is not None else "down")
             continue
         if b is not None:
             b._stop.set()                         # 주소나 목록 토큰이 바뀌었다 — 그 세션만 갈아 끼운다
@@ -1259,13 +1280,15 @@ async def _conn_reconcile(tg) -> bool:
         # 지킴(_CONN_ACTIVE)은 첫 연결 **전에** 단다 — 첫 연결이 취소 · 실패해도 이 키가 '선언이 아닌 백엔드' 로 읽혀 위의 collision 에 걸리지 않게.
         _CONN_ACTIVE.add(key)
         await _first_connect(tg, key, nb)
-        _CONN_STATUS[key] = "ok" if nb.session is not None else "down"
+        _conn_set_status(key, "ok" if nb.session is not None else "down")
         changed = True
         log.info("외부 연결 %s 붙임 — 호스트 %s · 목록 %s · %s", key, urlsplit(spec["mcp_url"]).hostname,
                  "등록 토큰" if lh else "자격 없이", _CONN_STATUS[key])
     for key in [k for k in _CONN_ACTIVE if k not in wanted and k in backends]:
         changed |= _conn_drop(key)
         _CONN_STATUS.pop(key, None)
+        _CONN_SINCE.pop(key, None)
+        _CONN_NOLIST_BACKOFF.pop(key, None)
     return changed
 
 
@@ -1701,14 +1724,17 @@ def _conn_registry_set(raw: object, rows: dict, *, persist: bool = True) -> bool
         if got is None:
             if _CONN_STATUS.get(str(k)) != status:
                 log.warning("외부 연결 선언 %s 를 받지 않는다 — %s", k, status)
+                _CONN_SINCE[str(k)] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             _CONN_STATUS[str(k)] = status
         else:
             reg[str(k)] = got
             if _CONN_STATUS.get(str(k)) in ("invalid", "no-policy-row"):
                 _CONN_STATUS.pop(str(k), None)  # 이제 받는다 — 상태는 다음 맞추기가 정한다(검사만 내는 사유라 남기면 틀린 말이다)
+                _CONN_SINCE.pop(str(k), None)
     for k in [k for k in _CONN_STATUS if k not in reg and k not in _CONN_ACTIVE
               and (not isinstance(raw, dict) or k not in raw)]:
         _CONN_STATUS.pop(k, None)               # 선언에서 아예 빠진 키의 옛 사유는 지운다
+        _CONN_SINCE.pop(k, None)
     changed = reg != _CONN_REG
     if changed:
         _CONN_REG.clear()
@@ -4931,6 +4957,7 @@ def _bearer_gate(app, pat_verifier=None):
                 "access_policy_ready": _ACCESS_POLICY_READY,
                 # 외부 연결 플랫폼 — 키와 상태만(주소 · 이메일은 싣지 않는다). 스모크는 이 키를 신원 없이 부르지 않는다(HWAXPortal PX1).
                 "conn_platforms": _conn_platforms(),
+                "conn_since": {k: _CONN_SINCE[k] for k in sorted(_CONN_SINCE) if k in _CONN_STATUS},
                 # 프록시 우회 보정 — 수만(주소는 싣지 않는다). 포털 출구 점검이 게이트웨이 목적지를 이것으로 판정한다(HG-18).
                 "no_proxy": _no_proxy_health(),
                 **({"policy": POLICY, "access_policy": _ACCESS_POLICY} if _detail else {}),
@@ -5029,6 +5056,8 @@ def _bearer_gate(app, pat_verifier=None):
                                                or k == _email)]
             for k in _pgone:
                 _USER_PATS.pop(k, None)
+            # 목록 계정이 방금 등록했을 수 있다 — 다음 재활 패스가 바로 다시 묻게 한다(HG-09)
+            _CONN_NOLIST_BACKOFF.clear()
             log.info("connection cache invalidated: %s (conn %d · resp %d · pat %d)",
                      _email or "(전체)", len(_gone), len(_rgone), len(_pgone))
             _body = json.dumps({"ok": True, "dropped": len(_gone),
@@ -5056,6 +5085,7 @@ def _bearer_gate(app, pat_verifier=None):
                 await send({"type": "http.response.body", "body": b'{"error":"not ready"}'})
                 return
             _before = len(exposed_tools)
+            _CONN_NOLIST_BACKOFF.clear()           # 손으로 부른 패스는 목록 계정을 바로 다시 묻는다(HG-09)
             try:
                 # 정책 · 외부 연결 선언을 먼저 받는다 — 운영자가 박스 권한표에 적은 새 플랫폼을 이 한 번으로 붙인다(GW15).
                 await _refresh_access_policy()

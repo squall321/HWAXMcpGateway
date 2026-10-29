@@ -1135,6 +1135,8 @@ async def _aggregate():
     exposed_tools.clear()
     route.clear()
     alias_route.clear()
+    _core_vocab()
+    core_tag = (_CORE_VOCAB["data"] or {}).get("tag")
     for key, t in collected:
         # 충돌 여부와 **무관하게** 별칭을 등록한다(호출 전용).
         _alias = f"{key.replace('-', '')}_{t.name}"
@@ -1158,7 +1160,7 @@ async def _aggregate():
         exposed_tools.append(
             types.Tool(
                 name=exposed_name,
-                description=t.description,
+                description=_core_tagged(key, t.description, core_tag),
                 inputSchema=t.inputSchema,
                 **({"outputSchema": t.outputSchema} if getattr(t, "outputSchema", None) else {}),
                 **({"annotations": ann} if ann else {}),
@@ -1169,6 +1171,7 @@ async def _aggregate():
             )
         )
         route[exposed_name] = (key, t.name)
+    _CORE_VOCAB["tag_applied"] = core_tag
     log.info("AGGREGATED %d exposed tools (unique names: %d, call-only aliases: %d)",
              len(exposed_tools), len(set(route)), len(alias_route))
     _rebuild_ui_resources()
@@ -1543,6 +1546,8 @@ async def _revive_once_locked(tg) -> bool:
         except Exception as exc:  # noqa: BLE001 — 다음 주기에 재시도
             log.debug("revive %s failed: %r", key, exc)
     # 호출 경로(_call_tool)에서 재연결이 일어났으면 그쪽은 카탈로그를 못 고치므로 여기서 갱신.
+    # 코어 어휘표의 정본 소개 줄이 바뀌었어도 — 검색이 없던 동안의 변경도 한 회차 안에 붙는다(R-3).
+    _core_vocab()
     if _REAGG.pop("pending", False):
         revived = True
     if revived:
@@ -2721,6 +2726,82 @@ _READ_NAME_HINT = re.compile(r"(instructions|guide|advice|preview|estimate|statu
 _QUALITY_WORDS = ("불량", "시장", "원인", "대책", "사례")
 # 같은 도구 사본의 정본 고르기 — 점수가 같으면 라벨에 시험 · 사본 표지가 없는 앱을 앞에 둔다(종전엔 이름순이라 사본 허브가 앞이었다).
 _COPY_LABEL = re.compile(r"[(\[](?:시험|사본|테스트|test|copy|staging|dev)[)\]]", re.I)
+# 심의를 청하는 낱말 — 코어 질문(어휘표 낱말이 든 질의)에 이것이 없으면 일반 업무 낱말(원인 · 판정 · 설계 …)을 deliberate_start 에 잇지
+# 않는다(HWAXPortal docs/request-1029 R-5). 코어 낱말이 없는 질의는 종전대로 잇는다 — 다 끊으면 '안 선택' · '신뢰 판정' 같은 심의 업무 낱말
+# 14쌍 중 7쌍이 밀렸다(평가셋 doc-04 1 → 10위 · doc-05 2 → 20위, 10-29 dev 카탈로그).
+_DELIB_ASK = ("심의", "토의", "회의")
+
+# ── 코어 어휘표(HWAXPortal docs/request-1029 B-1 · C-11) ──────────────────────────────────────────────
+# 정본은 포털 리포의 backend/config/core_vocab.json 이다. 게이트웨이 · 포털은 늘 한 박스에 형제 리포로 있어(dev ~/claude · cae00 ~/Projects)
+# 그 파일을 직접 읽는다 — 새 통로가 없고 포털이 내려가 있어도 표가 산다. 바뀐 시각이 다르면 다시 읽는다. 없거나 꼴이 틀리면 지금 동작
+# (search_tools 의 손 낱말 · 소개 줄 없음)으로 돌고, 그 사실을 /health 의 core_vocab 에 싣는다.
+CORE_VOCAB_PATH = Path(__file__).resolve().parent.parent / "HWAXPortal" / "backend" / "config" / "core_vocab.json"
+_CORE_VOCAB: dict = {"mtime": None, "data": None, "error": "아직 읽지 않음", "tag_applied": None}
+
+
+def _core_vocab_parse(d: dict) -> dict:
+    """정본 꼴에서 게이트웨이가 쓰는 것만 — 검색 낱말(띄어 쓴 꼴은 조각까지) · 정본 앱과 소개 줄. 꼴이 틀리면 예외."""
+    syn = []
+    for e in d["search"]:
+        tools = tuple(str(t).lower() for t in e["tools"])
+        for w in e["words"]:
+            w = str(w).lower().strip()
+            parts = tuple(p for p in w.split() if len(p) >= 2) if " " in w else ()
+            syn.append((re.sub(r"\s+", "", w), parts, tools))
+    can = d["canonical"]
+    app, tagline = str(can["app"]), str(can.get("tagline") or "").strip()
+    return {"version": d.get("version"), "canonical": app, "tag": (app, tagline) if tagline else None, "syn": syn}
+
+
+def _core_vocab() -> dict | None:
+    """코어 어휘표 — 바뀐 시각이 다르면 다시 읽는다. 없거나 못 읽으면 None 이고 까닭은 _CORE_VOCAB['error'] 다.
+    정본 소개 줄은 집계(_aggregate) 때 도구 설명에 붙으므로, 붙어 있는 것과 달라지면 다음 재활 회차에 다시 집계하게 예약한다."""
+    try:
+        mt = CORE_VOCAB_PATH.stat().st_mtime_ns
+    except OSError:
+        if _CORE_VOCAB["error"] != "없음":
+            log.warning("코어 어휘표가 없다(%s) — search_tools 손 낱말 · 소개 줄 없이 돈다", CORE_VOCAB_PATH)
+        _CORE_VOCAB.update(mtime=None, data=None, error="없음")
+    else:
+        if mt != _CORE_VOCAB["mtime"]:
+            try:
+                data = _core_vocab_parse(json.loads(CORE_VOCAB_PATH.read_text(encoding="utf-8")))
+            except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                log.warning("코어 어휘표를 못 읽었다(%s) — 손 낱말로 돈다: %r", CORE_VOCAB_PATH, exc)
+                _CORE_VOCAB.update(mtime=mt, data=None, error=f"못 읽음({type(exc).__name__})")
+            else:
+                _CORE_VOCAB.update(mtime=mt, data=data, error=None)
+    tag = (_CORE_VOCAB["data"] or {}).get("tag")
+    if tag != _CORE_VOCAB["tag_applied"] and exposed_tools:
+        _REAGG["pending"] = True
+    return _CORE_VOCAB["data"]
+
+
+def _core_vocab_health() -> dict:
+    """/health 의 core_vocab — 읽었나 · 버전 · 낱말 수 · 정본 앱 · 소개 줄이 붙었나. 경로는 싣지 않는다(박스 배치가 드러난다)."""
+    d = _core_vocab()
+    if d is None:
+        return {"loaded": False, "error": _CORE_VOCAB["error"]}
+    return {"loaded": True, "version": d["version"], "words": len(d["syn"]), "canonical": d["canonical"],
+            "tagline_applied": _CORE_VOCAB["tag_applied"] is not None and _CORE_VOCAB["tag_applied"] == d["tag"]}
+
+
+def _core_untagged(key: str, desc: str) -> str:
+    """집계가 붙인 정본 소개 줄을 뗀 설명 — 검색이 같은 도구의 사본을 알아볼 때 쓴다(소개 줄 하나로 사본이 아닌 것이 되지 않게)."""
+    tag = _CORE_VOCAB["tag_applied"]
+    if tag and key == tag[0]:
+        head = f"[{tag[1]}]"
+        if desc.startswith(head):
+            return desc[len(head):].lstrip()
+    return desc
+
+
+def _core_tagged(key: str, desc: str | None, tag: tuple | None) -> str | None:
+    """정본 앱 도구 설명 앞에 소개 한 줄(R-3) — 웹 챗 · 심의 좌석 · 개인 Claude 가 같은 설명을 받는다. 검색은 이 줄을 떼고 사본을 알아본다
+    (_core_untagged — 정본이 사본 무리를 대표한다). 근본은 Datahub 플랫폼 DP-03(설치별 tagline)이다 — 그것이 들어오면 이 줄을 걷는다."""
+    if not tag or key != tag[0]:
+        return desc
+    return f"[{tag[1]}] {desc or ''}".rstrip()
 
 
 def _label_names(label: str) -> set[str]:
@@ -2817,13 +2898,28 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
         "전작": ("predecessor", "graph_neighbors"), "후속": ("successor", "graph_neighbors"),
         "시장": ("market", "voc"), "대책": ("countermeasure",),
     }
-    expand = {w: (w,) + tuple(s for k, ss in _SYN.items() if k in w for s in ss) for w in terms}
-    write_intent = any(w in q + " " for w in _WRITE_INTENT)
     q_flat = re.sub(r"\s+", "", q)
+    vocab = _core_vocab()
+    # 코어 질문에서는 일반 업무 낱말 → deliberate_start 를 심의를 청할 때만 잇는다(R-5 — 조회 질문이 심의 시작으로 끌렸다).
+    no_delib = bool(vocab) and not any(w in q for w in _DELIB_ASK) and any(f in q_flat for f, _p, _t in vocab["syn"])
+    expand = {w: (w,) + tuple(s for k, ss in _SYN.items() if k in w for s in ss if not (no_delib and s == "deliberate_start"))
+              for w in terms}
+    write_intent = any(w in q + " " for w in _WRITE_INTENT)
+    if vocab:
+        # 코어 낱말 → 허브 읽기 도구 이름(R-4 — 타입 이름에 이으면 어느 도구 이름 · 설명에도 없어 0점이었다). 띄어 쓴 꼴('관리 기준')은
+        # 붙여 쓴 꼴이 질의에 있으면 그 조각을 담은 낱말마다 잇는다 — 낱말은 빈칸에서 갈라지므로 '관리기준' 열쇠로는 못 맞힌다.
+        for flat, parts, tools in vocab["syn"]:
+            hit = [w for w in expand if flat in w]
+            if not hit and parts and flat in q_flat:
+                hit = [w for w in expand if any(p in w for p in parts)]
+            for w in hit:
+                expand[w] += tuple(t for t in tools if t not in expand[w])
+    canon = (vocab or {}).get("canonical")
     quality_n = sum(1 for w in _QUALITY_WORDS if w in q)
     groups = _request_groups()
     visible = _visible_tools(groups)
     rows = []
+    named_apps: set[str] = set()          # 질의가 이름을 부른 앱 — 사본 무리에서 그 앱 줄을 올린다
     for t in visible:
         name = t.name.lower()
         desc = (t.description or "").lower()
@@ -2839,6 +2935,8 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
             app_hit = any(v in hay_app for v in variants)
             # 질의가 앱 이름을 불렀으면(진짜 앱 라벨 적중) 이름 적중과 같은 가중이다 — 종전엔 라벨 · 설명 어디에 맞든 1점이었다(HG-01).
             named = any(_named(names, v, q_flat) for v in variants)
+            if named:
+                named_apps.add(app)
             if name_hit or desc_freq or app_hit or named:
                 covered += 1
                 score += 4 * (name_hit or named) + desc_freq + app_hit
@@ -2857,17 +2955,30 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
     mode = None
     if TOOL_SEARCH_EMBED_URL:
         rows, mode = await _tool_rank_fused(raw_q, rows, visible)
-    # 같은 도구의 사본 — 원래 이름과 설명이 같으면 첫 줄(점수 · 정본 순) 하나만 올리고 나머지는 same_in 으로 접는다(HG-01).
+    # 같은 도구의 사본 — 원래 이름과 설명(정본 소개 줄은 뗀다)이 같으면 한 줄만 올리고 나머지는 same_in 으로 접는다(HG-01).
+    # 그 한 줄은 무리에서 가장 앞선 줄의 자리에 서는 정본이다(R-4) — 질의가 사본의 앱을 콕 불렀을 때만 그 사본이다(OT-12 허브 건너기).
+    # 형제 사본은 겹침 접두 · 라벨 낱말(failuretrace 의 failure)이 동의어에 맞아 정본보다 앞서고, 정본 사본은 점수가 0 이라 줄에 없기도
+    # 하다 — 점수로는 정본을 못 세운다. 그래서 정본에 같은 도구가 있으면 그 도구가 무리를 대표한다.
     # 접힌 것도 이름으로 부를 수 있다(호출 별칭은 그대로다). 순위에서만 빠진다.
+    copies: dict[tuple, list] = {}
+    for r in rows:
+        copies.setdefault((r[6], _core_untagged(r[2], r[3])), []).append(r)
+    canon_tools = {(route[t.name][1], _core_untagged(canon, (t.description or "").strip())): t
+                   for t in visible if route.get(t.name, ("",))[0] == canon} if canon else {}
     folded: dict[tuple, list] = {}
     kept = []
-    for r in rows:
-        k = (r[6], r[3])
-        if k in folded:
-            folded[k].append({"tool": r[1], "app": r[2]})
-            continue
-        folded[k] = []
-        kept.append(r)
+    for k, g in copies.items():              # 넣은 차례 — 무리의 가장 앞선 줄 순서다
+        head = g[0]
+        if head[2] != canon and head[2] not in named_apps:
+            mine = next((r for r in g if r[2] == canon), None)
+            if mine is None and k in canon_tools:          # 정본 사본이 점수 0 이라 줄에 없다 — 이 무리의 자리에 세운다
+                ct = canon_tools[k]
+                mine = (head[0], ct.name, canon, (ct.description or "").strip(), ct, _tool_is_write(ct, k[0]), k[0],
+                        1 if _COPY_LABEL.search(str(_app_meta(canon).get("label") or "")) else 0)
+                g = [mine] + g
+            head = mine or head
+        kept.append(head)
+        folded[(head[6], head[3])] = [{"tool": r[1], "app": r[2]} for r in g if r is not head]
     rows = kept
 
     def _args_summary(t) -> dict:
@@ -5258,6 +5369,8 @@ def _bearer_gate(app, pat_verifier=None):
                 "no_proxy": _no_proxy_health(),
                 "pii_mask": {"on": PII_MASK_ON, "masked": _PII_STAT["masked"]},     # 수만(HG-20) — 무인증 칸이다
                 **({"policy": POLICY, "access_policy": _ACCESS_POLICY} if _detail else {}),
+                # 코어 어휘표를 읽었나 — 못 읽으면 search_tools 가 손 낱말로 돈다(HWAXPortal docs/request-1029 C-11). 경로는 싣지 않는다
+                "core_vocab": _core_vocab_health(),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

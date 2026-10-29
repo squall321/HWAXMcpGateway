@@ -179,6 +179,16 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 - 모양은 `{threshold, total: {apps, tools, args, described, unit_or_range, described_ratio, unit_or_range_ratio}, apps: [{app, tools, args, described, unit_or_range, described_ratio, unit_or_range_ratio, worst: [{tool, args, described}]}]}` 다. 앱은 설명 비율이 낮은 순(같으면 설명 없는 인자가 많은 순)이고 인자가 없는 앱(비율 `null`)은 맨 뒤다. `worst` 는 앱마다 최대 다섯 — 설명 없는 인자가 많은 순(같으면 인자가 많은 순)이고 설명이 다 있는 도구는 싣지 않는다. 수만 싣는다(인자 이름·설명·값은 없다).
 - 기준은 `GATEWAY_ARG_DESC_WARN_RATIO`(기본 0.3, **미만**이면 부족 · 0 이면 끈다)다. 기동(첫 재집계) 때는 기준 미만 앱 수를 요약 한 줄(`인자 설명 부족 — 기동 때 붙은 앱 N개 가운데 M개가 …`)로만 남긴다 — 거의 모든 앱이 기준 아래라 앱마다 한 줄이면 기동마다 열댓 줄이 쌓인다. 기동 뒤 새로 붙는 앱은 붙을 때 한 줄(`인자 설명 부족 — <앱> 의 …`, 앱 이름·비율·가장 나쁜 도구)이다. 앱마다 프로세스당 한 번이고, 재프로비저닝은 게이트웨이를 다시 띄우므로 그때 다시 본다.
 
+## 코어 어휘표 — 형제 포털 리포의 정본을 읽는다(HWAXPortal docs/request-1029 B-1)
+
+정본은 `../HWAXPortal/backend/config/core_vocab.json` 이다. 게이트웨이와 포털은 늘 한 박스에 형제 리포로 있다(dev `~/claude` · cae00 `~/Projects`). 바뀐 시각이 다르면 다시 읽으므로, 표를 고치면 재기동 없이 다음 검색부터 탄다.
+
+- `search_tools` — 코어 낱말(`search.words`)이 든 질의는 허브 읽기 도구 이름(`search.tools`)에 이름 적중을 준다(R-4). 띄어 쓴 꼴('관리 기준')은 붙여 쓴 꼴이 질의에 있으면 그 조각을 담은 낱말마다 잇는다.
+- 정본 소개 줄 — 정본 앱(`canonical.app`)의 도구 설명 앞에 `[canonical.tagline]` 을 집계 때 붙인다(R-3). 줄이 바뀌면 다음 재활 회차(60초)에 다시 집계한다.
+- 사본 접기 — 원래 이름과 설명(소개 줄은 떼고 본다)이 같은 사본은 정본 한 줄로 접고 나머지는 `same_in` 이다. 질의가 사본의 앱 이름을 부르면 그 사본이 무리를 대표한다(허브 건너기).
+- 심의 가중 — 코어 질문(코어 낱말이 든 질의)에 '심의 · 토의 · 회의' 가 없으면 일반 업무 낱말(원인 · 판정 · 설계 …)을 `deliberate_start` 에 잇지 않는다(R-5). 코어 낱말이 없는 질의는 종전대로다.
+- 표가 없거나 꼴이 틀리면 지금 동작(손 낱말 · 소개 줄 없음)으로 돈다. `/health` 의 `core_vocab` 이 `{loaded, version, words, canonical, tagline_applied}` 또는 `{loaded: false, error}` 를 싣는다(경로는 싣지 않는다).
+
 ## search_tools 의미 순위 — 선택, 기본 꺼짐
 
 `search_tools` 의 부분문자열 순위에 AIDataHub 임베딩 순위를 RRF(k=60)로 **더한다**(갈아 끼우지 않는다 — 한국어 업무어는 부분문자열이 이기는 사례가 있다). 켤지는 평가 결과를 보고 정한다 — 평가셋·러너·숫자는 `tool_search_eval/README.md`.

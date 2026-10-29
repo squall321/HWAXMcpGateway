@@ -35,6 +35,20 @@ def _no_real_portal(monkeypatch):
     monkeypatch.setattr(gw, "_ENT_CACHE", {})
 
 
+# 형제 포털 리포의 코어 어휘표 정본(HWAXPortal backend/config/core_vocab.json) — 아래 격리가 걸기 전의 기본 경로다.
+_REAL_CORE_VOCAB = gw.CORE_VOCAB_PATH
+
+
+@pytest.fixture(autouse=True)
+def _no_core_vocab(monkeypatch, tmp_path):
+    """코어 어휘표 격리 — 기본은 '없음'(지금 동작)이다. 형제 리포의 실제 표를 읽는 시험은 본문에서 _REAL_CORE_VOCAB 를 다시 건다.
+
+    ⚠ 안 걸면 실제 표가 검색 순위 · 도구 설명(정본 소개 줄) · 재집계 예약을 바꾸고, 모듈 상태라 앞 시험의 것이 뒤 시험에 남는다
+    (HWAXPortal docs/request-1029 C-11). '없음' 을 이미 아는 상태로 두어 시험마다 경고 줄이 생기지 않게 한다."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", tmp_path / "no-core-vocab.json")
+    monkeypatch.setattr(gw, "_CORE_VOCAB", {"mtime": None, "data": None, "error": "없음", "tag_applied": None})
+
+
 def _tool(name: str) -> types.Tool:
     return types.Tool(name=name, description="", inputSchema={"type": "object"})
 
@@ -6152,7 +6166,8 @@ def _tool_search_embed_off(monkeypatch):
 
 
 # 의미 순위를 끈 `_search_tools` 의 기준본이다 — 옵션을 끈 답이 이것과 바이트 단위로 같아야 한다. 처음엔 master 303f023 원문이었고,
-# 순위 · 응답 꼴을 일부러 바꾼 10-28(HWAXPortal docs/request-1027 HG-01 · HG-12)에 그 판에서 RRF · 질의 기록 줄만 빼고 다시 떴다.
+# 순위 · 응답 꼴을 일부러 바꾼 10-28(HWAXPortal docs/request-1027 HG-01 · HG-12)과 10-29(request-1029 R-3 · R-4 · R-5 — 어휘표 ·
+# 정본이 대표하는 사본 접기 · 코어 질문의 심의 가중)에 그 판에서 RRF · 질의 기록 줄만 빼고 다시 떴다.
 # 순위를 일부러 바꿀 때만 다시 뜬다 — RRF 를 고치다 끈 길이 바뀌면 이 시험이 잡는다.
 _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.CallToolResult:
     """도구 검색 안내대 — 351개 평면 노출의 선택 비용을 줄이는 입구(실측: 상위 40개가
@@ -6207,13 +6222,28 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
         "전작": ("predecessor", "graph_neighbors"), "후속": ("successor", "graph_neighbors"),
         "시장": ("market", "voc"), "대책": ("countermeasure",),
     }
-    expand = {w: (w,) + tuple(s for k, ss in _SYN.items() if k in w for s in ss) for w in terms}
-    write_intent = any(w in q + " " for w in _WRITE_INTENT)
     q_flat = re.sub(r"\s+", "", q)
+    vocab = _core_vocab()
+    # 코어 질문에서는 일반 업무 낱말 → deliberate_start 를 심의를 청할 때만 잇는다(R-5 — 조회 질문이 심의 시작으로 끌렸다).
+    no_delib = bool(vocab) and not any(w in q for w in _DELIB_ASK) and any(f in q_flat for f, _p, _t in vocab["syn"])
+    expand = {w: (w,) + tuple(s for k, ss in _SYN.items() if k in w for s in ss if not (no_delib and s == "deliberate_start"))
+              for w in terms}
+    write_intent = any(w in q + " " for w in _WRITE_INTENT)
+    if vocab:
+        # 코어 낱말 → 허브 읽기 도구 이름(R-4 — 타입 이름에 이으면 어느 도구 이름 · 설명에도 없어 0점이었다). 띄어 쓴 꼴('관리 기준')은
+        # 붙여 쓴 꼴이 질의에 있으면 그 조각을 담은 낱말마다 잇는다 — 낱말은 빈칸에서 갈라지므로 '관리기준' 열쇠로는 못 맞힌다.
+        for flat, parts, tools in vocab["syn"]:
+            hit = [w for w in expand if flat in w]
+            if not hit and parts and flat in q_flat:
+                hit = [w for w in expand if any(p in w for p in parts)]
+            for w in hit:
+                expand[w] += tuple(t for t in tools if t not in expand[w])
+    canon = (vocab or {}).get("canonical")
     quality_n = sum(1 for w in _QUALITY_WORDS if w in q)
     groups = _request_groups()
     visible = _visible_tools(groups)
     rows = []
+    named_apps: set[str] = set()          # 질의가 이름을 부른 앱 — 사본 무리에서 그 앱 줄을 올린다
     for t in visible:
         name = t.name.lower()
         desc = (t.description or "").lower()
@@ -6229,6 +6259,8 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
             app_hit = any(v in hay_app for v in variants)
             # 질의가 앱 이름을 불렀으면(진짜 앱 라벨 적중) 이름 적중과 같은 가중이다 — 종전엔 라벨 · 설명 어디에 맞든 1점이었다(HG-01).
             named = any(_named(names, v, q_flat) for v in variants)
+            if named:
+                named_apps.add(app)
             if name_hit or desc_freq or app_hit or named:
                 covered += 1
                 score += 4 * (name_hit or named) + desc_freq + app_hit
@@ -6243,17 +6275,30 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
             rows.append((final, t.name, app, (t.description or "").strip(), t, is_write, original,
                          1 if _COPY_LABEL.search(label) else 0))
     rows.sort(key=lambda r: (-r[0], r[7], r[1]))
-    # 같은 도구의 사본 — 원래 이름과 설명이 같으면 첫 줄(점수 · 정본 순) 하나만 올리고 나머지는 same_in 으로 접는다(HG-01).
+    # 같은 도구의 사본 — 원래 이름과 설명(정본 소개 줄은 뗀다)이 같으면 한 줄만 올리고 나머지는 same_in 으로 접는다(HG-01).
+    # 그 한 줄은 무리에서 가장 앞선 줄의 자리에 서는 정본이다(R-4) — 질의가 사본의 앱을 콕 불렀을 때만 그 사본이다(OT-12 허브 건너기).
+    # 형제 사본은 겹침 접두 · 라벨 낱말(failuretrace 의 failure)이 동의어에 맞아 정본보다 앞서고, 정본 사본은 점수가 0 이라 줄에 없기도
+    # 하다 — 점수로는 정본을 못 세운다. 그래서 정본에 같은 도구가 있으면 그 도구가 무리를 대표한다.
     # 접힌 것도 이름으로 부를 수 있다(호출 별칭은 그대로다). 순위에서만 빠진다.
+    copies: dict[tuple, list] = {}
+    for r in rows:
+        copies.setdefault((r[6], _core_untagged(r[2], r[3])), []).append(r)
+    canon_tools = {(route[t.name][1], _core_untagged(canon, (t.description or "").strip())): t
+                   for t in visible if route.get(t.name, ("",))[0] == canon} if canon else {}
     folded: dict[tuple, list] = {}
     kept = []
-    for r in rows:
-        k = (r[6], r[3])
-        if k in folded:
-            folded[k].append({"tool": r[1], "app": r[2]})
-            continue
-        folded[k] = []
-        kept.append(r)
+    for k, g in copies.items():              # 넣은 차례 — 무리의 가장 앞선 줄 순서다
+        head = g[0]
+        if head[2] != canon and head[2] not in named_apps:
+            mine = next((r for r in g if r[2] == canon), None)
+            if mine is None and k in canon_tools:          # 정본 사본이 점수 0 이라 줄에 없다 — 이 무리의 자리에 세운다
+                ct = canon_tools[k]
+                mine = (head[0], ct.name, canon, (ct.description or "").strip(), ct, _tool_is_write(ct, k[0]), k[0],
+                        1 if _COPY_LABEL.search(str(_app_meta(canon).get("label") or "")) else 0)
+                g = [mine] + g
+            head = mine or head
+        kept.append(head)
+        folded[(head[6], head[3])] = [{"tool": r[1], "app": r[2]} for r in g if r is not head]
     rows = kept
 
     def _args_summary(t) -> dict:
@@ -6465,6 +6510,172 @@ def test_HG01_StepForge_를_부르면_그_앱_도구가_다른_앱의_비슷한_
     assert out["ranked"][:2] == ["zz_list_parts", "aa_list_parts"], out["ranked"]
     out = _hg01(monkeypatch, "파트 목록", 10, specs=specs)
     assert out["ranked"][:2] == ["aa_list_parts", "zz_list_parts"], "앱을 부르지 않으면 설명 적중대로다"
+
+
+# ── 코어 어휘표 — 정본 소개 줄 · 코어 낱말 → 허브 읽기 도구 · 사본 접기 · 심의 가중(HWAXPortal docs/request-1029 B-1 · R-3 · R-4 · R-5) ──────
+# 10-29 cae00 웹 챗 QA — 고장모드 · 시험항목 · 가상검증 · 관리 기준 · 물성 질문 다섯이 코어를 건너뛰었고, 챗이 부른 search_tools 8건의 상위 5에
+# 자주검증 도구가 0개였다. 허브 셋은 키 · 도구 이름 · 설명까지 cae00 꼴이다(이름이 겹쳐 셋 다 접두가 붙는다). 집계(_aggregate)를 실제로 돌린다.
+_CORE_HUBS = (("rootdesigndatahub", "자주검증 Datahub(rootdesign)"), ("failuretrace", "FailureTrace"),
+              ("caegroupdatahub", "CAE 그룹 Datahub"))
+_CORE_HUB_TOOLS = (
+    ("object_resolve", "이름 하나가 어느 객체인지 찾아 id 를 준다 — 이름 · 코드 · 별칭으로 찾는다."),
+    ("objects_list", "한 타입의 객체 목록을 준다 — 조건 · 정렬 · 쪽."),
+    ("objects_summary", "조건에 맞는 객체를 세고 묶어 요약한다 — 개수 · 분포."),
+    ("object_get", "객체 하나의 필드와 관계를 준다."),
+    ("graph_neighbors", "객체의 이웃을 관계를 따라 준다."),
+    ("objects_upsert", "객체를 만들거나 고친다."),
+)
+# 코어 질문을 가로챈 앱(FMEA · ARP · ODB 허브 · MatNexus)과 낙하 · 심의 도구 — 설명에 그 앱의 업무 낱말을 싣는다(요청서 R-3: FMEA 는 '규격 ·
+# 시험 · 고장모드' 를 설명에 싣는다).
+_CORE_OTHER = {
+    "fmea": ("FMEA", [("gather_evidence_tool", "고장모드 · 원인 · 대책의 사례 근거를 모은다(FMEA 사례 · 규격)."),
+                      ("list_candidate_specs", "질문에 맞는 사내 시험 규격 후보 목록 — 시험항목 · 불량 모드."),
+                      ("get_spec_details", "규격 한 건의 상세 — 시험 방법 · 판정 기준 · 고장모드.")]),
+    "arp": ("ARP", [("compare_items", "해석 항목끼리 실측 값을 견준다."),
+                    ("search_data", "해석 · 시험 실측 데이터를 찾는다 — 모델 · 항목 · 조건.")]),
+    "odb-hub": ("ODB 허브", [("list_rules", "보드 설계 규칙 목록."), ("find_job", "보드 잡을 이름 · 모델로 찾는다.")]),
+    "matnexus": ("MatNexus", [("resolve_property", "물성 이름을 표준 물성으로 푼다 — 영률 · 항복강도.")]),
+    "hwax-deliberation": ("HWAX 전문가 심의", [
+        ("deliberate_start", "HWAX 전문가 심의를 시작한다 — 원인 규명 · 불량 원인 분석 · 안 선택 · 신뢰 판정 · 리스크 심사 · 시험 계획 · "
+                             "해석 설계 · 검증 항목.")]),
+    "smart-twin-mcp": ("SmartTwin", [("single_drop_simulation", "단일 낙하 해석 잡 — 철판 · 낙하 높이 · 자세."),
+                                     ("fullangle_drop_simulation", "전각도 낙하 해석 잡.")]),
+}
+
+
+def _core_search(monkeypatch, query: str, limit: int = 8, *, vocab: bool = True) -> dict:
+    """cae00 꼴 카탈로그로 search_tools — vocab=False 면 어휘표가 없는 박스(지금 동작)다."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB if vocab else _REAL_CORE_VOCAB.with_name("__none__.json"))
+    spec = {k: [types.Tool(name=n, description=d, inputSchema={"type": "object", "properties": {"q": {"type": "string"}}})
+                for n, d in _CORE_HUB_TOOLS] for k, _l in _CORE_HUBS}
+    spec.update({k: [types.Tool(name=n, description=d, inputSchema={"type": "object", "properties": {}}) for n, d in ts]
+                 for k, (_l, ts) in _CORE_OTHER.items()})
+    _aggregate_tools(monkeypatch, spec)
+    monkeypatch.setattr(gw, "DISCOVERED_META", {**{k: {"label": l, "description": "코어 온톨로지 허브"} for k, l in _CORE_HUBS},
+                                                **{k: {"label": l, "description": ""} for k, (l, _t) in _CORE_OTHER.items()}})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    _no_embed(monkeypatch)
+    return json.loads(asyncio.run(gw._search_tools({"query": query, "limit": limit})).content[0].text)
+
+
+def test_코어_어휘표_정본을_형제_포털_리포에서_읽고_health_에_싣는다(monkeypatch):
+    """C-11 — 소비자의 해석이 정본의 꼴과 어긋나지 않게 실제 파일을 읽는다. 경로는 /health 에 싣지 않는다(박스 배치가 드러난다)."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    d = gw._core_vocab()
+    assert d is not None, f"형제 리포의 어휘표를 못 읽었다: {gw._CORE_VOCAB['error']}"
+    assert d["canonical"] == "rootdesigndatahub" and d["tag"][0] == "rootdesigndatahub" and d["tag"][1].startswith("사내 코어 정본")
+    syn = {flat: (parts, tools) for flat, parts, tools in d["syn"]}
+    assert syn["관리기준"][0] in ((), ("관리", "기준")) and "object_resolve" in syn["관리기준"][1]
+    assert ("관리", "기준") in {parts for parts, _t in syn.values()}, "띄어 쓴 꼴은 조각까지 든다"
+    for w in ("고장모드", "시험항목", "가상검증", "기준", "영률", "대책", "실패모드"):
+        assert w in syn, w
+    assert "메커니즘" not in syn and "물성" in syn, "검색 낱말은 R-4 의 목록이다 — 메커니즘은 '메커니즘 규명'(심의)을 가로챈다"
+    h = gw._core_vocab_health()
+    assert h["loaded"] is True and h["canonical"] == "rootdesigndatahub" and h["words"] == len(d["syn"])
+    assert h["tagline_applied"] is False, "아직 집계 전이다"
+    assert "HWAXPortal" not in json.dumps(h, ensure_ascii=False)
+
+
+def test_코어_어휘표는_바뀐_시각에_다시_읽고_없거나_깨지면_지금_동작으로_돈다(monkeypatch, tmp_path, caplog):
+    import os
+    p = tmp_path / "core_vocab.json"
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", p)
+    monkeypatch.setattr(gw, "_REAGG", {})
+    monkeypatch.setattr(gw, "exposed_tools", [_tool("x")])
+    body = {"version": 1, "canonical": {"app": "hub", "label": "Hub", "tagline": "소개 하나"},
+            "search": [{"words": ["관리 기준"], "tools": ["object_resolve"]}], "apps": {}}
+    p.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+    assert gw._core_vocab()["tag"] == ("hub", "소개 하나")
+    assert gw._REAGG.get("pending") is True, "붙어 있는 소개 줄(없음)과 다르다 — 다음 재활 회차에 다시 집계한다"
+    gw._REAGG.clear()
+    gw._CORE_VOCAB["tag_applied"] = ("hub", "소개 하나")          # 집계가 붙였다
+    assert gw._core_vocab()["tag"] == ("hub", "소개 하나") and not gw._REAGG, "같으면 다시 집계하지 않는다"
+    body["canonical"]["tagline"] = "소개 둘"
+    p.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+    st = p.stat()
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert gw._core_vocab()["tag"] == ("hub", "소개 둘") and gw._REAGG.get("pending") is True
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        p.write_text("{깨진", encoding="utf-8")
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+        assert gw._core_vocab() is None and gw._CORE_VOCAB["error"] == "못 읽음(JSONDecodeError)"
+        p.unlink()
+        assert gw._core_vocab() is None and gw._CORE_VOCAB["error"] == "없음"
+        assert gw._core_vocab_health() == {"loaded": False, "error": "없음"}
+    assert sum("코어 어휘표" in r.getMessage() for r in caplog.records) == 2, "깨짐 · 없어짐을 한 번씩 알린다"
+
+
+def test_R3_집계는_정본_앱_도구에만_소개_줄을_붙이고_어휘표가_없으면_설명은_그대로다(monkeypatch):
+    same = "이름 하나가 어느 객체인지 찾아 id 를 준다."
+    spec = {k: [types.Tool(name="object_resolve", description=same, inputSchema={"type": "object"})] for k, _l in _CORE_HUBS}
+    _aggregate_tools(monkeypatch, spec)
+    assert {t.description for t in gw.exposed_tools} == {same}, "어휘표가 없으면 지금 동작이다"
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    monkeypatch.setattr(gw, "_CORE_VOCAB", {"mtime": None, "data": None, "error": "없음", "tag_applied": None})
+    _aggregate_tools(monkeypatch, spec)
+    desc = {t.name: t.description for t in gw.exposed_tools}
+    assert desc["rootdesigndatahub_object_resolve"] == f"[{gw._CORE_VOCAB['data']['tag'][1]}] {same}"
+    assert desc["failuretrace_object_resolve"] == desc["caegroupdatahub_object_resolve"] == same
+    assert gw._core_untagged("rootdesigndatahub", desc["rootdesigndatahub_object_resolve"]) == same
+    assert gw._core_vocab_health()["tagline_applied"] is True
+
+
+@pytest.mark.parametrize("query", [
+    "가상검증 항목 해석으로 확인하는 검증 리스트", "관리 기준 개수", "철판 낙하 기준", "규격 실패모드", "가상검증", "관리 기준",
+    "Which test items detect drop failure modes"])
+def test_R4_요청서_시험_질의는_상위_5에_정본_읽기_도구가_둘_이상이다(monkeypatch, query):
+    """요청서 HG-01 이 이름을 댄 질의 일곱(cae00 질의 기록의 여덟 가운데 일곱 — 원문 여덟은 cae00 재시험에서 다시 잰다)과 OT-07 의 영어 질문.
+    '낙하 해석 담당' 은 뺐다 — 코어 낱말이 없어 어휘표가 닿지 않는다(context-notes C-14)."""
+    out = _core_search(monkeypatch, query)
+    top = [m for m in out["matches"][:5] if m["app"] == "rootdesigndatahub" and not m.get("write")]
+    assert len(top) >= 2, out["ranked"]
+    assert "deliberate_start" not in out["ranked"][:5], out["ranked"]
+    # 어휘표가 없으면(지금 동작) 같은 질의의 정본이 줄어든다 — 위 결과가 어휘표에서 왔다는 것. 0 은 아니다: 정본 라벨 '자주검증' 이
+    # '검증' 에 맞는다(앱 적중 1점).
+    off = _core_search(monkeypatch, query, vocab=False)
+    assert sum(1 for m in off["matches"][:5] if m["app"] == "rootdesigndatahub") < len(top), off["ranked"]
+
+
+def test_R4_같은_도구의_사본은_정본_한_줄로_접히고_사본을_부르면_그_사본이다(monkeypatch):
+    out = _core_search(monkeypatch, "고장모드 목록")
+    rows = [m for m in out["matches"] if m["tool"].endswith("_objects_list")]
+    assert [m["app"] for m in rows] == ["rootdesigndatahub"], out["ranked"]
+    assert sorted(x["app"] for x in rows[0]["same_in"]) == ["caegroupdatahub", "failuretrace"]
+    # FailureTrace 의 라벨 낱말(failure)이 동의어에 맞아 사본이 1 ~ 2점 앞서도 정본이 그 자리에 선다 — 영어 질문 · '불량' 질문
+    for q in ("Which test items detect drop failure modes", "솔더 접합 불량 고장모드 원인 대책"):
+        out = _core_search(monkeypatch, q, 10)
+        hub = [m for m in out["matches"] if m["app"] in {k for k, _l in _CORE_HUBS}]
+        assert hub and {m["app"] for m in hub} == {"rootdesigndatahub"}, (q, out["ranked"])
+    # 사본의 앱을 콕 부르면(허브 건너기 OT-12) 그 사본이 무리를 대표한다
+    out = _core_search(monkeypatch, "FailureTrace 고장모드 목록")
+    rows = [m for m in out["matches"] if m["tool"].endswith("_objects_list")]
+    assert [m["app"] for m in rows] == ["failuretrace"] and out["ranked"][0] == "failuretrace_objects_list", out["ranked"]
+    assert "rootdesigndatahub" in {x["app"] for x in rows[0]["same_in"]}
+
+
+def test_R4_띄어_쓴_코어_낱말도_허브_읽기_도구에_닿는다(monkeypatch):
+    """질의 낱말은 빈칸에서 갈라진다 — '시험 항목' 은 '시험' · '항목' 둘이라 붙여 쓴 열쇠로는 못 맞힌다. 어휘표의 띄어 쓴 꼴은 붙여 쓴 꼴이 질의에
+    있으면 그 조각을 담은 낱말마다 잇는다(요청서 R-4 '관리 기준 처럼 띄어 쓴 꼴도 받는다')."""
+    for q in ("시험 항목 목록", "시험항목 목록"):
+        out = _core_search(monkeypatch, q)
+        assert out["ranked"][0] == "rootdesigndatahub_objects_list", (q, out["ranked"])
+
+
+def test_R5_코어_질문은_심의를_청할_때만_일반_낱말이_deliberate_start_에_닿는다(monkeypatch):
+    """요청서 R-5 는 '심의 · 토의 · 회의가 없으면 끈다' 였다. 그대로 하면 코어 낱말이 없는 심의 업무 낱말 14쌍 중 7쌍이 밀려(10-29 dev
+    카탈로그 — '안 선택' 1 → 10위 · '신뢰 판정' 2 → 20위) 코어 질문에만 건다(context-notes C-13)."""
+    def pos(q, vocab=True):
+        r = _core_search(monkeypatch, q, 20, vocab=vocab)["ranked"]
+        return r.index("deliberate_start") + 1 if "deliberate_start" in r else None
+    q = "기준 판정 설계 선택"                    # 코어 낱말(기준) 하나에 일반 낱말 셋 — 잇는다면 deliberate_start 가 1위다
+    assert pos(q, vocab=False) == 1, "어휘표가 없으면 지금 동작이다"
+    core = pos(q)
+    assert core is None or core > 5, core
+    assert pos(q + " 심의") == 1, "심의를 청하면 종전대로 잇는다"
+    assert pos("신뢰 판정") == pos("해석 설계") == 1, "코어 낱말이 없으면 종전대로 잇는다"
 
 
 def test_search_tools_의미_순위를_끄면_답이_master_와_바이트까지_같다(monkeypatch):

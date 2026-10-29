@@ -8748,6 +8748,7 @@ def test_보고서는_저절로면_그_사람_이름으로_RA_초안을_만들�
     res, text = _rt_run("routine_report_submit", {"run_id": "r1", "sections": {"insight": "근거 [voc.c1]"}})
     out = json.loads(text)
     assert out["ra_report_id"] == "58" and out["coverage"] == {"ok": 2, "skipped": 1} and out["report_chars"] == len("# 보고서")
+    assert out["report_md"] == "# 보고서", "렌더된 본문을 돌려준다 — 챗이 답으로 보인다"
     [(exposed, args, corr)] = inner
     assert exposed == "create_report_draft" and args == {"template_id": "deliberation", "template_version": 1, "title": "S26 스웰링",
                                                          "blocks": {"background": ["b"]}, "tags": ["분석 루틴"]}

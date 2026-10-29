@@ -4648,8 +4648,9 @@ async def _routine_report(a: dict) -> types.CallToolResult:
     made = await _routine_portal("POST", f"/runs/{qr}/report", body=body)
     ra = made.get("ra") or {}
     mode = ra.get("upload") or "off"
+    # 렌더된 보고서 본문도 돌려준다 — 챗(Qwen 길)은 이것을 답으로 보이고, Claude 는 사람에게 그대로 보인다(원장에도 있다)
     out = {"run_id": run_id, "coverage": made.get("coverage"), "warnings": made.get("warnings") or [],
-           "report_chars": len(made.get("report_md") or ""), "ra_upload": mode}
+           "report_chars": len(made.get("report_md") or ""), "ra_upload": mode, "report_md": made.get("report_md") or ""}
     if mode == "auto" or (mode == "ask" and a.get("upload") is True):
         exposed = _rt_exposed(ROUTINE_RA_BACKEND, "create_report_draft")
         rid, err = None, None

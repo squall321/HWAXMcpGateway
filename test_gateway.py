@@ -6682,6 +6682,42 @@ def test_R5_코어_질문은_심의를_청할_때만_일반_낱말이_deliberate
     assert pos("신뢰 판정") == pos("해석 설계") == 1, "코어 낱말이 없으면 종전대로 잇는다"
 
 
+def test_R6_시험_사본은_목록_검색에서_빠지고_이름으로_부르면_닿는다(monkeypatch):
+    """어휘표에서 역할이 '시험'(staging)인 앱(stepforge-prod · dynaforge-prod) — 10-29 에도 6번 불렸고 OT-02 는 사본 결과를 '운영도 같다' 는 근거로
+    썼다(HWAXPortal docs/request-1029 R-6 · 결정 D-2). 숨김만이다 — invoke_tool 이나 노출 이름으로 부르면 그대로 닿는다."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    prod, real = _CallB(["find_plm_task"]), _CallB(["find_plm_task"])
+    calls: list = []
+    for key, b in (("stepforge-prod", prod), ("heax-step_forge", real)):
+        async def _ct(original, args, read_timeout_seconds=None, _k=key):
+            calls.append((_k, original))
+            return types.CallToolResult(content=[types.TextContent(type="text", text=f"{_k} 결과")])
+        b.session.call_tool = _ct
+    monkeypatch.setattr(gw, "backends", {"stepforge-prod": prod, "heax-step_forge": real})
+    for k in ("exposed_tools", "route", "alias_route"):
+        monkeypatch.setattr(gw, k, [] if k == "exposed_tools" else {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    gw._RESP_CACHE.clear()
+    asyncio.run(gw._aggregate())
+    staged = next(n for n, (k, _o) in gw.route.items() if k == "stepforge-prod")
+    visible = {t.name for t in gw._visible_tools([])}
+    assert staged not in visible and any(gw.route.get(n, ("",))[0] == "heax-step_forge" for n in visible), visible
+    _no_embed(monkeypatch)
+    out = json.loads(asyncio.run(gw._search_tools({"query": "PLM 과제 찾기", "limit": 10})).content[0].text)
+    assert staged not in out["ranked"] and all(m["app"] != "stepforge-prod" for m in out["matches"]), out["ranked"]
+    assert asyncio.run(gw._call_tool("invoke_tool", {"name": staged, "arguments": {}})).content[0].text == "stepforge-prod 결과"
+    assert asyncio.run(gw._call_tool(staged, {})).content[0].text == "stepforge-prod 결과"
+    assert ("stepforge-prod", "find_plm_task") in calls
+    assert gw._core_vocab_health()["staging_hidden"] == ["stepforge-prod"]
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB.with_name("__none__.json"))
+    gw._core_vocab()
+    assert staged in {t.name for t in gw._visible_tools([])}, "어휘표가 없으면 지금 동작이다(숨기지 않는다)"
+
+
 def test_search_tools_의미_순위를_끄면_답이_master_와_바이트까지_같다(monkeypatch):
     """옵션을 끈 것이 기본값이다 — 그때 search_tools 는 종전 코드와 글자 하나 다르지 않아야 하고 임베더를 부르지 않는다.
     질의는 손으로 고른 가장자리(짧음·빈 낱말·대소문자·조사·limit)와 평가셋의 질의 전부다."""

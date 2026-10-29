@@ -2740,7 +2740,7 @@ _CORE_VOCAB: dict = {"mtime": None, "data": None, "error": "아직 읽지 않음
 
 
 def _core_vocab_parse(d: dict) -> dict:
-    """정본 꼴에서 게이트웨이가 쓰는 것만 — 검색 낱말(띄어 쓴 꼴은 조각까지) · 정본 앱과 소개 줄. 꼴이 틀리면 예외."""
+    """정본 꼴에서 게이트웨이가 쓰는 것만 — 검색 낱말(띄어 쓴 꼴은 조각까지) · 정본 앱과 소개 줄 · 앱 역할. 꼴이 틀리면 예외."""
     syn = []
     for e in d["search"]:
         tools = tuple(str(t).lower() for t in e["tools"])
@@ -2750,7 +2750,8 @@ def _core_vocab_parse(d: dict) -> dict:
             syn.append((re.sub(r"\s+", "", w), parts, tools))
     can = d["canonical"]
     app, tagline = str(can["app"]), str(can.get("tagline") or "").strip()
-    return {"version": d.get("version"), "canonical": app, "tag": (app, tagline) if tagline else None, "syn": syn}
+    return {"version": d.get("version"), "canonical": app, "tag": (app, tagline) if tagline else None, "syn": syn,
+            "staging": frozenset(str(k) for k, v in (d.get("apps") or {}).items() if str(v.get("role")) == "staging")}
 
 
 def _core_vocab() -> dict | None:
@@ -2784,7 +2785,7 @@ def _core_vocab_health() -> dict:
     if d is None:
         return {"loaded": False, "error": _CORE_VOCAB["error"]}
     return {"loaded": True, "version": d["version"], "words": len(d["syn"]), "canonical": d["canonical"],
-            "canonical_backend": d["canonical"] in backends,
+            "canonical_backend": d["canonical"] in backends, "staging_hidden": sorted(d["staging"] & set(backends)),
             "tagline_applied": _CORE_VOCAB["tag_applied"] is not None and _CORE_VOCAB["tag_applied"] == d["tag"]}
 
 
@@ -4025,8 +4026,12 @@ def _local_tools() -> list[types.Tool]:
 def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 사용자가 포털에서 끈 앱은 개인 PAT 의 tools/list·search_tools 에서 뺀다(숨김만 — 호출은 막지 않는다)
     muted = _request_muted()
+    # 코어 어휘표에서 역할이 '시험'(staging)인 사본(StepForge · DynaForge 의 *-prod)도 목록 · 검색에서 뺀다 — 10-29 에도 6번 불렸고 OT-02 는
+    # 사본 결과를 '운영도 같다' 는 근거로 썼다(HWAXPortal docs/request-1029 R-6 · 결정 D-2). 숨김만이다 — 이름을 콕 집어 부르면(invoke_tool ·
+    # 노출 이름) 그대로 닿는다.
+    hidden = muted | ((_CORE_VOCAB["data"] or {}).get("staging") or frozenset())
     return [t for t in exposed_tools
-            if _backend_allowed(route[t.name][0], groups) and route[t.name][0] not in muted] + _local_tools()
+            if _backend_allowed(route[t.name][0], groups) and route[t.name][0] not in hidden] + _local_tools()
 
 
 def _request_groups() -> list[str]:

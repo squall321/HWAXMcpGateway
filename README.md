@@ -188,7 +188,40 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 - 사본 접기 — 원래 이름과 설명(소개 줄은 떼고 본다)이 같은 사본은 정본 한 줄로 접고 나머지는 `same_in` 이다. 질의가 사본의 앱 이름을 부르면 그 사본이 무리를 대표한다(허브 건너기).
 - 심의 가중 — 코어 질문(코어 낱말이 든 질의)에 '심의 · 토의 · 회의' 가 없으면 일반 업무 낱말(원인 · 판정 · 설계 …)을 `deliberate_start` 에 잇지 않는다(R-5). 코어 낱말이 없는 질의는 종전대로다.
 - 시험 사본 숨김 — 앱 역할이 `staging` 인 앱(`apps.<키>.role`)은 tools/list · `search_tools` 에서 빠진다(R-6). 웹 챗 묶음 · 개인 Claude 기본 목록 · 검색 결과가 한 번에 빠진다. `invoke_tool` · 노출 이름 호출은 경로가 그대로다(숨김만 — 허브 앱 켜고 끄기와 같은 자리).
-- 표가 없거나 꼴이 틀리면 지금 동작(손 낱말 · 소개 줄 없음 · 숨기지 않음)으로 돈다. `/health` 의 `core_vocab` 이 `{loaded, version, words, canonical, canonical_backend, staging_hidden, tagline_applied}` 또는 `{loaded: false, error}` 를 싣는다(경로는 싣지 않는다). `canonical_backend` 가 false 면 정본 키가 이 박스의 백엔드 키와 달라 소개 줄 · 정본 대표 접기가 꺼져 있다. `staging_hidden` 은 이 박스에서 숨긴 백엔드다.
+- 박스 덧씌우기 — 같은 자리의 `core_vocab.local.json`(포털 리포 gitignore)을 JSON merge patch 로 얹는다(아래 '검색 손잡이' 와 같은 규칙). 코어 낱말 · 정본 · 앱 역할을 cae00 에서 커밋 없이 고친다. 깨지면 버리고 기본 표로 돈다. 에이전트 서버도 같은 파일을 같은 규칙으로 읽는다 — 두 쪽의 `/health` `core_vocab.fingerprint` 가 같아야 한다(포털 update-all §6 이 견준다).
+- 표가 없거나 꼴이 틀리면 지금 동작(손 낱말 · 소개 줄 없음 · 숨기지 않음)으로 돈다. `/health` 의 `core_vocab` 이 `{loaded, version, words, canonical, canonical_backend, staging_hidden, tagline_applied}` 또는 `{loaded: false, error}` 를 싣고, 실린 표에는 지문 `fingerprint`(덧씌운 표) · `base`(기본 표) · 덧씌우기 `overlay`(`present` · 건드린 칸 · 버린 까닭)가 붙는다(경로는 싣지 않는다). `canonical_backend` 가 false 면 정본 키가 이 박스의 백엔드 키와 달라 소개 줄 · 정본 대표 접기가 꺼져 있다. `staging_hidden` 은 이 박스에서 숨긴 백엔드다.
+
+## 검색 손잡이 — `search_tuning.json` + 박스 덧씌우기(HWAXPortal docs/request-1029 E-7)
+
+`search_tools` 의 손 동의어(73) · 쓰기 의도 낱말 · 품질 낱말 · 심의 낱말 · 가중치는 코드 상수가 아니라 `search_tuning.json`(추적 — 기본값)에 있다. 10-29 에 상수를 옮기며 응답 · 평가가 옮기기 전과 바이트까지 같은 것을 먼저 보였다(`test_gateway.py` 의 `_SEARCH_TOOLS_MASTER`).
+
+- 박스 튜닝 — 같은 자리의 `search_tuning.local.json`(gitignore)에 바꿀 칸만 적는다. **JSON merge patch(RFC 7386)** — 객체는 재귀로 합치고 그 밖은 바꾸며 `null` 은 지운다(목록은 통째로 바뀐다). 두 파일의 바뀐 시각을 보고 **재기동 없이** 다음 검색부터 탄다. 덧씌우기가 깨지면(JSON 아님 · 객체 아님 · 가중치가 수가 아님 · `to` 가 목록이 아님) 버리고 기본값으로 돌며 까닭을 `/health` 에 싣는다.
+- 묶음별 끄기 `switches` — `synonyms`(손 동의어) · `core_vocab`(코어 어휘표 낱말) · `delib_narrow`(코어 질문의 심의 가중 끔) · `quality`(품질 낱말 가중) · `write_penalty`(쓰기 도구 감점) · `copy_fold`(같은 도구 사본 접기).
+- 손 동의어 한 줄은 `{to: [이을 낱말 · 도구 이름 조각], owner, source_fix}` 다. `owner` 는 그 낱말이 도구 설명에 없어 우리가 보정하는 플랫폼(백엔드 키, 일반 낱말은 null), `source_fix` 는 그쪽이 고칠 것이다 — 아래 피드백 보고서가 읽는다. 보정은 비계다 — 그쪽이 설명을 고치면 걷는다.
+- 지문 — `/health` 의 `search_tuning` 이 `{fingerprint(덧씌운 값), base(기본값), switches_off, synonyms, overlay{present, fingerprint, changed, error}}` 를 싣는다. 지문은 `_doc` 을 뺀 키 차례 JSON 의 sha256 앞 12자이고 질의 기록 줄(`fp`) · 평가 결과에도 실린다 — dev 와 cae00 이 다르게 도는 것을 숫자 곁에서 보인다.
+
+## 검색 고리 창구 — `/search-log` · `/search-review` · `/search-eval`(E-9)
+
+포털 관리자 '도구 검색 검토' 화면과 `tool_search_eval/run.py live` 가 부른다. 질의 원문을 내므로 공유 비밀(`_gateway.token` — `/conn-invalidate` 와 같다)을 요구한다(틀리면 401).
+
+| 창구 | 하는 일 |
+|---|---|
+| `GET /search-log?days=7&limit=200&q=` | 최근 질의(새것 먼저)마다 상위 다섯 · 보정 표지(`via` · `boost_only`) · 뒤이은 호출(`outcomes`)과 박스 표시(`mark`). `days` 는 질의 기록 창 안, `limit` 은 1,000까지, `q` 는 대소문자 없이 부분 일치 |
+| `POST /search-review` | `{q, verdict: ok\|gold\|remove, gold, memo?, qid?}` → 박스 정답쌍 `tool_search_eval/pairs.local.jsonl`(`source: "box"`, id `box-<질의 해시>`). 같은 질의는 바꿔 쓰고 `remove` 는 지운다. `gold` 는 `앱키:원래 이름` 1 ~ 10개 |
+| `POST /search-eval` | 떠 있는 카탈로그 · 서비스 시야로 정답쌍(추적 + 박스)을 판마다(덧씌운 값 · 기본값 · 보정 끔 · 묶음 하나씩 끔) 잰다. 부분문자열 순위만 · 기록 안 남김 · 일꾼 스레드(게이트웨이 루프를 막지 않는다) · 한 번에 하나(409) |
+
+## 플랫폼별 피드백 보고서 — `platform_feedback_report.py`(E-8)
+
+우리가 다루지 않는 플랫폼에 돌려줄 마크다운이다. 보정이 그쪽 설명의 빈 곳을 가리므로, 무엇을 가렸는지와 그쪽이 고칠 것을 플랫폼마다 적는다. **cae00 에서 짓는다** — 실사용 질의가 거기 있다.
+
+```bash
+python3 platform_feedback_report.py                                        # 이 박스 게이트웨이 · 감사 · 질의 기록, 30일, 전 플랫폼
+python3 platform_feedback_report.py --platform heax-step_forge --out stepforge.md
+```
+
+- 일곱 절 — ① 보정 덕에만 찾아진 질의(규칙마다 · 손 동의어는 `owner` · `source_fix`) ② 상위 다섯에 보이고도 안 불림(다른 도구를 불렀나 · 아무것도 안 불렀나) ③ 상위 다섯 밖에서 불림(결과에 없었는데 불림 · 6위 아래) ④ 실패(플랫폼 쪽 — 게이트웨이 · 권한에서 막힌 forbidden · refused · per-user 는 따로 센다) ⑤ 큰 응답(감사 `chars`, `--big-chars` 기본 50,000) ⑥ 인자 설명(`/tools-map` `arg_scores`) ⑦ 안 불린 도구(`tool_usage_report.py` 와 같은 셈). 맨 위 요약표는 피드백이 많은 플랫폼이 먼저다.
+- 질의 원문은 싣는다(고칠 낱말이 거기 있다). 부른 사람 · 주소는 싣지 않는다 — 실패 사유 글에 `@` 가 들었으면 싣지 않고, 사유의 숫자는 `#` 로 접는다. 표마다 `--rows`(기본 10)를 넘으면 '그 밖 N개' 로 적는다.
+- 손잡이 읽기는 게이트웨이와 같은 규칙이고 지문이 같다(`test_gateway.py` 가 맞댄다). 질의 기록은 KST 날짜로, 감사는 UTC 시각으로 기간을 끊는다. 표준 라이브러리만 쓴다(`python3` 로 돈다).
 
 ## 오래 안 불린 도구 보고 — `tool_usage_report.py`(HWAXPortal docs/request-1029 E-3)
 
@@ -215,7 +248,7 @@ python3 tool_usage_report.py --days 60 --out unused.md
 - 켜면 결과에 `mode` 가 붙는다 — `rrf`, 또는 못 섞었을 때 `substring` 과 까닭 `mode_reason`(색인이 덜 참 · 임베더 오류 · 시간 초과 · 차원이 바뀜).
 - 색인은 도구마다 '앱 라벨 · 이름: 설명' 글의 해시로 두고 재집계 뒤 뒤에서 새 글만 임베딩한다(기동 직후 첫 색인 동안은 부분문자열로 답한다). 순위만 쓰고 코사인 값으로 거르지 않는다.
 - 게이트웨이는 `.env` 를 읽지 않는다 — 띄우는 프로세스의 env 에 있어야 하고, 기동 로그의 `search_tools 의미 순위 켬` 줄로 닿았는지 본다.
-- 실사용 질의 모으기(10-18 결정 21) — `search_tools` 질의를 이름 없이 `tool_search_eval/queries.local.jsonl` 에 30일 동안 남긴다(첫 줄 날짜부터, 그 뒤 저절로 멈춤). 끄기는 `GATEWAY_TOOL_QUERY_LOG=0`. 꼴과 쓰는 법은 `tool_search_eval/README.md` '실사용 질의'.
+- 실사용 질의 모으기(10-18 결정 21 → 10-29 굴러가는 창) — `search_tools` 질의를 이름 없이 날짜 파일 `tool_search_eval/queries-YYYY-MM-DD.local.jsonl` 에 남기고, 같은 호출자가 600초 안에 부른 백엔드 도구를 결과 줄로 잇는다. 창은 `GATEWAY_TOOL_QUERY_LOG_DAYS`(기본 30)일, 끄기는 `GATEWAY_TOOL_QUERY_LOG=0`. 꼴과 쓰는 법은 `tool_search_eval/README.md` '실사용 질의' · '박스에서 닫히는 고리'.
 
 ## 실행
 ```bash

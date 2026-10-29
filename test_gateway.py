@@ -51,7 +51,9 @@ def _no_core_vocab(monkeypatch, tmp_path):
     ⚠ 안 걸면 실제 표가 검색 순위 · 도구 설명(정본 소개 줄) · 재집계 예약을 바꾸고, 모듈 상태라 앞 시험의 것이 뒤 시험에 남는다
     (HWAXPortal docs/request-1029 C-11). '없음' 을 이미 아는 상태로 두어 시험마다 경고 줄이 생기지 않게 한다."""
     monkeypatch.setattr(gw, "CORE_VOCAB_PATH", tmp_path / "no-core-vocab.json")
-    monkeypatch.setattr(gw, "_CORE_VOCAB", {"mtime": None, "data": None, "error": "없음", "tag_applied": None})
+    # 박스 덧씌우기도 늘 '없음' — 실제 표를 읽는 시험에도 박스의 core_vocab.local.json 이 끼어들지 않게 한다(E-7 ②)
+    monkeypatch.setattr(gw, "CORE_VOCAB_LOCAL_PATH", tmp_path / "no-core-vocab.local.json")
+    monkeypatch.setattr(gw, "_CORE_VOCAB", {"mtime": None, "data": None, "error": "없음", "tag_applied": None, "overlay": None})
 
 
 def _tool(name: str) -> types.Tool:
@@ -8418,3 +8420,24 @@ def test_health_에_검색_손잡이_지문이_실린다():
     assert '"search_tuning": _tuning_health(),' in src[i:src.index('if scope.get("path") == "/tools-map":', i)]
     h = gw._tuning_health()
     assert set(h) <= {"fingerprint", "base", "switches_off", "synonyms", "overlay", "error"} and len(h["fingerprint"]) == 12
+
+
+def test_코어_어휘표_박스_덧씌우기는_merge_patch_로_얹는다(monkeypatch, tmp_path):
+    """core_vocab.local.json — 코어 낱말 · 정본 · 앱 역할을 cae00 에서 커밋 없이 고친다. 깨지면 버리고 기본 표로 돈다(E-7 ②)."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    loc = tmp_path / "core_vocab.local.json"
+    monkeypatch.setattr(gw, "CORE_VOCAB_LOCAL_PATH", loc)
+    base = gw._core_vocab()
+    assert base["fingerprint"] == base["base_fingerprint"] and gw._core_vocab_health()["overlay"] == {"present": False}
+    loc.write_text(json.dumps({"apps": {"stepforge-prod": None}, "search": [{"words": ["메인 PBA"], "tools": ["object_resolve"]}]},
+                              ensure_ascii=False), encoding="utf-8")
+    d = gw._core_vocab()
+    assert "stepforge-prod" not in d["staging"] and "dynaforge-prod" in d["staging"], "객체는 합치고 null 은 지운다"
+    assert [s for s in d["syn"] if s[0] == "메인pba"] and len(d["syn"]) < len(base["syn"]), "목록은 통째로 바뀐다"
+    h = gw._core_vocab_health()
+    assert h["fingerprint"] != h["base"] and h["overlay"]["present"] and set(h["overlay"]["changed"]) == {"apps.stepforge-prod", "search"}
+    loc.write_text("{깨진", encoding="utf-8")
+    st = loc.stat()
+    gw.os.utime(loc, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    d = gw._core_vocab()
+    assert d["fingerprint"] == base["fingerprint"] and "덧씌우기를 버렸다" in gw._core_vocab_health()["overlay"]["error"]

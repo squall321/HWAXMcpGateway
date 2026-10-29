@@ -2912,7 +2912,9 @@ def _tuning_health() -> dict:
 # 그 파일을 직접 읽는다 — 새 통로가 없고 포털이 내려가 있어도 표가 산다. 바뀐 시각이 다르면 다시 읽는다. 없거나 꼴이 틀리면 지금 동작
 # (search_tools 의 손 낱말 · 소개 줄 없음)으로 돌고, 그 사실을 /health 의 core_vocab 에 싣는다.
 CORE_VOCAB_PATH = Path(__file__).resolve().parent.parent / "HWAXPortal" / "backend" / "config" / "core_vocab.json"
-_CORE_VOCAB: dict = {"mtime": None, "data": None, "error": "아직 읽지 않음", "tag_applied": None}
+# 박스 덧씌우기(docs/request-1029 E-7 ② — gitignore) — 코어 낱말 · 정본 · 앱 역할을 cae00 에서 커밋 없이 고친다. 검색 손잡이와 같은 merge patch 다.
+CORE_VOCAB_LOCAL_PATH = CORE_VOCAB_PATH.with_name("core_vocab.local.json")
+_CORE_VOCAB: dict = {"mtime": None, "data": None, "error": "아직 읽지 않음", "tag_applied": None, "overlay": None}
 
 
 def _core_vocab_parse(d: dict) -> dict:
@@ -2940,14 +2942,32 @@ def _core_vocab() -> dict | None:
             log.warning("코어 어휘표가 없다(%s) — search_tools 손 낱말 · 소개 줄 없이 돈다", CORE_VOCAB_PATH)
         _CORE_VOCAB.update(mtime=None, data=None, error="없음")
     else:
-        if mt != _CORE_VOCAB["mtime"]:
+        try:
+            lmt = CORE_VOCAB_LOCAL_PATH.stat().st_mtime_ns
+        except OSError:
+            lmt = None
+        if (mt, lmt) != _CORE_VOCAB["mtime"]:
             try:
-                data = _core_vocab_parse(json.loads(CORE_VOCAB_PATH.read_text(encoding="utf-8")))
+                raw = json.loads(CORE_VOCAB_PATH.read_text(encoding="utf-8"))
+                data = _core_vocab_parse(raw)
             except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
                 log.warning("코어 어휘표를 못 읽었다(%s) — 손 낱말로 돈다: %r", CORE_VOCAB_PATH, exc)
-                _CORE_VOCAB.update(mtime=mt, data=None, error=f"못 읽음({type(exc).__name__})")
+                _CORE_VOCAB.update(mtime=(mt, lmt), data=None, error=f"못 읽음({type(exc).__name__})", overlay=None)
             else:
-                _CORE_VOCAB.update(mtime=mt, data=data, error=None)
+                eff, overlay = raw, {"present": lmt is not None}
+                if lmt is not None:
+                    try:
+                        patch = json.loads(CORE_VOCAB_LOCAL_PATH.read_text(encoding="utf-8"))
+                        if not isinstance(patch, dict):
+                            raise TypeError("덧씌우기는 객체여야 한다")
+                        merged = _merge_patch(raw, patch)
+                        data, eff = _core_vocab_parse(merged), merged
+                        overlay.update(fingerprint=_json_fp(patch), changed=_patch_paths(patch)[:40])
+                    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                        overlay["error"] = f"덧씌우기를 버렸다({type(exc).__name__}: {str(exc)[:120]})"
+                        log.warning("코어 어휘표 덧씌우기(%s)를 버리고 기본 표로 돈다: %r", CORE_VOCAB_LOCAL_PATH, exc)
+                data = {**data, "fingerprint": _json_fp(eff), "base_fingerprint": _json_fp(raw)}
+                _CORE_VOCAB.update(mtime=(mt, lmt), data=data, error=None, overlay=overlay)
     tag = (_CORE_VOCAB["data"] or {}).get("tag")
     if tag != _CORE_VOCAB["tag_applied"] and exposed_tools:
         _REAGG["pending"] = True
@@ -2962,7 +2982,10 @@ def _core_vocab_health() -> dict:
         return {"loaded": False, "error": _CORE_VOCAB["error"]}
     return {"loaded": True, "version": d["version"], "words": len(d["syn"]), "canonical": d["canonical"],
             "canonical_backend": d["canonical"] in backends, "staging_hidden": sorted(d["staging"] & set(backends)),
-            "tagline_applied": _CORE_VOCAB["tag_applied"] is not None and _CORE_VOCAB["tag_applied"] == d["tag"]}
+            "tagline_applied": _CORE_VOCAB["tag_applied"] is not None and _CORE_VOCAB["tag_applied"] == d["tag"],
+            # 덧씌운 표의 지문 · 기본 표의 지문 · 박스 덧씌우기 — 에이전트 서버 /health 의 지문과 같아야 한다(update-all §6 이 견준다, E-7 ③)
+            "fingerprint": d["fingerprint"], "base": d["base_fingerprint"],
+            "overlay": dict(_CORE_VOCAB.get("overlay") or {"present": False})}
 
 
 def _core_untagged(key: str, desc: str) -> str:

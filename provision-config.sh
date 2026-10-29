@@ -34,7 +34,8 @@
 #      TESTSCOPE_SSO_SECRET(+TESTSCOPE_SSO_URL, 기본 주소 없음). 비밀이 없는 실행은 직전 값을 이어받는다 —
 #      끄는 것은 PER_USER_SSO_OFF(update-all 이 infra/.env 의 빈 RA·TestScope 비밀을 보고 넘긴다)로만.
 #      그 밖의 앱은 이 파일을 고치지 않고 붙인다 — PER_USER_SSO_APPS="<per_user 키>:<ENV 접두> …"
-#      (예: "newapp:NEWAPP" → NEWAPP_SSO_SECRET · NEWAPP_SSO_URL, 기본 주소 없음). PER_USER_SSO_OFF 로도 꺼진다 —
+#      (예: "newapp:NEWAPP" → NEWAPP_SSO_SECRET · NEWAPP_SSO_URL, 기본 주소 없음 · NEWAPP_SSO_CLIENT 는 발급 요청의 클라이언트 이름 —
+#      비면 gateway, 한 발급처에 위임이 둘 이상이면 갈라 적는다). PER_USER_SSO_OFF 로도 꺼진다 —
 #      쌍을 남기고 비밀을 비웠든, 쌍째 지웠든(순회가 쓴 항목의 managed_by 표지로 가린다). 어느 쪽이든 **이름이 와야** 꺼진다 —
 #      목록이 비었다고 스스로 지우지 않는다. 넘기는 쪽은 provision.env 를 읽은 호출자다(update-all, 손으로는 PER_USER_SSO_OFF=<키>).
 #      heax-hub 밖에서 도는 앱(MatNexus 처럼 다른 조직 서버)은 <접두>_MCP_URL 을 더 적으면 MCP 백엔드도 같은 키로 붙는다
@@ -795,8 +796,16 @@ for _i, _pair in enumerate((e.get("PER_USER_SSO_APPS") or "").split(), 1):
         _u = e.get(f"{_p}_SSO_URL") or (per_user.get(_k) or {}).get("sso_url")
         if _u:
             # managed_by — 이 순회가 쓴 항목이라는 표지다(게이트웨이는 읽지 않는다). 목록에서 뺀 앱을 아래 끄기가 이것으로 가린다.
+            # <접두>_SSO_CLIENT — 발급 요청의 클라이언트 이름(X-Heax-Client). 비면 gateway. 같은 발급처(같은 비밀 · 주소)에 위임이 둘 이상이면
+            # 이름을 가른다 — 발급처가 '같은 이름의 직전 토큰' 을 회수하면 두 위임이 같은 사람의 토큰을 서로 죽인다(SimFlow HG-03 과 같은 꼴 —
+            # KooSlurm 하나가 smart-twin-mcp · smart-twin-cluster 둘에 kst_ 를 내는 경우, HWAXPortal docs/request-1027 · 낙하 트윈 10-29).
+            # 읽지 못한 값은 gateway 로 두고 말한다(값은 비밀이 아니라 찍는다 — 발급처의 허용 목록과 맞춰 볼 일이다).
+            _cl = (e.get(f"{_p}_SSO_CLIENT") or "").strip()
+            if _cl and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", _cl):
+                print(f"  ⚠ {_p}_SSO_CLIENT={_cl[:64]!r} 를 읽지 못했다(영숫자 · . · _ · - 64자까지) — {_k} 은 gateway 로 보낸다")
+                _cl = ""
             per_user[_k] = {**(per_user.get(_k) or {}), "sso_url": _u, "secret": e[f"{_p}_SSO_SECRET"],
-                            "client": "gateway", "managed_by": "PER_USER_SSO_APPS"}
+                            "client": _cl or "gateway", "managed_by": "PER_USER_SSO_APPS"}
             # <접두>_SEND_PLAT — 위임 호출에 호출자의 plat: 권한을 서명과 함께 싣는다(gateway PLAT_HEADER, HWAXPortal docs/mxwp-wiki P4).
             # 적혀 있을 때만 이 값이 정한다(1 · true · yes · on 이면 켬, 그 밖의 값이면 끔). 안 적었으면 직전 config 를 이어받는다.
             _sp = e.get(f"{_p}_SEND_PLAT")
@@ -805,7 +814,8 @@ for _i, _pair in enumerate((e.get("PER_USER_SSO_APPS") or "").split(), 1):
                     per_user[_k]["send_plat"] = True
                 else:
                     per_user[_k].pop("send_plat", None)
-            print(f"  ✓ {_k} 사람별 위임 — {_u}" + (" · plat 권한 전달" if per_user[_k].get("send_plat") else ""))
+            print(f"  ✓ {_k} 사람별 위임 — {_u}" + (" · plat 권한 전달" if per_user[_k].get("send_plat") else "")
+                  + (f" · 클라이언트 {_cl}" if _cl else ""))
         else:
             print(f"  ⚠ {_p}_SSO_SECRET 은 있는데 주소가 없다({_p}_SSO_URL·직전 config 둘 다 없음) — {_k} 위임 생략")
     if e.get(f"{_p}_MCP_URL"):

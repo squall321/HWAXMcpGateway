@@ -683,6 +683,29 @@ def test_일반_앱의_SEND_PLAT_은_적혀_있을_때만_plat_전달을_정한�
     assert "send_plat" not in plain, "기본은 끔 — 쓰지 않는 앱에 권한 목록을 보내지 않는다"
 
 
+def test_일반_앱의_SSO_CLIENT_는_발급처가_같은_위임끼리_이름을_가른다(tmp_path):
+    """한 발급처(KooSlurm)가 smart-twin-mcp · smart-twin-cluster 둘에 kst_ 를 낸다 — 같은 이름의 직전 토큰을 회수하는 발급처라 둘이
+    gateway 한 이름으로 받으면 같은 사람의 토큰을 서로 죽인다(SimFlow HG-03 과 같은 꼴, HWAXPortal 낙하 트윈 10-29). 비면 gateway 그대로."""
+    env = {"PER_USER_SSO_APPS": "smart-twin-mcp:KST_MCP smart-twin-cluster:KST_CLUSTER",
+           "KST_MCP_SSO_SECRET": "kst-deleg-xyz", "KST_MCP_SSO_URL": "http://127.0.0.1:5010/api/auth/sso",
+           "KST_CLUSTER_SSO_SECRET": "kst-deleg-xyz", "KST_CLUSTER_SSO_URL": "http://127.0.0.1:5010/api/auth/sso",
+           "KST_MCP_SSO_CLIENT": "gateway-smart-twin-mcp", "KST_CLUSTER_SSO_CLIENT": "gateway-smart-twin-cluster"}
+    log: list = []
+    pu = _run_provision(tmp_path, env, log)["heax_registry"]["per_user_sso"]
+    assert pu["smart-twin-mcp"]["client"] == "gateway-smart-twin-mcp"
+    assert pu["smart-twin-cluster"]["client"] == "gateway-smart-twin-cluster"
+    assert "smart-twin-mcp 사람별 위임 — http://127.0.0.1:5010/api/auth/sso · 클라이언트 gateway-smart-twin-mcp" in log[0]
+    assert "kst-deleg-xyz" not in log[0]
+    _force_backup(tmp_path)
+    log = []
+    bad = _run_provision(tmp_path, {**env, "KST_CLUSTER_SSO_CLIENT": "gate way;rm"}, log)["heax_registry"]["per_user_sso"]
+    assert bad["smart-twin-cluster"]["client"] == "gateway" and "KST_CLUSTER_SSO_CLIENT" in log[0] and "gateway 로 보낸다" in log[0]
+    _force_backup(tmp_path)
+    plain = {k: v for k, v in env.items() if not k.endswith("_SSO_CLIENT")}
+    assert _run_provision(tmp_path, plain)["heax_registry"]["per_user_sso"]["smart-twin-mcp"]["client"] == "gateway", \
+        "안 적으면 gateway — 지금 있는 일반 앱(mx-white-paper)의 이름이 바뀌지 않는다"
+
+
 def test_MXWP_REST_다리는_위임이_있을_때만_본인_명의로_간다(tmp_path):
     """위임 창구가 없는 MXWP 판에서 REST 를 끊지 않는다 — 위임이 없으면 지금처럼 서비스 토큰 주입(GET · HEAD 만)이다
     (HWAXPortal docs/mxwp-wiki P2). 위임이 생기면 쓰기도 그 사람 이름으로 열린다(rest_proxy.allowed_methods)."""

@@ -40,6 +40,7 @@
     "heax-paper_ingest": "research",
     "reportarchive": "report",
     "heax-web_design_agents": "report",
+    "heax-doc_forge": "report",
     "hwax-deliberation": "expert",
     "heax-hwax_risk": "expert",
     "knox-bridge": "system",

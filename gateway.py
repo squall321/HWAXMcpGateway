@@ -2747,6 +2747,157 @@ def _note_search_outcome(caller: str | None, tool: str, backend: str | None, ok:
         log.warning("search_tools 결과 줄을 남기지 못했다(%r)", exc)
 
 
+SEARCH_PAIRS_PATH = TOOL_QUERY_LOG_DIR / "pairs.jsonl"              # 추적하는 평가셋(dev 가 지은 정답쌍)
+SEARCH_PAIRS_LOCAL_PATH = TOOL_QUERY_LOG_DIR / "pairs.local.jsonl"  # 박스에서 사람이 표시한 정답쌍(E-9 ② — gitignore, dev 를 거치지 않는다)
+_SEARCH_REVIEW_VERDICTS = ("ok", "gold", "remove")
+_SEARCH_EVAL_LOCK = {"busy": False}
+
+
+def _read_jsonl(p: Path) -> list[dict]:
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def _box_pair_id(q: str) -> str:
+    return "box-" + hashlib.sha1(q.strip().encode()).hexdigest()[:10]
+
+
+def _search_log_view(days: int, limit: int, query: str = "") -> dict:
+    """/search-log — 최근 질의(새것 먼저)마다 상위 다섯 · 보정 표지 · 뒤이은 호출, 그리고 그 질의에 박스 표시가 있으면 그것."""
+    recs = _qlog_read(days)
+    outs: dict[str, list] = {}
+    for r in recs:
+        if "o" in r:
+            outs.setdefault(str(r["o"]), []).append({k: r.get(k) for k in ("t", "r", "ok")})
+    marks = {p.get("query"): {"gold": p.get("gold") or [], "verdict": p.get("verdict"), "at": p.get("at")}
+             for p in _read_jsonl(SEARCH_PAIRS_LOCAL_PATH)}
+    q_low = query.strip().lower()
+    rows = []
+    for r in reversed([r for r in recs if "q" in r]):
+        if q_low and q_low not in str(r.get("q") or "").lower():
+            continue
+        row = {k: r[k] for k in ("id", "d", "ts", "q", "mode", "fp", "top", "via", "boost_only") if k in r}
+        row["outcomes"] = outs.get(str(r.get("id")), [])
+        if r.get("q") in marks:
+            row["mark"] = marks[r["q"]]
+        rows.append(row)
+        if len(rows) >= limit:
+            break
+    return {"days": days, "count": len(rows), "searches": rows, "fingerprint": _tuning()["fingerprint"]}
+
+
+def _search_review_write(body: dict) -> dict:
+    """/search-review — 사람 표시를 박스 정답쌍(pairs.local.jsonl)에 둔다. 같은 질의는 바꿔 쓴다 · remove 는 지운다. 통째로 다시 쓴다(원자적)."""
+    q = str(body.get("q") or "").strip()
+    verdict = str(body.get("verdict") or "")
+    gold = [str(g).strip() for g in (body.get("gold") or []) if str(g).strip()]
+    if not q or len(q) > 500:
+        raise ValueError("q 는 1 ~ 500자")
+    if verdict not in _SEARCH_REVIEW_VERDICTS:
+        raise ValueError(f"verdict 는 {' · '.join(_SEARCH_REVIEW_VERDICTS)} 중 하나")
+    if verdict != "remove" and not (1 <= len(gold) <= 10 and all(re.fullmatch(r"[^:\s]+:[^\s]+", g) for g in gold)):
+        raise ValueError("gold 는 '앱키:원래 이름' 1 ~ 10개")
+    pid = _box_pair_id(q)
+    pairs = [p for p in _read_jsonl(SEARCH_PAIRS_LOCAL_PATH) if p.get("id") != pid]
+    if verdict != "remove":
+        pairs.append({"id": pid, "query": q, "gold": gold, "source": "box", "reviewed": True, "verdict": verdict,
+                      "memo": str(body.get("memo") or "")[:300], "qid": str(body.get("qid") or "")[:24] or None,
+                      "at": datetime.now(_KST).isoformat(timespec="seconds")})
+    TOOL_QUERY_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = SEARCH_PAIRS_LOCAL_PATH.with_name(SEARCH_PAIRS_LOCAL_PATH.name + ".tmp")
+    tmp.write_text("".join(json.dumps(p, ensure_ascii=False) + "\n" for p in pairs), encoding="utf-8")
+    os.replace(tmp, SEARCH_PAIRS_LOCAL_PATH)
+    return {"ok": True, "id": pid, "removed": verdict == "remove", "pairs": len(pairs)}
+
+
+def _eval_variants() -> dict[str, dict]:
+    """재는 판 — 지금 값(덧씌운 것) · 기본값 · 보정 끔 · 묶음 하나씩 끔."""
+    eff = _tuning()
+    try:
+        base_raw = json.loads(SEARCH_TUNING_PATH.read_text(encoding="utf-8"))
+        base = {**_tuning_parse(base_raw), "fingerprint": _json_fp(base_raw), "base_fingerprint": _json_fp(base_raw)}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        base = eff
+    out = {"effective": eff, "base": base,
+           "off": {**eff, "switches": {k: False for k in _TUNING_SWITCHES}}}
+    for k in _TUNING_SWITCHES:
+        out[f"-{k}"] = {**eff, "switches": {**eff["switches"], k: False}}
+    return out
+
+
+def _search_eval_run() -> dict:
+    """/search-eval — 떠 있는 카탈로그 · 서비스 시야로 정답쌍(추적 + 박스)을 판마다 잰다. 부분문자열 순위만(임베딩은 끈다) · 기록은 남기지 않는다.
+    일꾼 스레드에서 새 이벤트 루프로 돈다 — 게이트웨이 루프를 막지 않는다."""
+    t0 = time.monotonic()
+    pairs = _read_jsonl(SEARCH_PAIRS_PATH) + _read_jsonl(SEARCH_PAIRS_LOCAL_PATH)
+    keys = {t.name: _eval_name(t.name) for t in _visible_tools([SERVICE_GROUP])}
+    have = set(keys.values())
+    live = [p for p in pairs if p.get("query") and any(g in have for g in p.get("gold") or [])]
+    variants = _eval_variants()
+    ranks: dict[str, dict[str, int | None]] = {}
+
+    async def run_all():
+        for name, tun in variants.items():
+            ranks[name] = {}
+            for p in live:
+                res = await _search_tools({"query": p["query"], "limit": 20}, groups=[SERVICE_GROUP], tuning=tun,
+                                          embed=False, log_query=False)
+                ranked = json.loads(res.content[0].text).get("ranked") or [] if not res.isError else []
+                ranks[name][p["id"]] = next((i for i, n in enumerate(ranked, 1) if keys.get(n) in set(p["gold"])), None)
+    asyncio.run(run_all())
+
+    def summary(rv: dict, ids) -> dict:
+        rs = [rv[i] for i in ids]
+        n = len(rs)
+        if not n:
+            return {"n": 0}
+        return {"n": n, "hit@1": round(sum(1 for r in rs if r and r <= 1) / n, 3), "hit@5": round(sum(1 for r in rs if r and r <= 5) / n, 3),
+                "mrr@20": round(sum(1 / r for r in rs if r) / n, 3)}
+    by_src = {"전체": [p["id"] for p in live]}
+    for src in ("doc", "auto", "box"):
+        ids = [p["id"] for p in live if p.get("source") == src]
+        if ids:
+            by_src[src] = ids
+    out_v = {name: {g: summary(ranks[name], ids) for g, ids in by_src.items()} for name in variants}
+    changed = [{"id": p["id"], "query": p["query"], "source": p.get("source"),
+                "effective": ranks["effective"][p["id"]], "base": ranks["base"][p["id"]], "off": ranks["off"][p["id"]]}
+               for p in live if len({ranks["effective"][p["id"]], ranks["base"][p["id"]], ranks["off"][p["id"]]}) > 1]
+    return {"fingerprint": variants["effective"]["fingerprint"], "base": variants["base"]["fingerprint"],
+            "pairs": {"total": len(pairs), "measured": len(live), "missing_gold": len(pairs) - len(live),
+                      **{g: len(ids) for g, ids in by_src.items() if g != "전체"}},
+            "variants": out_v, "changed": changed[:40], "changed_count": len(changed),
+            "seconds": round(time.monotonic() - t0, 1)}
+
+
+async def _read_json_body(receive, limit: int = 64 * 1024) -> dict:
+    """ASGI 요청 본문을 JSON 객체로 — 크기 상한을 넘거나 객체가 아니면 ValueError."""
+    buf = b""
+    while True:
+        msg = await receive()
+        if msg.get("type") != "http.request":
+            break
+        buf += msg.get("body", b"")
+        if len(buf) > limit:
+            raise ValueError("본문이 너무 크다")
+        if not msg.get("more_body"):
+            break
+    d = json.loads(buf.decode("utf-8") or "{}")
+    if not isinstance(d, dict):
+        raise ValueError("본문은 객체여야 한다")
+    return d
+
+
 SEARCH_TOOLS_TOOL = types.Tool(
     name="search_tools",
     description=(
@@ -3047,7 +3198,8 @@ def _brief_desc(desc: str, n: int = 200) -> str:
     return (line[:cut + 1] if cut > n // 3 else line[:n]).rstrip() + " …"
 
 
-async def _search_tools(arguments: dict) -> types.CallToolResult:
+async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tuning: dict | None = None,
+                        embed: bool = True, log_query: bool = True) -> types.CallToolResult:
     """도구 검색 안내대 — 351개 평면 노출의 선택 비용을 줄이는 입구(실측: 상위 40개가
     호출의 79%, 30%는 한 번도 안 불림 — 롱테일은 검색으로 찾게 한다). 기본은 임베딩 없이
     부분문자열 매칭(한국어는 조사 탓에 토큰 경계가 흐려 substring 이 더 잘 맞는다). 켜면 임베딩 순위를 RRF 로
@@ -3062,7 +3214,8 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
     terms = [w for w in re.split(r"[\s,;·/()\[\]{}\"']+", q) if len(w) >= 2]
     # 손잡이(search_tuning.json + 박스 덧씌우기 — E-7). 도구 이름이 전부 영어라 한국어 질의가 이름을 못 맞힌다 — 손 동의어로 넓힌다
     # (조사가 붙어도 substring 이라 '보고서를'→'보고서' 매칭은 된다). 낱말마다 어느 규칙에서 온 갈래인지(src) 함께 든다 — 귀속(E-9 ①).
-    tun = _tuning()
+    # 키워드 인자는 평가 창구(/search-eval)만 쓴다 — 서비스 시야(groups) · 바꾼 손잡이(tuning) · 임베딩 끔 · 기록 끔(E-9 ③)
+    tun = tuning or _tuning()
     sw, wt = tun["switches"], tun["weights"]
     syn = tun["synonyms"] if sw["synonyms"] else {}
     q_flat = re.sub(r"\s+", "", q)
@@ -3098,7 +3251,7 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
     canon = (vocab or {}).get("canonical")
     quality_n = sum(1 for w in tun["quality_words"] if w in q) if sw["quality"] else 0
     w_name, w_app, cap, w_cov = wt["name"], wt["app"], wt["desc_cap"], wt["coverage"]
-    groups = _request_groups()
+    groups = _request_groups() if groups is None else groups
     visible = _visible_tools(groups)
     rows = []
     named_apps: set[str] = set()          # 질의가 이름을 부른 앱 — 사본 무리에서 그 앱 줄을 올린다
@@ -3148,7 +3301,7 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
     rows.sort(key=lambda r: (-r[0], r[7], r[1]))
     # 의미 순위(선택) — 켜져 있으면 임베딩 순위를 RRF 로 섞는다. 꺼져 있으면 이 아래는 종전과 한 글자도 다르지 않다.
     mode = None
-    if TOOL_SEARCH_EMBED_URL:
+    if TOOL_SEARCH_EMBED_URL and embed:
         rows, mode = await _tool_rank_fused(raw_q, rows, visible)
     # 같은 도구의 사본 — 원래 이름과 설명(정본 소개 줄은 뗀다)이 같으면 한 줄만 올리고 나머지는 same_in 으로 접는다(HG-01).
     # 그 한 줄은 무리에서 가장 앞선 줄의 자리에 서는 정본이다(R-4) — 질의가 사본의 앱을 콕 불렀을 때만 그 사본이다(OT-12 허브 건너기).
@@ -3223,7 +3376,8 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
     # 귀속 — 보정 뺀 점수로 줄을 세워, 보여 준 결과 가운데 보정 덕에만 든 것(boost_only — 보정을 빼면 0점이거나 limit 밖)을 가린다(E-9 ①)
     base_order = {r[1]: i for i, r in enumerate(sorted(rows, key=lambda r: (-r[8], r[7], r[1])), 1)}
     attrib = {r[1]: (r[9], r[8] <= 0 or base_order[r[1]] > limit) for r in rows[:limit]}
-    _log_tool_query(raw_q, (mode or {}).get("mode") or "substring", [m["tool"] for m in matches], attrib, tun["fingerprint"])
+    if log_query:
+        _log_tool_query(raw_q, (mode or {}).get("mode") or "substring", [m["tool"] for m in matches], attrib, tun["fingerprint"])
     # ⚠ 순서가 뜻이다 — 이름 순위·안내를 먼저, 설명·스키마 전문(matches)을 맨 뒤에 둔다. 작은 창의 소비자(dev 웹 챗
     #   TOOL_RESULT_MAX=6,000)는 앞에서부터 글자로 자르므로, 전문이 앞서면 6~8위 도구는 이름조차 사라져 '없다' 로 읽혔다(gw-adh GA-7,
     #   리스크 앱 도구 실측 8건 7,000~8,400자). 게이트웨이는 자르지 않는다 — 잘려도 순위가 남게 놓을 뿐이다.
@@ -5681,6 +5835,40 @@ def _bearer_gate(app, pat_verifier=None):
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": _body})
+            return
+        if scope.get("path") in ("/search-log", "/search-review", "/search-eval"):
+            # 검색 고리 창구(HWAXPortal docs/request-1029 E-9 ② ③) — 포털 관리자 화면이 공유 비밀로 부른다. 질의 원문을 내므로 무인증으로 두지 않는다.
+            async def _reply(status: int, obj: dict):
+                await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": json.dumps(obj, ensure_ascii=False).encode()})
+            if not _secret_eq(dict(scope.get("headers") or {}).get(b"authorization", b"").decode("latin-1"), expected):
+                await _reply(401, {"error": "unauthorized"})
+                return
+            path, method = scope.get("path"), scope.get("method")
+            try:
+                if path == "/search-log" and method == "GET":
+                    qs = parse_qs((scope.get("query_string") or b"").decode("utf-8"))
+                    days = max(1, min(TOOL_QUERY_LOG_DAYS, int((qs.get("days") or ["7"])[0])))
+                    limit = max(1, min(1000, int((qs.get("limit") or ["200"])[0])))
+                    await _reply(200, await anyio.to_thread.run_sync(lambda: _search_log_view(days, limit, (qs.get("q") or [""])[0])))
+                elif path == "/search-review" and method == "POST":
+                    await _reply(200, _search_review_write(await _read_json_body(receive)))
+                elif path == "/search-eval" and method == "POST":
+                    if _SEARCH_EVAL_LOCK["busy"]:
+                        await _reply(409, {"error": "평가가 이미 돌고 있다 — 끝난 뒤 다시"})
+                        return
+                    _SEARCH_EVAL_LOCK["busy"] = True
+                    try:
+                        await _reply(200, await anyio.to_thread.run_sync(_search_eval_run))
+                    finally:
+                        _SEARCH_EVAL_LOCK["busy"] = False
+                else:
+                    await _reply(405, {"error": "method not allowed"})
+            except ValueError as exc:
+                await _reply(400, {"error": str(exc)[:300]})
+            except Exception as exc:  # noqa: BLE001 — 창구의 실패가 게이트웨이를 죽이면 안 된다
+                log.warning("%s 실패: %r", path, exc)
+                await _reply(500, {"error": _clip(exc, 200)})
             return
         if scope.get("path") == "/refresh" and scope.get("method") == "POST":
             # 외부 MCP 의 기능 변경을 **즉시** 반영시키는 트리거. 주기 루프가 60초마다 같은

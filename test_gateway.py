@@ -24,6 +24,8 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "TOOL_QUERY_LOG", tmp_path / "qlog" / "queries.local.jsonl")
     monkeypatch.setattr(gw, "_QLOG", {"day": None})
     monkeypatch.setattr(gw, "_RECENT_SEARCH", gw.OrderedDict())
+    # 박스 정답쌍(사람 표시 — /search-review 가 쓴다)도 같다 — 안 걸면 시험 표시가 실제 박스 파일에 쌓인다(E-9 ②)
+    monkeypatch.setattr(gw, "SEARCH_PAIRS_LOCAL_PATH", tmp_path / "qlog" / "pairs.local.jsonl")
     # 검색 손잡이 덧씌우기도 같다 — 박스에 search_tuning.local.json 이 있으면 시험 순위가 그 박스 값으로 돈다. 기본값만 보게 없는 자리를 건다.
     monkeypatch.setattr(gw, "SEARCH_TUNING_LOCAL_PATH", tmp_path / "search_tuning.local.json")
     monkeypatch.setattr(gw, "_TUNING", {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None})
@@ -6178,7 +6180,8 @@ def _tool_search_embed_off(monkeypatch):
 # 순위를 일부러 바꿀 때만 다시 뜬다 — RRF 를 고치다 끈 길이 바뀌면 이 시험이 잡는다.
 # 10-29 저녁(E-7)에 손잡이를 search_tuning.json 으로 옮긴 판에서 다시 떴다 — 옮기기 전 사본과 응답이 바이트까지 같은 것을 먼저 보였다
 # (옛 사본은 코드 상수를 읽고 새 함수는 손잡이 파일을 읽었다). 귀속 · 기록 줄도 RRF 처럼 뺐다.
-_SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.CallToolResult:
+_SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tuning: dict | None = None,
+                        embed: bool = True, log_query: bool = True) -> types.CallToolResult:
     """도구 검색 안내대 — 351개 평면 노출의 선택 비용을 줄이는 입구(실측: 상위 40개가
     호출의 79%, 30%는 한 번도 안 불림 — 롱테일은 검색으로 찾게 한다). 기본은 임베딩 없이
     부분문자열 매칭(한국어는 조사 탓에 토큰 경계가 흐려 substring 이 더 잘 맞는다). 켜면 임베딩 순위를 RRF 로
@@ -6193,7 +6196,8 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
     terms = [w for w in re.split(r"[\s,;·/()\[\]{}\"']+", q) if len(w) >= 2]
     # 손잡이(search_tuning.json + 박스 덧씌우기 — E-7). 도구 이름이 전부 영어라 한국어 질의가 이름을 못 맞힌다 — 손 동의어로 넓힌다
     # (조사가 붙어도 substring 이라 '보고서를'→'보고서' 매칭은 된다). 낱말마다 어느 규칙에서 온 갈래인지(src) 함께 든다 — 귀속(E-9 ①).
-    tun = _tuning()
+    # 키워드 인자는 평가 창구(/search-eval)만 쓴다 — 서비스 시야(groups) · 바꾼 손잡이(tuning) · 임베딩 끔 · 기록 끔(E-9 ③)
+    tun = tuning or _tuning()
     sw, wt = tun["switches"], tun["weights"]
     syn = tun["synonyms"] if sw["synonyms"] else {}
     q_flat = re.sub(r"\s+", "", q)
@@ -6229,7 +6233,7 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
     canon = (vocab or {}).get("canonical")
     quality_n = sum(1 for w in tun["quality_words"] if w in q) if sw["quality"] else 0
     w_name, w_app, cap, w_cov = wt["name"], wt["app"], wt["desc_cap"], wt["coverage"]
-    groups = _request_groups()
+    groups = _request_groups() if groups is None else groups
     visible = _visible_tools(groups)
     rows = []
     named_apps: set[str] = set()          # 질의가 이름을 부른 앱 — 사본 무리에서 그 앱 줄을 올린다
@@ -8441,3 +8445,81 @@ def test_코어_어휘표_박스_덧씌우기는_merge_patch_로_얹는다(monke
     gw.os.utime(loc, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
     d = gw._core_vocab()
     assert d["fingerprint"] == base["fingerprint"] and "덧씌우기를 버렸다" in gw._core_vocab_health()["overlay"]["error"]
+
+
+# ── E-9 ② ③ — 검색 고리 창구(/search-log · /search-review · /search-eval) ─────────────────────────────────────────────
+def _gate_call(monkeypatch, path, method="GET", qs=b"", body=None, token="gw-secret"):
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    sent = []
+
+    async def send(m):
+        sent.append(m)
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body, ensure_ascii=False).encode() if body is not None else b"",
+                "more_body": False}
+    mw = gw._bearer_gate(None, None)
+    asyncio.run(mw({"type": "http", "path": path, "method": method, "query_string": qs,
+                    "headers": [(b"authorization", f"Bearer {token}".encode())]}, receive, send))
+    return sent[0]["status"], json.loads(sent[1]["body"])
+
+
+def test_E9_검색_고리_창구는_공유_비밀을_요구한다(monkeypatch):
+    for path, method in (("/search-log", "GET"), ("/search-review", "POST"), ("/search-eval", "POST")):
+        st, body = _gate_call(monkeypatch, path, method, body={}, token="wrong")
+        assert st == 401, path
+
+
+def test_E9_검색_기록_보기는_새것_먼저_뒤이은_호출과_박스_표시를_싣는다(monkeypatch):
+    _qlog_kit(monkeypatch)
+    monkeypatch.setattr(gw, "backends", {"signalforge": object()})
+    asyncio.run(gw._search_tools({"query": "report digest"}))
+    gw._audit("report_list", "signalforge", True, None, 5, caller="someone@example.com")
+    asyncio.run(gw._search_tools({"query": "요약"}))
+    st, body = _gate_call(monkeypatch, "/search-review", "POST", body={"q": "요약", "verdict": "ok", "gold": ["signalforge:digest"]})
+    assert st == 200 and body["ok"] and body["pairs"] == 1
+    st, body = _gate_call(monkeypatch, "/search-log", qs=b"days=3&limit=10")
+    assert st == 200 and [r["q"] for r in body["searches"]] == ["요약", "report digest"], "새것 먼저"
+    first, second = body["searches"]
+    assert first["mark"]["gold"] == ["signalforge:digest"] and first["boost_only"] == ["signalforge:digest"]
+    assert second["outcomes"] == [{"t": "signalforge:list", "r": 2, "ok": True}] and "mark" not in second
+    st, body = _gate_call(monkeypatch, "/search-log", qs=b"q=DIGEST")
+    assert [r["q"] for r in body["searches"]] == ["report digest"], "q 는 대소문자 없이 부분 일치로 거른다"
+
+
+def test_E9_사람_표시는_박스_정답쌍에_두고_같은_질의는_바꿔_쓰고_remove_는_지운다(monkeypatch):
+    for gold in (["signalforge:digest"], ["signalforge:list", "signalforge:digest"]):
+        st, body = _gate_call(monkeypatch, "/search-review", "POST", body={"q": " 요약 ", "verdict": "gold", "gold": gold, "memo": "m"})
+        assert st == 200
+    [p] = gw._read_jsonl(gw.SEARCH_PAIRS_LOCAL_PATH)
+    assert p["query"] == "요약" and p["gold"] == ["signalforge:list", "signalforge:digest"] and p["source"] == "box", p
+    assert p["id"] == gw._box_pair_id("요약") and p["reviewed"] is True and p["memo"] == "m"
+    st, body = _gate_call(monkeypatch, "/search-review", "POST", body={"q": "요약", "verdict": "remove"})
+    assert st == 200 and body["removed"] and gw._read_jsonl(gw.SEARCH_PAIRS_LOCAL_PATH) == []
+    for bad in ({"q": "", "verdict": "ok", "gold": ["a:b"]}, {"q": "x", "verdict": "maybe", "gold": ["a:b"]},
+                {"q": "x", "verdict": "ok", "gold": []}, {"q": "x", "verdict": "ok", "gold": ["앱키만"]}):
+        st, body = _gate_call(monkeypatch, "/search-review", "POST", body=bad)
+        assert st == 400, bad
+
+
+def test_E9_평가는_떠_있는_카탈로그로_판마다_재고_기록을_남기지_않는다(monkeypatch, tmp_path):
+    _search_catalog(monkeypatch)
+    _no_embed(monkeypatch)
+    pairs = tmp_path / "pairs.jsonl"
+    pairs.write_text("\n".join(json.dumps(p, ensure_ascii=False) for p in (
+        {"id": "doc-x", "query": "물성 조회", "gold": ["heax-materialtwin_web:get_material_properties"], "source": "doc"},
+        {"id": "doc-y", "query": "없는 도구", "gold": ["nowhere:none"], "source": "doc"})) + "\n", encoding="utf-8")
+    monkeypatch.setattr(gw, "SEARCH_PAIRS_PATH", pairs)
+    _gate_call(monkeypatch, "/search-review", "POST", body={"q": "응력 곡선 그림", "verdict": "gold",
+                                                            "gold": ["heax-materialtwin_web:plot_curve"]})
+    st, body = _gate_call(monkeypatch, "/search-eval", "POST", body={})
+    assert st == 200, body
+    assert body["pairs"]["total"] == 3 and body["pairs"]["measured"] == 2 and body["pairs"]["missing_gold"] == 1
+    assert body["pairs"]["box"] == 1 and body["pairs"]["doc"] == 1
+    assert set(body["variants"]) == {"effective", "base", "off", *[f"-{k}" for k in gw._TUNING_SWITCHES]}
+    assert body["variants"]["effective"]["전체"]["n"] == 2 and body["variants"]["effective"]["box"]["hit@5"] == 1.0
+    assert body["fingerprint"] == gw._tuning()["fingerprint"]
+    assert not [r for r in gw._qlog_read() if "q" in r], "평가 질의는 실사용 질의 기록에 섞이지 않는다"
+    monkeypatch.setattr(gw, "_SEARCH_EVAL_LOCK", {"busy": True})
+    st, _ = _gate_call(monkeypatch, "/search-eval", "POST", body={})
+    assert st == 409, "평가는 한 번에 하나"

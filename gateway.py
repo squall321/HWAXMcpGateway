@@ -841,6 +841,7 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001
         pass
+    _note_search_outcome(caller, tool, backend, bool(ok))      # 찾기 → 부르기 → 성공(E-9 ①) — 이 감사 줄이 그 찾기의 결과인가
 
 
 class _Backend:
@@ -2608,7 +2609,7 @@ async def _tool_embed_order(raw_q: str, tools: list[types.Tool]) -> tuple[list[t
 
 
 async def _tool_rank_fused(raw_q: str, rows: list, tools: list[types.Tool]) -> tuple[list, dict]:
-    """부분문자열 순위(rows — 정렬된 (점수, 이름, 앱, 설명, 도구, 쓰기, 원래 이름, 사본 표지))에 임베딩 순위를 RRF 로 섞는다 — (새 rows, 결과에 붙일 mode 칸).
+    """부분문자열 순위(rows — 정렬된 (점수, 이름, 앱, 설명, 도구, 쓰기, 원래 이름, 사본 표지, 보정 뺀 점수, 귀속))에 임베딩 순위를 RRF 로 섞는다 — (새 rows, 결과에 붙일 mode 칸).
     · 후보 — 부분문자열이 맞힌 도구 전부 + 임베딩 순위 상위 _TOOL_EMBED_DEPTH 개(순위로 자른다 — 코사인 문턱이 아니다).
     · 점수 — Σ 1/(k + 순위). 부분문자열 순위는 점수가 같으면 같은 순위로 친다 — 이름 차례가 섞기에 끼어들지 않게.
     · 못 섞으면 rows 를 그대로 두고 까닭을 단다."""
@@ -2626,7 +2627,7 @@ async def _tool_rank_fused(raw_q: str, rows: list, tools: list[types.Tool]) -> t
             app, original = route.get(t.name, ("_gateway", t.name))[:2]
             label = str((_app_meta(app) if app != "_gateway" else {}).get("label") or "")
             cand[t.name] = (0, t.name, app, (t.description or "").strip(), t, _tool_is_write(t, original), original,
-                            1 if _COPY_LABEL.search(label) else 0)
+                            1 if _COPY_LABEL.search(label) else 0, 0, ("embedding",))
     # 줄의 꼬리(쓰기 표지 · 원래 이름 · 사본 표지 — search_tools 의 줄 꼴)는 그대로 들고 간다. 점수 자리만 RRF 로 바꾼다.
     fused = [(1 / (_TOOL_RRF_K + emb[n]) + (1 / (_TOOL_RRF_K + lex[n]) if n in lex else 0.0), *r[1:])
              for n, r in cand.items()]
@@ -2634,16 +2635,25 @@ async def _tool_rank_fused(raw_q: str, rows: list, tools: list[types.Tool]) -> t
     return fused, {"mode": "rrf"}
 
 
-# ── search_tools 실사용 질의 모으기(HWAXPortal docs/followups-1017 결정 21 — 10-18 사용자 결정 '30일') ────────────
+# ── search_tools 실사용 질의 모으기(HWAXPortal docs/followups-1017 결정 21 · docs/request-1029 E-9 ①) ────────────
 # 평가셋(tool_search_eval/pairs.jsonl)에 실사용 질의가 없다 — 감사 원장은 search_tools 를 남기지 않는다(로컬 도구라 감사 밖).
-# 이름 · 주소 없이 날짜(KST) · 질의 원문 · 순위 방식 · 상위 다섯(평가셋 정답과 같은 '앱키:원래 이름')만 한 줄씩 덧붙인다.
-# 첫 줄 날짜부터 30일이 지나면 저절로 멈춘다 — 다시 모으려면 파일을 옮기고 재기동. 끄기 — GATEWAY_TOOL_QUERY_LOG=0.
-# 파일은 추적하지 않는다(.gitignore 의 tool_search_eval/*.local.*). 남기다 실패해도 검색은 그대로 답한다.
-TOOL_QUERY_LOG = Path(__file__).with_name("tool_search_eval") / "queries.local.jsonl"
+# 이름 · 주소 없이 날짜(KST) · 질의 원문 · 순위 방식 · 상위 다섯(평가셋 정답과 같은 '앱키:원래 이름')과, 손잡이 지문(fp) · 점수를 보탠 규칙(via) ·
+# 보정 덕에만 든 결과(boost_only)를 날짜별 파일(queries-YYYY-MM-DD.local.jsonl)에 한 줄씩 덧붙인다. 같은 호출자가 600초 안에 백엔드 도구를 부르면
+# 결과 줄({o: 질의 id, t, r: 순위 또는 null, ok})을 덧붙인다 — 사람 표시 없이 나오는 '찾기 → 부르기 → 성공' 신호다. 호출자는 기억에만 두고 적지 않는다.
+# 창은 굴러간다 — 날이 바뀔 때 TOOL_QUERY_LOG_DAYS(기본 30)일보다 오랜 날짜 파일을 지운다(10-18 결정 '30일' 을 일회성에서 굴러가는 창으로 —
+# 고리는 cae00 에서 닫힌다, C-31). 옛 일회성 파일(queries.local.jsonl)은 읽기만 한다. 끄기 — GATEWAY_TOOL_QUERY_LOG=0.
+# 파일은 추적하지 않는다(.gitignore 의 tool_search_eval/*.local.*). 남기다 실패해도 검색 · 호출은 그대로 답한다.
+TOOL_QUERY_LOG_DIR = Path(__file__).with_name("tool_search_eval")
+TOOL_QUERY_LOG = TOOL_QUERY_LOG_DIR / "queries.local.jsonl"          # 옛 30일 일회성 파일 — 읽는 쪽(_qlog_read)만 본다
 TOOL_QUERY_LOG_ON = os.environ.get("GATEWAY_TOOL_QUERY_LOG", "1").strip() != "0"
-TOOL_QUERY_LOG_DAYS = 30
+TOOL_QUERY_LOG_DAYS = max(1, int(os.environ.get("GATEWAY_TOOL_QUERY_LOG_DAYS", "30") or 30))
+SEARCH_OUTCOME_WINDOW_S = 600       # 찾은 뒤 이만큼 안의 호출을 그 찾기의 결과로 본다
+SEARCH_OUTCOME_PER_QUERY = 5        # 찾기 하나에 결과 줄은 서로 다른 도구 다섯까지
 _KST = timezone(timedelta(hours=9))
-_QLOG: dict = {"first": None, "stopped": False}
+_QLOG: dict = {"day": None}
+_RECENT_SEARCH: "OrderedDict[str, tuple]" = OrderedDict()   # 호출자 → (질의 id, 찾은 때, {앱키:원래 이름: 순위}, 결과를 적은 도구들)
+_RECENT_SEARCH_MAX = 500
+_QLOG_FILE = re.compile(r"^queries-(\d{4}-\d{2}-\d{2})\.local\.jsonl$")
 
 
 def _eval_name(name: str) -> str:
@@ -2652,36 +2662,89 @@ def _eval_name(name: str) -> str:
     return f"{b[0]}:{b[1]}" if b else f"_gateway:{name}"
 
 
-def _log_tool_query(q: str, mode: str, ranked: list[str]) -> None:
-    if not TOOL_QUERY_LOG_ON or _QLOG["stopped"]:
-        return
-    try:
-        today = datetime.now(_KST).date()
-        if _QLOG["first"] is None:
-            first = today
-            head = ""
-            if TOOL_QUERY_LOG.exists():
-                with open(TOOL_QUERY_LOG, encoding="utf-8") as f:
-                    head = f.readline().strip()
-            if head:
+def _qlog_write(rec: dict) -> None:
+    """오늘(KST) 날짜 파일에 한 줄. 날이 바뀌면 창 밖의 날짜 파일을 지운다."""
+    today = datetime.now(_KST).date()
+    TOOL_QUERY_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if _QLOG["day"] != today:
+        _QLOG["day"] = today
+        for f in TOOL_QUERY_LOG_DIR.iterdir():
+            m = _QLOG_FILE.match(f.name)
+            if m and (today - date.fromisoformat(m.group(1))).days >= TOOL_QUERY_LOG_DAYS:
+                f.unlink(missing_ok=True)
+    with open(TOOL_QUERY_LOG_DIR / f"queries-{today.isoformat()}.local.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"d": today.isoformat(), **rec}, ensure_ascii=False) + "\n")
+
+
+def _qlog_read(days: int | None = None) -> list[dict]:
+    """모은 줄 전부(옛 일회성 파일 + 날짜 파일, 날짜 차례) — 질의 줄과 결과 줄이 섞여 있다. days 를 주면 그날 수 안의 것만."""
+    files = sorted(f for f in TOOL_QUERY_LOG_DIR.glob("queries-*.local.jsonl") if _QLOG_FILE.match(f.name))
+    if TOOL_QUERY_LOG.exists():
+        files.insert(0, TOOL_QUERY_LOG)
+    cut = (datetime.now(_KST).date() - timedelta(days=days - 1)).isoformat() if days else ""
+    out = []
+    for f in files:
+        try:
+            for line in f.read_text(encoding="utf-8").splitlines():
                 try:
-                    first = date.fromisoformat(json.loads(head)["d"])
-                except Exception:  # noqa: BLE001 — 시작 날짜를 모르면 30일을 셀 수 없다 → 모으지 않는 쪽으로
-                    _QLOG["stopped"] = True
-                    log.warning("search_tools 질의 모으기 — %s 첫 줄의 날짜를 못 읽어 멈춘다(30일을 셀 수 없다)", TOOL_QUERY_LOG)
-                    return
-            _QLOG["first"] = first
-        if (today - _QLOG["first"]).days >= TOOL_QUERY_LOG_DAYS:
-            _QLOG["stopped"] = True
-            log.info("search_tools 질의 모으기 — 첫 줄(%s)부터 %d일이 지나 멈췄다(%s). 다시 모으려면 파일을 옮기고 재기동",
-                     _QLOG["first"], TOOL_QUERY_LOG_DAYS, TOOL_QUERY_LOG)
-            return
-        TOOL_QUERY_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(TOOL_QUERY_LOG, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"d": today.isoformat(), "q": q, "mode": mode, "top": [_eval_name(n) for n in ranked[:5]]},
-                               ensure_ascii=False) + "\n")
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and str(rec.get("d") or "") >= cut:
+                    out.append(rec)
+        except OSError:
+            continue
+    return out
+
+
+def _log_tool_query(q: str, mode: str, ranked: list[str], attrib: dict | None = None, fp: str | None = None) -> str | None:
+    """질의 한 줄을 남기고 그 id 를 돌려준다. attrib — {노출 이름: (점수를 보탠 규칙, 보정 덕에만 들었나)}."""
+    if not TOOL_QUERY_LOG_ON:
+        return None
+    try:
+        qid = os.urandom(6).hex()
+        rec: dict = {"ts": int(time.time()), "id": qid, "q": q, "mode": mode, "top": [_eval_name(n) for n in ranked[:5]]}
+        if fp:
+            rec["fp"] = fp
+        attrib = attrib or {}
+        via = {_eval_name(n): list(attrib[n][0]) for n in ranked[:5] if n in attrib and attrib[n][0]}
+        if via:
+            rec["via"] = via
+        boost = [_eval_name(n) for n in ranked[:5] if n in attrib and attrib[n][1]]
+        if boost:
+            rec["boost_only"] = boost
+        _qlog_write(rec)
+        caller = _request_user()
+        if caller:
+            _RECENT_SEARCH[caller] = (qid, time.monotonic(), {_eval_name(n): i for i, n in enumerate(ranked, 1)}, set())
+            _RECENT_SEARCH.move_to_end(caller)
+            while len(_RECENT_SEARCH) > _RECENT_SEARCH_MAX:
+                _RECENT_SEARCH.popitem(last=False)
+        return qid
     except Exception as exc:  # noqa: BLE001 — 모으기가 검색을 막지 않는다
         log.warning("search_tools 질의를 남기지 못했다(%r) — 검색은 그대로 답한다", exc)
+        return None
+
+
+def _note_search_outcome(caller: str | None, tool: str, backend: str | None, ok: bool) -> None:
+    """찾기 뒤의 호출 — 같은 호출자의 마지막 찾기가 창 안이면 결과 줄(순위 · 성공)을 남긴다. 감사(_audit)가 부른다."""
+    if not TOOL_QUERY_LOG_ON or not caller or caller not in _RECENT_SEARCH or backend not in backends:
+        return
+    try:
+        qid, t0, ranks, seen = _RECENT_SEARCH[caller]
+        if time.monotonic() - t0 > SEARCH_OUTCOME_WINDOW_S:
+            _RECENT_SEARCH.pop(caller, None)
+            return
+        r = route.get(tool) or alias_route.get(tool)
+        if r is None:
+            return                                   # 도구로 풀리지 않는 감사 줄(rest_call · resources/read …)은 찾기의 결과가 아니다
+        key = f"{r[0]}:{r[1]}"
+        if key in seen or len(seen) >= SEARCH_OUTCOME_PER_QUERY:
+            return
+        seen.add(key)
+        _qlog_write({"ts": int(time.time()), "o": qid, "t": key, "r": ranks.get(key), "ok": bool(ok)})
+    except Exception as exc:  # noqa: BLE001 — 결과 줄이 호출을 막지 않는다
+        log.warning("search_tools 결과 줄을 남기지 못했다(%r)", exc)
 
 
 SEARCH_TOOLS_TOOL = types.Tool(
@@ -2706,14 +2769,15 @@ SEARCH_TOOLS_TOOL = types.Tool(
 
 
 # ── search_tools 순위의 손잡이(HWAXPortal docs/request-1027 HG-01) ──────────────────────────────────────────
-# 쓰기 · 잡 시작 의도 낱말 — 질의에 하나도 없으면 쓰기 도구를 감점한다. 조회 질문(OT-16)의 상위 8 중 6개가 쓰기 · 적용 도구였다.
-# 한 글자 어간은 넣지 않는다(다른 낱말 안에 너무 자주 든다). 심의 · 토의 · 심사 · 회의는 그 자체가 잡을 세우는 일이라 의도로 친다.
-_WRITE_INTENT = ("등록", "생성", "만들", "추가", "수정", "고치", "고쳐", "바꾸", "바꿔", "변경", "삭제", "지우", "지워", "저장", "올리",
-                 "올려", "업로드", "반입", "가져오", "실행", "돌리", "돌려", "제출", "시작", "걸어", "적용", "반영", "보내", "발행", "게시",
-                 "취소", "중지", "멈추", "멈춰", "학습", "이어서", "다시 돌", "채워", "채우", "넣어", "넣고", "남기", "남겨",
-                 "붙여", "붙이", "기각", "승인", "심의", "토의", "심사", "회의",
-                 "create", "add ", "update", "edit", "modify", "delete", "remove", "save", "register", "upload", "import",
-                 "run ", "execute", "submit", "start", "launch", "apply", "publish", "send", "cancel", "stop", "train", "rename")
+# 낱말 묶음 셋은 search_tuning.json 으로 옮겼다(docs/request-1029 E-7 — 박스에서 덧씌워 튜닝한다). 까닭은 그대로다.
+#   write_intent — 쓰기 · 잡 시작 의도 낱말. 질의에 하나도 없으면 쓰기 도구를 감점한다(weights.write_penalty). 조회 질문(OT-16)의 상위 8 중
+#     6개가 쓰기 · 적용 도구였다. 한 글자 어간은 넣지 않는다(다른 낱말 안에 너무 자주 든다). 심의 · 토의 · 심사 · 회의는 그 자체가 잡을 세우는
+#     일이라 의도로 친다.
+#   quality — 품질 질의 낱말. 있으면 품질 · VOC 영역 도구에 가중을 준다(weights.quality_per_word). '시장 불량 원인 대책' 상위 10 중
+#     deliberate_* 가 8개이고 plm_defect_search · VOC 도구는 0개였다.
+#   delib_ask — 심의를 청하는 낱말. 코어 질문(어휘표 낱말이 든 질의)에 이것이 없으면 일반 업무 낱말(원인 · 판정 · 설계 …)을 deliberate_start 에
+#     잇지 않는다(R-5). 코어 낱말이 없는 질의는 종전대로 잇는다 — 다 끊으면 '안 선택' · '신뢰 판정' 같은 심의 업무 낱말 14쌍 중 7쌍이
+#     밀렸다(평가셋 doc-04 1 → 10위 · doc-05 2 → 20위, 10-29 dev 카탈로그).
 # 쓰기 · 잡 시작 도구의 이름 꼴 — 원래 이름의 낱말(밑줄로 가른 조각) 하나가 동사면 쓰기로 본다. 앱이 readOnlyHint 를 달았으면 그것이 이긴다.
 # 순위의 감점일 뿐이라(막지 않는다) 틀려도 조금 내려갈 뿐이다. 안내 · 미리보기 꼴은 뺀다(upload_instructions 는 읽기다).
 _WRITE_NAME = re.compile(r"(?:^|_)(create|update|delete|remove|set|save|register|upload|submit|run|rerun|start|import|ingest|apply|add|"
@@ -2721,15 +2785,127 @@ _WRITE_NAME = re.compile(r"(?:^|_)(create|update|delete|remove|set|save|register
                          r"fileback|decide|ack|attach|intake|record|forget|draft|send|purge|restore|trash|reload|reset|continue|upsert|merge|"
                          r"replace|overwrite|write)(?:_|$)")
 _READ_NAME_HINT = re.compile(r"(instructions|guide|advice|preview|estimate|status|history|_log$|_state$)")
-# 품질 질의 낱말 — 있으면 품질 · VOC 영역 도구에 가중을 준다. '시장 불량 원인 대책' 상위 10 중 deliberate_* 가 8개이고
-# plm_defect_search · VOC 도구는 0개였다.
-_QUALITY_WORDS = ("불량", "시장", "원인", "대책", "사례")
 # 같은 도구 사본의 정본 고르기 — 점수가 같으면 라벨에 시험 · 사본 표지가 없는 앱을 앞에 둔다(종전엔 이름순이라 사본 허브가 앞이었다).
 _COPY_LABEL = re.compile(r"[(\[](?:시험|사본|테스트|test|copy|staging|dev)[)\]]", re.I)
-# 심의를 청하는 낱말 — 코어 질문(어휘표 낱말이 든 질의)에 이것이 없으면 일반 업무 낱말(원인 · 판정 · 설계 …)을 deliberate_start 에 잇지
-# 않는다(HWAXPortal docs/request-1029 R-5). 코어 낱말이 없는 질의는 종전대로 잇는다 — 다 끊으면 '안 선택' · '신뢰 판정' 같은 심의 업무 낱말
-# 14쌍 중 7쌍이 밀렸다(평가셋 doc-04 1 → 10위 · doc-05 2 → 20위, 10-29 dev 카탈로그).
-_DELIB_ASK = ("심의", "토의", "회의")
+
+# ── 검색 손잡이 파일(HWAXPortal docs/request-1029 E-7 · 설계 2.5 ①) ──────────────────────────────────────────────
+# 손 동의어 · 품질 낱말 · 심의 낱말 · 쓰기 의도 낱말 · 가중치를 코드 대신 search_tuning.json(추적 — 기본값)에 둔다. 박스는 같은 자리의
+# search_tuning.local.json(gitignore)에 바꿀 칸만 적어 커밋 없이 튜닝한다 — JSON merge patch(RFC 7386). 두 파일의 바뀐 시각을 보고 재기동 없이
+# 다시 읽는다. 덧씌우기가 깨지면 버리고 기본값으로 돈다(까닭은 /health 의 search_tuning). 기본값이 깨지면(리포의 결함) 마지막으로 읽은 값,
+# 그것도 없으면 손 동의어 없는 _TUNING_FALLBACK 으로 돈다. 고리는 cae00 에서 닫힌다 — 거기서 고치고 그 자리에서 잰다(C-31).
+SEARCH_TUNING_PATH = Path(__file__).with_name("search_tuning.json")
+SEARCH_TUNING_LOCAL_PATH = Path(__file__).with_name("search_tuning.local.json")
+_TUNING_SWITCHES = ("synonyms", "core_vocab", "delib_narrow", "quality", "write_penalty", "copy_fold")
+_TUNING_WEIGHTS = ("name", "desc_cap", "app", "coverage", "write_penalty", "quality_per_word")
+_TUNING_FALLBACK = {"weights": {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2}}
+_TUNING: dict = {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None}
+
+
+def _merge_patch(target, patch):
+    """JSON merge patch(RFC 7386) — 객체는 재귀로 합치고, 그 밖은 바꾸며, null 은 그 칸을 지운다(목록은 통째로 바뀐다)."""
+    if not isinstance(patch, dict):
+        return patch
+    out = dict(target) if isinstance(target, dict) else {}
+    for k, v in patch.items():
+        if v is None:
+            out.pop(k, None)
+        else:
+            out[k] = _merge_patch(out.get(k), v)
+    return out
+
+
+def _json_fp(obj) -> str:
+    """값의 지문 — 키 차례 JSON 의 sha256 앞 12자(설명 칸 _doc 은 뺀다). dev 와 cae00 이 다르게 도는 것을 숫자 곁에서 보인다."""
+    if isinstance(obj, dict):
+        obj = {k: v for k, v in obj.items() if k != "_doc"}
+    return hashlib.sha256(json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:12]
+
+
+def _patch_paths(patch: dict) -> list[str]:
+    """덧씌우기가 건드린 칸 — 두 층까지 점 이름으로(switches.quality · synonyms.메인 PBA). /health 에 싣는다."""
+    out = []
+    for k, v in patch.items():
+        if k == "_doc":
+            continue
+        out += [f"{k}.{kk}" for kk in v] if isinstance(v, dict) and v else [k]
+    return out
+
+
+def _tuning_parse(d: dict) -> dict:
+    """손잡이 꼴 → 순위가 쓰는 값. 꼴이 틀리면 예외(그 판을 버린다)."""
+    sw = d.get("switches") or {}
+    weights = {}
+    for k in _TUNING_WEIGHTS:
+        v = d["weights"][k]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise TypeError(f"weights.{k} 는 수여야 한다")
+        weights[k] = v
+    syn = {}
+    for k, e in (d.get("synonyms") or {}).items():
+        to = e["to"]
+        if not isinstance(to, list):
+            raise TypeError(f"synonyms.{k}.to 는 목록이어야 한다")
+        syn[str(k).lower()] = tuple(str(x).lower() for x in to)
+    words = lambda key: tuple(str(x).lower() for x in (d.get(key) or ()))  # noqa: E731
+    quality = d.get("quality") or {}
+    return {"switches": {k: sw.get(k, True) is not False for k in _TUNING_SWITCHES}, "weights": weights, "synonyms": syn,
+            "owners": {str(k).lower(): {"owner": (e or {}).get("owner"), "source_fix": (e or {}).get("source_fix")}
+                       for k, e in (d.get("synonyms") or {}).items()},
+            "quality_words": tuple(str(x).lower() for x in quality.get("words") or ()),
+            "quality_areas": tuple(str(x) for x in quality.get("areas") or ()),
+            "delib_ask": words("delib_ask"), "write_intent": words("write_intent")}
+
+
+def _tuning() -> dict:
+    """지금 쓰는 검색 손잡이 — 기본값에 박스 덧씌우기를 얹은 것. 두 파일의 바뀐 시각이 같으면 다시 읽지 않는다."""
+    def mt(p: Path):
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return None
+    key = (mt(SEARCH_TUNING_PATH), mt(SEARCH_TUNING_LOCAL_PATH))
+    if key == _TUNING["key"] and _TUNING["data"] is not None:
+        return _TUNING["data"]
+    base_raw, error = None, None
+    try:
+        base_raw = json.loads(SEARCH_TUNING_PATH.read_text(encoding="utf-8"))
+        base = _tuning_parse(base_raw)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        error = f"기본값을 못 읽음({type(exc).__name__})"
+        log.warning("검색 손잡이 기본값(%s)을 못 읽었다 — %s: %r", SEARCH_TUNING_PATH, "마지막 값으로 돈다" if _TUNING["data"] else
+                    "손 동의어 없이 돈다", exc)
+        if _TUNING["data"] is not None:
+            _TUNING.update(key=key, error=error)
+            return _TUNING["data"]
+        base_raw, base = _TUNING_FALLBACK, _tuning_parse(_TUNING_FALLBACK)
+    data, overlay = base, {"present": key[1] is not None}
+    eff_raw = base_raw
+    if key[1] is not None:
+        try:
+            patch = json.loads(SEARCH_TUNING_LOCAL_PATH.read_text(encoding="utf-8"))
+            if not isinstance(patch, dict):
+                raise TypeError("덧씌우기는 객체여야 한다")
+            eff_raw = _merge_patch(base_raw, patch)
+            data = _tuning_parse(eff_raw)
+            overlay.update(fingerprint=_json_fp(patch), changed=_patch_paths(patch)[:40])
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            data, eff_raw = base, base_raw
+            overlay["error"] = f"덧씌우기를 버렸다({type(exc).__name__}: {str(exc)[:120]})"
+            log.warning("검색 손잡이 덧씌우기(%s)를 버리고 기본값으로 돈다: %r", SEARCH_TUNING_LOCAL_PATH, exc)
+    data = {**data, "fingerprint": _json_fp(eff_raw), "base_fingerprint": _json_fp(base_raw)}
+    _TUNING.update(key=key, data=data, error=error, overlay=overlay)
+    return data
+
+
+def _tuning_health() -> dict:
+    """/health 의 search_tuning — 지문(덧씌운 값 · 기본값) · 꺼 둔 묶음 · 덧씌우기(있나 · 지문 · 건드린 칸 · 버린 까닭). 경로는 싣지 않는다."""
+    d = _tuning()
+    out = {"fingerprint": d["fingerprint"], "base": d["base_fingerprint"],
+           "switches_off": [k for k in _TUNING_SWITCHES if not d["switches"][k]], "synonyms": len(d["synonyms"]),
+           "overlay": dict(_TUNING["overlay"] or {"present": False})}
+    if _TUNING["error"]:
+        out["error"] = _TUNING["error"]
+    return out
 
 # ── 코어 어휘표(HWAXPortal docs/request-1029 B-1 · C-11) ──────────────────────────────────────────────
 # 정본은 포털 리포의 backend/config/core_vocab.json 이다. 게이트웨이 · 포털은 늘 한 박스에 형제 리포로 있어(dev ~/claude · cae00 ~/Projects)
@@ -2861,54 +3037,30 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
         return types.CallToolResult(content=[types.TextContent(
             type="text", text='{"error": "query 를 2자 이상 주세요"}')], isError=True)
     terms = [w for w in re.split(r"[\s,;·/()\[\]{}\"']+", q) if len(w) >= 2]
-    # 도구 이름이 전부 영어라 한국어 질의가 이름을 못 맞힌다 — 도메인 동의어로 넓힌다.
-    # (조사가 붙어도 substring 이라 '보고서를'→'보고서' 매칭은 된다.)
-    _SYN = {
-        "보고서": ("report",), "리포트": ("report",), "요약": ("digest", "summary"),
-        "검색": ("search",), "조회": ("get", "list", "search"), "목록": ("list",),
-        "물성": ("material", "property", "material_property"), "재료": ("material",), "곡선": ("curve",),
-        "잡": ("job",), "작업": ("job",), "상태": ("status", "health"),
-        "슬럼": ("slurm",), "슬럼잡": ("slurm",), "클러스터": ("cluster",),
-        "메쉬": ("mesh",), "메시": ("mesh",), "형상": ("geometry", "shape"),
-        "시험": ("test",), "측정": ("measure",), "업로드": ("upload",),
-        "그래프": ("plot", "chart"), "차트": ("chart", "plot"), "그림": ("plot", "render"),
-        "템플릿": ("template",), "초안": ("draft",), "전문가": ("agent", "expert"),
-        "부품": ("part",), "적층": ("laminate",), "대화": ("conversation",),
-        # 낙하/충격 리포트(DynaForge) 계열 — 도구 이름이 report_angle_stats·report_part_energy·
-        # report_scatter·report_geometry·report_upload_instructions 라 한국어 업무어가 이름을 못 맞힌다.
-        "낙하": ("drop", "impact", "sphere"), "충격": ("impact",), "전각도": ("sphere", "angle"),
-        "방향": ("angle", "direction", "scatter"), "각도": ("angle",), "산포": ("scatter",),
-        "에너지": ("energy",), "소성": ("plastic", "strain"), "변형률": ("strain",),
-        "응력": ("stress",), "속도": ("velocity",), "인테이크": ("intake", "upload"),
-        "반입": ("intake", "upload"), "시각화": ("geometry", "render"),
-        # 심의 계열 — 도구 이름이 deliberate_* 라 한국어 업무 낱말이 이름을 못 맞힌다.
-        # 앱 설명만으로는 app_hit 가산점뿐이라 다른 앱에 밀린다(실측: '안 선택' 이 물성·VOC 에 밀림).
-        # 이름까지 맞히게 이어 준다 — 한 글자 토큰('안')은 위에서 이미 버려지므로 두 글자 이상만.
-        "심의": ("deliberate",), "토의": ("deliberate",), "심사": ("deliberate", "risk"),
-        "리스크": ("deliberate", "risk"), "위험": ("deliberate", "risk"),
-        "전문가심의": ("deliberate",), "회의": ("deliberate", "meeting"),
-        # 일반 업무 낱말은 심의를 **시작하는 도구 하나**에만 잇는다 — 가족 접두(deliberate)에 이으면 status · result · list ·
-        # transcript … 여덟이 한꺼번에 이름 적중을 받아, '시장 불량 원인 대책' 상위 10 중 8개가 deliberate_* 였다(HG-01).
-        "규명": ("deliberate_start",), "원인": ("deliberate_start",), "불량": ("deliberate_start", "defect", "failure"),
-        "선택": ("deliberate_start",), "대안": ("deliberate_start",), "판정": ("deliberate_start",),
-        "신뢰": ("deliberate_start",), "도출": ("deliberate_start",), "설계": ("deliberate_start",),
-        "계획": ("deliberate_start", "plan"),
-        # 코어 온톨로지 — 허브 읽기 도구(object_resolve · objects_list · graph_neighbors …)와 타입 이름에 잇는다. 코어 질문 16개 중 15개에서
-        # 상위 8에 허브 온톨로지 읽기 도구가 0개였다(온톨로지 시험 C-5).
-        "과제": ("object_resolve", "plm_task", "task"), "고장모드": ("failure_mode",), "고장": ("failure",),
-        "시험항목": ("test_item",), "가상검증": ("sim_capability",), "관리기준": ("criterion",), "기준": ("criterion",),
-        "영률": ("material_property", "modulus", "young"),
-        "전작": ("predecessor", "graph_neighbors"), "후속": ("successor", "graph_neighbors"),
-        "시장": ("market", "voc"), "대책": ("countermeasure",),
-    }
+    # 손잡이(search_tuning.json + 박스 덧씌우기 — E-7). 도구 이름이 전부 영어라 한국어 질의가 이름을 못 맞힌다 — 손 동의어로 넓힌다
+    # (조사가 붙어도 substring 이라 '보고서를'→'보고서' 매칭은 된다). 낱말마다 어느 규칙에서 온 갈래인지(src) 함께 든다 — 귀속(E-9 ①).
+    tun = _tuning()
+    sw, wt = tun["switches"], tun["weights"]
+    syn = tun["synonyms"] if sw["synonyms"] else {}
     q_flat = re.sub(r"\s+", "", q)
     vocab = _core_vocab()
     # 코어 질문에서는 일반 업무 낱말 → deliberate_start 를 심의를 청할 때만 잇는다(R-5 — 조회 질문이 심의 시작으로 끌렸다).
-    no_delib = bool(vocab) and not any(w in q for w in _DELIB_ASK) and any(f in q_flat for f, _p, _t in vocab["syn"])
-    expand = {w: (w,) + tuple(s for k, ss in _SYN.items() if k in w for s in ss if not (no_delib and s == "deliberate_start"))
-              for w in terms}
-    write_intent = any(w in q + " " for w in _WRITE_INTENT)
-    if vocab:
+    no_delib = (sw["delib_narrow"] and bool(vocab) and not any(w in q for w in tun["delib_ask"])
+                and any(f in q_flat for f, _p, _t in vocab["syn"]))
+    expand: dict[str, tuple] = {}
+    src: dict[str, dict[str, list]] = {}
+    for w in terms:
+        vs, sm = [w], {}
+        for k, ss in syn.items():
+            if k in w:
+                for v in ss:
+                    if no_delib and v == "deliberate_start":
+                        continue
+                    vs.append(v)
+                    sm.setdefault(v, []).append(f"syn:{k}")
+        expand[w], src[w] = tuple(vs), sm
+    write_intent = any(w in q + " " for w in tun["write_intent"])
+    if vocab and sw["core_vocab"]:
         # 코어 낱말 → 허브 읽기 도구 이름(R-4 — 타입 이름에 이으면 어느 도구 이름 · 설명에도 없어 0점이었다). 띄어 쓴 꼴('관리 기준')은
         # 붙여 쓴 꼴이 질의에 있으면 그 조각을 담은 낱말마다 잇는다 — 낱말은 빈칸에서 갈라지므로 '관리기준' 열쇠로는 못 맞힌다.
         for flat, parts, tools in vocab["syn"]:
@@ -2916,9 +3068,13 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
             if not hit and parts and flat in q_flat:
                 hit = [w for w in expand if any(p in w for p in parts)]
             for w in hit:
-                expand[w] += tuple(t for t in tools if t not in expand[w])
+                add = tuple(t for t in tools if t not in expand[w])
+                expand[w] += add
+                for v in add:
+                    src[w].setdefault(v, []).append(f"vocab:{flat}")
     canon = (vocab or {}).get("canonical")
-    quality_n = sum(1 for w in _QUALITY_WORDS if w in q)
+    quality_n = sum(1 for w in tun["quality_words"] if w in q) if sw["quality"] else 0
+    w_name, w_app, cap, w_cov = wt["name"], wt["app"], wt["desc_cap"], wt["coverage"]
     groups = _request_groups()
     visible = _visible_tools(groups)
     rows = []
@@ -2932,9 +3088,11 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
         hay_app = (label + " " + str(meta.get("description") or "")).lower()
         names = _label_names(label)
         score, covered = 0, 0
+        base, base_cov = 0, 0             # 보정 없이 — 질의 낱말 그 자체만으로 낸 점수(귀속 · boost_only 판정)
+        via: set[str] = set()
         for w, variants in expand.items():
             name_hit = any(v in name for v in variants)
-            desc_freq = max(min(desc.count(v), 3) for v in variants)
+            desc_freq = max(min(desc.count(v), cap) for v in variants)
             app_hit = any(v in hay_app for v in variants)
             # 질의가 앱 이름을 불렀으면(진짜 앱 라벨 적중) 이름 적중과 같은 가중이다 — 종전엔 라벨 · 설명 어디에 맞든 1점이었다(HG-01).
             named = any(_named(names, v, q_flat) for v in variants)
@@ -2942,17 +3100,28 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
                 named_apps.add(app)
             if name_hit or desc_freq or app_hit or named:
                 covered += 1
-                score += 4 * (name_hit or named) + desc_freq + app_hit
+                score += w_name * (name_hit or named) + desc_freq + w_app * app_hit
+                b_name, b_desc, b_app, b_named = w in name, min(desc.count(w), cap), w in hay_app, _named(names, w, q_flat)
+                if b_name or b_desc or b_app or b_named:
+                    base_cov += 1
+                    base += w_name * (b_name or b_named) + b_desc + w_app * b_app
+                for v in variants[1:]:
+                    if v in name or v in desc or v in hay_app or _named(names, v, q_flat):
+                        via.update(src[w].get(v, ()))
         if score > 0:
-            if quality_n and _area_of(t.name, app) in ("quality", "voc"):
-                score += 2 * quality_n          # 품질 질의 — 품질 · VOC 도구를 위로(HG-01)
+            if quality_n and _area_of(t.name, app) in tun["quality_areas"]:
+                score += wt["quality_per_word"] * quality_n          # 품질 질의 — 품질 · VOC 도구를 위로(HG-01)
+                via.add("quality")
             # 커버리지 승수 — 질의어를 더 많이 맞힌 도구가 개별 단어 빈도보다 앞선다.
-            final = score * (1 + covered / max(1, len(terms)))
+            final = score * (1 + w_cov * covered / max(1, len(terms)))
+            base_final = base * (1 + w_cov * base_cov / max(1, len(terms))) if base > 0 else 0
             is_write = _tool_is_write(t, original)
-            if is_write and not write_intent:
-                final *= 0.5                    # 쓰기 낱말이 없는 질문 — 쓰기 · 잡 시작 도구를 내린다(HG-01)
+            if is_write and not write_intent and sw["write_penalty"]:
+                final *= wt["write_penalty"]                     # 쓰기 낱말이 없는 질문 — 쓰기 · 잡 시작 도구를 내린다(HG-01)
+                base_final *= wt["write_penalty"]
+            # 줄 꼴 — (점수, 이름, 앱, 설명, 도구, 쓰기, 원래 이름, 사본 표지, 보정 뺀 점수, 점수를 보탠 규칙)
             rows.append((final, t.name, app, (t.description or "").strip(), t, is_write, original,
-                         1 if _COPY_LABEL.search(label) else 0))
+                         1 if _COPY_LABEL.search(label) else 0, base_final, tuple(sorted(via))))
     rows.sort(key=lambda r: (-r[0], r[7], r[1]))
     # 의미 순위(선택) — 켜져 있으면 임베딩 순위를 RRF 로 섞는다. 꺼져 있으면 이 아래는 종전과 한 글자도 다르지 않다.
     mode = None
@@ -2962,27 +3131,28 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
     # 그 한 줄은 무리에서 가장 앞선 줄의 자리에 서는 정본이다(R-4) — 질의가 사본의 앱을 콕 불렀을 때만 그 사본이다(OT-12 허브 건너기).
     # 형제 사본은 겹침 접두 · 라벨 낱말(failuretrace 의 failure)이 동의어에 맞아 정본보다 앞서고, 정본 사본은 점수가 0 이라 줄에 없기도
     # 하다 — 점수로는 정본을 못 세운다. 그래서 정본에 같은 도구가 있으면 그 도구가 무리를 대표한다.
-    # 접힌 것도 이름으로 부를 수 있다(호출 별칭은 그대로다). 순위에서만 빠진다.
-    copies: dict[tuple, list] = {}
-    for r in rows:
-        copies.setdefault((r[6], _core_untagged(r[2], r[3])), []).append(r)
-    canon_tools = {(route[t.name][1], _core_untagged(canon, (t.description or "").strip())): t
-                   for t in visible if route.get(t.name, ("",))[0] == canon} if canon else {}
+    # 접힌 것도 이름으로 부를 수 있다(호출 별칭은 그대로다). 순위에서만 빠진다. 손잡이 copy_fold 를 끄면 접지 않는다.
     folded: dict[tuple, list] = {}
-    kept = []
-    for k, g in copies.items():              # 넣은 차례 — 무리의 가장 앞선 줄 순서다
-        head = g[0]
-        if head[2] != canon and head[2] not in named_apps:
-            mine = next((r for r in g if r[2] == canon), None)
-            if mine is None and k in canon_tools:          # 정본 사본이 점수 0 이라 줄에 없다 — 이 무리의 자리에 세운다
-                ct = canon_tools[k]
-                mine = (head[0], ct.name, canon, (ct.description or "").strip(), ct, _tool_is_write(ct, k[0]), k[0],
-                        1 if _COPY_LABEL.search(str(_app_meta(canon).get("label") or "")) else 0)
-                g = [mine] + g
-            head = mine or head
-        kept.append(head)
-        folded[(head[6], head[3])] = [{"tool": r[1], "app": r[2]} for r in g if r is not head]
-    rows = kept
+    if sw["copy_fold"]:
+        copies: dict[tuple, list] = {}
+        for r in rows:
+            copies.setdefault((r[6], _core_untagged(r[2], r[3])), []).append(r)
+        canon_tools = {(route[t.name][1], _core_untagged(canon, (t.description or "").strip())): t
+                       for t in visible if route.get(t.name, ("",))[0] == canon} if canon else {}
+        kept = []
+        for k, g in copies.items():              # 넣은 차례 — 무리의 가장 앞선 줄 순서다
+            head = g[0]
+            if head[2] != canon and head[2] not in named_apps:
+                mine = next((r for r in g if r[2] == canon), None)
+                if mine is None and k in canon_tools:          # 정본 사본이 점수 0 이라 줄에 없다 — 이 무리의 자리에 세운다
+                    ct = canon_tools[k]
+                    mine = (head[0], ct.name, canon, (ct.description or "").strip(), ct, _tool_is_write(ct, k[0]), k[0],
+                            1 if _COPY_LABEL.search(str(_app_meta(canon).get("label") or "")) else 0, head[8], head[9])
+                    g = [mine] + g
+                head = mine or head
+            kept.append(head)
+            folded[(head[6], head[3])] = [{"tool": r[1], "app": r[2]} for r in g if r is not head]
+        rows = kept
 
     def _args_summary(t) -> dict:
         """invoke_tool 로 바로 부를 수 있게 인자 계약을 붙인다 — 이게 없으면 모델이
@@ -3019,7 +3189,7 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
         return out
 
     matches = []
-    for _, n, a, d, t, w, orig, _c in rows[:limit]:
+    for _, n, a, d, t, w, orig, _c, *_attr in rows[:limit]:
         m = {"tool": n, "app": a, "description": d if detail else _brief_desc(d),
              "args": _args_summary(t) if detail else _args_brief(t)}
         if w:
@@ -3027,7 +3197,10 @@ async def _search_tools(arguments: dict) -> types.CallToolResult:
         if folded.get((orig, d)):
             m["same_in"] = folded[(orig, d)]
         matches.append(m)
-    _log_tool_query(raw_q, (mode or {}).get("mode") or "substring", [m["tool"] for m in matches])
+    # 귀속 — 보정 뺀 점수로 줄을 세워, 보여 준 결과 가운데 보정 덕에만 든 것(boost_only — 보정을 빼면 0점이거나 limit 밖)을 가린다(E-9 ①)
+    base_order = {r[1]: i for i, r in enumerate(sorted(rows, key=lambda r: (-r[8], r[7], r[1])), 1)}
+    attrib = {r[1]: (r[9], r[8] <= 0 or base_order[r[1]] > limit) for r in rows[:limit]}
+    _log_tool_query(raw_q, (mode or {}).get("mode") or "substring", [m["tool"] for m in matches], attrib, tun["fingerprint"])
     # ⚠ 순서가 뜻이다 — 이름 순위·안내를 먼저, 설명·스키마 전문(matches)을 맨 뒤에 둔다. 작은 창의 소비자(dev 웹 챗
     #   TOOL_RESULT_MAX=6,000)는 앞에서부터 글자로 자르므로, 전문이 앞서면 6~8위 도구는 이름조차 사라져 '없다' 로 읽혔다(gw-adh GA-7,
     #   리스크 앱 도구 실측 8건 7,000~8,400자). 게이트웨이는 자르지 않는다 — 잘려도 순위가 남게 놓을 뿐이다.
@@ -5378,6 +5551,8 @@ def _bearer_gate(app, pat_verifier=None):
                 **({"policy": POLICY, "access_policy": _ACCESS_POLICY} if _detail else {}),
                 # 코어 어휘표를 읽었나 — 못 읽으면 search_tools 가 손 낱말로 돈다(HWAXPortal docs/request-1029 C-11). 경로는 싣지 않는다
                 "core_vocab": _core_vocab_health(),
+                # 검색 손잡이 — 지문(덧씌운 값 · 기본값) · 꺼 둔 묶음 · 박스 덧씌우기(있나 · 건드린 칸 · 버린 까닭). dev 와 cae00 이 다르게 도는 것을 보인다(E-7)
+                "search_tuning": _tuning_health(),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

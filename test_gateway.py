@@ -20,8 +20,13 @@ def _no_prod_audit(monkeypatch, tmp_path):
     """
     monkeypatch.setattr(gw, "AUDIT_PATH", str(tmp_path / "audit.jsonl"))
     # search_tools 질의 모으기도 같다 — 안 걸면 시험 질의가 실사용 질의 파일(tool_search_eval/queries.local.jsonl)에 쌓인다.
-    monkeypatch.setattr(gw, "TOOL_QUERY_LOG", tmp_path / "queries.local.jsonl")
-    monkeypatch.setattr(gw, "_QLOG", {"first": None, "stopped": False})
+    monkeypatch.setattr(gw, "TOOL_QUERY_LOG_DIR", tmp_path / "qlog")
+    monkeypatch.setattr(gw, "TOOL_QUERY_LOG", tmp_path / "qlog" / "queries.local.jsonl")
+    monkeypatch.setattr(gw, "_QLOG", {"day": None})
+    monkeypatch.setattr(gw, "_RECENT_SEARCH", gw.OrderedDict())
+    # 검색 손잡이 덧씌우기도 같다 — 박스에 search_tuning.local.json 이 있으면 시험 순위가 그 박스 값으로 돈다. 기본값만 보게 없는 자리를 건다.
+    monkeypatch.setattr(gw, "SEARCH_TUNING_LOCAL_PATH", tmp_path / "search_tuning.local.json")
+    monkeypatch.setattr(gw, "_TUNING", {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None})
 
 
 @pytest.fixture(autouse=True)
@@ -6169,6 +6174,8 @@ def _tool_search_embed_off(monkeypatch):
 # 순위 · 응답 꼴을 일부러 바꾼 10-28(HWAXPortal docs/request-1027 HG-01 · HG-12)과 10-29(request-1029 R-3 · R-4 · R-5 — 어휘표 ·
 # 정본이 대표하는 사본 접기 · 코어 질문의 심의 가중)에 그 판에서 RRF · 질의 기록 줄만 빼고 다시 떴다.
 # 순위를 일부러 바꿀 때만 다시 뜬다 — RRF 를 고치다 끈 길이 바뀌면 이 시험이 잡는다.
+# 10-29 저녁(E-7)에 손잡이를 search_tuning.json 으로 옮긴 판에서 다시 떴다 — 옮기기 전 사본과 응답이 바이트까지 같은 것을 먼저 보였다
+# (옛 사본은 코드 상수를 읽고 새 함수는 손잡이 파일을 읽었다). 귀속 · 기록 줄도 RRF 처럼 뺐다.
 _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.CallToolResult:
     """도구 검색 안내대 — 351개 평면 노출의 선택 비용을 줄이는 입구(실측: 상위 40개가
     호출의 79%, 30%는 한 번도 안 불림 — 롱테일은 검색으로 찾게 한다). 기본은 임베딩 없이
@@ -6182,54 +6189,30 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
         return types.CallToolResult(content=[types.TextContent(
             type="text", text='{"error": "query 를 2자 이상 주세요"}')], isError=True)
     terms = [w for w in re.split(r"[\s,;·/()\[\]{}\"']+", q) if len(w) >= 2]
-    # 도구 이름이 전부 영어라 한국어 질의가 이름을 못 맞힌다 — 도메인 동의어로 넓힌다.
-    # (조사가 붙어도 substring 이라 '보고서를'→'보고서' 매칭은 된다.)
-    _SYN = {
-        "보고서": ("report",), "리포트": ("report",), "요약": ("digest", "summary"),
-        "검색": ("search",), "조회": ("get", "list", "search"), "목록": ("list",),
-        "물성": ("material", "property", "material_property"), "재료": ("material",), "곡선": ("curve",),
-        "잡": ("job",), "작업": ("job",), "상태": ("status", "health"),
-        "슬럼": ("slurm",), "슬럼잡": ("slurm",), "클러스터": ("cluster",),
-        "메쉬": ("mesh",), "메시": ("mesh",), "형상": ("geometry", "shape"),
-        "시험": ("test",), "측정": ("measure",), "업로드": ("upload",),
-        "그래프": ("plot", "chart"), "차트": ("chart", "plot"), "그림": ("plot", "render"),
-        "템플릿": ("template",), "초안": ("draft",), "전문가": ("agent", "expert"),
-        "부품": ("part",), "적층": ("laminate",), "대화": ("conversation",),
-        # 낙하/충격 리포트(DynaForge) 계열 — 도구 이름이 report_angle_stats·report_part_energy·
-        # report_scatter·report_geometry·report_upload_instructions 라 한국어 업무어가 이름을 못 맞힌다.
-        "낙하": ("drop", "impact", "sphere"), "충격": ("impact",), "전각도": ("sphere", "angle"),
-        "방향": ("angle", "direction", "scatter"), "각도": ("angle",), "산포": ("scatter",),
-        "에너지": ("energy",), "소성": ("plastic", "strain"), "변형률": ("strain",),
-        "응력": ("stress",), "속도": ("velocity",), "인테이크": ("intake", "upload"),
-        "반입": ("intake", "upload"), "시각화": ("geometry", "render"),
-        # 심의 계열 — 도구 이름이 deliberate_* 라 한국어 업무 낱말이 이름을 못 맞힌다.
-        # 앱 설명만으로는 app_hit 가산점뿐이라 다른 앱에 밀린다(실측: '안 선택' 이 물성·VOC 에 밀림).
-        # 이름까지 맞히게 이어 준다 — 한 글자 토큰('안')은 위에서 이미 버려지므로 두 글자 이상만.
-        "심의": ("deliberate",), "토의": ("deliberate",), "심사": ("deliberate", "risk"),
-        "리스크": ("deliberate", "risk"), "위험": ("deliberate", "risk"),
-        "전문가심의": ("deliberate",), "회의": ("deliberate", "meeting"),
-        # 일반 업무 낱말은 심의를 **시작하는 도구 하나**에만 잇는다 — 가족 접두(deliberate)에 이으면 status · result · list ·
-        # transcript … 여덟이 한꺼번에 이름 적중을 받아, '시장 불량 원인 대책' 상위 10 중 8개가 deliberate_* 였다(HG-01).
-        "규명": ("deliberate_start",), "원인": ("deliberate_start",), "불량": ("deliberate_start", "defect", "failure"),
-        "선택": ("deliberate_start",), "대안": ("deliberate_start",), "판정": ("deliberate_start",),
-        "신뢰": ("deliberate_start",), "도출": ("deliberate_start",), "설계": ("deliberate_start",),
-        "계획": ("deliberate_start", "plan"),
-        # 코어 온톨로지 — 허브 읽기 도구(object_resolve · objects_list · graph_neighbors …)와 타입 이름에 잇는다. 코어 질문 16개 중 15개에서
-        # 상위 8에 허브 온톨로지 읽기 도구가 0개였다(온톨로지 시험 C-5).
-        "과제": ("object_resolve", "plm_task", "task"), "고장모드": ("failure_mode",), "고장": ("failure",),
-        "시험항목": ("test_item",), "가상검증": ("sim_capability",), "관리기준": ("criterion",), "기준": ("criterion",),
-        "영률": ("material_property", "modulus", "young"),
-        "전작": ("predecessor", "graph_neighbors"), "후속": ("successor", "graph_neighbors"),
-        "시장": ("market", "voc"), "대책": ("countermeasure",),
-    }
+    # 손잡이(search_tuning.json + 박스 덧씌우기 — E-7). 도구 이름이 전부 영어라 한국어 질의가 이름을 못 맞힌다 — 손 동의어로 넓힌다
+    # (조사가 붙어도 substring 이라 '보고서를'→'보고서' 매칭은 된다). 낱말마다 어느 규칙에서 온 갈래인지(src) 함께 든다 — 귀속(E-9 ①).
+    tun = _tuning()
+    sw, wt = tun["switches"], tun["weights"]
+    syn = tun["synonyms"] if sw["synonyms"] else {}
     q_flat = re.sub(r"\s+", "", q)
     vocab = _core_vocab()
     # 코어 질문에서는 일반 업무 낱말 → deliberate_start 를 심의를 청할 때만 잇는다(R-5 — 조회 질문이 심의 시작으로 끌렸다).
-    no_delib = bool(vocab) and not any(w in q for w in _DELIB_ASK) and any(f in q_flat for f, _p, _t in vocab["syn"])
-    expand = {w: (w,) + tuple(s for k, ss in _SYN.items() if k in w for s in ss if not (no_delib and s == "deliberate_start"))
-              for w in terms}
-    write_intent = any(w in q + " " for w in _WRITE_INTENT)
-    if vocab:
+    no_delib = (sw["delib_narrow"] and bool(vocab) and not any(w in q for w in tun["delib_ask"])
+                and any(f in q_flat for f, _p, _t in vocab["syn"]))
+    expand: dict[str, tuple] = {}
+    src: dict[str, dict[str, list]] = {}
+    for w in terms:
+        vs, sm = [w], {}
+        for k, ss in syn.items():
+            if k in w:
+                for v in ss:
+                    if no_delib and v == "deliberate_start":
+                        continue
+                    vs.append(v)
+                    sm.setdefault(v, []).append(f"syn:{k}")
+        expand[w], src[w] = tuple(vs), sm
+    write_intent = any(w in q + " " for w in tun["write_intent"])
+    if vocab and sw["core_vocab"]:
         # 코어 낱말 → 허브 읽기 도구 이름(R-4 — 타입 이름에 이으면 어느 도구 이름 · 설명에도 없어 0점이었다). 띄어 쓴 꼴('관리 기준')은
         # 붙여 쓴 꼴이 질의에 있으면 그 조각을 담은 낱말마다 잇는다 — 낱말은 빈칸에서 갈라지므로 '관리기준' 열쇠로는 못 맞힌다.
         for flat, parts, tools in vocab["syn"]:
@@ -6237,9 +6220,13 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
             if not hit and parts and flat in q_flat:
                 hit = [w for w in expand if any(p in w for p in parts)]
             for w in hit:
-                expand[w] += tuple(t for t in tools if t not in expand[w])
+                add = tuple(t for t in tools if t not in expand[w])
+                expand[w] += add
+                for v in add:
+                    src[w].setdefault(v, []).append(f"vocab:{flat}")
     canon = (vocab or {}).get("canonical")
-    quality_n = sum(1 for w in _QUALITY_WORDS if w in q)
+    quality_n = sum(1 for w in tun["quality_words"] if w in q) if sw["quality"] else 0
+    w_name, w_app, cap, w_cov = wt["name"], wt["app"], wt["desc_cap"], wt["coverage"]
     groups = _request_groups()
     visible = _visible_tools(groups)
     rows = []
@@ -6253,9 +6240,11 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
         hay_app = (label + " " + str(meta.get("description") or "")).lower()
         names = _label_names(label)
         score, covered = 0, 0
+        base, base_cov = 0, 0             # 보정 없이 — 질의 낱말 그 자체만으로 낸 점수(귀속 · boost_only 판정)
+        via: set[str] = set()
         for w, variants in expand.items():
             name_hit = any(v in name for v in variants)
-            desc_freq = max(min(desc.count(v), 3) for v in variants)
+            desc_freq = max(min(desc.count(v), cap) for v in variants)
             app_hit = any(v in hay_app for v in variants)
             # 질의가 앱 이름을 불렀으면(진짜 앱 라벨 적중) 이름 적중과 같은 가중이다 — 종전엔 라벨 · 설명 어디에 맞든 1점이었다(HG-01).
             named = any(_named(names, v, q_flat) for v in variants)
@@ -6263,43 +6252,55 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
                 named_apps.add(app)
             if name_hit or desc_freq or app_hit or named:
                 covered += 1
-                score += 4 * (name_hit or named) + desc_freq + app_hit
+                score += w_name * (name_hit or named) + desc_freq + w_app * app_hit
+                b_name, b_desc, b_app, b_named = w in name, min(desc.count(w), cap), w in hay_app, _named(names, w, q_flat)
+                if b_name or b_desc or b_app or b_named:
+                    base_cov += 1
+                    base += w_name * (b_name or b_named) + b_desc + w_app * b_app
+                for v in variants[1:]:
+                    if v in name or v in desc or v in hay_app or _named(names, v, q_flat):
+                        via.update(src[w].get(v, ()))
         if score > 0:
-            if quality_n and _area_of(t.name, app) in ("quality", "voc"):
-                score += 2 * quality_n          # 품질 질의 — 품질 · VOC 도구를 위로(HG-01)
+            if quality_n and _area_of(t.name, app) in tun["quality_areas"]:
+                score += wt["quality_per_word"] * quality_n          # 품질 질의 — 품질 · VOC 도구를 위로(HG-01)
+                via.add("quality")
             # 커버리지 승수 — 질의어를 더 많이 맞힌 도구가 개별 단어 빈도보다 앞선다.
-            final = score * (1 + covered / max(1, len(terms)))
+            final = score * (1 + w_cov * covered / max(1, len(terms)))
+            base_final = base * (1 + w_cov * base_cov / max(1, len(terms))) if base > 0 else 0
             is_write = _tool_is_write(t, original)
-            if is_write and not write_intent:
-                final *= 0.5                    # 쓰기 낱말이 없는 질문 — 쓰기 · 잡 시작 도구를 내린다(HG-01)
+            if is_write and not write_intent and sw["write_penalty"]:
+                final *= wt["write_penalty"]                     # 쓰기 낱말이 없는 질문 — 쓰기 · 잡 시작 도구를 내린다(HG-01)
+                base_final *= wt["write_penalty"]
+            # 줄 꼴 — (점수, 이름, 앱, 설명, 도구, 쓰기, 원래 이름, 사본 표지, 보정 뺀 점수, 점수를 보탠 규칙)
             rows.append((final, t.name, app, (t.description or "").strip(), t, is_write, original,
-                         1 if _COPY_LABEL.search(label) else 0))
+                         1 if _COPY_LABEL.search(label) else 0, base_final, tuple(sorted(via))))
     rows.sort(key=lambda r: (-r[0], r[7], r[1]))
     # 같은 도구의 사본 — 원래 이름과 설명(정본 소개 줄은 뗀다)이 같으면 한 줄만 올리고 나머지는 same_in 으로 접는다(HG-01).
     # 그 한 줄은 무리에서 가장 앞선 줄의 자리에 서는 정본이다(R-4) — 질의가 사본의 앱을 콕 불렀을 때만 그 사본이다(OT-12 허브 건너기).
     # 형제 사본은 겹침 접두 · 라벨 낱말(failuretrace 의 failure)이 동의어에 맞아 정본보다 앞서고, 정본 사본은 점수가 0 이라 줄에 없기도
     # 하다 — 점수로는 정본을 못 세운다. 그래서 정본에 같은 도구가 있으면 그 도구가 무리를 대표한다.
-    # 접힌 것도 이름으로 부를 수 있다(호출 별칭은 그대로다). 순위에서만 빠진다.
-    copies: dict[tuple, list] = {}
-    for r in rows:
-        copies.setdefault((r[6], _core_untagged(r[2], r[3])), []).append(r)
-    canon_tools = {(route[t.name][1], _core_untagged(canon, (t.description or "").strip())): t
-                   for t in visible if route.get(t.name, ("",))[0] == canon} if canon else {}
+    # 접힌 것도 이름으로 부를 수 있다(호출 별칭은 그대로다). 순위에서만 빠진다. 손잡이 copy_fold 를 끄면 접지 않는다.
     folded: dict[tuple, list] = {}
-    kept = []
-    for k, g in copies.items():              # 넣은 차례 — 무리의 가장 앞선 줄 순서다
-        head = g[0]
-        if head[2] != canon and head[2] not in named_apps:
-            mine = next((r for r in g if r[2] == canon), None)
-            if mine is None and k in canon_tools:          # 정본 사본이 점수 0 이라 줄에 없다 — 이 무리의 자리에 세운다
-                ct = canon_tools[k]
-                mine = (head[0], ct.name, canon, (ct.description or "").strip(), ct, _tool_is_write(ct, k[0]), k[0],
-                        1 if _COPY_LABEL.search(str(_app_meta(canon).get("label") or "")) else 0)
-                g = [mine] + g
-            head = mine or head
-        kept.append(head)
-        folded[(head[6], head[3])] = [{"tool": r[1], "app": r[2]} for r in g if r is not head]
-    rows = kept
+    if sw["copy_fold"]:
+        copies: dict[tuple, list] = {}
+        for r in rows:
+            copies.setdefault((r[6], _core_untagged(r[2], r[3])), []).append(r)
+        canon_tools = {(route[t.name][1], _core_untagged(canon, (t.description or "").strip())): t
+                       for t in visible if route.get(t.name, ("",))[0] == canon} if canon else {}
+        kept = []
+        for k, g in copies.items():              # 넣은 차례 — 무리의 가장 앞선 줄 순서다
+            head = g[0]
+            if head[2] != canon and head[2] not in named_apps:
+                mine = next((r for r in g if r[2] == canon), None)
+                if mine is None and k in canon_tools:          # 정본 사본이 점수 0 이라 줄에 없다 — 이 무리의 자리에 세운다
+                    ct = canon_tools[k]
+                    mine = (head[0], ct.name, canon, (ct.description or "").strip(), ct, _tool_is_write(ct, k[0]), k[0],
+                            1 if _COPY_LABEL.search(str(_app_meta(canon).get("label") or "")) else 0, head[8], head[9])
+                    g = [mine] + g
+                head = mine or head
+            kept.append(head)
+            folded[(head[6], head[3])] = [{"tool": r[1], "app": r[2]} for r in g if r is not head]
+        rows = kept
 
     def _args_summary(t) -> dict:
         """invoke_tool 로 바로 부를 수 있게 인자 계약을 붙인다 — 이게 없으면 모델이
@@ -6336,7 +6337,7 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict) -> types.Cal
         return out
 
     matches = []
-    for _, n, a, d, t, w, orig, _c in rows[:limit]:
+    for _, n, a, d, t, w, orig, _c, *_attr in rows[:limit]:
         m = {"tool": n, "app": a, "description": d if detail else _brief_desc(d),
              "args": _args_summary(t) if detail else _args_brief(t)}
         if w:
@@ -7198,52 +7199,155 @@ def _qlog_kit(monkeypatch):
 
 
 def _qlog_lines():
-    p = gw.TOOL_QUERY_LOG
-    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()] if p.exists() else []
+    return [r for r in gw._qlog_read() if "q" in r]
 
 
-def test_search_tools_질의를_이름_없이_남긴다(monkeypatch):
+def _qlog_outcomes():
+    return [r for r in gw._qlog_read() if "o" in r]
+
+
+def test_search_tools_질의를_이름_없이_날짜_파일에_남긴다(monkeypatch):
     _qlog_kit(monkeypatch)
     out = json.loads(asyncio.run(gw._search_tools({"query": "Report 요약"})).content[0].text)
     assert out["ranked"][0] == "report_digest"
     [line] = _qlog_lines()
-    assert set(line) == {"d", "q", "mode", "top"}, "이름 · 주소 · 결과 전문은 남기지 않는다"
+    assert set(line) <= {"d", "ts", "id", "q", "mode", "top", "fp", "via", "boost_only"}, "이름 · 주소 · 결과 전문은 남기지 않는다"
     assert line["q"] == "Report 요약", "질의는 원문(대소문자 그대로 — 임베딩에 주는 글)"
     assert line["mode"] == "substring" and line["top"][0] == "signalforge:digest", "정답은 평가셋 꼴(앱키:원래 이름)"
-    assert line["d"] == gw.datetime.now(gw._KST).date().isoformat()
+    today = gw.datetime.now(gw._KST).date().isoformat()
+    assert line["d"] == today and (gw.TOOL_QUERY_LOG_DIR / f"queries-{today}.local.jsonl").exists()
+    assert line["fp"] == gw._tuning()["fingerprint"], "어느 손잡이로 잰 질의인가"
+    assert "someone@example.com" not in json.dumps(gw._qlog_read(), ensure_ascii=False)
     asyncio.run(gw._search_tools({"query": "x"}))                      # 2자 미만은 검색 오류 — 남기지 않는다
     assert len(_qlog_lines()) == 1
 
 
-def test_search_tools_질의_모으기는_첫_줄부터_30일_뒤_멈춘다(monkeypatch):
+def test_search_tools_질의_기록은_굴러가는_창이다(monkeypatch):
+    """10-18 결정 '30일' 을 일회성에서 굴러가는 창으로(E-9 ① — 고리는 cae00 에서 닫힌다). 날이 바뀔 때 창 밖의 날짜 파일을 지운다."""
     _qlog_kit(monkeypatch)
+    gw.TOOL_QUERY_LOG_DIR.mkdir(parents=True)
     today = gw.datetime.now(gw._KST).date()
-    for age, writes in ((29, True), (30, False)):
-        gw.TOOL_QUERY_LOG.write_text(json.dumps({"d": (today - gw.timedelta(days=age)).isoformat(), "q": "옛", "mode": "substring",
-                                                 "top": []}) + "\n", encoding="utf-8")
-        monkeypatch.setattr(gw, "_QLOG", {"first": None, "stopped": False})
-        asyncio.run(gw._search_tools({"query": "report"}))
-        assert (len(_qlog_lines()) == 2) is writes, f"첫 줄이 {age}일 전"
+    for age in (gw.TOOL_QUERY_LOG_DAYS - 1, gw.TOOL_QUERY_LOG_DAYS):
+        d = (today - gw.timedelta(days=age)).isoformat()
+        (gw.TOOL_QUERY_LOG_DIR / f"queries-{d}.local.jsonl").write_text(json.dumps({"d": d, "q": f"옛 {age}", "top": []}) + "\n")
+    gw.TOOL_QUERY_LOG.write_text(json.dumps({"d": "2026-01-01", "q": "옛 일회성", "top": []}) + "\n")
     asyncio.run(gw._search_tools({"query": "report"}))
-    assert len(_qlog_lines()) == 1 and gw._QLOG["stopped"], "멈춘 뒤로는 파일을 다시 열지도 않는다"
+    qs = [r["q"] for r in _qlog_lines()]
+    assert qs == ["옛 일회성", f"옛 {gw.TOOL_QUERY_LOG_DAYS - 1}", "report"], qs
+    assert gw.TOOL_QUERY_LOG.exists(), "옛 일회성 파일은 읽기만 한다(지우지 않는다)"
+    assert [r["q"] for r in gw._qlog_read(days=1)] == ["report"], "days 를 주면 그날 수 안의 것만"
 
 
 def test_search_tools_질의_모으기는_끌_수_있고_못_남겨도_검색은_답한다(monkeypatch, tmp_path):
     _qlog_kit(monkeypatch)
     monkeypatch.setattr(gw, "TOOL_QUERY_LOG_ON", False)
     asyncio.run(gw._search_tools({"query": "report"}))
-    assert not gw.TOOL_QUERY_LOG.exists(), "GATEWAY_TOOL_QUERY_LOG=0"
+    assert not gw.TOOL_QUERY_LOG_DIR.exists(), "GATEWAY_TOOL_QUERY_LOG=0"
     monkeypatch.setattr(gw, "TOOL_QUERY_LOG_ON", True)
-    monkeypatch.setattr(gw, "TOOL_QUERY_LOG", tmp_path)                 # 디렉터리라 덧붙이기가 실패한다
+    (tmp_path / "file").write_text("x")
+    monkeypatch.setattr(gw, "TOOL_QUERY_LOG_DIR", tmp_path / "file" / "qlog")    # 파일 아래라 만들기가 실패한다
     out = json.loads(asyncio.run(gw._search_tools({"query": "report"})).content[0].text)
     assert out["ranked"], "남기기 실패가 검색을 막지 않는다"
 
 
-def test_search_tools_질의_모으기는_첫_줄_날짜를_모르면_멈춘다(monkeypatch):
+def test_search_tools_귀속은_보정_덕에만_든_결과를_가린다(monkeypatch):
+    """'요약' 은 도구 이름 · 설명에 없고 손 동의어(요약 → digest)로만 report_digest 에 닿는다 — boost_only. 'report' 는 이름에 그대로 있다."""
     _qlog_kit(monkeypatch)
-    gw.TOOL_QUERY_LOG.write_text("{깨진 줄\n", encoding="utf-8")
+    asyncio.run(gw._search_tools({"query": "요약"}))
     asyncio.run(gw._search_tools({"query": "report"}))
-    assert gw.TOOL_QUERY_LOG.read_text(encoding="utf-8") == "{깨진 줄\n" and gw._QLOG["stopped"], "30일을 셀 수 없으면 모으지 않는 쪽"
+    a, b = _qlog_lines()
+    assert a["top"][0] == "signalforge:digest" and a["via"]["signalforge:digest"] == ["syn:요약"], a
+    assert a["boost_only"] == ["signalforge:digest"], "보정을 빼면 0점이다"
+    assert "via" not in b and "boost_only" not in b, b
+
+
+def test_search_tools_찾기_뒤의_호출은_결과_줄로_남는다(monkeypatch):
+    """같은 호출자가 600초 안에 부른 백엔드 도구 — 순위 · 성공. 찾기 하나 · 도구 하나에 한 번이고, 결과에 없던 도구는 r 이 null 이다(E-9 ①)."""
+    _qlog_kit(monkeypatch)
+    monkeypatch.setattr(gw, "backends", {"signalforge": object()})
+    monkeypatch.setattr(gw, "alias_route", {"signalforge_list": ("signalforge", "list")})
+    asyncio.run(gw._search_tools({"query": "report digest"}))
+    [q] = _qlog_lines()
+    gw._audit("report_list", "signalforge", True, None, 5, caller="someone@example.com")
+    gw._audit("report_list", "signalforge", True, None, 5, caller="someone@example.com")       # 같은 도구 — 한 번만
+    gw._audit("signalforge_list", "signalforge", False, "boom", 5, caller="someone@example.com")  # 별칭도 같은 도구다
+    gw._audit("report_list", "signalforge", True, None, 5, caller="other@example.com")          # 다른 호출자
+    gw._audit("rest_call GET /x", "signalforge", True, None, 5, caller="someone@example.com")    # 도구가 아니다
+    [o] = _qlog_outcomes()
+    assert o["o"] == q["id"] and o["t"] == "signalforge:list" and o["r"] == q["top"].index("signalforge:list") + 1 and o["ok"] is True, o
+    assert "caller" not in o and "someone" not in json.dumps(o)
+    gw._RECENT_SEARCH["someone@example.com"] = (q["id"], gw.time.monotonic() - gw.SEARCH_OUTCOME_WINDOW_S - 1, {}, set())
+    gw._audit("report_digest", "signalforge", True, None, 5, caller="someone@example.com")
+    assert len(_qlog_outcomes()) == 1, "창(600초) 밖의 호출은 그 찾기의 결과가 아니다"
+    asyncio.run(gw._search_tools({"query": "report digest"}))
+    monkeypatch.setattr(gw, "route", {**gw.route, "elsewhere": ("signalforge", "elsewhere")})
+    gw._audit("elsewhere", "signalforge", True, None, 5, caller="someone@example.com")
+    assert _qlog_outcomes()[-1]["r"] is None, "결과에 없던 도구를 불렀다 — 찾기에서 못 보였다(설명 문제의 신호)"
+
+
+# ── 검색 손잡이 파일 · 박스 덧씌우기(HWAXPortal docs/request-1029 E-7 · 설계 2.5 ①) ──────────────────────────────────────
+def _tune(monkeypatch, tmp_path, overlay):
+    p = tmp_path / "search_tuning.local.json"
+    if overlay is None:
+        p.unlink(missing_ok=True)
+    else:
+        p.write_text(overlay if isinstance(overlay, str) else json.dumps(overlay, ensure_ascii=False), encoding="utf-8")
+        st = p.stat()
+        gw.os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    monkeypatch.setattr(gw, "SEARCH_TUNING_LOCAL_PATH", p)
+    return gw._tuning()
+
+
+def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
+    """기본값은 지금 순위와 바이트까지 같다(_SEARCH_TOOLS_MASTER 가 응답을 본다) — 여기서는 옮긴 값 자체를 본다."""
+    d = gw._tuning()
+    # 옮기기 전(10-29) 게이트웨이 코드 상수 그대로 — 기본값을 일부러 바꾸면 이 값을 함께 고친다(순위 기준 사본도 다시 뜬다)
+    assert d["delib_ask"] == ('심의', '토의', '회의')
+    assert d["quality_words"] == ('불량', '시장', '원인', '대책', '사례') and d["quality_areas"] == ("quality", "voc")
+    assert d["write_intent"] == ('등록', '생성', '만들', '추가', '수정', '고치', '고쳐', '바꾸', '바꿔', '변경', '삭제', '지우', '지워', '저장', '올리', '올려', '업로드', '반입', '가져오', '실행', '돌리', '돌려', '제출', '시작', '걸어', '적용', '반영', '보내', '발행', '게시', '취소', '중지', '멈추', '멈춰', '학습', '이어서', '다시 돌', '채워', '채우', '넣어', '넣고', '남기', '남겨', '붙여', '붙이', '기각', '승인', '심의', '토의', '심사', '회의', 'create', 'add ', 'update', 'edit', 'modify', 'delete', 'remove', 'save', 'register', 'upload', 'import', 'run ', 'execute', 'submit', 'start', 'launch', 'apply', 'publish', 'send', 'cancel', 'stop', 'train', 'rename')
+    assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2}
+    assert all(d["switches"].values()) and len(d["synonyms"]) == 73 and d["synonyms"]["요약"] == ("digest", "summary")
+    assert d["fingerprint"] == d["base_fingerprint"] and gw._tuning_health()["overlay"] == {"present": False}
+
+
+def test_검색_손잡이_덧씌우기는_merge_patch_로_얹고_재기동_없이_읽는다(monkeypatch, tmp_path):
+    _qlog_kit(monkeypatch)
+    base = gw._tuning()
+    d = _tune(monkeypatch, tmp_path, {"switches": {"synonyms": False}, "synonyms": {"요약": None, "다이제스트": {"to": ["digest"]}},
+                                      "weights": {"name": 5}})
+    assert d["switches"]["synonyms"] is False and "요약" not in d["synonyms"] and d["synonyms"]["다이제스트"] == ("digest",)
+    assert d["weights"]["name"] == 5 and d["weights"]["app"] == 1, "객체는 합치고 그 밖은 바꾼다"
+    assert d["fingerprint"] != base["fingerprint"] and d["base_fingerprint"] == base["base_fingerprint"]
+    h = gw._tuning_health()
+    assert h["switches_off"] == ["synonyms"] and h["overlay"]["present"] is True and h["overlay"]["fingerprint"]
+    assert set(h["overlay"]["changed"]) == {"switches.synonyms", "synonyms.요약", "synonyms.다이제스트", "weights.name"}, h
+    out = json.loads(asyncio.run(gw._search_tools({"query": "요약"})).content[0].text)
+    assert "report_digest" not in out["ranked"], "손 동의어를 끄면 '요약' 은 report_digest(이름 · 설명에 그 낱말이 없다)에 안 닿는다"
+    _tune(monkeypatch, tmp_path, None)
+    out = json.loads(asyncio.run(gw._search_tools({"query": "요약"})).content[0].text)
+    assert out["ranked"][0] == "report_digest", "덧씌우기를 지우면 기본값으로 돌아온다"
+
+
+def test_검색_손잡이_덧씌우기가_깨지면_버리고_기본값으로_돈다(monkeypatch, tmp_path):
+    base = gw._tuning()
+    for bad in ("{깨진", "[]", json.dumps({"weights": {"name": "넷"}}), json.dumps({"synonyms": {"x": {"to": "y"}}})):
+        d = _tune(monkeypatch, tmp_path, bad)
+        assert d["fingerprint"] == base["fingerprint"], bad
+        assert "덧씌우기를 버렸다" in gw._tuning_health()["overlay"]["error"], bad
+
+
+def test_검색_손잡이_묶음별로_끈다(monkeypatch, tmp_path):
+    """품질 가중 · 쓰기 감점 · 사본 접기를 하나씩 끄면 그것만 빠진다."""
+    _search_catalog(monkeypatch)
+    _no_embed(monkeypatch)
+    q = "시장 불량 원인 대책"
+    on = json.loads(asyncio.run(gw._search_tools({"query": q, "limit": 20})).content[0].text)["ranked"]
+    _tune(monkeypatch, tmp_path, {"switches": {"quality": False}})
+    off = json.loads(asyncio.run(gw._search_tools({"query": q, "limit": 20})).content[0].text)["ranked"]
+    assert on.index("search_voc") < off.index("search_voc"), (on, off)
+    _tune(monkeypatch, tmp_path, {"switches": {"write_penalty": False}})
+    w = json.loads(asyncio.run(gw._search_tools({"query": "회의", "limit": 20})).content[0].text)["ranked"]
+    assert w.index("meeting_start") <= on.index("meeting_start") if "meeting_start" in on else True
 
 
 def test_평가_러너는_실사용_질의_파일에_쓰지_않는다():
@@ -8304,3 +8408,13 @@ def test_HG11_start_sh_stop_은_리스너를_닫고_비우는_옛_프로세스�
     finally:
         if fake.poll() is None:
             fake.kill()
+
+
+def test_health_에_검색_손잡이_지문이_실린다():
+    """/health 의 search_tuning — 무인증 칸이다(지문 · 꺼 둔 묶음 · 덧씌우기 여부만, 경로 · 낱말은 없다)."""
+    import inspect
+    src = inspect.getsource(gw)
+    i = src.index('if scope.get("path") == "/health":')
+    assert '"search_tuning": _tuning_health(),' in src[i:src.index('if scope.get("path") == "/tools-map":', i)]
+    h = gw._tuning_health()
+    assert set(h) <= {"fingerprint", "base", "switches_off", "synonyms", "overlay", "error"} and len(h["fingerprint"]) == 12

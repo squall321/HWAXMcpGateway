@@ -19,3 +19,6 @@ gateway_config.json.bak-*
 .conn_registry_cache.json
 # search_tools 평가 러너의 로컬 파일 — 카탈로그 스냅샷(내부 도구 설명 전문)·실사용 질의는 추적하지 않는다(tool_search_eval/README.md)
 tool_search_eval/*.local.*
+# 검색 손잡이의 박스 덧씌우기(HWAXPortal docs/request-1029 E-7) — 박스에서 커밋 없이 튜닝한다. 무시 목록에 없으면 deploy-all · update-all 의
+# git stash -u 가 치운다
+search_tuning.local.json

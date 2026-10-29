@@ -1,0 +1,667 @@
+{
+ "_doc": [
+  "search_tools 순위의 손잡이 — 게이트웨이 코드 상수를 옮긴 기본값이다(HWAXPortal docs/request-1029 E-7 · 설계 2.5 ①). 이 판의 순위는 옮기기 전과 바이트까지 같다.",
+  "박스에서 튜닝하려면 같은 자리의 search_tuning.local.json(gitignore)에 바꿀 칸만 적는다 — JSON merge patch(RFC 7386): 객체는 합치고 그 밖은 바꾸며 null 은 지운다(목록은 통째로 바뀐다). 바뀐 시각을 보고 재기동 없이 다시 읽는다.",
+  "switches — 묶음별 끄기(synonyms 손 동의어 · core_vocab 코어 어휘표 낱말 · delib_narrow 코어 질문의 심의 가중 끔 · quality 품질 낱말 가중 · write_penalty 쓰기 도구 감점 · copy_fold 같은 도구 사본 접기).",
+  "synonyms — {낱말: {to: [이을 낱말 · 도구 이름 조각], owner, source_fix}}. 질의 낱말이 이 낱말을 담으면 to 를 함께 맞춘다. owner 는 그 낱말이 도구 설명에 없어 우리가 보정하는 플랫폼(백엔드 키 — 일반 낱말은 null), source_fix 는 그쪽이 고칠 것(비면 '설명 · 별칭에 그 낱말을 넣는다'). 플랫폼별 피드백 보고서(platform_feedback_report.py)가 읽는다.",
+  "weights — 낱말 하나의 점수 = name × (이름 적중 또는 앱 이름 적중) + min(설명 빈도, desc_cap) + app × 앱 라벨 · 설명 적중, 도구 점수 = 합 × (1 + coverage × 맞힌 낱말 비율). 쓰기 낱말이 없는 질의의 쓰기 도구는 × write_penalty, 품질 질의는 품질 · VOC 영역 도구에 + quality_per_word × 품질 낱말 수."
+ ],
+ "version": 1,
+ "switches": {
+  "synonyms": true,
+  "core_vocab": true,
+  "delib_narrow": true,
+  "quality": true,
+  "write_penalty": true,
+  "copy_fold": true
+ },
+ "weights": {
+  "name": 4,
+  "desc_cap": 3,
+  "app": 1,
+  "coverage": 1,
+  "write_penalty": 0.5,
+  "quality_per_word": 2
+ },
+ "synonyms": {
+  "보고서": {
+   "to": [
+    "report"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "리포트": {
+   "to": [
+    "report"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "요약": {
+   "to": [
+    "digest",
+    "summary"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "검색": {
+   "to": [
+    "search"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "조회": {
+   "to": [
+    "get",
+    "list",
+    "search"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "목록": {
+   "to": [
+    "list"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "물성": {
+   "to": [
+    "material",
+    "property",
+    "material_property"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "재료": {
+   "to": [
+    "material"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "곡선": {
+   "to": [
+    "curve"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "잡": {
+   "to": [
+    "job"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "작업": {
+   "to": [
+    "job"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "상태": {
+   "to": [
+    "status",
+    "health"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "슬럼": {
+   "to": [
+    "slurm"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "슬럼잡": {
+   "to": [
+    "slurm"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "클러스터": {
+   "to": [
+    "cluster"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "메쉬": {
+   "to": [
+    "mesh"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "메시": {
+   "to": [
+    "mesh"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "형상": {
+   "to": [
+    "geometry",
+    "shape"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "시험": {
+   "to": [
+    "test"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "측정": {
+   "to": [
+    "measure"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "업로드": {
+   "to": [
+    "upload"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "그래프": {
+   "to": [
+    "plot",
+    "chart"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "차트": {
+   "to": [
+    "chart",
+    "plot"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "그림": {
+   "to": [
+    "plot",
+    "render"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "템플릿": {
+   "to": [
+    "template"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "초안": {
+   "to": [
+    "draft"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "전문가": {
+   "to": [
+    "agent",
+    "expert"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "부품": {
+   "to": [
+    "part"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "적층": {
+   "to": [
+    "laminate"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "대화": {
+   "to": [
+    "conversation"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "낙하": {
+   "to": [
+    "drop",
+    "impact",
+    "sphere"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "충격": {
+   "to": [
+    "impact"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "전각도": {
+   "to": [
+    "sphere",
+    "angle"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "방향": {
+   "to": [
+    "angle",
+    "direction",
+    "scatter"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "각도": {
+   "to": [
+    "angle"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "산포": {
+   "to": [
+    "scatter"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "에너지": {
+   "to": [
+    "energy"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "소성": {
+   "to": [
+    "plastic",
+    "strain"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "변형률": {
+   "to": [
+    "strain"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "응력": {
+   "to": [
+    "stress"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "속도": {
+   "to": [
+    "velocity"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "인테이크": {
+   "to": [
+    "intake",
+    "upload"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "반입": {
+   "to": [
+    "intake",
+    "upload"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "시각화": {
+   "to": [
+    "geometry",
+    "render"
+   ],
+   "owner": "heax-kooremapper_mcp",
+   "source_fix": null
+  },
+  "심의": {
+   "to": [
+    "deliberate"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "토의": {
+   "to": [
+    "deliberate"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "심사": {
+   "to": [
+    "deliberate",
+    "risk"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "리스크": {
+   "to": [
+    "deliberate",
+    "risk"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "위험": {
+   "to": [
+    "deliberate",
+    "risk"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "전문가심의": {
+   "to": [
+    "deliberate"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "회의": {
+   "to": [
+    "deliberate",
+    "meeting"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "규명": {
+   "to": [
+    "deliberate_start"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "원인": {
+   "to": [
+    "deliberate_start"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "불량": {
+   "to": [
+    "deliberate_start",
+    "defect",
+    "failure"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "선택": {
+   "to": [
+    "deliberate_start"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "대안": {
+   "to": [
+    "deliberate_start"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "판정": {
+   "to": [
+    "deliberate_start"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "신뢰": {
+   "to": [
+    "deliberate_start"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "도출": {
+   "to": [
+    "deliberate_start"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "설계": {
+   "to": [
+    "deliberate_start"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "계획": {
+   "to": [
+    "deliberate_start",
+    "plan"
+   ],
+   "owner": "hwax-deliberation",
+   "source_fix": null
+  },
+  "과제": {
+   "to": [
+    "object_resolve",
+    "plm_task",
+    "task"
+   ],
+   "owner": "rootdesigndatahub",
+   "source_fix": null
+  },
+  "고장모드": {
+   "to": [
+    "failure_mode"
+   ],
+   "owner": "rootdesigndatahub",
+   "source_fix": null
+  },
+  "고장": {
+   "to": [
+    "failure"
+   ],
+   "owner": "rootdesigndatahub",
+   "source_fix": null
+  },
+  "시험항목": {
+   "to": [
+    "test_item"
+   ],
+   "owner": "rootdesigndatahub",
+   "source_fix": null
+  },
+  "가상검증": {
+   "to": [
+    "sim_capability"
+   ],
+   "owner": "rootdesigndatahub",
+   "source_fix": null
+  },
+  "관리기준": {
+   "to": [
+    "criterion"
+   ],
+   "owner": "rootdesigndatahub",
+   "source_fix": null
+  },
+  "기준": {
+   "to": [
+    "criterion"
+   ],
+   "owner": "rootdesigndatahub",
+   "source_fix": null
+  },
+  "영률": {
+   "to": [
+    "material_property",
+    "modulus",
+    "young"
+   ],
+   "owner": "rootdesigndatahub",
+   "source_fix": null
+  },
+  "전작": {
+   "to": [
+    "predecessor",
+    "graph_neighbors"
+   ],
+   "owner": "rootdesigndatahub",
+   "source_fix": null
+  },
+  "후속": {
+   "to": [
+    "successor",
+    "graph_neighbors"
+   ],
+   "owner": "rootdesigndatahub",
+   "source_fix": null
+  },
+  "시장": {
+   "to": [
+    "market",
+    "voc"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "대책": {
+   "to": [
+    "countermeasure"
+   ],
+   "owner": null,
+   "source_fix": null
+  }
+ },
+ "quality": {
+  "words": [
+   "불량",
+   "시장",
+   "원인",
+   "대책",
+   "사례"
+  ],
+  "areas": [
+   "quality",
+   "voc"
+  ]
+ },
+ "delib_ask": [
+  "심의",
+  "토의",
+  "회의"
+ ],
+ "write_intent": [
+  "등록",
+  "생성",
+  "만들",
+  "추가",
+  "수정",
+  "고치",
+  "고쳐",
+  "바꾸",
+  "바꿔",
+  "변경",
+  "삭제",
+  "지우",
+  "지워",
+  "저장",
+  "올리",
+  "올려",
+  "업로드",
+  "반입",
+  "가져오",
+  "실행",
+  "돌리",
+  "돌려",
+  "제출",
+  "시작",
+  "걸어",
+  "적용",
+  "반영",
+  "보내",
+  "발행",
+  "게시",
+  "취소",
+  "중지",
+  "멈추",
+  "멈춰",
+  "학습",
+  "이어서",
+  "다시 돌",
+  "채워",
+  "채우",
+  "넣어",
+  "넣고",
+  "남기",
+  "남겨",
+  "붙여",
+  "붙이",
+  "기각",
+  "승인",
+  "심의",
+  "토의",
+  "심사",
+  "회의",
+  "create",
+  "add ",
+  "update",
+  "edit",
+  "modify",
+  "delete",
+  "remove",
+  "save",
+  "register",
+  "upload",
+  "import",
+  "run ",
+  "execute",
+  "submit",
+  "start",
+  "launch",
+  "apply",
+  "publish",
+  "send",
+  "cancel",
+  "stop",
+  "train",
+  "rename"
+ ]
+}

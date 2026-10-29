@@ -8523,3 +8523,36 @@ def test_E9_평가는_떠_있는_카탈로그로_판마다_재고_기록을_남�
     monkeypatch.setattr(gw, "_SEARCH_EVAL_LOCK", {"busy": True})
     st, _ = _gate_call(monkeypatch, "/search-eval", "POST", body={})
     assert st == 409, "평가는 한 번에 하나"
+
+
+def test_E9_run_py_live_는_떠_있는_창구를_불러_판마다_표로_찍는다(monkeypatch, tmp_path, capsys):
+    # CLI → httpx → 실제 미들웨어 → _search_eval_run 을 한 줄로 — 가짜 응답이 아니라 창구가 내는 꼴 그대로 표를 찍는지 본다
+    import argparse
+    import importlib.util
+    _search_catalog(monkeypatch)
+    _no_embed(monkeypatch)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    pairs = tmp_path / "pairs.jsonl"
+    pairs.write_text(json.dumps({"id": "doc-x", "query": "물성 조회", "gold": ["heax-materialtwin_web:get_material_properties"],
+                                 "source": "doc"}, ensure_ascii=False) + "\n", encoding="utf-8")
+    monkeypatch.setattr(gw, "SEARCH_PAIRS_PATH", pairs)
+    spec = importlib.util.spec_from_file_location("tse_run", gw.Path(gw.__file__).with_name("tool_search_eval") / "run.py")
+    run = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda **kw: real(transport=httpx.ASGITransport(app=gw._bearer_gate(None, None)), **kw))
+    for token, want_ok in (("gw-secret", True), ("wrong", False)):
+        cfg = tmp_path / f"cfg-{token}.json"
+        cfg.write_text(json.dumps({"_gateway": {"token": token}}), encoding="utf-8")
+        args = argparse.Namespace(gateway="http://gw", config=str(cfg), timeout=30.0, detail=True)
+        if not want_ok:
+            with pytest.raises(SystemExit, match="/search-eval 401"):
+                asyncio.run(run._live(args))
+            continue
+        asyncio.run(run._live(args))
+        out = capsys.readouterr().out
+        assert "(덧씌우기 없음)" in out and "정답쌍 — 1쌍 중 1쌍을 잰다" in out and "doc 1" in out, out
+        rows = [ln.split() for ln in out.splitlines() if ln.startswith(("effective ", "base ", "off "))]
+        assert {r[0] for r in rows} == {"effective", "base", "off"} and all(r[1] in ("전체", "doc") for r in rows), out
+

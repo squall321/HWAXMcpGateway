@@ -72,7 +72,7 @@ k 가 작으면 각 순위의 1·2위가 무거워져 부분문자열이 잡은 
 - 모든 쌍이 `reviewed: false` 다 — 사람이 질의와 정답을 고치면 `true` 로 바꾼다. 특히 정답이 하나뿐인 쌍은 지금 카탈로그에서 다른 도구도 맞는 답일 수 있다(위 '읽는 법' 3).
 - 검토는 검토 화면(claude.ai 아티팩트 — 주소는 HWAXPortal `docs/followups-1017/checklist.md` 결정 21 줄)에서 한다. 쌍마다 질의 · 정답 · 두 순위(부분문자열 · RRF)의 상위 다섯을 보고 맞음 · 고침 · 빼기와 메모를 남긴다. 표시를 되돌리는 것은 `apply_review.py` 다 — Claude 가 화면의 저장소(`marks`)를 내려받아 `--marks <폴더>` 로 먼저 바뀌는 것만 보고(`--write` 없이), 맞으면 `--write` 로 쓴다. 맞음은 `reviewed: true`, 고침은 `gold` · `query` 를 바꾸고 `reviewed: true`, 빼기는 줄을 지운다. 메모는 `review_memo`.
 - 정답 도구가 지금 카탈로그에 없으면 그 쌍은 재지 않고 러너가 따로 센다(DynaForge·ReportArchive 가 내려간 dev 에서 doc 8쌍).
-- 실사용 질의는 아직 없다 — 게이트웨이 감사 원장은 `search_tools` 호출과 인자를 남기지 않는다(로컬 도구라 감사 밖이다). 10-18 부터 30일 동안 따로 모은다(아래 '실사용 질의').
+- 실사용 질의는 감사 원장에 없다 — `search_tools` 는 로컬 도구라 감사 밖이다. 10-18 부터 따로 모은다(아래 '실사용 질의' — 10-29 부터 굴러가는 창). 박스에서 사람이 단 정답은 `pairs.local.jsonl`(`source: "box"`)에 둔다(아래 '박스에서 닫히는 고리').
 
 ## BGE-M3 로 다시 잼(2026-10-18 — 결정 21 '끈 채 재측정')
 
@@ -141,18 +141,36 @@ cae00 웹 챗 QA(10-29)에서 고장모드 · 시험항목 · 가상검증 · �
   따로 잴 일이다. 정본이 사본을 대표하게 한 것은 접기로 했다.
 - cae00 에서 다시 재려면 거기서 스냅샷을 뜬다(위 '러너'). 실제 효과는 같은 16문항 점검기로 본다(사람 · cae00 세션).
 
-## 실사용 질의 — 30일 모으기(2026-10-18 결정 21)
+## 실사용 질의 — 날짜별 굴러가는 창(2026-10-18 결정 21 → 10-29 E-9 ①)
 
-게이트웨이가 `search_tools` 를 답할 때마다 `tool_search_eval/queries.local.jsonl` 에 한 줄을 덧붙인다(추적하지 않는다 — `.gitignore` 의 `*.local.*`).
+게이트웨이가 `search_tools` 를 답할 때마다 그날(KST) 파일 `tool_search_eval/queries-YYYY-MM-DD.local.jsonl` 에 한 줄을 덧붙인다(추적하지 않는다 — `.gitignore` 의 `*.local.*`).
+10-18 의 '첫 줄부터 30일 뒤 멈춤' 은 10-29 에 **굴러가는 창**으로 바꿨다 — 고리는 cae00 에서 닫혀야 해서 모으기가 멈추면 안 된다(HWAXPortal `docs/request-1029` C-31).
 
 ```json
-{"d": "2026-10-18", "q": "보스 응력 보강 심의", "mode": "substring", "top": ["hwax-deliberation:deliberate_start", "…"]}
+{"d": "2026-10-29", "ts": 1793260800, "id": "3f9a1c0b7d2e", "q": "보고서 요약해줘", "mode": "substring", "top": ["signalforge:digest", "…"],
+ "fp": "6c8512116255", "via": {"signalforge:digest": ["syn:요약"]}, "boost_only": ["signalforge:digest"]}
+{"d": "2026-10-29", "ts": 1793260830, "o": "3f9a1c0b7d2e", "t": "signalforge:digest", "r": 1, "ok": true}
 ```
 
-- 남기는 것은 날짜(KST) · 질의 원문 · 순위 방식(`substring` | `rrf`) · 그때 상위 다섯(정답과 같은 꼴 `앱키:원래 이름`)뿐이다. 누가 · 어디서 불렀는지와 결과 전문은 남기지 않는다.
-- **첫 줄 날짜부터 30일이 지나면 저절로 멈춘다**(게이트웨이 로그에 한 줄). 다시 모으려면 파일을 옮기고 게이트웨이를 재기동한다. 첫 줄의 날짜를 못 읽으면 30일을 셀 수 없어 모으지 않는다.
-- 끄기 — 게이트웨이를 띄우는 프로세스의 env 에 `GATEWAY_TOOL_QUERY_LOG=0`. 남기다 실패해도 검색은 그대로 답한다. 시험(`test_gateway.py`)과 이 러너는 이 파일에 쓰지 않는다.
-- 쓰는 법 — 모은 질의는 정답이 없다. 사람이 정답을 달아 `pairs.jsonl` 꼴(`source: "usage"`)로 옮긴 뒤 `--pairs` 로 잰다. 그때 '실사용 질의가 doc 쪽(짧은 업무 낱말)에 가까운가' 가 RRF 를 켤지의 근거가 된다(위 BGE-M3 절의 판정).
+- 질의 줄 — 날짜 · 시각 · 질의 id · 원문 · 순위 방식 · 상위 다섯(정답 꼴 `앱키:원래 이름`) · 손잡이 지문(`fp`) · 점수를 보탠 규칙(`via` — `syn:<낱말>` · `vocab:<낱말>` · `quality` · `embedding`) · 보정 덕에만 든 결과(`boost_only` — 보정을 빼면 0점이거나 limit 밖).
+- 결과 줄 — 같은 호출자가 찾은 뒤 600초 안에 백엔드 도구를 부르면 `{o: 질의 id, t, r: 순위 또는 null, ok}` 를 덧붙인다(찾기 하나에 서로 다른 도구 다섯까지). 사람 표시 없이 나오는 '찾기 → 부르기 → 성공' 신호다. 호출자는 게이트웨이 기억 안에서만 쓰고 적지 않는다.
+- 창 — 날이 바뀔 때 `GATEWAY_TOOL_QUERY_LOG_DAYS`(기본 30)일보다 오랜 날짜 파일을 지운다. 옛 일회성 파일 `queries.local.jsonl` 은 읽기만 한다(id 가 없어 결과 줄과 잇지 못한다).
+- 끄기 — 게이트웨이를 띄우는 프로세스의 env 에 `GATEWAY_TOOL_QUERY_LOG=0`. 남기다 실패해도 검색 · 호출은 그대로 답한다. 시험 · 이 러너 · `/search-eval` 은 이 파일에 쓰지 않는다.
+
+## 박스에서 닫히는 고리 — 창구 셋 · `run.py live`(10-29 E-9 ② ③)
+
+dev 의 카탈로그 · 정답은 운영과 달라 잰 것이 운영을 말하지 못한다(C-31). 그래서 cae00 에서 모으고 · 표시하고 · 잰다.
+
+- 보기 — `GET /search-log?days=&limit=&q=`(게이트웨이 공유 비밀 `_gateway.token` — `/conn-invalidate` 와 같다): 최근 질의(새것 먼저)마다 상위 다섯 · 보정 표지 · 뒤이은 호출과, 그 질의에 박스 표시가 있으면 그것.
+- 표시 — `POST /search-review {q, verdict: ok|gold|remove, gold: ["앱키:원래 이름", …], memo?, qid?}` 가 **박스 정답쌍** `tool_search_eval/pairs.local.jsonl` 에 `source: "box"` 로 둔다(같은 질의는 바꿔 쓴다 · `remove` 는 지운다 · gitignore). 포털 관리자 '도구 검색 검토' 화면이 이 창구를 부른다 — claude.ai 아티팩트 → Claude → 리포를 거치던 길(위 '평가셋')은 dev 가 지은 기본 정답에만 쓴다.
+- 재기 — `POST /search-eval` 은 떠 있는 카탈로그 · 서비스 시야로 정답쌍(추적 `pairs.jsonl` + 박스 `pairs.local.jsonl`)을 판마다 잰다 — 덧씌운 값(`effective`) · 기본값(`base`) · 보정 끔(`off`) · 묶음 하나씩 끔(`-synonyms` · `-core_vocab` · `-delib_narrow` · `-quality` · `-write_penalty` · `-copy_fold`). 부분문자열 순위만이고(임베딩 끔) 질의 기록에 섞지 않는다. 한 번에 하나다(돌고 있으면 409).
+
+```bash
+PY=../HWAXAgentServer/.venv/bin/python
+$PY tool_search_eval/run.py live --gateway http://127.0.0.1:9110 --config gateway_config.json [--detail]
+```
+
+`live` 는 `/search-eval` 의 답을 표로 찍는다 — 손잡이 지문(덧씌운 값 · 기본값) · 잰 쌍 수(정답 도구가 지금 카탈로그에 없어 뺀 쌍 따로) · 판 × 출처(doc · auto · box · 전체)의 hit@1 · hit@5 · MRR@20, `--detail` 이면 판마다 정답 순위가 다른 쌍(창구는 앞의 40개만 싣는다).
 
 ## 러너 — `run.py`
 
@@ -162,6 +180,8 @@ PY=../HWAXAgentServer/.venv/bin/python        # 게이트웨이와 같은 파이
 $PY tool_search_eval/run.py snapshot --gateway http://127.0.0.1:9110 --config gateway_config.json
 # 2) 견주기 — 임베더를 주면 RRF 와 임베딩 순위(진단)도 잰다. --detail 은 쌍마다 방법별 순위
 $PY tool_search_eval/run.py eval --embed-url http://127.0.0.1:8001/api/embed --detail
+# 3) 박스에서 바로 — 떠 있는 게이트웨이의 /search-eval(위 '박스에서 닫히는 고리')
+$PY tool_search_eval/run.py live --detail
 ```
 
 - 러너는 `gateway` 를 import 해(임시 설정, 백엔드·포털 없이) 스냅샷을 카탈로그로 앉히고 `_search_tools(limit=20)` 를 옵션을 끄고 한 번, 켜고 한 번 부른다 — 재는 것이 배포되는 코드 그 자체다. 앱 라벨·설명(app_hit)도 라이브의 `/tools-map` 값 그대로다.

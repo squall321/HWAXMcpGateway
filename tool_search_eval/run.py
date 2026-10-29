@@ -6,6 +6,9 @@
   $PY tool_search_eval/run.py snapshot --gateway http://127.0.0.1:9110 --config gateway_config.json
   # 2) 견준다 — 임베더 주소를 주면 RRF 와 임베딩 순위(진단)도 잰다. 빼면 부분문자열만
   $PY tool_search_eval/run.py eval --embed-url http://127.0.0.1:8001/api/embed [--detail]
+  # 3) 박스에서 바로 — 떠 있는 게이트웨이의 /search-eval 을 부른다(스냅샷 없이). 정답쌍은 추적(pairs.jsonl) + 박스 표시
+  #    (pairs.local.jsonl), 손잡이는 덧씌운 값 · 기본값 · 보정 끔 · 묶음 하나씩 끔. 부분문자열 순위만 잰다(HWAXPortal docs/request-1029 E-9)
+  $PY tool_search_eval/run.py live --gateway http://127.0.0.1:9110 --config gateway_config.json [--detail]
 
 순위는 게이트웨이 코드 그대로다 — 이 러너는 gateway 를 import 해 스냅샷을 카탈로그로 앉히고 `_search_tools`(limit 20)를
 옵션을 끄고 한 번, 켜고 한 번 부른다. 그래서 MRR 은 20위까지만 센다(MRR@20 — 20위 밖은 0).
@@ -233,6 +236,38 @@ async def _eval(args) -> None:
             print(f"  {p['id']:<10} {p['source']:<4} {cells}  {p['query']}")
 
 
+async def _live(args) -> None:
+    import httpx
+    token = json.loads(Path(args.config).read_text(encoding="utf-8"))["_gateway"]["token"]
+    base = args.gateway.rstrip("/")
+    async with httpx.AsyncClient(timeout=args.timeout) as cli:
+        r = await cli.post(f"{base}/search-eval", headers={"Authorization": f"Bearer {token}"}, json={})
+    if r.status_code != 200:
+        sys.exit(f"/search-eval {r.status_code} — {r.text[:300]}")
+    d = r.json()
+    pc = d["pairs"]
+    print(f"손잡이 지문 — 덧씌운 값 {d['fingerprint']} · 기본값 {d['base']}"
+          + (" (덧씌우기 없음)" if d["fingerprint"] == d["base"] else ""))
+    print(f"정답쌍 — {pc['total']}쌍 중 {pc['measured']}쌍을 잰다"
+          + (f" · 정답 도구가 지금 카탈로그에 없어 뺀 {pc['missing_gold']}쌍" if pc["missing_gold"] else "")
+          + " · " + " · ".join(f"{g} {pc[g]}" for g in ("doc", "auto", "box") if g in pc) + f" · {d['seconds']}초")
+    print()
+    print(f"{'판':<16} {'출처':<5} {'n':>4} {'hit@1':>7} {'hit@5':>7} {'MRR@20':>7}")
+    for name, by in d["variants"].items():
+        for g, s in by.items():
+            if s.get("n"):
+                print(f"{name:<16} {g:<5} {s['n']:>4} {s['hit@1']:>7.3f} {s['hit@5']:>7.3f} {s['mrr@20']:>7.3f}")
+    print()
+    print(f"판마다 정답 순위가 다른 쌍 {d['changed_count']}개(덧씌운 값 · 기본값 · 보정 끔 — 20위 밖은 -)"
+          + ("" if args.detail or not d["changed_count"] else " — 쌍별은 --detail"))
+    if args.detail:
+        for c in d["changed"]:
+            cells = " ".join(f"{k}={c[k] or '-'}" for k in ("effective", "base", "off"))
+            print(f"  {c['id']:<16} {c.get('source') or '':<4} {cells}  {c['query']}")
+        if d["changed_count"] > len(d["changed"]):
+            print(f"  … 그 밖 {d['changed_count'] - len(d['changed'])}개(창구는 앞의 {len(d['changed'])}개만 싣는다)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -247,8 +282,13 @@ def main() -> None:
     e.add_argument("--embed-timeout", type=float, default=30.0,
                    help="잴 때의 질의 임베딩 한도(초) — 방법을 재는 것이라 넉넉히 둔다. 시간은 따로 찍는다")
     e.add_argument("--detail", action="store_true", help="쌍마다 방법별 순위를 찍는다")
+    v = sub.add_parser("live", help="떠 있는 게이트웨이의 /search-eval 로 박스에서 잰다(스냅샷 없이)")
+    v.add_argument("--gateway", default="http://127.0.0.1:9110")
+    v.add_argument("--config", default=str(ROOT / "gateway_config.json"), help="_gateway.token 을 읽을 설정 파일")
+    v.add_argument("--timeout", type=float, default=600.0, help="평가 한 번의 한도(초) — 판이 아홉이라 쌍 수만큼 걸린다")
+    v.add_argument("--detail", action="store_true", help="판마다 정답 순위가 다른 쌍을 찍는다")
     args = ap.parse_args()
-    asyncio.run(_snapshot(args) if args.cmd == "snapshot" else _eval(args))
+    asyncio.run({"snapshot": _snapshot, "eval": _eval, "live": _live}[args.cmd](args))
 
 
 if __name__ == "__main__":

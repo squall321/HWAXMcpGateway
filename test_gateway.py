@@ -88,7 +88,7 @@ def test_visible_tools(monkeypatch):
     local = {t.name for t in (gw.SAVE_CONV_TOOL, gw.SEARCH_CONV_TOOL, gw.LIST_APPS_TOOL,
                               gw.SEARCH_TOOLS_TOOL, gw.INVOKE_TOOL,
                               gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL,
-                              gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL)}
+                              gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL, *gw.ROUTINE_TOOLS)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -6074,7 +6074,7 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores"]
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
-    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 8, "reportarchive": 2}
+    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 14, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
     assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
@@ -6141,7 +6141,7 @@ def test_기준_미만으로_처음_붙는_앱만_한_번_경고하고_막지_�
 def test_게이트웨이_로컬_도구는_제_앱으로_센다(monkeypatch, _fresh_scores):
     """로컬 도구는 route 에 없다 — `_gateway` 앱으로 세고, tools/list 가 붙이는 것과 같은 목록이다(REST 다리는 사이트가 있을
     때만). 목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
-    for rest, n_local in (({}, 8), ({"s": {"base": "http://x"}}, 10)):
+    for rest, n_local in (({}, 14), ({"s": {"base": "http://x"}}, 16)):      # 로컬 8 + 분석 루틴 6(+ REST 다리 둘)
         monkeypatch.setattr(gw, "REST", rest)
         _aggregate_tools(monkeypatch, {"sf": [_stool("sf_q", {"q": None})]})
         row = {r["app"]: r for r in gw._ARG_SCORE["apps"]}["_gateway"]
@@ -8600,3 +8600,237 @@ def test_E8_피드백_보고서의_손잡이_읽기는_게이트웨이와_지문
         assert mine["fingerprint"] == theirs["fingerprint"] and mine["base_fingerprint"] == theirs["base_fingerprint"], overlay
         assert {k: (e["owner"], e["source_fix"]) for k, e in mine["synonyms"].items()} == \
                {k: (e["owner"], e["source_fix"]) for k, e in theirs["owners"].items()}, overlay
+
+
+# ── 분석 루틴(HWAXPortal docs/analysis-routines R2) — 로컬 도구 여섯 · 단계 울타리 · 원장 · RA 초안 ────────────────────────────
+_RT_PLAN = {"run": {"id": "r1", "state": "running", "calls": 0},          # 포털 run_view 꼴 — allowed 는 {백엔드: [원래 이름]}
+            "steps": [{"id": "voc", "state": "running", "backends": ["signalforge"],
+                       "allowed": {"signalforge": ["search_voc", "defect_profile"]}, "budget": {"calls": 3}, "calls": 0},
+                      {"id": "delib", "state": "pending", "backends": ["hwax-deliberation"],
+                       "allowed": {"hwax-deliberation": ["deliberate_start"]}, "budget": {"calls": 3}, "calls": 0},
+                      {"id": "old", "state": "ok", "backends": ["signalforge"], "allowed": {"signalforge": ["search_voc"]},
+                       "budget": {"calls": 3}, "calls": 1},
+                      {"id": "two", "state": "pending", "backends": ["signalforge", "failuretrace"],
+                       "allowed": {"signalforge": ["search_voc"], "failuretrace": ["search_voc"]}, "budget": {"calls": 3}, "calls": 0}]}
+
+
+def _rt_kit(monkeypatch, plan=None, result_text='{"rows": [1, 2]}', is_error=False, extra=None):
+    """포털(/routines-api)은 가짜(부른 것을 적는다), 안쪽 도구 호출(_call_tool_body)도 가짜다 — 이름 · 인자 · 그때의 corr 를 적는다.
+    노출 이름은 실제 꼴이다(겹침 별칭은 '<백엔드에서 하이픈 뺀 것>_<원래 이름>')."""
+    seen, inner = [], []
+    replies = {("GET", "/runs/r1"): plan or _RT_PLAN, ("POST", "/runs/r1/calls"): {"call_id": "voc.c1"},
+               ("GET", "/runs/r1/evidence"): {"evidence": [{"source": "signalforge:search_voc", "key": "voc.c1"}]},
+               ("POST", "/runs/r1/ra"): {"ok": True}, **(extra or {})}
+
+    async def portal(method, path, *, body=None, params=None, timeout=None):
+        seen.append((method, path, body, params))
+        if (method, path) not in replies:
+            raise AssertionError(f"뜻밖의 포털 호출 {method} {path}")
+        v = replies[(method, path)]
+        if isinstance(v, Exception):
+            raise v
+        return v
+    monkeypatch.setattr(gw, "_routine_portal", portal)
+    monkeypatch.setattr(gw, "route", {"search_voc": ("signalforge", "search_voc"),
+                                      "signalforge_defect_profile": ("signalforge", "defect_profile"),
+                                      "submit_job": ("signalforge", "submit_job"),
+                                      "create_report_draft": ("reportarchive", "create_report_draft"),
+                                      "deliberate_start": ("hwax-deliberation", "deliberate_start")})
+    monkeypatch.setattr(gw, "alias_route", {})
+
+    async def body(name, args):
+        inner.append((name, args, gw._request_corr()))
+        return types.CallToolResult(content=[types.TextContent(type="text", text=result_text)], isError=is_error)
+    monkeypatch.setattr(gw, "_call_tool_body", body)
+    return seen, inner
+
+
+def _rt_run(name, args):
+    res = asyncio.run(gw._routine_dispatch(name, args))
+    return res, res.content[0].text
+
+
+def test_루틴_도구_여섯은_로컬_목록에_있고_읽기_전용_PAT_는_목록_계획만(monkeypatch):
+    names = [t.name for t in gw._local_tools()]
+    assert {t.name for t in gw.ROUTINE_TOOLS} <= set(names) and len(gw.ROUTINE_TOOLS) == 6
+    for t in gw.ROUTINE_TOOLS:
+        props = t.inputSchema.get("properties") or {}
+        assert all((p.get("description") or "").strip() for p in props.values()), f"{t.name} 인자 설명(점수판)"
+    assert {n for n in gw._LOCAL_READ if n.startswith("routine_")} == {"routine_list", "routine_get"}
+    for n in ("routine_run_start", "routine_call", "routine_step_done", "routine_report_submit"):
+        assert gw._readonly_denial(n, {}).startswith("read_only:"), n
+    assert gw._readonly_denial("routine_list", {}) == "" and gw._readonly_denial("routine_get", {}) == ""
+    st, body = _gate_call(monkeypatch, "/tools-map")
+    assert st == 200 and all(body["map"].get(t.name) == "_gateway" for t in gw.ROUTINE_TOOLS), "도구 지도 · list_tool_apps 의 수가 맞는다"
+
+
+def test_routine_call_은_단계_울타리_밖을_거절한다(monkeypatch):
+    seen, inner = _rt_kit(monkeypatch)
+    for name, step, why in (("search_reports", "voc", "울타리 밖"), ("submit_job", "voc", "울타리 밖"),
+                            ("search_voc", "old", "이미 닫혔다"), ("search_voc", "nope", "단계 'nope' 가 없다")):
+        res, text = _rt_run("routine_call", {"run_id": "r1", "step": step, "name": name})
+        assert res.isError and text.startswith("ROUTINE_ERROR:") and why in text, (name, text)
+    assert inner == [], "울타리 밖은 안쪽 도구를 부르지 않는다"
+    plan = {**_RT_PLAN, "run": {**_RT_PLAN["run"], "state": "cancelled"}}
+    _rt_kit(monkeypatch, plan=plan)
+    _, text = _rt_run("routine_call", {"run_id": "r1", "step": "voc", "name": "search_voc"})
+    assert "cancelled 상태" in text
+    steps = [dict(_RT_PLAN["steps"][0], calls=3)] + _RT_PLAN["steps"][1:]
+    _rt_kit(monkeypatch, plan={**_RT_PLAN, "steps": steps})
+    _, text = _rt_run("routine_call", {"run_id": "r1", "step": "voc", "name": "search_voc"})
+    assert "호출 예산(3번)을 다 썼다" in text
+    _rt_kit(monkeypatch, plan={**_RT_PLAN, "run": {**_RT_PLAN["run"], "limit_reached": "시간 60분"}})
+    _, text = _rt_run("routine_call", {"run_id": "r1", "step": "voc", "name": "search_voc"})
+    assert "실행 상한에 닿았다(시간 60분)" in text
+
+
+def test_routine_call_은_원래_이름을_풀고_corr_를_달아_부른_뒤_원장에_남긴다(monkeypatch):
+    seen, inner = _rt_kit(monkeypatch)
+    res, text = _rt_run("routine_call", {"run_id": "r1", "step": "voc", "name": "defect_profile", "arguments": {"product": "X"}})
+    assert not res.isError, text
+    [(exposed, args, corr)] = inner
+    assert exposed == "signalforge_defect_profile" and args == {"product": "X"}, "원래 이름 → 이 게이트웨이의 노출 이름"
+    assert corr == "routine:r1:voc" and gw._request_corr() == "", "안쪽 호출 동안만 그 실행 · 단계가 corr 다"
+    post = next(b for m, p, b, _ in seen if (m, p) == ("POST", "/runs/r1/calls"))
+    assert post == {"step": "voc", "backend": "signalforge", "tool": "defect_profile", "args": {"product": "X"}, "ok": True,
+                    "ms": post["ms"], "result": '{"rows": [1, 2]}', "truncated": False}
+    head = json.loads(text)
+    assert head == {"routine_call": "voc.c1", "step": "voc", "tool": "signalforge:defect_profile", "ok": True, "chars": 16}
+    assert res.content[1].text == '{"rows": [1, 2]}', "작은 결과는 원래 블록 그대로"
+
+
+def test_두_백엔드에_같은_이름이면_백엔드_이름으로_부른다(monkeypatch):
+    seen, inner = _rt_kit(monkeypatch)
+    monkeypatch.setattr(gw, "route", {**gw.route, "failuretrace_search_voc": ("failuretrace", "search_voc")})
+    _, text = _rt_run("routine_call", {"run_id": "r1", "step": "two", "name": "search_voc"})
+    assert "signalforge, failuretrace 에 다 있다" in text, "노출 이름 search_voc 는 signalforge 것이다 — 고르지 않고 묻는다"
+    res, text = _rt_run("routine_call", {"run_id": "r1", "step": "two", "name": "failuretrace:search_voc"})
+    assert not res.isError and inner[-1][0] == "failuretrace_search_voc"
+    post = [b for m, p, b, _ in seen if (m, p) == ("POST", "/runs/r1/calls")][-1]
+    assert (post["backend"], post["tool"]) == ("failuretrace", "search_voc")
+    _, text = _rt_run("routine_call", {"run_id": "r1", "step": "two", "name": "nope:search_voc"})
+    assert "울타리 밖" in text
+
+
+def test_routine_call_큰_결과는_원장에_다_두고_응답은_첫_쪽만(monkeypatch):
+    seen, _ = _rt_kit(monkeypatch, result_text="가" * 150_000)
+    res, text = _rt_run("routine_call", {"run_id": "r1", "step": "voc", "name": "search_voc"})
+    head = json.loads(text)
+    assert head["pages"] == 3 and "page=2" in head["next"] and len(res.content[1].text) == gw.ROUTINE_PAGE_CHARS
+    post = next(b for m, p, b, _ in seen if (m, p) == ("POST", "/runs/r1/calls"))
+    assert len(post["result"]) == 150_000 and post["truncated"] is False
+
+
+def test_routine_call_오류_결과도_원장에_남기고_isError_를_잇는다(monkeypatch):
+    seen, _ = _rt_kit(monkeypatch, result_text="backend down", is_error=True)
+    res, _ = _rt_run("routine_call", {"run_id": "r1", "step": "voc", "name": "search_voc"})
+    assert res.isError
+    post = next(b for m, p, b, _ in seen if (m, p) == ("POST", "/runs/r1/calls"))
+    assert post["ok"] is False and post["result"] == "backend down"
+
+
+def test_심의_단계는_evidence_를_비우면_원장에서_채운다(monkeypatch):
+    seen, inner = _rt_kit(monkeypatch)
+    _rt_run("routine_call", {"run_id": "r1", "step": "delib", "name": "deliberate_start", "arguments": {"question": "왜"}})
+    assert inner[-1][1] == {"question": "왜", "evidence": [{"source": "signalforge:search_voc", "key": "voc.c1"}]}
+    assert ("GET", "/runs/r1/evidence", None, {"step": "delib"}) in seen
+    seen.clear()
+    _rt_run("routine_call", {"run_id": "r1", "step": "delib", "name": "deliberate_start",
+                             "arguments": {"question": "왜", "evidence": [{"source": "직접"}]}})
+    assert inner[-1][1]["evidence"] == [{"source": "직접"}] and not any(p.endswith("/evidence") for _, p, _, _ in seen)
+
+
+def test_보고서는_저절로면_그_사람_이름으로_RA_초안을_만들고_결과를_원장에_돌려준다(monkeypatch):
+    rendered = {"report_md": "# 보고서", "coverage": {"ok": 2, "skipped": 1}, "warnings": ["w"],
+                "ra": {"upload": "auto", "title": "S26 스웰링", "blocks": {"background": ["b"]}, "tags": ["분석 루틴"]}}
+    seen, inner = _rt_kit(monkeypatch, result_text='{"report_id": 58, "title": "S26"}',
+                          extra={("POST", "/runs/r1/report"): rendered})
+    res, text = _rt_run("routine_report_submit", {"run_id": "r1", "sections": {"insight": "근거 [voc.c1]"}})
+    out = json.loads(text)
+    assert out["ra_report_id"] == "58" and out["coverage"] == {"ok": 2, "skipped": 1} and out["report_chars"] == len("# 보고서")
+    [(exposed, args, corr)] = inner
+    assert exposed == "create_report_draft" and args == {"template_id": "deliberation", "template_version": 1, "title": "S26 스웰링",
+                                                         "blocks": {"background": ["b"]}, "tags": ["분석 루틴"]}
+    assert corr == "routine:r1:report"
+    assert ("POST", "/runs/r1/ra", {"report_id": "58"}, None) in seen
+    assert ("POST", "/runs/r1/report", {"sections": {"insight": "근거 [voc.c1]"}}, None) in seen
+
+
+def test_RA_토큰이_없으면_건너뛰고_까닭을_원장에(monkeypatch):
+    rendered = {"report_md": "x", "ra": {"upload": "auto", "title": "t", "blocks": {}, "tags": []}}
+    seen, _ = _rt_kit(monkeypatch, result_text="Report Archive 토큰을 등록하세요(/tokens?tab=connect)", is_error=True,
+                      extra={("POST", "/runs/r1/report"): rendered})
+    _, text = _rt_run("routine_report_submit", {"run_id": "r1"})
+    out = json.loads(text)
+    assert "토큰을 등록" in out["ra_error"] and "ra_report_id" not in out
+    assert any((m, p) == ("POST", "/runs/r1/ra") and "토큰을 등록" in b["error"] for m, p, b, _ in seen)
+
+
+def test_끝에_묻기_루틴은_upload_true_일_때만_올리고_안_올림은_안_올린다(monkeypatch):
+    for mode, upload, called in (("ask", None, False), ("ask", True, True), ("off", True, False)):
+        rendered = {"report_md": "x", "ra": {"upload": mode, "title": "t", "blocks": {}, "tags": []}}
+        _, inner = _rt_kit(monkeypatch, result_text='{"report_id": 7}', extra={("POST", "/runs/r1/report"): rendered})
+        _, text = _rt_run("routine_report_submit", {"run_id": "r1", **({"upload": upload} if upload else {})})
+        assert bool(inner) is called, (mode, upload)
+        if mode == "ask" and not upload:
+            assert "upload=true" in json.loads(text)["ra_next"]
+    _rt_kit(monkeypatch, extra={("POST", "/runs/r1/report"): {"ra": {"upload": "auto"}}})
+    monkeypatch.setattr(gw, "route", {})
+    _, text = _rt_run("routine_report_submit", {"run_id": "r1"})
+    assert json.loads(text)["ra_error"] == "이 박스 게이트웨이에 Report Archive 가 없다"
+
+
+def test_실행_시작은_자격으로_실행자를_가린다(monkeypatch):
+    seen, _ = _rt_kit(monkeypatch, extra={("POST", "/runs"): {"run_id": "r9"}})
+    _set_request_headers(monkeypatch, {gw.VIA_HEADER: "chat"})
+    _rt_run("routine_run_start", {"routine_id": "x", "inputs": {"model": "S26"}, "version": 2})
+    _set_request_headers(monkeypatch, {gw.VIA_HEADER: "pat"})
+    _rt_run("routine_run_start", {"routine_id": "x"})
+    bodies = [b for m, p, b, _ in seen if (m, p) == ("POST", "/runs")]
+    assert bodies == [{"routine_id": "x", "inputs": {"model": "S26"}, "executor": "chat", "version": 2},
+                      {"routine_id": "x", "inputs": {}, "executor": "mcp"}]
+
+
+def test_포털_창구는_호출자_PAT_를_넘기고_낡은_포털을_말한다(monkeypatch):
+    import re
+    sent = []
+    reply = {"r": httpx.Response(200, json={"routines": []})}
+
+    def handler(req):
+        sent.append(req)
+        return reply["r"]
+    real = httpx.AsyncClient
+    monkeypatch.setattr(gw.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(gw, "PORTAL", {"api_base": "http://portal.test"})
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
+    got = asyncio.run(gw._routine_portal("GET", "/routines", params={"q": "x"}))
+    assert got == {"routines": []} and sent[0].headers["authorization"] == "Bearer pat-person"
+    assert str(sent[0].url) == "http://portal.test/routines-api/routines?q=x"
+    cases = [(httpx.Response(200, text="<html>SPA</html>", headers={"content-type": "text/html"}), "포털이 이 게이트웨이보다 낡았다"),
+             (httpx.Response(404, json={"detail": "Not Found"}), "포털이 이 게이트웨이보다 낡았다"),
+             (httpx.Response(404, json={"detail": "루틴을 찾을 수 없습니다"}), "루틴을 찾을 수 없습니다"),
+             (httpx.Response(401, json={"detail": "x"}), "토큰을 받지 않았다"),
+             (httpx.Response(403, json={"detail": "권한이 없습니다(feat:routines)"}), "feat:routines")]
+    for resp, why in cases:
+        reply["r"] = resp
+        with pytest.raises(gw._RoutineError, match=re.escape(why)):
+            asyncio.run(gw._routine_portal("GET", "/routines"))
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    _set_request_headers(monkeypatch, {"authorization": "Bearer gw-secret"})
+    with pytest.raises(gw._RoutineError, match="사람 PAT 로만"):
+        asyncio.run(gw._routine_portal("GET", "/routines"))
+
+
+def test_루틴_도구는_정상_호출_경로에서_디스패치되고_읽기_전용은_실행을_못_한다(monkeypatch):
+    real = gw._call_tool_body
+    seen, _ = _rt_kit(monkeypatch, extra={("GET", "/routines"): {"count": 0, "routines": []}})
+    monkeypatch.setattr(gw, "_call_tool_body", real)              # 안쪽 호출은 가짜로 두지 않는다 — 진짜 디스패치를 탄다
+    _set_request_headers(monkeypatch, {})
+    res = asyncio.run(real("routine_list", {"q": "x" * 300}))
+    assert not res.isError and json.loads(res.content[0].text) == {"count": 0, "routines": []}
+    assert seen[-1] == ("GET", "/routines", None, {"q": "x" * 200}), "q 는 200자까지"
+    _set_request_headers(monkeypatch, {gw.READONLY_HEADER: "1"})
+    res = asyncio.run(real("routine_call", {"run_id": "r1", "step": "voc", "name": "search_voc"}))
+    assert res.isError and res.content[0].text.startswith("read_only: routine_call"), res.content[0].text
+    res = asyncio.run(real("routine_list", {}))
+    assert not res.isError, "목록은 읽기 전용 토큰도 본다"

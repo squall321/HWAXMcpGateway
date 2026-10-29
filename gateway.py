@@ -11,6 +11,7 @@ import time
 from array import array
 from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -4360,12 +4361,324 @@ async def _rest_call(args: dict) -> types.CallToolResult:
     return _evid_keep("rest_call", _pii_mask(_rest_text(payload)))
 
 
+# ── 분석 루틴(HWAXPortal docs/analysis-routines — R2) ───────────────────────────────────────────────────────────────────
+# 정의 · 실행 원장 · 보고서 렌더는 포털(/routines-api)이 쥐고, 게이트웨이는 호출자 PAT 를 그대로 넘기는 얇은 도구와 단계 울타리(routine_call)만
+# 맡는다 — 챗(Qwen, 에이전트 서버)과 개인 Claude 가 같은 울타리 · 같은 원장을 탄다(AR-D3). 사람 PAT 로만 돈다 — 원장 · RA 초안이 그 사람
+# 이름이어야 하고 게이트웨이 공유 비밀(GW_TOKEN)은 사람이 아니다. 단계에서 부를 수 있는 도구(allowed)는 포털이 실행을 시작할 때 그 사람의 도구
+# 목록에서 읽기 도구만 골라 계획에 박는다 — 쓰기 분류의 정본은 포털 하나다(단계 안 쓰기 금지 v1, AR-D5).
+ROUTINE_TIMEOUT_S = float(os.environ.get("GATEWAY_ROUTINE_TIMEOUT_S", "60") or 60)
+ROUTINE_PAGE_CHARS = 60_000          # 큰 결과는 원장에 다 두고 응답은 이만큼씩 — Claude Code 의 MCP 결과 상한(약 25k 토큰) 안
+ROUTINE_LEDGER_CHARS = 2_000_000     # 원장에 싣는 결과 글자 상한(포털 원장 2MB 와 같은 몫) — 넘으면 앞부분과 표시
+ROUTINE_RA_BACKEND = "reportarchive"
+# routine_call 이 부르는 안쪽 호출의 감사 corr. 핸들러 안에서 세우고 같은 태스크에서 안쪽 도구를 부른 뒤 되돌린다 — _request_ip 주석의
+# 'ContextVar 로 옮기지 마라' 는 미들웨어에서 세운 값이 세션 태스크에서 굳는 문제라 여기에 해당하지 않는다(세우는 곳이 핸들러 안이다).
+_ROUTINE_CORR: ContextVar[str] = ContextVar("hwax_routine_corr", default="")
+
+
+def _routine_tool(name: str, description: str, props: dict, required: list[str]) -> types.Tool:
+    return types.Tool(name=name, description=description,
+                      inputSchema={"type": "object", "properties": props, "required": required})
+
+
+_RT_RUN = {"type": "string", "description": "실행 id — routine_run_start 가 준 run_id(32자 16진수)"}
+_RT_STEP = {"type": "string", "description": "단계 id — 계획의 steps[].id(소문자 · 숫자 · 밑줄, 24자까지)"}
+ROUTINE_LIST_TOOL = _routine_tool(
+    "routine_list",
+    "포털 절차 › 루틴에 짜 둔 분석 루틴 목록(내 것 + 공개된 것). 루틴은 플랫폼 연쇄다 — 단계마다 플랫폼(울타리)과 할 일. 돌리는 순서는 "
+    "routine_get(계획) → routine_run_start → 단계마다 routine_call(그 단계 허용 도구만) · routine_step_done → routine_report_submit 이다.",
+    {"q": {"type": "string", "description": "제목 · 목적에 든 글(대소문자 없이, 200자까지) — 비우면 전부"}}, [])
+ROUTINE_GET_TOOL = _routine_tool(
+    "routine_get",
+    "루틴의 계획(단계 · 플랫폼 · 할 일 · 기대 출력 · 예산 · 내 준비도 · 허용 도구) 또는 실행의 진행(run_id — 단계 상태 · 다음 단계). "
+    "run_id 와 call_id 를 함께 주면 원장에 둔 그 호출 결과의 한 쪽(page — 쪽마다 60,000자)을 준다.",
+    {"routine_id": {"type": "string", "description": "루틴 id(routine_list 의 id, 32자 16진수) — run_id 를 주면 쓰지 않는다"},
+     "version": {"type": "integer", "minimum": 1, "description": "판 번호(1 이상, 비우면 최신)"},
+     "run_id": _RT_RUN,
+     "call_id": {"type": "string", "description": "원장의 호출 id(예: voc.c2) — run_id 와 함께, 큰 결과의 다음 쪽을 읽을 때"},
+     "page": {"type": "integer", "minimum": 1, "description": "쪽 번호(1 이상, 기본 1)"}}, [])
+ROUTINE_RUN_START_TOOL = _routine_tool(
+    "routine_run_start",
+    "루틴 실행을 시작한다 — 판과 입력을 박고 run_id 와 계획을 준다. 막힌 단계(권한 없음 · 토큰 없음 · 이 박스에 없음)는 계획에 그 상태로 "
+    "표시돼 건너뛴다(기준 키처럼 '멈춤' 으로 짠 단계가 막히면 실행이 멈춘다). 다음은 계획의 첫 pending 단계부터 routine_call.",
+    {"routine_id": {"type": "string", "description": "루틴 id(routine_list 의 id, 32자 16진수)"},
+     "version": {"type": "integer", "minimum": 1, "description": "판 번호(1 이상, 비우면 최신)"},
+     "inputs": {"type": "object", "description": "루틴 입력 {키: 값} — 계획의 vars(예: {model: 'S26', symptom: '스웰링'})"}},
+    ["routine_id"])
+ROUTINE_CALL_TOOL = _routine_tool(
+    "routine_call",
+    "실행 중인 단계의 도구 하나를 부른다 — 그 단계의 플랫폼 · 허용 도구(계획의 allowed)만 된다(울타리 밖은 거절). 호출과 결과는 원장에 "
+    "call_id 로 남는다 — 단계 요약 · 보고서는 [call_id] 로 인용한다. 결과가 60,000자를 넘으면 앞쪽만 오고 나머지는 routine_get(run_id, "
+    "call_id, page). 심의 단계에서 deliberate_start 의 evidence 를 비워 두면 앞 단계(uses)의 원 근거를 원장에서 채운다.",
+    {"run_id": _RT_RUN, "step": _RT_STEP,
+     "name": {"type": "string", "description": "부를 도구 — 원래 이름(계획의 allowed) 또는 노출 이름"},
+     "arguments": {"type": "object", "description": "그 도구의 인자(그 도구의 inputSchema 그대로)"}},
+    ["run_id", "step", "name"])
+ROUTINE_STEP_DONE_TOOL = _routine_tool(
+    "routine_step_done",
+    "단계를 닫는다. 포털이 원장과 맞대 상태를 고친다 — 호출 없이 ok 면 skipped, 결과가 다 오류면 failed, keys 의 값은 그 단계 결과에 "
+    "글자 그대로 있어야 다음 단계로 넘어간다. 답은 다음 단계 또는(다 닫혔으면) 보고서 틀이다.",
+    {"run_id": _RT_RUN, "step": _RT_STEP,
+     "status": {"type": "string", "enum": ["ok", "empty", "ambiguous", "denied", "not_connected", "unavailable", "failed", "skipped"],
+                "description": "실행자가 본 단계 결과"},
+     "reason": {"type": "string", "description": "ok 가 아니면 까닭(500자까지)"},
+     "summary": {"type": "string", "description": "단계 요약 — 마크다운 6,000자까지, 근거는 [call_id]"},
+     "keys": {"type": "object", "description": "다음 단계에 넘길 값 {키: 값}(계획의 expect.keys, 값은 200자까지)"},
+     "findings": {"type": "array", "description": "발견 20개까지 — [{text(500자까지), refs:[call_id]}]",
+                  "items": {"type": "object", "properties": {"text": {"type": "string"}, "refs": {"type": "array", "items": {"type": "string"}}}}},
+     "candidates": {"type": "array", "description": "ambiguous 일 때 사람이 고를 후보 20개까지 — [{label, key}]",
+                    "items": {"type": "object", "properties": {"label": {"type": "string"}, "key": {"type": "string"}}}}},
+    ["run_id", "step", "status"])
+ROUTINE_REPORT_TOOL = _routine_tool(
+    "routine_report_submit",
+    "모든 단계를 닫은 뒤 보고서를 낸다 — sections 는 {단계 id 또는 insight: 마크다운}(안 쓴 단계는 그 단계 요약으로 채운다). insight 는 "
+    "[call_id] 로 근거를 인용한다. 포털이 커버리지(건너뛴 단계와 까닭) · 근거 부록을 붙여 렌더하고, 루틴이 '저절로' 면 그 사람 이름으로 "
+    "Report Archive 초안을 만든다(RA 토큰이 없으면 건너뛰고 알린다 — 공용 계정으로 대신 올리지 않는다). 게시는 사람이 RA 에서 한다.",
+    {"run_id": _RT_RUN,
+     "title": {"type": "string", "description": "보고서 제목(200자까지, 비우면 루틴의 보고서 제목)"},
+     "sections": {"type": "object", "description": "{단계 id | insight: 마크다운} — 절마다 20,000자까지"},
+     "upload": {"type": "boolean", "description": "루틴이 '끝에 묻는다' 일 때 사람이 올리기로 했으면 true(저절로 · 안 올림 루틴에서는 무시)"}},
+    ["run_id"])
+ROUTINE_TOOLS = (ROUTINE_LIST_TOOL, ROUTINE_GET_TOOL, ROUTINE_RUN_START_TOOL, ROUTINE_CALL_TOOL, ROUTINE_STEP_DONE_TOOL,
+                 ROUTINE_REPORT_TOOL)
+
+
+class _RoutineError(Exception):
+    """루틴 도구가 호출자에게 그대로 말할 까닭."""
+
+
+def _caller_bearer() -> str:
+    """포털로 넘길 호출자 Authorization — 사람 PAT 만. 게이트웨이 공유 비밀이거나 없으면 ''."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return ""
+    auth = ((req.headers.get("authorization") if req is not None else None) or "").strip()
+    if not auth or _secret_eq(auth, f"Bearer {GW_TOKEN}"):
+        return ""
+    return auth
+
+
+async def _routine_portal(method: str, path: str, *, body: dict | None = None, params: dict | None = None,
+                          timeout: float | None = None) -> dict:
+    """포털 /routines-api 를 호출자 PAT 로 — 답이 JSON 이 아니면(SPA 폴백 · 옛 포털) '포털이 낡았다' 다('루틴 없음' 이 아니다)."""
+    base = _portal_api_base()
+    if not base:
+        raise _RoutineError("포털 주소가 없다(gateway_config.json portal.api_base)")
+    auth = _caller_bearer()
+    if not auth:
+        raise _RoutineError("루틴은 사람 PAT 로만 돈다 — 원장 · 보고서가 그 사람 이름이어야 한다(게이트웨이 공유 비밀로는 부를 수 없다)")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout or ROUTINE_TIMEOUT_S, connect=8.0)) as cli:
+            r = await cli.request(method, f"{base}/routines-api{path}", json=body, params=params,
+                                  headers={"Authorization": auth})
+    except httpx.HTTPError as exc:
+        raise _RoutineError(f"포털에 닿지 못했다({type(exc).__name__})") from None
+    stale = "포털에 루틴 창구가 없다 — 포털이 이 게이트웨이보다 낡았다(포털을 새 판으로)"
+    if "json" not in r.headers.get("content-type", ""):
+        raise _RoutineError(stale)
+    try:
+        data = r.json()
+    except ValueError:
+        raise _RoutineError(f"포털 답을 읽지 못했다({r.status_code})") from None
+    if r.status_code in (200, 201, 202):
+        return data if isinstance(data, dict) else {"items": data}
+    detail = data.get("detail") if isinstance(data, dict) else None
+    if r.status_code == 404 and detail == "Not Found":
+        raise _RoutineError(stale)
+    if r.status_code == 401:
+        raise _RoutineError("포털이 이 토큰을 받지 않았다(만료 · 폐기 — 포털 /tokens 에서 다시 발급)")
+    raise _RoutineError(_clip(str(detail or f"portal {r.status_code}"), 500))
+
+
+def _rt_json(obj) -> types.CallToolResult:
+    return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(obj, ensure_ascii=False))])
+
+
+def _rt_text(text) -> str:
+    return "\n".join(getattr(c, "text", "") for c in (getattr(text, "content", None) or []) if getattr(c, "type", "") == "text")
+
+
+def _rt_exposed(backend: str, original: str) -> str | None:
+    """(백엔드, 원래 이름) → 이 게이트웨이의 노출 이름. 겹침으로 접두가 붙었어도 찾는다."""
+    for exposed, r in route.items():
+        if r == (backend, original):
+            return exposed
+    return None
+
+
+async def _routine_dispatch(name: str, arguments: dict) -> types.CallToolResult:
+    """루틴 로컬 도구 여섯 — 실패는 ROUTINE_ERROR 한 줄로 낸다(까닭 그대로). 감사는 portal 로 한 줄."""
+    t0 = time.monotonic()
+    try:
+        if name == ROUTINE_CALL_TOOL.name:
+            res = await _routine_call(arguments)
+        elif name == ROUTINE_REPORT_TOOL.name:
+            res = await _routine_report(arguments)
+        else:
+            res = _rt_json(await _routine_simple(name, arguments))
+        _audit(name, "portal", True, None, round((time.monotonic() - t0) * 1000))
+        return res
+    except _RoutineError as exc:
+        _audit(name, "portal", False, str(exc), round((time.monotonic() - t0) * 1000))
+        return types.CallToolResult(content=[types.TextContent(type="text", text=f"ROUTINE_ERROR: {exc}")], isError=True)
+
+
+async def _routine_simple(name: str, a: dict) -> dict:
+    q = lambda s: quote(str(s or "").strip(), safe="")  # noqa: E731
+    if name == ROUTINE_LIST_TOOL.name:
+        return await _routine_portal("GET", "/routines", params={"q": str(a.get("q") or "")[:200]})
+    if name == ROUTINE_GET_TOOL.name:
+        run_id = str(a.get("run_id") or "").strip()
+        if run_id and a.get("call_id"):
+            return await _routine_portal("GET", f"/runs/{q(run_id)}/calls/{q(a['call_id'])}",
+                                         params={"page": max(1, int(a.get("page") or 1))})
+        if run_id:
+            return await _routine_portal("GET", f"/runs/{q(run_id)}")
+        if not a.get("routine_id"):
+            raise _RoutineError("routine_id 또는 run_id 를 준다")
+        return await _routine_portal("GET", f"/routines/{q(a['routine_id'])}/plan",
+                                     params={"version": int(a["version"])} if a.get("version") else None)
+    if name == ROUTINE_RUN_START_TOOL.name:
+        if not a.get("routine_id"):
+            raise _RoutineError("routine_id 를 준다")
+        body = {"routine_id": str(a["routine_id"]), "inputs": a.get("inputs") or {},
+                "executor": "chat" if _request_via() == "chat" else "mcp"}
+        if a.get("version"):
+            body["version"] = int(a["version"])
+        return await _routine_portal("POST", "/runs", body=body)
+    if name == ROUTINE_STEP_DONE_TOOL.name:
+        if not (a.get("run_id") and a.get("step")):
+            raise _RoutineError("run_id 와 step 을 준다")
+        env = {k: a[k] for k in ("status", "reason", "summary", "keys", "findings", "candidates") if k in a}
+        return await _routine_portal("POST", f"/runs/{q(a['run_id'])}/steps/{q(a['step'])}/done", body=env)
+    raise _RoutineError(f"모르는 루틴 도구: {name}")
+
+
+async def _routine_call(a: dict) -> types.CallToolResult:
+    """단계 울타리 — 실행 · 단계가 열려 있고, 도구가 그 단계 백엔드의 허용 도구이며, 예산이 남았을 때만 부른다. 부른 것은 원장에 남긴다."""
+    run_id, step = str(a.get("run_id") or "").strip(), str(a.get("step") or "").strip()
+    name, inner = str(a.get("name") or "").strip(), a.get("arguments") or {}
+    if not (run_id and step and name):
+        raise _RoutineError("run_id · step · name 을 준다")
+    if not isinstance(inner, dict):
+        raise _RoutineError("arguments 는 객체여야 한다")
+    qr, qs = quote(run_id, safe=""), quote(step, safe="")
+    plan = await _routine_portal("GET", f"/runs/{qr}")
+    run = plan.get("run") or {}
+    if run.get("state") != "running":
+        raise _RoutineError(f"실행이 {run.get('state')} 상태다 — 도구를 부르지 않는다")
+    st = next((s for s in plan.get("steps") or [] if s.get("id") == step), None)
+    if st is None:
+        raise _RoutineError(f"이 실행에 단계 {step!r} 가 없다")
+    if st.get("state") not in ("pending", "running"):
+        raise _RoutineError(f"단계 {step} 는 이미 닫혔다({st.get('state')})")
+    if int(st.get("calls") or 0) >= int((st.get("budget") or {}).get("calls") or 0):
+        raise _RoutineError(f"단계 {step} 의 호출 예산({(st.get('budget') or {}).get('calls')}번)을 다 썼다 — routine_step_done 으로 닫는다")
+    if run.get("limit_reached"):
+        raise _RoutineError(f"실행 상한에 닿았다({run['limit_reached']}) — 남은 단계를 닫고 보고서를 낸다")
+    backends = list(st.get("backends") or [])
+    allowed = {b: set(v or []) for b, v in (st.get("allowed") or {}).items()}   # {백엔드: 원래 이름} — 포털이 실행을 시작할 때 찍었다
+    resolved, exposed = None, None
+    hits = [b for b in backends if name in allowed.get(b, set())]
+    if ":" in name and name.split(":", 1)[0] in backends:      # '백엔드:원래 이름' — 두 백엔드에 같은 이름이 있을 때
+        resolved = tuple(name.split(":", 1))
+    elif len(hits) > 1:
+        # 계획은 원래 이름을 보인다 — 노출 이름이 한쪽 것이라도 조용히 그쪽을 고르지 않는다(다른 쪽을 뜻했을 수 있다)
+        raise _RoutineError(f"'{name}' 은 {', '.join(hits)} 에 다 있다 — '백엔드:원래 이름' 으로 부른다")
+    elif route.get(name):
+        resolved, exposed = route[name], name
+    elif alias_route.get(name):
+        resolved = alias_route[name]
+    if resolved is None or resolved[0] not in backends:       # 원래 이름으로 줬다 — 단계의 백엔드 안에서 찾는다
+        resolved, exposed = ((hits[0], name), None) if hits else (resolved, exposed)
+    if resolved is not None and exposed is None:
+        exposed = _rt_exposed(*resolved)
+    if resolved is None or resolved[0] not in backends or resolved[1] not in allowed.get(resolved[0], set()) or exposed is None:
+        shown = " · ".join(f"{b}: {', '.join(sorted(v)[:10])}{' …' if len(v) > 10 else ''}" for b, v in allowed.items() if v)
+        raise _RoutineError(f"울타리 밖 — 단계 {step} 는 {', '.join(backends) or '(없음)'} 의 허용 도구만 부른다({shown or '허용 도구 없음'})")
+    if resolved == ("hwax-deliberation", "deliberate_start") and not inner.get("evidence"):
+        ev = await _routine_portal("GET", f"/runs/{qr}/evidence", params={"step": step})
+        inner = {**inner, "evidence": ev.get("evidence") or []}
+    tok = _ROUTINE_CORR.set(f"routine:{run_id}:{step}"[:120])
+    t0 = time.monotonic()
+    try:
+        res = await _call_tool_body(exposed, inner)
+    finally:
+        _ROUTINE_CORR.reset(tok)
+    ms = round((time.monotonic() - t0) * 1000)
+    text = _rt_text(res)
+    ok = not getattr(res, "isError", False) and not _envelope_reason(res)
+    rec = await _routine_portal("POST", f"/runs/{qr}/calls", body={
+        "step": step, "backend": resolved[0], "tool": resolved[1], "args": inner, "ok": ok, "ms": ms,
+        "result": text[:ROUTINE_LEDGER_CHARS], "truncated": len(text) > ROUTINE_LEDGER_CHARS})
+    head = {"routine_call": rec.get("call_id"), "step": step, "tool": f"{resolved[0]}:{resolved[1]}", "ok": ok,
+            "chars": len(text)}
+    if len(text) > ROUTINE_PAGE_CHARS:
+        pages = -(-min(len(text), ROUTINE_LEDGER_CHARS) // ROUTINE_PAGE_CHARS)
+        head["pages"] = pages
+        head["next"] = f"routine_get(run_id, call_id={rec.get('call_id')}, page=2) — 이 답은 1/{pages}쪽"
+        body = [types.TextContent(type="text", text=text[:ROUTINE_PAGE_CHARS])]
+    else:
+        body = list(getattr(res, "content", None) or [])
+    return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(head, ensure_ascii=False))] + body,
+                                isError=bool(getattr(res, "isError", False)))
+
+
+def _rt_report_id(res) -> str | None:
+    """RA create_report_draft 의 답에서 보고서 id — 최상위 report_id 가 실측 꼴이다(에이전트 서버 _ra_report_id 와 같은 셋)."""
+    try:
+        obj = json.loads(_rt_text(res) or "{}")
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    inner = obj.get("report")
+    rid = (inner.get("id") if isinstance(inner, dict) else None) or obj.get("report_id") or obj.get("id")
+    return str(rid) if rid not in (None, "") else None
+
+
+async def _routine_report(a: dict) -> types.CallToolResult:
+    run_id = str(a.get("run_id") or "").strip()
+    if not run_id:
+        raise _RoutineError("run_id 를 준다")
+    qr = quote(run_id, safe="")
+    body = {"sections": a.get("sections") or {}}
+    if a.get("title"):
+        body["title"] = str(a["title"])
+    made = await _routine_portal("POST", f"/runs/{qr}/report", body=body)
+    ra = made.get("ra") or {}
+    mode = ra.get("upload") or "off"
+    out = {"run_id": run_id, "coverage": made.get("coverage"), "warnings": made.get("warnings") or [],
+           "report_chars": len(made.get("report_md") or ""), "ra_upload": mode}
+    if mode == "auto" or (mode == "ask" and a.get("upload") is True):
+        exposed = _rt_exposed(ROUTINE_RA_BACKEND, "create_report_draft")
+        rid, err = None, None
+        if exposed is None:
+            err = "이 박스 게이트웨이에 Report Archive 가 없다"
+        else:
+            tok = _ROUTINE_CORR.set(f"routine:{run_id}:report"[:120])
+            try:
+                res = await _call_tool_body(exposed, {"template_id": "deliberation", "template_version": 1,
+                                                      "title": ra.get("title") or "분석 루틴 보고서",
+                                                      "blocks": ra.get("blocks") or {}, "tags": ra.get("tags") or []})
+            finally:
+                _ROUTINE_CORR.reset(tok)
+            rid = None if getattr(res, "isError", False) else _rt_report_id(res)
+            if rid is None:
+                err = _clip(_envelope_reason(res) or _rt_text(res) or "보고서 id 가 없다", 500)
+        await _routine_portal("POST", f"/runs/{qr}/ra", body={"report_id": rid} if rid else {"error": err})
+        out.update({"ra_report_id": rid} if rid else {"ra_error": err})
+    elif mode == "ask":
+        out["ra_next"] = "사람에게 Report Archive 초안으로 올릴지 묻고, 올리기로 하면 같은 run_id 로 upload=true 를 붙여 다시 낸다"
+    return _rt_json(out)
+
+
 def _local_tools() -> list[types.Tool]:
     """tools/list 가 백엔드 도구 뒤에 늘 붙이는 게이트웨이 로컬 도구. 인자 설명 점수판도 이 목록을 `_gateway` 앱으로 센다 —
     목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
-             BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL]
+             BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS]
     # REST 다리는 **등록된 사이트가 있을 때만** 낸다 — 쓸 수 없는 도구를 목록에 두면
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
@@ -4426,6 +4739,9 @@ def _request_corr() -> str:
     다시 박아 위조를 막지만(2183행), 상관 ID 는 권한에 아무 영향이 없으므로 그대로 받는다.
     읽는 쪽은 이것을 **묶는 데만** 쓰고 누구인지 판정하는 데 쓰면 안 된다 — 그건 `caller` 다.
     """
+    routine = _ROUTINE_CORR.get()          # routine_call 의 안쪽 호출이면 그 실행 · 단계(분석 루틴 — 호출자는 머리를 못 싣는다)
+    if routine:
+        return routine
     try:
         req = _low.request_context.request
     except LookupError:
@@ -4518,6 +4834,9 @@ def _readonly_denial(name: str, arguments: dict) -> str:
         return "" if m in ("GET", "HEAD") else f"read_only: rest_call {m[:10]} — 읽기 전용 토큰(scopes 에 read 만)은 GET · HEAD 만 부른다."
     if name == SAVE_CONV_TOOL.name:
         return "read_only: save_conversation — 읽기 전용 토큰(scopes 에 read 만)은 대화를 저장할 수 없다."
+    if name in _ROUTINE_NAMES:
+        # 루틴 도구는 경로(route)에 없는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸린다 — 실행 · 원장 쓰기는 여기서 막는다(목록 · 계획은 _LOCAL_READ)
+        return f"read_only: {name} — 읽기 전용 토큰(scopes 에 read 만)은 루틴을 돌리지 못한다(원장에 쓴다). routine_list · routine_get 만 된다."
     resolved = route.get(name) or alias_route.get(name)
     if resolved is None:
         return ""      # 아래 'unknown tool' 로 끝난다 — 없는 도구를 읽기 전용 까닭으로 가리지 않는다
@@ -5309,7 +5628,9 @@ async def _list_tools():
 # 게이트웨이 자체 도구 가운데 조회만 하는 것 — 읽기 전용 토큰도 부른다. save_conversation(쓰기)은 빠지고, rest_call 은 메서드로,
 # invoke_tool 은 안쪽 도구로 바꾼 뒤 _readonly_denial 이 다시 본다.
 _LOCAL_READ = frozenset({SEARCH_CONV_TOOL.name, LIST_APPS_TOOL.name, SEARCH_TOOLS_TOOL.name, BROWSE_EXPERTS_TOOL.name,
-                         USE_EXPERTS_TOOL.name, VERIFY_TOOL.name, REST_CATALOG_TOOL.name})
+                         USE_EXPERTS_TOOL.name, VERIFY_TOOL.name, REST_CATALOG_TOOL.name,
+                         ROUTINE_LIST_TOOL.name, ROUTINE_GET_TOOL.name})   # 루틴 실행 · 원장 쓰기는 읽기 전용 PAT 밖
+_ROUTINE_NAMES = frozenset(t.name for t in ROUTINE_TOOLS)
 
 
 # 진행 중인 CallTool 수 — 재기동 때 이것이 0 이 될 때까지 짧게 기다린다(_GracefulServer, HG-11).
@@ -5391,6 +5712,8 @@ async def _call_tool_body(name: str, arguments: dict):
         return await _use_experts(arguments or {})
     if name == VERIFY_TOOL.name:
         return await _verify_answer(arguments or {})
+    if name in _ROUTINE_NAMES:
+        return await _routine_dispatch(name, arguments or {})
 
     if name == REST_CATALOG_TOOL.name:
         return await _rest_catalog(arguments or {})
@@ -5747,7 +6070,7 @@ def _bearer_gate(app, pat_verifier=None):
             # search_tools·invoke_tool 도 게이트웨이 로컬이다 — 빠뜨리면 /tools-map 의 _gateway
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
-                        VERIFY_TOOL):
+                        VERIFY_TOOL, *ROUTINE_TOOLS):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서

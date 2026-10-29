@@ -8556,3 +8556,47 @@ def test_E9_run_py_live_는_떠_있는_창구를_불러_판마다_표로_찍는�
         rows = [ln.split() for ln in out.splitlines() if ln.startswith(("effective ", "base ", "off "))]
         assert {r[0] for r in rows} == {"effective", "base", "off"} and all(r[1] in ("전체", "doc") for r in rows), out
 
+
+# ── E-8 — 플랫폼별 피드백 보고서가 게이트웨이가 남긴 기록을 그대로 읽는다(가짜가 아니라 진짜 꼴) ──────────────────────────────
+def test_E8_피드백_보고서는_게이트웨이가_남긴_질의_기록과_감사를_그대로_읽는다(monkeypatch, tmp_path):
+    import platform_feedback_report as pfr
+    _qlog_kit(monkeypatch)
+    # 실제 꼴 — 노출 이름은 원래 이름이거나 '<백엔드 키에서 하이픈 뺀 것>_<원래 이름>' 이다(_aggregate). _qlog_kit 의 route 는 그 꼴이 아니다
+    monkeypatch.setattr(gw, "route", {"report_digest": ("signalforge", "report_digest"), "report_list": ("signalforge", "report_list")})
+    monkeypatch.setattr(gw, "backends", {"signalforge": object()})
+    asyncio.run(gw._search_tools({"query": "요약"}))                      # 손 동의어로만 report_digest 에 닿는다 — boost_only
+    big = types.CallToolResult(content=[types.TextContent(type="text", text="가" * 60_000)])
+    gw._audit("report_list", "signalforge", True, None, 5, caller="someone@example.com", res=big)
+    gw._audit("report_digest", "signalforge", False, "refused: no-connection", 5, caller="someone@example.com")
+    tmap = tmp_path / "map.json"
+    tmap.write_text(json.dumps({"map": {"report_digest": "signalforge", "report_list": "signalforge"},
+                                "apps": [{"app": "signalforge", "label": "SignalForge"}]}), encoding="utf-8")
+    out = tmp_path / "r.md"
+    assert pfr.main(["--tools-map", str(tmap), "--audit", gw.AUDIT_PATH, "--qlog-dir", str(gw.TOOL_QUERY_LOG_DIR),
+                     "--tuning", str(gw.SEARCH_TUNING_PATH), "--out", str(out)]) == 0
+    text = out.read_text(encoding="utf-8")
+    assert "질의 1개 · 결과 줄 2개" in text and f"질의 때의 지문 `{gw._tuning()['fingerprint']}` 1개" in text, text[:600]
+    row = next(ln for ln in text.splitlines() if ln.startswith("| 손 동의어 '요약'"))
+    assert "`report_digest`(1)" in row and "「요약」" in row, row
+    row = next(ln for ln in text.splitlines() if ln.startswith("| `report_list` | 1 |") and ln.endswith("| 1 |"))
+    assert "60,000" in row, "감사 chars(진짜 _res_chars)로 큰 응답을 잰다"
+    assert "게이트웨이 · 권한에서 막힌 호출 1건은 실패에서 뺐다" in text
+    assert "someone" not in text
+
+
+def test_E8_피드백_보고서의_손잡이_읽기는_게이트웨이와_지문이_같다(monkeypatch):
+    import platform_feedback_report as pfr
+    local = gw.SEARCH_TUNING_LOCAL_PATH                                  # autouse 가 tmp 로 건 자리
+    cases = [None, {"synonyms": {"요약": {"owner": "signalforge", "source_fix": "digest 설명에 '요약'"}, "보고서": None},
+                    "switches": {"quality": False}},
+             {"weights": {"name": "넷"}}, "{깨진", [1, 2]]
+    for overlay in cases:
+        if overlay is None:
+            local.unlink(missing_ok=True)
+        else:
+            local.write_text(overlay if isinstance(overlay, str) else json.dumps(overlay, ensure_ascii=False), encoding="utf-8")
+        monkeypatch.setattr(gw, "_TUNING", {"key": None, "data": None, "error": None, "overlay": None})
+        mine, theirs = pfr.load_tuning(gw.SEARCH_TUNING_PATH, local), gw._tuning()
+        assert mine["fingerprint"] == theirs["fingerprint"] and mine["base_fingerprint"] == theirs["base_fingerprint"], overlay
+        assert {k: (e["owner"], e["source_fix"]) for k, e in mine["synonyms"].items()} == \
+               {k: (e["owner"], e["source_fix"]) for k, e in theirs["owners"].items()}, overlay

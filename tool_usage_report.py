@@ -60,14 +60,20 @@ def _tools_map(path: str | None, gateway: str) -> tuple[dict, str]:
         return json.loads(r.read().decode("utf-8")), gateway.rstrip("/") + "/tools-map"
 
 
-def report(tmap: dict, seen: Counter, *, days: int, since: datetime, until: datetime, audit: str, source: str, lines: int) -> str:
-    label = {a.get("app"): a.get("label") or a.get("app") for a in tmap.get("apps") or []}
+def usage_by_app(tmap: dict, seen: Counter) -> dict:
+    """앱(백엔드 키)마다 {used: [노출 이름], unused: [노출 이름]} — 게이트웨이 자체 도구는 뺀다. 플랫폼별 피드백 보고서도 이것을 쓴다."""
     by_app: dict = {}
     for name, bk in sorted((tmap.get("map") or {}).items()):
         if not bk or bk == "_gateway":
             continue
         used = any(seen.get((n, bk)) for n in _names(name, bk))
         by_app.setdefault(bk, {"used": [], "unused": []})["used" if used else "unused"].append(name)
+    return by_app
+
+
+def report(tmap: dict, seen: Counter, *, days: int, since: datetime, until: datetime, audit: str, source: str, lines: int) -> str:
+    label = {a.get("app"): a.get("label") or a.get("app") for a in tmap.get("apps") or []}
+    by_app = usage_by_app(tmap, seen)
     rows = sorted(by_app.items(), key=lambda kv: (-len(kv[1]["unused"]), kv[0]))
     tot = sum(len(v["used"]) + len(v["unused"]) for v in by_app.values())
     unused = sum(len(v["unused"]) for v in by_app.values())

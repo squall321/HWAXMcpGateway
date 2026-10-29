@@ -2778,11 +2778,13 @@ def _core_vocab() -> dict | None:
 
 
 def _core_vocab_health() -> dict:
-    """/health 의 core_vocab — 읽었나 · 버전 · 낱말 수 · 정본 앱 · 소개 줄이 붙었나. 경로는 싣지 않는다(박스 배치가 드러난다)."""
+    """/health 의 core_vocab — 읽었나 · 버전 · 낱말 수 · 정본 앱 · 그 앱이 이 박스 백엔드에 있나 · 소개 줄이 붙었나. 정본 키가 박스의
+    백엔드 키와 다르면 소개 줄 · 정본 대표 접기가 조용히 꺼진다 — canonical_backend 가 그것을 말한다. 경로는 싣지 않는다(박스 배치)."""
     d = _core_vocab()
     if d is None:
         return {"loaded": False, "error": _CORE_VOCAB["error"]}
     return {"loaded": True, "version": d["version"], "words": len(d["syn"]), "canonical": d["canonical"],
+            "canonical_backend": d["canonical"] in backends,
             "tagline_applied": _CORE_VOCAB["tag_applied"] is not None and _CORE_VOCAB["tag_applied"] == d["tag"]}
 
 

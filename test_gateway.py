@@ -6573,9 +6573,13 @@ def test_코어_어휘표_정본을_형제_포털_리포에서_읽고_health_에
     for w in ("고장모드", "시험항목", "가상검증", "기준", "영률", "대책", "실패모드"):
         assert w in syn, w
     assert "메커니즘" not in syn and "물성" in syn, "검색 낱말은 R-4 의 목록이다 — 메커니즘은 '메커니즘 규명'(심의)을 가로챈다"
+    monkeypatch.setattr(gw, "backends", {})
     h = gw._core_vocab_health()
     assert h["loaded"] is True and h["canonical"] == "rootdesigndatahub" and h["words"] == len(d["syn"])
     assert h["tagline_applied"] is False, "아직 집계 전이다"
+    assert h["canonical_backend"] is False, "정본 키의 백엔드가 이 박스에 없다 — 소개 줄 · 정본 대표가 조용히 꺼진 것을 말한다"
+    monkeypatch.setattr(gw, "backends", {"rootdesigndatahub": _B([])})
+    assert gw._core_vocab_health()["canonical_backend"] is True
     assert "HWAXPortal" not in json.dumps(h, ensure_ascii=False)
 
 

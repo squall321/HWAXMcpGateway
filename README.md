@@ -187,7 +187,7 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 - 정본 소개 줄 — 정본 앱(`canonical.app`)의 도구 설명 앞에 `[canonical.tagline]` 을 집계 때 붙인다(R-3). 줄이 바뀌면 다음 재활 회차(60초)에 다시 집계한다.
 - 사본 접기 — 원래 이름과 설명(소개 줄은 떼고 본다)이 같은 사본은 정본 한 줄로 접고 나머지는 `same_in` 이다. 질의가 사본의 앱 이름을 부르면 그 사본이 무리를 대표한다(허브 건너기).
 - 심의 가중 — 코어 질문(코어 낱말이 든 질의)에 '심의 · 토의 · 회의' 가 없으면 일반 업무 낱말(원인 · 판정 · 설계 …)을 `deliberate_start` 에 잇지 않는다(R-5). 코어 낱말이 없는 질의는 종전대로다.
-- 표가 없거나 꼴이 틀리면 지금 동작(손 낱말 · 소개 줄 없음)으로 돈다. `/health` 의 `core_vocab` 이 `{loaded, version, words, canonical, tagline_applied}` 또는 `{loaded: false, error}` 를 싣는다(경로는 싣지 않는다).
+- 표가 없거나 꼴이 틀리면 지금 동작(손 낱말 · 소개 줄 없음)으로 돈다. `/health` 의 `core_vocab` 이 `{loaded, version, words, canonical, canonical_backend, tagline_applied}` 또는 `{loaded: false, error}` 를 싣는다(경로는 싣지 않는다). `canonical_backend` 가 false 면 정본 키가 이 박스의 백엔드 키와 달라 소개 줄 · 정본 대표 접기가 꺼져 있다.
 
 ## search_tools 의미 순위 — 선택, 기본 꺼짐
 

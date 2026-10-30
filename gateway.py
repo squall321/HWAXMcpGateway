@@ -607,7 +607,9 @@ def _envelope_reason(res) -> str | None:
 # 게이트웨이를 거치지 않고 그 앱에서 본다. 원천에서 가리는 몫(FailureTrace 의 label · content_text 안 이름 — D-4, PLM — 보류)은 그쪽에 있다.
 #  · JSON 은 **칸 이름**으로 가린다 — 본문 서식(들여쓰기 · 순서)을 바꾸지 않게 글자 위에서 값만 바꾼다. 자유 글의 사람 이름은 꼴로 가르지
 #    않는다(오탐이 수치 · 부품명을 지운다).
-#  · IMEI 꼴(15자리, Luhn 검사 통과)은 어느 글에서든 가린다.
+#  · IMEI 꼴(15자리, Luhn 검사 통과)은 어느 글에서든 가린다. 소수점에 붙은 숫자열은 IMEI 가 아니고(DW-07 — 계산 결과의 소수부
+#    15자리가 Luhn 을 통과해 `4.[가림:IMEI]` 가 됐다), 따옴표 없는 JSON 수(`"칸": 수`)는 칸 이름에 imei · meid 가 들 때만 가린다
+#    (HWAXPortal docs/request_261030 HG-21).
 #  · 게이트웨이 자체 도구(대화 · 조직도 · 검색)는 대상이 아니다 — 백엔드 도구 결과와 rest_call 만. 끄기 — GATEWAY_PII_MASK=0(박스 손잡이).
 PII_MASK_ON = os.environ.get("GATEWAY_PII_MASK", "1").strip() != "0"
 _PII_KEYS = {
@@ -622,7 +624,9 @@ _PII_KEY_KIND = {k.lower(): kind for kind, ks in _PII_KEYS.items() for k in ks}
 _PII_STR_RX = re.compile(r'("(' + "|".join(re.escape(k) for k in _PII_KEY_KIND) + r')"\s*:\s*)"((?:[^"\\]|\\.)*)"', re.I)
 _PII_NUM_RX = re.compile(r'("(' + "|".join(re.escape(k) for kind in ("일련번호", "IMEI") for k in _PII_KEYS[kind]) + r')"\s*:\s*)(\d{8,})(?![\d.])',
                          re.I)
-_IMEI_RX = re.compile(r"(?<![\w-])(\d{2}[- ]?\d{6}[- ]?\d{6}[- ]?\d)(?![\w-])")
+# 소수점 앞뒤에 붙은 숫자열은 IMEI 가 아니다(지수 'e' 는 \w 에 든다). 뒤의 '.' 은 글자가 이어질 때만 거른다 — 문장 끝 마침표는 그대로 가린다.
+_IMEI_RX = re.compile(r"(?<![\w.-])(\d{2}[- ]?\d{6}[- ]?\d{6}[- ]?\d)(?![\w-]|\.\w)")
+_JSON_KEY_BEFORE_RX = re.compile(r'"((?:[^"\\]|\\.)*)"\s*:\s*\Z')       # 바로 앞이 `"칸":` 이면 따옴표 없는 JSON 수다
 _PII_STAT = {"masked": 0}
 
 
@@ -663,8 +667,12 @@ def _pii_mask_text(text: str) -> tuple[str, int]:
         digits = re.sub(r"\D", "", m.group(1))
         if len(digits) != 15 or not _luhn_ok(digits):
             return m.group(0)
+        # 따옴표 없는 JSON 수는 칸 이름으로만 가린다 — 칸 이름에 imei · meid 가 없으면 계산 결과의 수다(HG-21). 가리면 따옴표를 씌워 JSON 을 지킨다.
+        key = _JSON_KEY_BEFORE_RX.search(m.string, max(0, m.start() - 200), m.start())
+        if key and not any(w in key.group(1).lower() for w in ("imei", "meid")):
+            return m.group(0)
         n += 1
-        return "[가림:IMEI]"
+        return '"[가림:IMEI]"' if key else "[가림:IMEI]"
     out = _PII_STR_RX.sub(_str, text)
     out = _PII_NUM_RX.sub(_num, out)
     out = _IMEI_RX.sub(_imei, out)

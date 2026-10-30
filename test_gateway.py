@@ -8284,6 +8284,22 @@ def test_HG20_구조화_본문과_rest_call_도_가리고_health_는_수만_싣�
     assert health["pii_mask"]["on"] is True and isinstance(health["pii_mask"]["masked"], int) and health["pii_mask"]["masked"] >= 2
 
 
+# ── 소수 · 계산 결과의 수는 IMEI 가 아니다(HWAXPortal docs/request_261030 HG-21) ─────────────────────────────────────────────────
+def test_HG21_소수점에_붙은_숫자열과_IMEI_칸이_아닌_따옴표_없는_JSON_수는_가리지_않는다(monkeypatch):
+    """DW-07 — 적층 계산 결과의 소수부 15자리(Luhn 통과)가 `4.[가림:IMEI]` 로 바뀌었다. IMEI 칸 · 문장 끝 마침표 · 목록은 그대로 가린다."""
+    calc = ('{\n  "neutral_z": 4.352099001761481,\n  "scaled": 352099001761481.5,\n  "tiny": 1.352099001761481e-05,\n'
+            '  "total_cycles": 352099001761481,\n  "device_imei": 352099001761481,\n  "imei": 490154203237518,\n'
+            '  "note": "교체 IMEI 352099001761481."\n}')
+    _result_kit(monkeypatch, calc)
+    got = json.loads(asyncio.run(gw._call_tool("get_big", {})).content[0].text)
+    assert got["neutral_z"] == 4.352099001761481 and got["scaled"] == 352099001761481.5 and got["tiny"] == 1.352099001761481e-05
+    assert got["total_cycles"] == 352099001761481, "IMEI 칸이 아닌 따옴표 없는 수는 계산 결과다"
+    assert got["device_imei"] == got["imei"] == "[가림:IMEI]", "칸 이름에 imei 가 들면 가리고, 따옴표를 씌워 JSON 을 지킨다"
+    assert got["note"] == "교체 IMEI [가림:IMEI].", "문장 끝 마침표 앞의 IMEI 는 가린다"
+    out, n = gw._pii_mask_text('{"imei": [352099001761481, 490154203237518]}')
+    assert "352099001761481" not in out and "490154203237518" not in out and n == 2, "목록 원소는 앞에 칸 이름이 없어 꼴로 가린다(닫힌 쪽)"
+
+
 
 # ── 재기동 때 비우기(HWAXPortal docs/request-1027 HG-11) ─────────────────────────────────────────────────────────
 # 10-25 재기동에 열린 스트림 98건이 응답 없이 끊겼다. 리스너 먼저 → 새 세션 503 → 진행 중인 CallTool 이 0 이 될 때까지(상한) → 나머지.

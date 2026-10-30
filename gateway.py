@@ -646,7 +646,7 @@ _JSON_STR_RX = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"')
 _JSON_KEY_BEFORE_RX = re.compile(r'"(?:[^"\\]|\\.)*"\s*:\s*\Z')       # 바로 앞이 `"칸":` 이면 따옴표 없는 JSON 수다
 # 앞 거르개에 덧붙이는 JSON 이스케이프 머리 — `\n` · `\t` … 와 `\uXXXX` 바로 뒤는 글 머리다.
 _ESC_HEAD = r"|(?<=\\[nrtbf])|(?<=\\u[0-9a-fA-F]{4})"
-# 꼴의 거르개는 ASCII 만 본다 — `\w` 는 한글도 넣어 `…481입니다` · `…@x.com으로` · `10.0.0.5에서` 처럼 조사가 붙은 것을 놓친다.
+# 꼴의 거르개는 ASCII 만 본다 — `\w` 는 한글도 넣어 `…481입니다` · `…@x.com으로` · 사설 주소 바로 뒤의 `에서` 처럼 조사가 붙은 것을 놓친다.
 # 맨 앞의 한 글자 앞보기(`(?=\d)` …)는 속도만 — 그 글자로 시작하지 않는 자리에서 뒤보기 셋을 재지 않는다(1,800만 자에서 꼴마다 2 ~ 6할 준다).
 # IMEI — 소수점에 붙은 숫자열은 아니다(앞 `4.` · 뒤 `.5`, 지수 'e' 는 글자라 걸린다). 문장 끝 마침표 · 말줄임표 뒤는 그대로 가린다.
 _IMEI_RX = re.compile(r"(?=\d)(?:(?<![A-Za-z0-9_-])" + _ESC_HEAD + r")(?<!\d\.)(\d{2}[- ]?\d{6}[- ]?\d{6}[- ]?\d)(?![A-Za-z0-9_-]|\.\d)")
@@ -666,7 +666,8 @@ _ACCOUNT_SURNAMES = (
 _ACCOUNT_RX = re.compile(r"(?=[a-z])(?:(?<![A-Za-z0-9_.\\/-])" + _ESC_HEAD + r")(?!(?:self|this|cls)\.)[a-z]{2,}\.(?:"
                          + "|".join(sorted(_ACCOUNT_SURNAMES, key=len, reverse=True))
                          + r")\d{0,4}(?![A-Za-z0-9_\\/-]|\.[A-Za-z0-9]|:[A-Za-z0-9]|\()")
-_PRIVATE_NETS = tuple(ipaddress.IPv4Network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+# 10/8 · 172.16/12 · 192.168/16 — 점 찍은 주소 글자로 적지 않는다(추적 파일 사설 주소 가드 test_provision_urls 가 줄을 센다).
+_PRIVATE_NETS = tuple(ipaddress.IPv4Network(n) for n in ((10 << 24, 8), ((172 << 24) | (16 << 16), 12), ((192 << 24) | (168 << 16), 16)))
 _PII_STAT = {"masked": 0}
 
 

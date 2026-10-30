@@ -22,3 +22,6 @@ tool_search_eval/*.local.*
 # 검색 손잡이의 박스 덧씌우기(HWAXPortal docs/request-1029 E-7) — 박스에서 커밋 없이 튜닝한다. 무시 목록에 없으면 deploy-all · update-all 의
 # git stash -u 가 치운다
 search_tuning.local.json
+# 루틴 단계 읽기 목록의 박스 덧씌우기(HWAXPortal docs/analysis-routines R3 리뷰 #0) — read_tools.json 과 같은 꼴, 박스에서 커밋 없이 더한다.
+# 무시 목록에 없으면 deploy-all · update-all 의 git stash -u 가 치운다
+read_tools.local.json

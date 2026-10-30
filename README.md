@@ -23,7 +23,13 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
 포털 기본 읽기 · 쓰기) 다음만 부른다. 막으면 `read_only: …` 로 까닭과 여는 법을 답하고 감사 원장에 `read-only` 를 남긴다.
 
 - 백엔드 도구 — **`read_tools.json`(추적)의 `백엔드키:원래 이름`**(별칭 · 접두 노출 이름도 원래 이름으로 푼다) 또는 **앱이 그 도구에 단
-  `readOnlyHint`**(재집계마다 다시 읽는다). 처음 목록은 리스크 앱이 읽기 토큰으로 부르는 26종(10-18 대조).
+  `readOnlyHint`**(재집계마다 다시 읽는다). 처음 목록은 리스크 앱이 읽기 토큰으로 부르는 26종(10-18 대조). 이 목록은 분석 루틴 단계의 읽기
+  목록이기도 하다(아래 '분석 루틴') — 여기 더한 것은 두 쓰임에 다 열리므로 읽기만 더한다. 10-30 에 이름 꼴로 막히던 조회 넷(`ai-data-hub:get_record` ·
+  `get_record_sections` · `describe_record_schema` — `record` 가 쓰기 동사, `heax-hwax_risk:risk_next_step` — 조회 낱말이 없다)을 앱 소스로 읽기임을
+  확인하고 더했다. 루틴 단계의 이름 규칙을 좁히며(아래 — R3 리뷰 2차) 그 규칙으로만 열리던 진짜 읽기 일곱도 소스로 확인하고 더했다
+  (`signalforge:resolve_product_keyword` · `heax-step_forge:resolve_materials` · `reportarchive:resolve` · `testscope:resolve` — `resolve` 가 조회 낱말에서
+  빠졌다, `heax-step_forge:upload_instructions` · `heax-kooremapper_mcp:report_upload_instructions` — 안내 글만 준다, `reportarchive:preview_publish` — 게시
+  미리보기, 게시하지 않고 확인 토큰은 서명뿐이라 저장이 없다). 같은 파일의 `deny` 는 루틴 단계만 닫는다 — 읽기 전용 PAT 판정은 보지 않는다.
 - 게이트웨이 자체 도구 — 조회(search_tools · list_tool_apps · rest_catalog · search_conversations · browse_experts · use_experts ·
   verify_answer)는 열고 `save_conversation` 은 막는다. `rest_call` 과 REST 다리(`/api/<site>/`)는 GET · HEAD 만. `invoke_tool` 은 안쪽 도구로 본다.
 - 표지 `x-hwax-readonly` 는 PAT 분기에서만 싣고 클라이언트 사본은 두 분기(GW_TOKEN · PAT) 모두 버린다.
@@ -249,6 +255,58 @@ python3 tool_usage_report.py --days 60 --out unused.md
 - 색인은 도구마다 '앱 라벨 · 이름: 설명' 글의 해시로 두고 재집계 뒤 뒤에서 새 글만 임베딩한다(기동 직후 첫 색인 동안은 부분문자열로 답한다). 순위만 쓰고 코사인 값으로 거르지 않는다.
 - 게이트웨이는 `.env` 를 읽지 않는다 — 띄우는 프로세스의 env 에 있어야 하고, 기동 로그의 `search_tools 의미 순위 켬` 줄로 닿았는지 본다.
 - 실사용 질의 모으기(10-18 결정 21 → 10-29 굴러가는 창) — `search_tools` 질의를 이름 없이 날짜 파일 `tool_search_eval/queries-YYYY-MM-DD.local.jsonl` 에 남기고, 같은 호출자가 600초 안에 부른 백엔드 도구를 결과 줄로 잇는다. 창은 `GATEWAY_TOOL_QUERY_LOG_DAYS`(기본 30)일, 끄기는 `GATEWAY_TOOL_QUERY_LOG=0`. 꼴과 쓰는 법은 `tool_search_eval/README.md` '실사용 질의' · '박스에서 닫히는 고리'.
+
+## 분석 루틴 — 로컬 도구 여섯 · 프롬프트(HWAXPortal docs/analysis-routines)
+
+정의 · 실행 원장 · 보고서 렌더는 포털 `/routines-api` 가 쥐고, 게이트웨이는 호출자 PAT 를 그대로 넘기는 로컬 도구 여섯(`routine_list` · `routine_get` ·
+`routine_run_start` · `routine_call` · `routine_step_done` · `routine_report_submit`)과 단계 울타리를 맡는다. 사람 PAT 로만 돈다(공유 비밀 · 익명은 거절).
+읽기 전용 PAT 는 `routine_list` · `routine_get` 만 부른다. R3 의 정본 계약은 포털 `docs/analysis-routines/R3-design.md` 3.4 다.
+
+- `routine_run_start` — `conversation_id`(64자까지, 포털 `RunIn.conversation_id`)를 주면 실행을 그 대화에 잇는다. `note`(2000자까지, 포털 `RunIn.note`)는
+  사람이 덧붙인 말로 실행에 남는다(비면 싣지 않는다 — 이어서에도 같은 말). `run_id` 를 주면 새로 만들지 않고 포털 `POST /runs/{id}/resume` 으로 이어서
+  돈다(나머지 인자는 보지 않는다). `run_id` 와 `cancel=true` 를 주면 이어서 대신 포털 `POST /runs/{id}/cancel` 로 그 실행을 멈추고 포털의 답(그 실행이
+  시작한 심의를 접은 결과 `delib_cancelled` · `delib_cancel_errors` 포함)을 그대로 돌려준다 — Claude 길도 실행을 멈춘다(R3 리뷰 2차 #2). `run_id` 없는
+  `cancel` 은 새 실행을 만들지 않고 거절하고, 참 · 거짓이 아닌 값도 거절한다(이어서로 읽지 않는다).
+- `routine_call` — 단계의 허용 도구(`allowed`)만 부르고 원장에 남긴다. **읽기로 확인된 도구만 부른다**(닫힌 쪽 — 그 밖은
+  `ROUTINE_ERROR: 단계 안에서는 읽기로 확인된 도구만 부른다(v1) — …`). 판정 `_routine_read` 의 차례는 ⓪ 닫기 목록(`read_tools.json` ∪ 박스 덧씌우기의
+  `deny`)에 있으면 아니다(앱 표지보다 먼저 — 거절 글은 `… 는 이 박스가 닫았다(… 의 deny)`) ① 앱 표지 `readOnlyHint=False` · `destructiveHint=True`
+  면 아니다 ② `readOnlyHint=True` 면 읽기 ③ 읽기 목록(`read_tools.json` ∪ 박스 덧씌우기 `read_tools.local.json`)의 `백엔드키:원래 이름` 이면 읽기 ④ 원래
+  이름을 밑줄로 가른 조각 하나가 조회 낱말(get · list · search · find · query · detail · status · profile · neighbors …)이고 쓰기 동사(`_WRITE_NAME`)가
+  없으면 읽기 ⑤ 나머지는 아니다(표지 없는 `risk_job_action` · `single_drop_simulation` · `docforge_convert` 같은 잡 · 쓰기 도구가 여기서 막힌다).
+  ④ 는 `_tool_is_write` 의 안내 · 미리보기 예외(`_READ_NAME_HINT` — status · history · preview …)를 쓰지 않는다 — `update_status` · `delete_history` ·
+  `apply_preview` 같은 쓰기가 읽기로 열렸다(R3 리뷰 2차 #5). 동사로도 쓰이는 `fetch` · `resolve` · `trace` 는 조회 낱말이 아니다 — `fetch_rerank_model`
+  (모델 내려받기) · `resolve_thread`(검토 스레드 닫기)가 열렸다(R3 리뷰 2차 #0). 그 규칙으로만 열리던 진짜 읽기는 `read_tools.json` 에 있다(위 읽기 전용
+  PAT 절). 코어 허브의 `object_resolve` · `objects_resolve_many` 는 이 리포에서 박스의 백엔드 키를 확인할 수 없어 박스 덧씌우기로 연다.
+  `_tool_is_write` 와 검색 순위는 그대로다. 예외는 심의 단계(`kind: deliberation`)의 `hwax-deliberation` 셋(`deliberate_start` · `deliberate_status` ·
+  `deliberate_result`)이다. `deliberate_start` 의 인자는 안쪽 호출 · 원장 쓰기 전에 거른다(R3 리뷰 2차 #1) — `question` · `job` · `rounds` · `modifiers` ·
+  `evidence` · `personas` · `human_note` · `search_sources` · `options` · `stop_after_round` · `advanced` 만 남기고(`tools` — 엔진이 시작 전에 읽기 판정
+  없이 부르는 도구 · `apps` 같은 그 밖은 버린다), `save_report` · `wiki` 는 늘 `false` 다(보고서 · RA 초안은 루틴이 낸다). `advanced` 는 엔진이 통째로
+  덮어 합치므로 그 안의 `tools` · `apps` · `save_report` · `wiki` 도 빼고(JSON 글이면 풀어서 보고, 사전이 아니면 버린다), `evidence` 가 비면 앞 단계 원
+  근거로 채운다. 원장에는 거른 인자가 남는다.
+  심의 단계의 `deliberate_result` 는 단계 호출 예산 밖이다(시작이 예산을 다 써도 결정문을 읽는다). 실행 보기의 `run.limit_kind` 가 `time` 이면
+  `deliberate_result` 는 시간 상한 뒤에도 부른다(실행 호출 상한은 그대로, 그 칸이 없는 옛 포털이면 종전대로 막는다). 심의 진행(`deliberate_status`)은
+  `routine_call` 없이 직접 부른다(원장 · 예산을 쓰지 않는다). `deliberate_start` 가 됐는데 원장 쓰기(`POST /runs/{id}/calls`)가 거절되거나
+  실패하면(부르는 사이에 시간 상한 · 사람의 멈춤) 그 심의는 원장에도 답에도 job_id 가 없다 — 답의 job_id 로 같은 신원 · 정상 호출 길의
+  `deliberate_cancel` 을 부르고 포털의 까닭 뒤에 ` — 막 시작한 심의(<job_id>)는 접었다`(못 접으면 `…접지 못했다(<까닭>)`)를 붙인다.
+- 읽기 목록 덧씌우기 `read_tools.local.json`(gitignore) — `read_tools.json` 과 같은 꼴(`{"tools": ["백엔드키:원래 이름", …], "deny": [...]}`)로, 이름 꼴로는
+  막히는 조회 도구를 박스에서 커밋 없이 열고(`tools`) 이름 꼴 · 앱 표지로 열린 쓰기를 코드 고침 없이 닫는다(`deny` — 앱의 `readOnlyHint=True` 보다 먼저,
+  R3 리뷰 2차 #0). 리포에 둘 것은 `read_tools.json` 에(위 읽기 전용 PAT 절 — 그 파일의 `deny` 도 루틴만 닫는다). 바뀐 시각이 다르면 재기동 없이 다시
+  읽고, 못 읽거나 꼴이 틀리면 통째로 버린다(빈 목록 — `deny` 도 빠진다, 경고 한 줄).
+  루틴 단계 판정만 본다(읽기 전용 PAT 의 허용 목록은 `read_tools.json` 그대로다). update-all §1 의 stash 는 받기 전의 `.gitignore` 로 돌므로 **이 판을 받은
+  뒤에 만든다**.
+- `routine_report_submit` — 끝난 실행에 다시 내면 포털이 저장본을 돌려준다(`ask` 의 `upload=true` 다시 내기, R3-D12). 저장본에 이미 만든 RA 초안의
+  `ra_report_id` 가 있으면 초안을 또 만들지 않고 그 id 를 `ra_note` 와 함께 돌려준다(원장 `/ra` 에도 다시 적지 않는다). 앞 올리기가 실패한 저장본은 다시 올린다.
+- 포털 오류 — 5xx 는 `포털 오류(HTTP n) — 잠시 뒤 다시`(포털이 JSON 으로 까닭을 줬으면 뒤에 붙인다)다. '포털이 낡았다' 는 창구가 없다는 답(글 404 ·
+  detail `Not Found` · `/routines-api` 를 모르는 옛 포털의 SPA 폴백 200 + HTML)일 때만이다.
+- `/tools-map` 의 `routine_read` — 루틴 단계에서 부를 수 있는 읽기 도구(위 `_routine_read`)의 노출 이름(정렬, 로컬 도구는 없다). 포털 루틴 계획이
+  이것과 겹치는 도구만 단계에 묶는다. `write`(쓰기로 분류된 백엔드 도구의 노출 이름 — `_tool_is_write`)는 `routine_read` 를 모르는 옛 포털을 위해
+  그대로 싣는다(칸이 둘 다 없으면 옛 게이트웨이로 보고 이름 목록만 쓴다). 다른 칸은 그대로다.
+- MCP prompts — `prompts/list` 는 부른 사람(사람 PAT)이 볼 수 있는 루틴마다 `routine-<루틴 id>`(제목 · 단계 사슬 · 변수 인자 — 필수 표시는 포털 목록의
+  `required`)를 낸다. 공유 비밀 · 익명 · 포털 실패는 빈 목록이다(실패는 경고 한 줄, 다만 권한(`feat:routines`)이 없다는 포털 403 은 정상 거절이라 정보 한 줄).
+  `prompts/get` 은 계획의 변수로 빠진 필수 · 없는 입력을 먼저 거절하고, 루틴을 `routine_*` 도구로 돌리는
+  지시문(차례 · 울타리 · 인용 · 키 · 쓰기 금지)에 받은 입력을 `inputs` 로 박아 준다. 공개 루틴은 남이 쓰므로 제목 · 단계 제목은 한 줄 `«…»` 데이터로만
+  싣고(줄바꿈 · `«»` 를 지운다) 작성자의 글이지 지시가 아니라고 한 줄 말한다 — 사람의 말(user)로 올라가 규칙을 덮지 못하게.
+- 서버 지침 12번이 루틴의 차례 · 울타리 · 키 규칙을 한 줄로 말한다(차례의 자세한 글은 `routine_list` 설명 — 지침 전체가 2048자 안이어야 한다).
 
 ## 실행
 ```bash

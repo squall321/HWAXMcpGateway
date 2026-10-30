@@ -605,18 +605,28 @@ def _envelope_reason(res) -> str | None:
 # ── 나가는 응답의 개인정보 가림(HWAXPortal docs/request-1027 HG-20 · 사용자 결정 D-2 — 기본으로 가린다) ─────────────────────────
 # 걸리던 출력 — SignalForge 의 author_name(커뮤니티 작성자) · 계정 핸들, 결함 이력의 검출자 · 작업자, 기기 IMEI · 일련번호. 원문이 필요한 화면은
 # 게이트웨이를 거치지 않고 그 앱에서 본다. 원천에서 가리는 몫(FailureTrace 의 label · content_text 안 이름 — D-4, PLM — 보류)은 그쪽에 있다.
+# 10-30 에는 담당자 칸(ARP partOwner 실명 · StepForge owner 메일 · 담당 계정 · 클러스터 잡 제출자 메일)과 컨트롤러 사설 IP 가 그대로 나갔다
+# (HWAXPortal docs/request_261030 HG-22 — DW-03 · 06 · 12 · 22).
 #  · JSON 은 **칸 이름**으로 가린다 — 본문 서식(들여쓰기 · 순서)을 바꾸지 않게 글자 위에서 값만 바꾼다. 자유 글의 사람 이름은 꼴로 가르지
 #    않는다(오탐이 수치 · 부품명을 지운다).
-#  · IMEI 꼴(15자리, Luhn 검사 통과)은 어느 글에서든 가린다. 소수점에 붙은 숫자열은 IMEI 가 아니고(DW-07 — 계산 결과의 소수부
-#    15자리가 Luhn 을 통과해 `4.[가림:IMEI]` 가 됐다), 따옴표 없는 JSON 수(`"칸": 수`)는 칸 이름에 imei · meid 가 들 때만 가린다
-#    (HWAXPortal docs/request_261030 HG-21).
-#  · 게이트웨이 자체 도구(대화 · 조직도 · 검색)는 대상이 아니다 — 백엔드 도구 결과와 rest_call 만. 끄기 — GATEWAY_PII_MASK=0(박스 손잡이).
+#  · 칸 이름과 상관없이 꼴로 가리는 것 — IMEI 꼴(15자리, Luhn 검사 통과) · 메일 꼴 · 사설 IPv4(10/8 · 172.16/12 · 192.168/16 — 공인 ·
+#    루프백 · 문서용 주소는 그대로). IMEI 꼴은 소수점에 붙은 숫자열이 아니고(DW-07 — 계산 결과의 소수부 15자리가 Luhn 을 통과해
+#    `4.[가림:IMEI]` 가 됐다), 따옴표 없는 JSON 수(`"칸": 수`)는 칸 이름에 imei · meid 가 들 때만 가린다(HG-21).
+#  · 사내 계정 꼴(영문.영문숫자 — gildong.hong)은 칸 이름(user · owner …)으로만 가린다. 꼴로는 설정 경로(shell.thickness · load.drop) ·
+#    파일 이름 · 코드(json.dumps)와 가를 수 없다 — dev 말뭉치(도구 설명 · 앱 출력 · 문서 4,500만 자)에서 확장자 · 도메인 끝을 빼고도
+#    533건이 모두 오탐이고 참은 0건이었다(10-30).
+#  · 게이트웨이 자체 도구(대화 · 조직도 · 검색)는 대상이 아니다 — 백엔드 도구 결과와 rest_call 만. 바이트를 그대로 흘리는 REST 프록시
+#    (`/api/<site>/` — 파일 · 프로그램 길)도 가리지 않는다. 끄기 — GATEWAY_PII_MASK=0(박스 손잡이).
 PII_MASK_ON = os.environ.get("GATEWAY_PII_MASK", "1").strip() != "0"
 _PII_KEYS = {
     "이름": ("author", "author_name", "writer", "writer_name", "username", "user_name", "nickname", "screen_name", "detector",
            "detector_name", "detected_by", "inspector", "inspector_name", "reporter", "reporter_name", "worker_name",
-           "작성자", "검출자", "작업자", "보고자"),
-    "계정": ("author_id", "account_id", "account_name", "handle", "user_handle"),
+           "작성자", "검출자", "작업자", "보고자",
+           # 담당자 칸(HG-22) — 대소문자를 가리지 않으므로 낙타 꼴(partOwner · submittedBy)은 붙인 소문자로 적는다
+           "owner", "owner_name", "ownername", "part_owner", "partowner", "submitter", "submitter_name", "submitted_by",
+           "submittedby", "assignee", "assignee_name", "assigned_to", "assignedto"),
+    "계정": ("author_id", "account_id", "account_name", "handle", "user_handle", "user"),
+    "메일": ("email", "e_mail", "email_address", "emailaddress"),
     "일련번호": ("serial", "serial_no", "serial_number", "sn"),
     "IMEI": ("imei", "imei1", "imei2", "meid"),
 }
@@ -627,6 +637,10 @@ _PII_NUM_RX = re.compile(r'("(' + "|".join(re.escape(k) for kind in ("일련번�
 # 소수점 앞뒤에 붙은 숫자열은 IMEI 가 아니다(지수 'e' 는 \w 에 든다). 뒤의 '.' 은 글자가 이어질 때만 거른다 — 문장 끝 마침표는 그대로 가린다.
 _IMEI_RX = re.compile(r"(?<![\w.-])(\d{2}[- ]?\d{6}[- ]?\d{6}[- ]?\d)(?![\w-]|\.\w)")
 _JSON_KEY_BEFORE_RX = re.compile(r'"((?:[^"\\]|\\.)*)"\s*:\s*\Z')       # 바로 앞이 `"칸":` 이면 따옴표 없는 JSON 수다
+# 메일 · IPv4 의 앞뒤 거르개는 ASCII 만 본다 — `\w` 는 한글도 넣어 `…@x.com으로` · `10.0.0.5에서` 처럼 조사가 붙은 것을 놓친다.
+_EMAIL_RX = re.compile(r"(?<![A-Za-z0-9_.%+-])[A-Za-z0-9_.%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?![A-Za-z0-9_-]|\.[A-Za-z0-9])")
+_IPV4_RX = re.compile(r"(?<![A-Za-z0-9_.])(\d{1,3}(?:\.\d{1,3}){3})(?![A-Za-z0-9_]|\.\d)")
+_PRIVATE_NETS = tuple(ipaddress.IPv4Network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 _PII_STAT = {"masked": 0}
 
 
@@ -673,9 +687,27 @@ def _pii_mask_text(text: str) -> tuple[str, int]:
             return m.group(0)
         n += 1
         return '"[가림:IMEI]"' if key else "[가림:IMEI]"
+
+    def _email(m):
+        nonlocal n
+        n += 1
+        return "[가림:메일]"
+
+    def _ip(m):
+        nonlocal n
+        try:
+            ip = ipaddress.IPv4Address(m.group(1))
+        except ValueError:                       # 255 를 넘는 칸 · 앞자리 0 — IPv4 가 아니다
+            return m.group(0)
+        if not any(ip in net for net in _PRIVATE_NETS):
+            return m.group(0)
+        n += 1
+        return "[가림:IP]"
     out = _PII_STR_RX.sub(_str, text)
     out = _PII_NUM_RX.sub(_num, out)
     out = _IMEI_RX.sub(_imei, out)
+    out = _EMAIL_RX.sub(_email, out)
+    out = _IPV4_RX.sub(_ip, out)
     return out, n
 
 

@@ -8284,7 +8284,7 @@ def test_HG20_구조화_본문과_rest_call_도_가리고_health_는_수만_싣�
     assert health["pii_mask"]["on"] is True and isinstance(health["pii_mask"]["masked"], int) and health["pii_mask"]["masked"] >= 2
 
 
-# ── 소수 · 계산 결과의 수는 IMEI 가 아니다(HWAXPortal docs/request_261030 HG-21) ─────────────────────────────────────────────────
+# ── 소수 · 계산 결과의 수는 IMEI 가 아니다 · 담당자 칸 · 메일 · 사설 IP(HWAXPortal docs/request_261030 HG-21 · HG-22) ─────────────────
 def test_HG21_소수점에_붙은_숫자열과_IMEI_칸이_아닌_따옴표_없는_JSON_수는_가리지_않는다(monkeypatch):
     """DW-07 — 적층 계산 결과의 소수부 15자리(Luhn 통과)가 `4.[가림:IMEI]` 로 바뀌었다. IMEI 칸 · 문장 끝 마침표 · 목록은 그대로 가린다."""
     calc = ('{\n  "neutral_z": 4.352099001761481,\n  "scaled": 352099001761481.5,\n  "tiny": 1.352099001761481e-05,\n'
@@ -8298,6 +8298,69 @@ def test_HG21_소수점에_붙은_숫자열과_IMEI_칸이_아닌_따옴표_없�
     assert got["note"] == "교체 IMEI [가림:IMEI].", "문장 끝 마침표 앞의 IMEI 는 가린다"
     out, n = gw._pii_mask_text('{"imei": [352099001761481, 490154203237518]}')
     assert "352099001761481" not in out and "490154203237518" not in out and n == 2, "목록 원소는 앞에 칸 이름이 없어 꼴로 가린다(닫힌 쪽)"
+
+
+_DW_ROW = ('{\n  "projects": [\n    {"id": "p1", "owner": "gildong.hong", "partOwner": "홍길동", "assignee": "김민수", '
+           '"submitter": "kim@corp.example",\n     "submitted_by": "lee@corp.example", "user": "mongryong.lee01", "email": "mongryong.lee01", '
+           '"ownerName": "이몽룡", "assignedTo": "성춘향",\n     "submittedBy": "임꺽정", "emailAddress": "x@corp.example", '
+           '"params": {"shell.thickness": 1.2, "load.drop": "face"}, "file": "config.yaml",\n     "call": "json.dumps", '
+           '"host": "head.corp.example", "note": "담당 gildong.hong · 메일 lee@corp.example로 문의"}\n  ],\n  "count": 1\n}')
+
+
+def test_HG22_담당자_칸_이름을_가리고_계정_꼴은_칸_이름으로만_가린다(monkeypatch):
+    """DW-06 ARP partOwner(실명) · DW-03 StepForge owner(메일) · DW-12 잡 제출자(메일) · DW-22 담당 계정 — 칸 이름(낙타 꼴 포함)으로 가린다.
+    계정 꼴(영문.영문숫자)은 꼴로 가리지 않는다 — 설정 경로 · 파일 이름 · 코드 · 호스트 이름과 가를 수 없다(gateway.py 가림 머리 주석)."""
+    _result_kit(monkeypatch, _DW_ROW)
+    out = asyncio.run(gw._call_tool("get_big", {})).content[0].text
+    p = json.loads(out)["projects"][0]
+    assert {k: p[k] for k in ("owner", "partOwner", "assignee", "submitter", "submitted_by", "ownerName", "assignedTo", "submittedBy")} \
+        == dict.fromkeys(("owner", "partOwner", "assignee", "submitter", "submitted_by", "ownerName", "assignedTo", "submittedBy"),
+                         "[가림:이름]")
+    assert p["user"] == "[가림:계정]" and p["email"] == p["emailAddress"] == "[가림:메일]"
+    for leak in ("홍길동", "김민수", "kim@corp.example", "lee@corp.example", "mongryong.lee01", "이몽룡", "성춘향", "임꺽정", "x@corp.example"):
+        assert leak not in out, leak
+    assert p["note"] == "담당 gildong.hong · 메일 [가림:메일]로 문의", "자유 글의 계정 꼴은 두고 메일은 조사가 붙어도 가린다"
+    assert p["params"] == {"shell.thickness": 1.2, "load.drop": "face"} and p["file"] == "config.yaml" and p["call"] == "json.dumps"
+    assert p["host"] == "head.corp.example" and p["id"] == "p1"
+    assert out.count("\n") == _DW_ROW.count("\n") and json.loads(out)["count"] == 1, "서식 · 나머지 값은 그대로"
+
+
+def test_HG22_메일_꼴과_사설_IPv4_는_칸_이름과_상관없이_가리고_공인_주소와_IPv4_가_아닌_것은_둔다():
+    hide = ("잡 제출자 kim@corp.example으로 알림 · 컨트롤러 head01(10.20.30.40) · 노드 172.16.0.5, 172.31.255.254 · NAS 192.168.0.7:2049 · "
+            "주소 http://10.1.2.3:8080/api · 원격 10.20.30.40에서 접속")
+    keep = ("공인 8.8.8.8 · 경계 172.32.0.1 · 172.15.255.255 · 루프백 127.0.0.1 · 문서용 192.0.2.10 · 판 1.10.0.0.1 · v10.0.0.1 · "
+            "10.256.1.1 · 010.1.1.1 · react@18.3.1 · @app.get · a@b · calls:risk_screen@1000")
+    out, n = gw._pii_mask_text(hide + " | " + keep)
+    for leak in ("kim@corp.example", "10.20.30.40", "172.16.0.5", "172.31.255.254", "192.168.0.7", "10.1.2.3"):
+        assert leak not in out, leak
+    assert out.startswith("잡 제출자 [가림:메일]으로 알림 · 컨트롤러 head01([가림:IP]) · 노드 [가림:IP], [가림:IP] · NAS [가림:IP]:2049 · "
+                          "주소 http://[가림:IP]:8080/api · 원격 [가림:IP]에서 접속"), "한글 조사 · 포트 · 괄호가 붙어도 가린다"
+    assert out.endswith(" | " + keep), "공인 · 루프백 · 문서용 주소, IPv4 가 아닌 것(255 초과 · 앞자리 0 · 다섯 마디 · 판 번호) · 메일이 아닌 @ 는 그대로"
+    assert n == 7
+
+
+def test_HG22_구조화_본문도_담당자_칸_메일_사설_IP_를_가리고_수는_건드리지_않는다():
+    sc = {"rows": [{"partOwner": "홍길동", "user": "mongryong.lee01", "by": "kim@corp.example", "ctl": "head01 (10.20.30.40)",
+                    "z": 4.352099001761481, "total": 352099001761481}]}
+    res = types.CallToolResult(content=[types.TextContent(type="text", text="ok")], structuredContent=sc)
+    assert gw._pii_mask(res).structuredContent == {"rows": [{
+        "partOwner": "[가림:이름]", "user": "[가림:계정]", "by": "[가림:메일]", "ctl": "head01 ([가림:IP])",
+        "z": 4.352099001761481, "total": 352099001761481}]}
+
+
+def test_HG22_REST_다리_rest_call_출력도_같은_가림을_거친다(_rest, monkeypatch):
+    """TODO-20261029 R-08 — 모델이 읽는 REST 다리(rest_call) 출력도 백엔드 도구 결과와 같은 가림을 거친다(소수는 그대로)."""
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    body = {"jobs": [{"id": "j-17", "submitted_by": "kim@corp.example", "source_ip": "192.168.3.7", "owner": "gildong.hong",
+                      "z": 4.352099001761481}], "controller": "head01 (10.20.30.40)", "contact": "ops lee@corp.example"}
+    _Cli.status, _Cli.raw, _Cli.ctype, _Cli.clen = 200, json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json", None
+    raw = asyncio.run(gw._rest_call({"site": "locked", "path": "/jobs"})).content[0].text
+    for leak in ("kim@corp.example", "192.168.3.7", "gildong.hong", "10.20.30.40", "lee@corp.example"):
+        assert leak not in raw, leak
+    got = json.loads(raw)["body"]
+    assert got["jobs"][0] == {"id": "j-17", "submitted_by": "[가림:이름]", "source_ip": "[가림:IP]", "owner": "[가림:이름]",
+                              "z": 4.352099001761481}
+    assert got["controller"] == "head01 ([가림:IP])" and got["contact"] == "ops [가림:메일]"
 
 
 

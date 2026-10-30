@@ -5216,9 +5216,9 @@ def _local_tools() -> list[types.Tool]:
 def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 사용자가 포털에서 끈 앱은 개인 PAT 의 tools/list·search_tools 에서 뺀다(숨김만 — 호출은 막지 않는다)
     muted = _request_muted()
-    # 코어 어휘표에서 역할이 '시험'(staging)인 사본(StepForge · DynaForge 의 *-prod)도 목록 · 검색에서 뺀다 — 10-29 에도 6번 불렸고 OT-02 는
-    # 사본 결과를 '운영도 같다' 는 근거로 썼다(HWAXPortal docs/request-1029 R-6 · 결정 D-2). 숨김만이다 — 이름을 콕 집어 부르면(invoke_tool ·
-    # 노출 이름) 그대로 닿는다.
+    # 코어 어휘표에서 역할이 '시험'(staging)인 사본도 목록 · 검색에서 뺀다 — 10-29 에 사본이 6번 불렸고 OT-02 는 사본 결과를 '운영도 같다' 는
+    # 근거로 썼다(HWAXPortal docs/request-1029 R-6 · 결정 D-2). 숨김만이다 — 이름을 콕 집어 부르면(invoke_tool · 노출 이름) 그대로 닿는다.
+    # StepForge · DynaForge 의 *-prod 는 운영 앱이라 10-31 OB-04 에 기본 표에서 뺐다 — 다른 시험 사본은 박스 덧씌우기로 둔다.
     hidden = muted | ((_CORE_VOCAB["data"] or {}).get("staging") or frozenset())
     return [t for t in exposed_tools
             if _backend_allowed(route[t.name][0], groups) and route[t.name][0] not in hidden] + _local_tools()

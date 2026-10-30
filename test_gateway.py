@@ -49,6 +49,17 @@ def _no_real_portal(monkeypatch):
 _REAL_CORE_VOCAB = gw.CORE_VOCAB_PATH
 
 
+def _real_vocab_with_staging(tmp_path, *apps):
+    """실제 표 사본에 역할 '시험'(staging) 앱을 더한다 — 숨김 동작 시험이 실제 표의 역할 셋에 기대지 않게 한다. 10-31 OB-04 로 실제 표의
+    staging 이 비었다(운영 앱 stepforge-prod · dynaforge-prod 를 뺐다 — HWAXPortal docs/request-1030, 10-29 D-2 를 뒤집음)."""
+    d = json.loads(_REAL_CORE_VOCAB.read_text(encoding="utf-8"))
+    for a in apps:
+        d.setdefault("apps", {})[a] = {"role": "staging", "label": f"{a} 시험 사본"}
+    p = tmp_path / "core_vocab.json"
+    p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    return p
+
+
 @pytest.fixture(autouse=True)
 def _no_core_vocab(monkeypatch, tmp_path):
     """코어 어휘표 격리 — 기본은 '없음'(지금 동작)이다. 형제 리포의 실제 표를 읽는 시험은 본문에서 _REAL_CORE_VOCAB 를 다시 건다.
@@ -6693,10 +6704,11 @@ def test_R5_코어_질문은_심의를_청할_때만_일반_낱말이_deliberate
     assert pos("신뢰 판정") == pos("해석 설계") == 1, "코어 낱말이 없으면 종전대로 잇는다"
 
 
-def test_R6_시험_사본은_목록_검색에서_빠지고_이름으로_부르면_닿는다(monkeypatch):
-    """어휘표에서 역할이 '시험'(staging)인 앱(stepforge-prod · dynaforge-prod) — 10-29 에도 6번 불렸고 OT-02 는 사본 결과를 '운영도 같다' 는 근거로
-    썼다(HWAXPortal docs/request-1029 R-6 · 결정 D-2). 숨김만이다 — invoke_tool 이나 노출 이름으로 부르면 그대로 닿는다."""
-    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+def test_R6_시험_사본은_목록_검색에서_빠지고_이름으로_부르면_닿는다(monkeypatch, tmp_path):
+    """어휘표에서 역할이 '시험'(staging)인 앱 — 10-29 에 stepforge-prod 가 6번 불렸고 OT-02 는 사본 결과를 '운영도 같다' 는 근거로
+    썼다(HWAXPortal docs/request-1029 R-6 · 결정 D-2). 숨김만이다 — invoke_tool 이나 노출 이름으로 부르면 그대로 닿는다.
+    10-31 OB-04 로 그 앱이 운영 앱이 되어 실제 표에서 빠졌다 — 숨김 동작은 실제 표 사본에 시험 앱을 더해서 본다."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _real_vocab_with_staging(tmp_path, "stepforge-prod"))
     prod, real = _CallB(["find_plm_task"]), _CallB(["find_plm_task"])
     calls: list = []
     for key, b in (("stepforge-prod", prod), ("heax-step_forge", real)):
@@ -8593,8 +8605,9 @@ def test_health_에_검색_손잡이_지문이_실린다():
 
 
 def test_코어_어휘표_박스_덧씌우기는_merge_patch_로_얹는다(monkeypatch, tmp_path):
-    """core_vocab.local.json — 코어 낱말 · 정본 · 앱 역할을 cae00 에서 커밋 없이 고친다. 깨지면 버리고 기본 표로 돈다(E-7 ②)."""
-    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    """core_vocab.local.json — 코어 낱말 · 정본 · 앱 역할을 cae00 에서 커밋 없이 고친다. 깨지면 버리고 기본 표로 돈다(E-7 ②).
+    기본 표는 실제 표 사본에 시험 앱 둘을 더한 것이다 — 실제 표의 staging 은 10-31 OB-04 로 비었다."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _real_vocab_with_staging(tmp_path, "stepforge-prod", "dynaforge-prod"))
     loc = tmp_path / "core_vocab.local.json"
     monkeypatch.setattr(gw, "CORE_VOCAB_LOCAL_PATH", loc)
     base = gw._core_vocab()

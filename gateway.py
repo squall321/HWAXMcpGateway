@@ -607,14 +607,14 @@ def _envelope_reason(res) -> str | None:
 # 게이트웨이를 거치지 않고 그 앱에서 본다. 원천에서 가리는 몫(FailureTrace 의 label · content_text 안 이름 — D-4, PLM — 보류)은 그쪽에 있다.
 # 10-30 에는 담당자 칸(ARP partOwner 실명 · StepForge owner 메일 · 담당 계정 · 클러스터 잡 제출자 메일)과 컨트롤러 사설 IP 가 그대로 나갔다
 # (HWAXPortal docs/request_261030 HG-22 — DW-03 · 06 · 12 · 22).
-#  · JSON 은 **칸 이름**으로 가린다 — 본문 서식(들여쓰기 · 순서)을 바꾸지 않게 글자 위에서 값만 바꾼다. 자유 글의 사람 이름은 꼴로 가르지
-#    않는다(오탐이 수치 · 부품명을 지운다).
+#  · JSON 은 **칸 이름**으로 가린다 — 본문 서식(들여쓰기 · 순서)을 바꾸지 않게 글자 위에서 값만 바꾼다. 칸 이름은 대소문자 · 밑줄 · 하이픈 ·
+#    복수를 가리지 않는다(partOwner = part_owner, owners). 값이 목록이면 원소를, 사람 칸(이름 · 계정)의 값이 객체면 안의 이름 칸(name ·
+#    display_name …)도 가린다. 자유 글의 사람 이름은 꼴로 가르지 않는다(오탐이 수치 · 부품명을 지운다).
+#  · 수는 칸 이름으로만 가린다(HG-21) — 따옴표 없는 JSON 수는 IMEI · 일련번호 칸(그 목록의 원소 포함)일 때만 가리고, IMEI 꼴은 소수점에 붙은
+#    숫자열이 아니다(DW-07 — 계산 결과의 소수부 15자리가 Luhn 을 통과해 `4.[가림:IMEI]` 가 됐다).
 #  · 칸 이름과 상관없이 꼴로 가리는 것 — IMEI 꼴(15자리, Luhn 검사 통과) · 메일 꼴 · 사설 IPv4(10/8 · 172.16/12 · 192.168/16 — 공인 ·
-#    루프백 · 문서용 주소는 그대로). IMEI 꼴은 소수점에 붙은 숫자열이 아니고(DW-07 — 계산 결과의 소수부 15자리가 Luhn 을 통과해
-#    `4.[가림:IMEI]` 가 됐다), 따옴표 없는 JSON 수(`"칸": 수`)는 칸 이름에 imei · meid 가 들 때만 가린다(HG-21).
-#  · 사내 계정 꼴(영문.영문숫자 — gildong.hong)은 칸 이름(user · owner …)으로만 가린다. 꼴로는 설정 경로(shell.thickness · load.drop) ·
-#    파일 이름 · 코드(json.dumps)와 가를 수 없다 — dev 말뭉치(도구 설명 · 앱 출력 · 문서 4,500만 자)에서 확장자 · 도메인 끝을 빼고도
-#    533건이 모두 오탐이고 참은 0건이었다(10-30).
+#    루프백 · 문서용 주소는 그대로) · 사내 계정 꼴(이름.성 — gildong.hong · koo.park01, 아래 _ACCOUNT_RX). 앞 거르개는 JSON 이스케이프
+#    (\n · \uXXXX) 바로 뒤를 글 머리로 본다 — 로그 꼬리의 줄 머리 주소를 놓치거나 `\[가림:메일]` 로 JSON 을 깨지 않게.
 #  · 게이트웨이 자체 도구(대화 · 조직도 · 검색)는 대상이 아니다 — 백엔드 도구 결과와 rest_call 만. 바이트를 그대로 흘리는 REST 프록시
 #    (`/api/<site>/` — 파일 · 프로그램 길)도 가리지 않는다. 끄기 — GATEWAY_PII_MASK=0(박스 손잡이).
 PII_MASK_ON = os.environ.get("GATEWAY_PII_MASK", "1").strip() != "0"
@@ -622,24 +622,50 @@ _PII_KEYS = {
     "이름": ("author", "author_name", "writer", "writer_name", "username", "user_name", "nickname", "screen_name", "detector",
            "detector_name", "detected_by", "inspector", "inspector_name", "reporter", "reporter_name", "worker_name",
            "작성자", "검출자", "작업자", "보고자",
-           # 담당자 칸(HG-22) — 대소문자를 가리지 않으므로 낙타 꼴(partOwner · submittedBy)은 붙인 소문자로 적는다
-           "owner", "owner_name", "ownername", "part_owner", "partowner", "submitter", "submitter_name", "submitted_by",
-           "submittedby", "assignee", "assignee_name", "assigned_to", "assignedto"),
-    "계정": ("author_id", "account_id", "account_name", "handle", "user_handle", "user"),
-    "메일": ("email", "e_mail", "email_address", "emailaddress"),
+           # 담당자 칸(HG-22)
+           "owner", "owner_name", "part_owner", "part_owner_name", "submitter", "submitter_name", "submitted_by", "assignee",
+           "assignee_name", "assigned_to"),
+    "계정": ("author_id", "account_id", "account_name", "handle", "user_handle", "user", "user_id", "owner_id", "submitter_id",
+           "assignee_id"),
+    "메일": ("email", "e_mail", "email_address"),
     "일련번호": ("serial", "serial_no", "serial_number", "sn"),
-    "IMEI": ("imei", "imei1", "imei2", "meid"),
+    "IMEI": ("imei", "imei1", "imei2", "meid"),          # 칸 이름의 낱말에 imei · meid 가 들어도 같다(device_imei · deviceIMEI)
 }
-_PII_KEY_KIND = {k.lower(): kind for kind, ks in _PII_KEYS.items() for k in ks}
-_PII_STR_RX = re.compile(r'("(' + "|".join(re.escape(k) for k in _PII_KEY_KIND) + r')"\s*:\s*)"((?:[^"\\]|\\.)*)"', re.I)
-_PII_NUM_RX = re.compile(r'("(' + "|".join(re.escape(k) for kind in ("일련번호", "IMEI") for k in _PII_KEYS[kind]) + r')"\s*:\s*)(\d{8,})(?![\d.])',
-                         re.I)
-# 소수점 앞뒤에 붙은 숫자열은 IMEI 가 아니다(지수 'e' 는 \w 에 든다). 뒤의 '.' 은 글자가 이어질 때만 거른다 — 문장 끝 마침표는 그대로 가린다.
-_IMEI_RX = re.compile(r"(?<![\w.-])(\d{2}[- ]?\d{6}[- ]?\d{6}[- ]?\d)(?![\w-]|\.\w)")
-_JSON_KEY_BEFORE_RX = re.compile(r'"((?:[^"\\]|\\.)*)"\s*:\s*\Z')       # 바로 앞이 `"칸":` 이면 따옴표 없는 JSON 수다
-# 메일 · IPv4 의 앞뒤 거르개는 ASCII 만 본다 — `\w` 는 한글도 넣어 `…@x.com으로` · `10.0.0.5에서` 처럼 조사가 붙은 것을 놓친다.
-_EMAIL_RX = re.compile(r"(?<![A-Za-z0-9_.%+-])[A-Za-z0-9_.%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?![A-Za-z0-9_-]|\.[A-Za-z0-9])")
-_IPV4_RX = re.compile(r"(?<![A-Za-z0-9_.])(\d{1,3}(?:\.\d{1,3}){3})(?![A-Za-z0-9_]|\.\d)")
+_KEY_SEP_RX = re.compile(r"[\s_-]")
+_PII_KEY_KIND = {_KEY_SEP_RX.sub("", k).lower(): kind for kind, ks in _PII_KEYS.items() for k in ks}
+_PII_PERSON_SUB = {"name": "이름", "displayname": "이름", "fullname": "이름", "realname": "이름", "login": "계정"}
+_PII_NUM_KINDS = ("일련번호", "IMEI")          # 따옴표 없는 수(8자리 이상)도 가리는 종류
+_KEY_WORD_RX = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")      # 칸 이름의 낱말 — deviceIMEI → device · IMEI, timeInterval → time · Interval
+# 칸 이름 후보 — 표의 이름(밑줄 자리에 밑줄 · 하이픈 · 빈칸이 오거나 없고, 대소문자 무시, 복수 s)과 imei · meid 를 품은 칸. 가릴지는
+# _pii_key_kind 가 가른다. 모든 칸을 훑는 꼴보다 서너 배 빠르다(StepForge 출력 1,800만 자에서 2.4초 → 0.66초).
+_PII_KEY_RX = re.compile(r'"((?:' + "|".join(sorted({re.escape(k).replace("_", r"[_\-\s]?") for ks in _PII_KEYS.values() for k in ks},
+                                                     key=len, reverse=True))
+                         + r')s?|[^"\\]*(?:imei|meid)[^"\\]*)"\s*:\s*', re.I)
+_JSON_TOK_RX = re.compile(r'\s*(?:("(?:[^"\\]|\\.)*")|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|(true|false|null)|([\[\]{}:,]))')
+_JSON_STR_RX = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"')
+_JSON_KEY_BEFORE_RX = re.compile(r'"(?:[^"\\]|\\.)*"\s*:\s*\Z')       # 바로 앞이 `"칸":` 이면 따옴표 없는 JSON 수다
+# 앞 거르개에 덧붙이는 JSON 이스케이프 머리 — `\n` · `\t` … 와 `\uXXXX` 바로 뒤는 글 머리다.
+_ESC_HEAD = r"|(?<=\\[nrtbf])|(?<=\\u[0-9a-fA-F]{4})"
+# 꼴의 거르개는 ASCII 만 본다 — `\w` 는 한글도 넣어 `…481입니다` · `…@x.com으로` · `10.0.0.5에서` 처럼 조사가 붙은 것을 놓친다.
+# 맨 앞의 한 글자 앞보기(`(?=\d)` …)는 속도만 — 그 글자로 시작하지 않는 자리에서 뒤보기 셋을 재지 않는다(1,800만 자에서 꼴마다 2 ~ 6할 준다).
+# IMEI — 소수점에 붙은 숫자열은 아니다(앞 `4.` · 뒤 `.5`, 지수 'e' 는 글자라 걸린다). 문장 끝 마침표 · 말줄임표 뒤는 그대로 가린다.
+_IMEI_RX = re.compile(r"(?=\d)(?:(?<![A-Za-z0-9_-])" + _ESC_HEAD + r")(?<!\d\.)(\d{2}[- ]?\d{6}[- ]?\d{6}[- ]?\d)(?![A-Za-z0-9_-]|\.\d)")
+_EMAIL_RX = re.compile(r"(?=[A-Za-z0-9_.%+-])(?:(?<![A-Za-z0-9_.%+\\-])" + _ESC_HEAD + r")[A-Za-z0-9_.%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}"
+                       r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9])")
+_IPV4_RX = re.compile(r"(?=\d)(?:(?<![A-Za-z0-9_])" + _ESC_HEAD + r")(?<!\d\.)(\d{1,3}(?:\.\d{1,3}){3})(?![A-Za-z0-9_]|\.\d)")
+# 사내 계정 꼴 — 이름.성(+숫자, gildong.hong · koo.park01). 끝 마디가 성씨 로마자일 때만 계정으로 본다 — 영문.영문 꼴만으로는 설정 경로
+# (shell.thickness) · 코드(json.dumps) · 파일 이름과 가를 수 없었다(dev 말뭉치 4,500만 자에서 533건이 모두 오탐, 참 0). 성씨로 재면 리포
+# 열셋의 코드 · 문서 · JSON 84억 자에서 5,676건이 걸렸고 계정이 아닌 것은 코드 old.lim 2건이었다(10-30). 코드 · 파일 끝과 겹치는 성(min ·
+# ok · so · go · ko · do · jo · ra · in · won · sin · ma · mo · ha)과 rho · back · you 는 뺐다 — 그 성의 계정은 칸 이름으로만 걸린다.
+_ACCOUNT_SURNAMES = (
+    "kim gim lee yi rhee park pak bak choi choe jung jeong chung kang gang cho yoon yun youn jang chang lim rim im yim han oh seo "
+    "suh shin kwon gwon hwang ahn an song jeon jun chun cheon hong yoo yu ryu koh moon mun yang son sohn bae baek paik heo hur noh roh "
+    "nam sim shim kwak sung seong cha joo ju choo chu woo koo goo gu na jin ji eom chae bang kong gong hyun ham byun byeon yeom yeo "
+    "seok sun seon seol gil yeon pyo myung ban wang geum keum yook yuk maeng tak kook guk eun pyeon yong kyung bong hwangbo namgung "
+    "jegal sunwoo").split()
+_ACCOUNT_RX = re.compile(r"(?=[a-z])(?:(?<![A-Za-z0-9_.\\/-])" + _ESC_HEAD + r")(?!(?:self|this|cls)\.)[a-z]{2,}\.(?:"
+                         + "|".join(sorted(_ACCOUNT_SURNAMES, key=len, reverse=True))
+                         + r")\d{0,4}(?![A-Za-z0-9_\\/-]|\.[A-Za-z0-9]|:[A-Za-z0-9]|\()")
 _PRIVATE_NETS = tuple(ipaddress.IPv4Network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 _PII_STAT = {"masked": 0}
 
@@ -660,33 +686,127 @@ def _pii_value_ok(kind: str, value: str) -> bool:
     return bool(v) and (kind not in ("일련번호", "IMEI") or len(v) >= 6)
 
 
+def _pii_key_kind(key: str) -> str | None:
+    """칸 이름의 가림 종류(없으면 None). 대소문자 · 밑줄 · 하이픈 · 복수(owners)를 가리지 않는다. IMEI 는 낱말로 본다 — 글자로만 보면
+    timeInterval · frameId 같은 계산 칸이 imei · meid 를 품는다."""
+    k = _KEY_SEP_RX.sub("", key).lower()
+    kind = _PII_KEY_KIND.get(k)
+    if kind is None and len(k) > 3 and k.endswith("s"):          # sns 는 일련번호 sn 의 복수가 아니다(셋이라 빠진다)
+        kind = _PII_KEY_KIND.get(k[:-1])
+    if kind is None and ("imei" in k or "meid" in k) and any(
+            w.lower() in ("imei", "meid", "imeis", "meids") for w in _KEY_WORD_RX.findall(key)):
+        kind = "IMEI"
+    return kind
+
+
+def _pii_sub_kind(key: str, kind: str | None) -> str | None:
+    """그릇 안 칸의 가림 종류 — 그 칸의 이름이 먼저고, 사람 칸(이름 · 계정)의 객체면 name · display_name 같은 이름 칸도 가린다."""
+    return _pii_key_kind(key) or (_PII_PERSON_SUB.get(_KEY_SEP_RX.sub("", key).lower()) if kind in ("이름", "계정") else None)
+
+
+def _pii_json_value(text: str, pos: int, kind: str | None, edits: list) -> int | None:
+    """text[pos:] 의 JSON 값 하나를 읽고 끝 자리를 돌려준다(JSON 이 아니면 None). 가릴 토큰은 edits 에 (시작, 끝, 바꿀 글)로 모은다.
+    kind 는 이 값을 쥔 칸의 가림 종류다 — 목록은 원소가 이어받고(owners: [...]), 객체는 안의 칸을 _pii_sub_kind 로 본다."""
+    m = _JSON_TOK_RX.match(text, pos)
+    if m is None:
+        return None
+    s, num, lit, p = m.groups()
+    if s is not None or num is not None:
+        if kind and (_pii_value_ok(kind, s[1:-1]) if s is not None else kind in _PII_NUM_KINDS and num.isdigit() and len(num) >= 8):
+            g = 1 if s is not None else 2
+            edits.append((m.start(g), m.end(g), f'"[가림:{kind}]"'))       # 수도 따옴표를 씌워 JSON 을 지킨다
+        return m.end()
+    if lit is not None:
+        return m.end()
+    if p not in ("[", "{"):
+        return None
+    close, pos = ("]" if p == "[" else "}"), m.end()
+    m = _JSON_TOK_RX.match(text, pos)
+    if m is not None and m.group(4) == close:          # 빈 그릇
+        return m.end()
+    while True:
+        if p == "[":
+            pos = _pii_json_value(text, pos, kind, edits)
+        else:
+            mk = _JSON_TOK_RX.match(text, pos)
+            mc = _JSON_TOK_RX.match(text, mk.end()) if mk is not None and mk.group(1) is not None else None
+            if mc is None or mc.group(4) != ":":
+                return None
+            pos = _pii_json_value(text, mc.end(), _pii_sub_kind(mk.group(1)[1:-1], kind), edits)
+        m = None if pos is None else _JSON_TOK_RX.match(text, pos)
+        if m is None or m.group(4) not in (",", close):
+            return None
+        if m.group(4) == close:
+            return m.end()
+        pos = m.end()
+
+
+def _pii_mask_keys(text: str) -> tuple[str, int]:
+    """칸 이름으로 가린다 — 값이 그릇이면 끝까지 읽어 목록 원소 · 사람 객체의 이름 칸을 함께 가리고, 그 안의 칸은 다시 보지 않는다.
+    JSON 으로 못 읽는 값(따옴표 없는 글 · 잘린 그릇)은 건너뛴다 — 그릇이 깨졌으면 안의 칸을 하나씩 본다."""
+    edits, done = [], 0
+    for m in _PII_KEY_RX.finditer(text):
+        if m.start() < done:
+            continue
+        kind = _pii_key_kind(m.group(1))
+        if kind is None:
+            continue
+        mark = len(edits)
+        try:
+            end = _pii_json_value(text, m.end(), kind, edits)
+        except RecursionError:
+            end = None
+        if end is None:
+            del edits[mark:]
+        elif text[m.end():m.end() + 1] in ("[", "{"):
+            done = end
+    if not edits:
+        return text, 0
+    parts, at = [], 0
+    for s, e, rep in edits:
+        parts += (text[at:s], rep)
+        at = e
+    parts.append(text[at:])
+    return "".join(parts), len(edits)
+
+
+def _pii_json_doc(s: str) -> bool:
+    """s 가 JSON 문서(객체 · 목록)인가 — 그러면 따옴표 밖의 수는 모두 JSON 수다."""
+    if not s.lstrip().startswith(("{", "[")):
+        return False
+    try:
+        json.JSONDecoder(strict=False).decode(s)
+    except ValueError:
+        return False
+    return True
+
+
 def _pii_mask_text(text: str) -> tuple[str, int]:
-    n = 0
+    out, n = _pii_mask_keys(text)
+    doc = None          # JSON 문서면 [문자열 토큰 훑개, 지금 토큰 자리] — IMEI 꼴 후보가 나올 때 한 번만 잰다
 
-    def _str(m):
-        nonlocal n
-        kind = _PII_KEY_KIND[m.group(2).lower()]
-        if not _pii_value_ok(kind, m.group(3)):
-            return m.group(0)
-        n += 1
-        return f'{m.group(1)}"[가림:{kind}]"'
-
-    def _num(m):
-        nonlocal n
-        n += 1
-        return f'{m.group(1)}"[가림:{_PII_KEY_KIND[m.group(2).lower()]}]"'
+    def _bare_number(s: str, at: int) -> bool:
+        """at 이 따옴표 없는 JSON 수인가 — 칸 이름 길이 IMEI 칸의 수는 이미 가렸으니, 남은 것은 계산 결과의 수다(HG-21).
+        JSON 문서면 따옴표 밖인지로, 아니면(글 속 JSON 조각) 바로 앞이 `"칸":` 인지로 본다. 부르는 차례가 앞에서 뒤라 훑개는 한 번만 돈다."""
+        nonlocal doc
+        if doc is None:
+            doc = [_JSON_STR_RX.finditer(s), (-1, -1)] if _pii_json_doc(s) else False
+        if not doc:
+            return _JSON_KEY_BEFORE_RX.search(s, max(0, at - 200), at) is not None
+        span = doc[1]
+        while span[1] <= at:
+            nxt = next(doc[0], None)
+            span = nxt.span() if nxt is not None else (len(s) + 1, len(s) + 1)
+        doc[1] = span
+        return not span[0] <= at < span[1]
 
     def _imei(m):
         nonlocal n
         digits = re.sub(r"\D", "", m.group(1))
-        if len(digits) != 15 or not _luhn_ok(digits):
-            return m.group(0)
-        # 따옴표 없는 JSON 수는 칸 이름으로만 가린다 — 칸 이름에 imei · meid 가 없으면 계산 결과의 수다(HG-21). 가리면 따옴표를 씌워 JSON 을 지킨다.
-        key = _JSON_KEY_BEFORE_RX.search(m.string, max(0, m.start() - 200), m.start())
-        if key and not any(w in key.group(1).lower() for w in ("imei", "meid")):
+        if len(digits) != 15 or not _luhn_ok(digits) or _bare_number(m.string, m.start()):
             return m.group(0)
         n += 1
-        return '"[가림:IMEI]"' if key else "[가림:IMEI]"
+        return "[가림:IMEI]"
 
     def _email(m):
         nonlocal n
@@ -703,34 +823,34 @@ def _pii_mask_text(text: str) -> tuple[str, int]:
             return m.group(0)
         n += 1
         return "[가림:IP]"
-    out = _PII_STR_RX.sub(_str, text)
-    out = _PII_NUM_RX.sub(_num, out)
+
+    def _account(m):
+        nonlocal n
+        n += 1
+        return "[가림:계정]"
     out = _IMEI_RX.sub(_imei, out)
     out = _EMAIL_RX.sub(_email, out)
     out = _IPV4_RX.sub(_ip, out)
+    out = _ACCOUNT_RX.sub(_account, out)
     return out, n
 
 
-def _pii_mask_obj(v, n: list):
+def _pii_mask_obj(v, n: list, kind: str | None = None):
+    """structuredContent 의 가림 — 글 길(_pii_mask_text)과 같은 규칙이다. kind 는 이 값을 쥔 칸의 가림 종류다(목록 원소가 잇는다)."""
     if isinstance(v, dict):
-        out = {}
-        for k, x in v.items():
-            kind = _PII_KEY_KIND.get(str(k).lower())
-            if kind and isinstance(x, str) and _pii_value_ok(kind, x):
-                out[k] = f"[가림:{kind}]"
-                n[0] += 1
-            elif kind in ("일련번호", "IMEI") and isinstance(x, int) and not isinstance(x, bool) and len(str(abs(x))) >= 8:
-                out[k] = f"[가림:{kind}]"
-                n[0] += 1
-            else:
-                out[k] = _pii_mask_obj(x, n)
-        return out
+        return {k: _pii_mask_obj(x, n, _pii_sub_kind(str(k), kind)) for k, x in v.items()}
     if isinstance(v, list):
-        return [_pii_mask_obj(x, n) for x in v]
+        return [_pii_mask_obj(x, n, kind) for x in v]
     if isinstance(v, str):
+        if kind and _pii_value_ok(kind, v):
+            n[0] += 1
+            return f"[가림:{kind}]"
         t, k = _pii_mask_text(v)
         n[0] += k
         return t
+    if kind in _PII_NUM_KINDS and isinstance(v, int) and not isinstance(v, bool) and v >= 0 and len(str(v)) >= 8:
+        n[0] += 1
+        return f"[가림:{kind}]"
     return v
 
 

@@ -8297,7 +8297,34 @@ def test_HG21_소수점에_붙은_숫자열과_IMEI_칸이_아닌_따옴표_없�
     assert got["device_imei"] == got["imei"] == "[가림:IMEI]", "칸 이름에 imei 가 들면 가리고, 따옴표를 씌워 JSON 을 지킨다"
     assert got["note"] == "교체 IMEI [가림:IMEI].", "문장 끝 마침표 앞의 IMEI 는 가린다"
     out, n = gw._pii_mask_text('{"imei": [352099001761481, 490154203237518]}')
-    assert "352099001761481" not in out and "490154203237518" not in out and n == 2, "목록 원소는 앞에 칸 이름이 없어 꼴로 가린다(닫힌 쪽)"
+    assert json.loads(out) == {"imei": ["[가림:IMEI]", "[가림:IMEI]"]} and n == 2, "IMEI 칸의 목록 원소도 칸 이름으로 가리고 따옴표를 씌운다"
+
+
+def test_HG21_따옴표_없는_수는_목록_원소까지_IMEI_칸_낱말일_때만_가리고_글_길과_구조화_길이_같다():
+    """계산 결과의 목록 · 칸 이름이 imei 를 글자로만 품는 칸(timeInterval · frameId …)의 수는 그대로다 — 가리던 판은 목록에서 따옴표 없이
+    바꿔 JSON 을 깼고, 구조화 길은 같은 수를 두어 두 길이 달랐다(10-30 반대 검토). 소수점 뒤에 글자가 바로 이어지는 문장 · 조사가 붙은 IMEI 는 가린다."""
+    calc = {"cycles": [352099001761481, 12], "grid": [[352099001761481, 4.352099001761481]], "z": [352099001761481.5, 1.0],
+            "timeInterval_ns": 352099001761481, "frameId": 352099001761481, "runtimeInfo": 352099001761481,
+            "volumeId": 352099001761481, "nameid": 352099001761481}
+    text = json.dumps(calc, indent=2)
+    assert gw._pii_mask_text(text) == (text, 0)
+    n = [0]
+    assert gw._pii_mask_obj(calc, n) == calc and n == [0]
+    dev = {"imei": [[352099001761481]], "deviceIMEI": 352099001761481, "IMEI_2": 490154203237518, "device_imei": 352099001761481,
+           "imeiList": [352099001761481, "490154203237518"], "serial": 3}
+    want = {"imei": [["[가림:IMEI]"]], "deviceIMEI": "[가림:IMEI]", "IMEI_2": "[가림:IMEI]", "device_imei": "[가림:IMEI]",
+            "imeiList": ["[가림:IMEI]", "[가림:IMEI]"], "serial": 3}
+    out, k = gw._pii_mask_text(json.dumps(dev))
+    assert json.loads(out) == want and k == 6
+    n = [0]
+    assert gw._pii_mask_obj(dev, n) == want and n == [6], "구조화 길도 같은 칸 · 같은 수를 가린다"
+    for s, w in (("적층 두께 합 352099001761481.5 µm", None), ("중립축 4.352099001761481 mm", None),
+                 ("IMEI 352099001761481.다음 줄", "IMEI [가림:IMEI].다음 줄"), ("IMEI 352099001761481입니다", "IMEI [가림:IMEI]입니다"),
+                 ("번호...352099001761481", "번호...[가림:IMEI]"), ("기기352099001761481 교체", "기기[가림:IMEI] 교체")):
+        assert gw._pii_mask_text(s)[0] == (w or s), s
+    n = [0]
+    assert gw._pii_mask_obj({"note": "352099001761481"}, n) == {"note": "[가림:IMEI]"} and n == [1], "문자열 값의 IMEI 는 칸과 상관없이 가린다"
+    assert gw._pii_mask_text("352099001761481") == ("[가림:IMEI]", 1), "JSON 문서(객체 · 목록)가 아닌 글의 수는 꼴로 가린다"
 
 
 _DW_ROW = ('{\n  "projects": [\n    {"id": "p1", "owner": "gildong.hong", "partOwner": "홍길동", "assignee": "김민수", '
@@ -8307,9 +8334,9 @@ _DW_ROW = ('{\n  "projects": [\n    {"id": "p1", "owner": "gildong.hong", "partO
            '"host": "head.corp.example", "note": "담당 gildong.hong · 메일 lee@corp.example로 문의"}\n  ],\n  "count": 1\n}')
 
 
-def test_HG22_담당자_칸_이름을_가리고_계정_꼴은_칸_이름으로만_가린다(monkeypatch):
+def test_HG22_담당자_칸_이름을_가리고_계정_꼴은_칸_이름과_상관없이_가린다(monkeypatch):
     """DW-06 ARP partOwner(실명) · DW-03 StepForge owner(메일) · DW-12 잡 제출자(메일) · DW-22 담당 계정 — 칸 이름(낙타 꼴 포함)으로 가린다.
-    계정 꼴(영문.영문숫자)은 꼴로 가리지 않는다 — 설정 경로 · 파일 이름 · 코드 · 호스트 이름과 가를 수 없다(gateway.py 가림 머리 주석)."""
+    계정 꼴(이름.성)은 자유 글에서도 가리고, 설정 경로 · 파일 이름 · 코드 · 호스트 이름은 그대로 둔다(gateway.py _ACCOUNT_RX)."""
     _result_kit(monkeypatch, _DW_ROW)
     out = asyncio.run(gw._call_tool("get_big", {})).content[0].text
     p = json.loads(out)["projects"][0]
@@ -8319,7 +8346,7 @@ def test_HG22_담당자_칸_이름을_가리고_계정_꼴은_칸_이름으로�
     assert p["user"] == "[가림:계정]" and p["email"] == p["emailAddress"] == "[가림:메일]"
     for leak in ("홍길동", "김민수", "kim@corp.example", "lee@corp.example", "mongryong.lee01", "이몽룡", "성춘향", "임꺽정", "x@corp.example"):
         assert leak not in out, leak
-    assert p["note"] == "담당 gildong.hong · 메일 [가림:메일]로 문의", "자유 글의 계정 꼴은 두고 메일은 조사가 붙어도 가린다"
+    assert p["note"] == "담당 [가림:계정] · 메일 [가림:메일]로 문의", "자유 글의 계정 꼴 · 메일은 조사가 붙어도 가린다"
     assert p["params"] == {"shell.thickness": 1.2, "load.drop": "face"} and p["file"] == "config.yaml" and p["call"] == "json.dumps"
     assert p["host"] == "head.corp.example" and p["id"] == "p1"
     assert out.count("\n") == _DW_ROW.count("\n") and json.loads(out)["count"] == 1, "서식 · 나머지 값은 그대로"
@@ -8327,16 +8354,72 @@ def test_HG22_담당자_칸_이름을_가리고_계정_꼴은_칸_이름으로�
 
 def test_HG22_메일_꼴과_사설_IPv4_는_칸_이름과_상관없이_가리고_공인_주소와_IPv4_가_아닌_것은_둔다():
     hide = ("잡 제출자 kim@corp.example으로 알림 · 컨트롤러 head01(10.20.30.40) · 노드 172.16.0.5, 172.31.255.254 · NAS 192.168.0.7:2049 · "
-            "주소 http://10.1.2.3:8080/api · 원격 10.20.30.40에서 접속")
+            "주소 http://10.1.2.3:8080/api · 원격 10.20.30.40에서 접속 · 앞 생략...10.9.8.7")
     keep = ("공인 8.8.8.8 · 경계 172.32.0.1 · 172.15.255.255 · 루프백 127.0.0.1 · 문서용 192.0.2.10 · 판 1.10.0.0.1 · v10.0.0.1 · "
-            "10.256.1.1 · 010.1.1.1 · react@18.3.1 · @app.get · a@b · calls:risk_screen@1000")
+            "10.256.1.1 · 010.1.1.1 · 판 10.4.4.4.4 · react@18.3.1 · @app.get · a@b · calls:risk_screen@1000 · y = x@self.weight.T")
     out, n = gw._pii_mask_text(hide + " | " + keep)
-    for leak in ("kim@corp.example", "10.20.30.40", "172.16.0.5", "172.31.255.254", "192.168.0.7", "10.1.2.3"):
+    for leak in ("kim@corp.example", "10.20.30.40", "172.16.0.5", "172.31.255.254", "192.168.0.7", "10.1.2.3", "10.9.8.7"):
         assert leak not in out, leak
     assert out.startswith("잡 제출자 [가림:메일]으로 알림 · 컨트롤러 head01([가림:IP]) · 노드 [가림:IP], [가림:IP] · NAS [가림:IP]:2049 · "
-                          "주소 http://[가림:IP]:8080/api · 원격 [가림:IP]에서 접속"), "한글 조사 · 포트 · 괄호가 붙어도 가린다"
-    assert out.endswith(" | " + keep), "공인 · 루프백 · 문서용 주소, IPv4 가 아닌 것(255 초과 · 앞자리 0 · 다섯 마디 · 판 번호) · 메일이 아닌 @ 는 그대로"
-    assert n == 7
+                          "주소 http://[가림:IP]:8080/api · 원격 [가림:IP]에서 접속 · 앞 생략...[가림:IP]"), "한글 조사 · 포트 · 괄호 · 말줄임표가 붙어도 가린다"
+    assert out.endswith(" | " + keep), ("공인 · 루프백 · 문서용 주소, IPv4 가 아닌 것(255 초과 · 앞자리 0 · 다섯 마디 · 판 번호) · 메일이 아닌 @"
+                                        "(꾸미개 · 행렬 곱의 앞 마디) 는 그대로")
+    assert n == 8
+
+
+def test_HG22_사내_계정_꼴은_끝_마디가_성씨일_때만_가리고_설정_경로_코드_파일_이름은_둔다():
+    """DW-22 담당 계정 — 칸 이름 밖(자유 글 · 모르는 칸)의 이름.성 꼴도 가린다. 영문.영문 꼴만 보면 설정 경로 · 코드 · 파일 이름이 다 걸려서
+    끝 마디가 성씨 로마자일 때만 본다 — 코드 · 파일 끝과 겹치는 성(min · ok · so · go · ko …)은 빼 두었다(gateway.py _ACCOUNT_RX 주석)."""
+    hide = "담당 gildong.hong · koo.park01님 확인 · ssh koo.park@icn401 · 멘션 @mongryong.lee · 제출 jh.kim, minsu.choi."
+    keep = ("shell.thickness · load.drop · json.dumps(x) · config.yaml · stcx.sec.samsung.net · head.corp.example · np.min · resp.ok · "
+            "libm.so · main.go · nvidia.ko · self.lim · obj.lee(1)")
+    out, n = gw._pii_mask_text(hide + " | " + keep)
+    assert out == ("담당 [가림:계정] · [가림:계정]님 확인 · ssh [가림:계정]@icn401 · 멘션 @[가림:계정] · 제출 [가림:계정], [가림:계정]."
+                   " | " + keep) and n == 6
+    sc = {"rows": [{"pic": "gildong.hong", "path": "shell.thickness"}]}
+    k = [0]
+    assert gw._pii_mask_obj(sc, k) == {"rows": [{"pic": "[가림:계정]", "path": "shell.thickness"}]} and k == [1], "모르는 칸 이름이어도 가린다"
+
+
+def test_HG22_칸_이름은_대소문자_밑줄_하이픈_복수를_가리지_않고_목록_원소와_사람_객체의_이름_칸까지_가린다():
+    """10-30 반대 검토 — assigneeName · user_id · owners: [...] · user: {name} 이 빠져나갔다. 글 길과 구조화 길이 같은 값을 가린다."""
+    keys = {"이름": ("owner", "Owner", "OWNER", "owner_name", "ownerName", "owner-name", "part_owner", "partOwner", "part_owner_name",
+                   "partOwnerName", "submitter", "submitter_name", "submitterName", "submitted_by", "submittedBy", "assignee",
+                   "assignee_name", "assigneeName", "assigned_to", "assignedTo", "owners", "partOwners", "assignees"),
+            "계정": ("user", "users", "user_id", "userId", "owner_id", "ownerId", "submitter_id", "assignee_id"),
+            "메일": ("email", "e_mail", "eMail", "email_address", "emailAddress", "emails")}
+    for kind, ks in keys.items():
+        for key in ks:
+            assert gw._pii_mask_text(json.dumps({key: "홍길동"}, ensure_ascii=False)) == (f'{{"{key}": "[가림:{kind}]"}}', 1), key
+            n = [0]
+            assert gw._pii_mask_obj({key: "홍길동"}, n) == {key: f"[가림:{kind}]"} and n == [1], key
+    keep = {"sns": "twitter", "ownership": "team", "user_agent": "Mozilla/5.0", "display_name": "StepForge", "name": "BRKT-01", "users": 12}
+    text = json.dumps(keep, ensure_ascii=False)
+    assert gw._pii_mask_text(text) == (text, 0), "sns 는 sn 의 복수가 아니고, 사람 칸 밖의 name · display_name · 수는 그대로다"
+    row = {"owners": ["홍길동", "김민수"], "owner": [{"name": "홍길동", "dept": "HE"}],
+           "user": {"name": "홍길동", "display_name": "길동", "login": "gildong", "id": 7, "email": "x@corp.example", "team": "HE"},
+           "project": {"name": "P-01", "owner": "홍길동"}}
+    want = {"owners": ["[가림:이름]", "[가림:이름]"], "owner": [{"name": "[가림:이름]", "dept": "HE"}],
+            "user": {"name": "[가림:이름]", "display_name": "[가림:이름]", "login": "[가림:계정]", "id": 7, "email": "[가림:메일]",
+                     "team": "HE"},
+            "project": {"name": "P-01", "owner": "[가림:이름]"}}
+    text = json.dumps(row, ensure_ascii=False, indent=2)
+    out, k = gw._pii_mask_text(text)
+    assert json.loads(out) == want and k == 8 and out.count("\n") == text.count("\n")
+    n = [0]
+    assert gw._pii_mask_obj(row, n) == want and n == [8]
+
+
+def test_HG22_JSON_이스케이프_바로_뒤의_꼴도_가리고_JSON_은_깨지지_않는다():
+    """로그 꼬리의 줄 머리(\\n 바로 뒤) · ensure_ascii 한글(\\uXXXX) 바로 뒤에 붙은 메일 · IP · 계정 · IMEI — 앞 거르개가 이스케이프 글자를
+    낱말로 읽어 놓치거나, 메일 꼴이 이스케이프 글자를 먹어 `\\[가림:메일]` 로 JSON 을 깼다."""
+    obj = {"log": "hosts:\n10.20.30.40 head01\nkim@corp.example joined\nkoo.park 제출\nIMEI:\n352099001761481",
+           "note": "담당kim@corp.example · 주소10.1.2.3"}
+    want = {"log": "hosts:\n[가림:IP] head01\n[가림:메일] joined\n[가림:계정] 제출\nIMEI:\n[가림:IMEI]",
+            "note": "담당[가림:메일] · 주소[가림:IP]"}
+    for ascii_only in (False, True):
+        out, n = gw._pii_mask_text(json.dumps(obj, ensure_ascii=ascii_only))
+        assert json.loads(out) == want and n == 6, ascii_only
 
 
 def test_HG22_구조화_본문도_담당자_칸_메일_사설_IP_를_가리고_수는_건드리지_않는다():

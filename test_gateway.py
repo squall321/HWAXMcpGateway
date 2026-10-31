@@ -7074,6 +7074,202 @@ def test_E2_5_검색_평가는_꺼진_손잡이를_하나씩_켠_판도_잰다(m
     assert v["+quality"]["switches"]["quality"] is True, "박스에서 끈 묶음은 켠 판을 잰다"
 
 
+# ── 개인 Claude 보기(HWAXPortal docs/request-1029 E-4 · design-e2-e4.md 2.4 — 사용자 결정 10-31, 권장안 그대로) ───────────────────────────────
+# 보기 셋(전체 · 묶음 · 가벼운)은 tools/list 에만 건다 — 검색 · 부르기 · 이름 · 권한은 그대로다. 포털 사람 설정(권한 응답 view)으로 고르고 연결 머리
+# X-HWAX-View 가 덮는다(리포 .mcp.json 은 늘 full). 웹 챗 · 절차 · GW_TOKEN 은 늘 전체다.
+def _view_kit(monkeypatch, view=None, *, muted="", src=""):
+    """보기 머리를 세운 요청 문맥 + 실제 어휘표 + 합성 카탈로그(허브 셋 · 비코어 · 심의 · 낙하). _request_* 는 진짜로 머리를 읽는다."""
+    _role_catalog(monkeypatch)
+    hdrs = {gw.GROUPS_HEADER: "", gw.MUTED_HEADER: muted}
+    if view is not None:
+        hdrs[gw.VIEW_HEADER] = view
+    if src:
+        hdrs[gw.VIEW_SRC_HEADER] = src
+    _set_request_headers(monkeypatch, hdrs)
+
+
+def _listed() -> list[str]:
+    return [t.name for t in asyncio.run(gw._list_tools(types.ListToolsRequest()))]
+
+
+_HUB_READS = {f"rootdesigndatahub_{n}" for n in ("object_resolve", "objects_list", "objects_summary", "graph_neighbors", "object_get")}
+
+
+def test_E4_가벼운_보기는_두_도구만_싣고_검색은_전체_보기와_바이트까지_같다(monkeypatch):
+    _view_kit(monkeypatch, "full")
+    full_list = _listed()
+    queries = ("고장모드 목록", "규격 실패모드", "심의 시작", "철판 낙하 기준")
+    full = {q: asyncio.run(gw._search_tools({"query": q, "limit": 20})).content[0].text for q in queries}
+    _view_kit(monkeypatch, "light")
+    assert _listed() == ["search_tools", "invoke_tool"]
+    for q in queries:
+        assert asyncio.run(gw._search_tools({"query": q, "limit": 20})).content[0].text == full[q], \
+            "보기를 검색 시야(_visible_tools)에 걸면 가벼운 보기의 search_tools 가 빈손이 된다"
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert v["mode"] == "light" and v["listed"] == 2 and v["hidden_by_view"] == len(full_list) - 2
+    assert "search_tools" in v["note"] and "invoke_tool" in v["note"]
+
+
+def test_E4_보기는_선호다_목록_밖_도구도_invoke_tool_로_닿고_권한_검사는_그대로다(monkeypatch):
+    _view_kit(monkeypatch, "light")
+    hub, fmea = _CallB(["object_resolve"]), _CallB(["gather_evidence_tool"])
+    monkeypatch.setattr(gw, "backends", {**gw.backends, "rootdesigndatahub": hub, "fmea": fmea})
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    gw._RESP_CACHE.clear()
+    r = asyncio.run(gw._call_tool("invoke_tool", {"name": "rootdesigndatahub_object_resolve", "arguments": {}}))
+    assert not r.isError and hub.session.calls == ["object_resolve"]
+    monkeypatch.setattr(gw, "POLICY", {"fmea": ["fmea-only"]})
+    r = asyncio.run(gw._call_tool("invoke_tool", {"name": "gather_evidence_tool", "arguments": {}}))
+    assert r.isError and r.content[0].text.startswith("forbidden") and fmea.session.calls == [], "보기가 전체여도 같다 — 권한은 보기와 무관하다"
+
+
+def test_E4_묶음_보기는_고른_영역과_정본_읽기_다섯만_싣고_형제_사본은_뺀다(monkeypatch):
+    _view_kit(monkeypatch, "full")
+    full = set(_listed())
+    assert {n for n in full if n.startswith(("failuretrace_", "caegroupdatahub_"))}, "전체 보기는 형제 사본도 싣는다(결정 Q-4)"
+    _view_kit(monkeypatch, "bundle:sim")
+    got = _listed()
+    assert set(got) <= full, "보기는 빼기만 한다 — 이름을 바꾸지 않는다"
+    assert _HUB_READS <= set(got), "정본 읽기 다섯은 어느 묶음에나 든다((정본 키, 원래 이름)으로 고른다)"
+    assert "rootdesigndatahub_objects_upsert" not in got, "정본이라도 고르지 않은 영역(data)의 그 밖 도구는 아니다"
+    assert not [n for n in got if n.startswith(("failuretrace_", "caegroupdatahub_"))], "형제 사본은 묶음에 없다(X-B)"
+    assert {"single_drop_simulation", "fullangle_drop_simulation"} <= set(got) and "deliberate_start" not in got
+    assert {t.name for t in gw._local_tools()} <= set(got), "로컬 도구는 늘 싣는다"
+    _view_kit(monkeypatch, "bundle:data,knowledge")
+    got = set(_listed())
+    assert "rootdesigndatahub_objects_upsert" in got and not [n for n in got if n.startswith(("failuretrace_", "caegroupdatahub_"))]
+
+
+def test_E4_끈_앱은_어느_보기에서도_빠진다(monkeypatch):
+    """끄기가 더 세다 — 정본 읽기 다섯도 정본 허브를 끄면 묶음에 없다."""
+    for view in ("full", "bundle:sim,data", "light"):
+        _view_kit(monkeypatch, view, muted="smart-twin-mcp,rootdesigndatahub")
+        got = _listed()
+        assert got and not [n for n in got if gw.route.get(n, ("",))[0] in {"smart-twin-mcp", "rootdesigndatahub"}], (view, got)
+
+
+def _view_gate(monkeypatch, portal_view):
+    """인증 미들웨어를 실제로 태워 **앱이 받는 보기 머리**를 본다 — 포털 응답(view)만 가짜. 클라이언트가 실어 보낸 출처 머리는 위조로 둔다."""
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["headers"] = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+
+    async def fake_access(email, base, **_kw):
+        return {"keys": [], **({"view": portal_view} if portal_view is not None else {})}
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        def __init__(self, claims): self.claims = claims
+        async def verify(self, token, aud): return self.claims
+
+    def run(auth, claims, client_view=None):
+        seen.clear()
+        hdrs = [(b"authorization", auth), (gw.VIEW_SRC_HEADER.encode(), b"header")]
+        if client_view is not None:
+            hdrs.append((gw.VIEW_HEADER.encode(), client_view.encode()))
+        asyncio.run(gw._bearer_gate(app, _V(claims))({"type": "http", "path": "/mcp", "headers": hdrs}, None, None))
+        h = seen.get("headers", {})
+        return h.get(gw.VIEW_HEADER), h.get(gw.VIEW_SRC_HEADER)
+    return run
+
+
+def test_E4_보기는_머리가_꼴에_맞으면_그것_아니면_포털_설정이고_챗_절차_서비스는_늘_전체다(monkeypatch):
+    run = _view_gate(monkeypatch, "light")
+    me = {"email": "u@x.io", "groups": []}
+    assert run(b"Bearer me", me) == ("light", "portal"), "포털 가벼운 + 머리 없음 → 가벼운"
+    assert run(b"Bearer me", me, "full") == ("full", "header"), "머리 full 이 사람 설정을 덮는다(리포 .mcp.json)"
+    assert run(b"Bearer me", me, "Bundle:cad, mesh") == ("bundle:cad,mesh", "header")
+    assert run(b"Bearer me", me, "everything") == ("light", "portal;bad-header"), "틀린 꼴의 머리 → 포털 값 + 표시(list_tool_apps 의 view.error)"
+    chat = {**me, "pat_name": gw.CHAT_PAT_NAME, "jti": "chat-u-1790000000"}
+    assert run(b"Bearer chat", chat, "light") == ("full", "exempt"), "웹 챗 PAT 는 늘 전체(에이전트 서버가 이름으로 찾아 코드로 부르는 도구가 있다)"
+    assert run(b"Bearer proc", {**me, "purpose": gw.PROCEDURE_PURPOSE}, "light") == ("full", "exempt"), "절차는 tools/list 로 카탈로그를 만든다"
+    assert run(b"Bearer gw-secret", None, "light") == (None, None), "GW_TOKEN(에이전트 서버 · 심의)은 두 머리를 버린다 — 늘 전체"
+    assert _view_gate(monkeypatch, None)(b"Bearer me", me) == ("full", "default"), "포털이 보기를 모르면(옛 포털) 전체"
+    assert _view_gate(monkeypatch, "bundle:")(b"Bearer me", me) == ("full", "default"), "포털 값이 틀린 꼴이면 전체"
+
+
+def test_E4_list_tool_apps_의_view_는_보기_영역_수_모르는_영역_출처를_말한다(monkeypatch):
+    _view_kit(monkeypatch, "bundle:sim,nosuch", src="header")
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert (v["mode"], v["areas"], v["unknown_areas"], v["source"]) == ("bundle", ["sim"], ["nosuch"], "header")
+    assert v["listed"] == len(_listed()) and v["hidden_by_view"] == len(gw._visible_tools([])) - v["listed"] > 0
+    area = json.loads(asyncio.run(gw._list_tool_apps({"by": "area"})).content[0].text)
+    assert area["view"] == v, "영역 보기도 같은 칸을 싣는다"
+    _view_kit(monkeypatch, "light", src="portal;bad-header")
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert v["source"] == "portal" and "X-HWAX-View" in v["error"]
+    _view_kit(monkeypatch, None)
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert v == {"mode": "full", "listed": len(gw._visible_tools([])), "hidden_by_view": 0}, "머리가 없으면(서비스 · 옛 클라이언트) 전체"
+
+
+def test_E4_SDK_목록_처리기는_요청이면_보기를_얹고_캐시_채우기는_세지도_얹지도_않는다(monkeypatch):
+    """SDK 는 호출 검증용 캐시가 비면 목록 처리기를 요청 없이(None) 부른다(_get_cached_tool_definition) — 그 길에 보기를 얹으면 목록 밖 도구를 이름으로
+    부를 때의 출력 검증이 지금과 달라진다. 보기는 목록만 줄이고 호출은 그대로다. /health 는 클라이언트의 tools/list 만 보기별로 센다."""
+    real = gw.fm._mcp_server
+    monkeypatch.setattr(real, "_tool_cache", {})
+    handler = real.request_handlers[types.ListToolsRequest]
+    monkeypatch.setattr(gw, "_VIEW_LISTS", {"full": 0, "bundle": 0, "light": 0})
+    _view_kit(monkeypatch, "light")
+    res = asyncio.run(handler(types.ListToolsRequest()))
+    assert [t.name for t in res.root.tools] == ["search_tools", "invoke_tool"]
+    res = asyncio.run(handler(None))
+    assert len(res.root.tools) == len(gw._visible_tools([])) > 2
+    _view_kit(monkeypatch, "bundle:sim")
+    _listed()
+    _listed()
+    sent = []
+
+    async def send(m): sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/health", "headers": []}, None, send))
+    assert json.loads(sent[1]["body"])["tools_list_by_view"] == {"full": 0, "bundle": 2, "light": 1}
+
+
+def test_E4_보기_글의_꼴(monkeypatch):
+    for raw, want in (("full", ("full", ())), (" LIGHT ", ("light", ())), ("bundle:cad", ("bundle", ("cad",))),
+                      ("bundle:cad,mesh,cad", ("bundle", ("cad", "mesh"))), ("bundle:", None), ("bundle:CAD!", None),
+                      ("bundle:" + ",".join(f"a{i}" for i in range(33)), None), ("all", None), ("", None), (None, None)):
+        assert gw._parse_view(raw) == want, raw
+    assert gw._view_text("bundle", ("cad", "mesh")) == "bundle:cad,mesh" and gw._view_text("light") == "light"
+
+
+def test_E4_포털이_저장하는_보기_글을_게이트웨이가_같은_뜻으로_읽는다():
+    """포털 hub_view(사람 설정의 저장 꼴 — 권한 응답 view 로 온다)와 게이트웨이 _parse_view 가 어긋나면 사람 설정이 조용히 전체로 떨어진다. 형제 포털
+    리포의 실제 모듈을 읽는다(표준 라이브러리만 쓴다). 형제가 보기 이전 판이면 건너뛴다 — 작업 가지에서는 HWAX_PORTAL_ROOT 로 그 자리를 준다."""
+    import importlib.util
+    import os
+    root = gw.Path(os.environ.get("HWAX_PORTAL_ROOT") or gw.Path(gw.__file__).resolve().parent.parent / "HWAXPortal")
+    src = root / "backend" / "app" / "access" / "hub_view.py"
+    if not src.exists():
+        pytest.skip(f"형제 포털({root.name})에 backend/app/access/hub_view.py 가 없다 — 보기 이전 판이다")
+    spec = importlib.util.spec_from_file_location("portal_hub_view", src)
+    hv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hv)
+    assert tuple(hv.MODES) == ("full", "bundle", "light")
+    for mode, areas in (("full", ()), ("light", ()), ("bundle", ("cad",)), ("bundle", ("cad", "mesh", "data"))):
+        text = hv.format_view(mode, list(areas))
+        assert gw._parse_view(text) == (mode, areas) and hv.parse_view(text) == (mode, list(areas)), text
+    for bad in ("bundle:", "everything", "bundle:CAD!"):
+        assert gw._parse_view(bad) is None and hv.parse_view(bad) is None, bad
+
+
+def test_E4_리포_mcp_json_은_보기_머리로_늘_전체를_청한다():
+    """리포 파이프라인(infra/pipeline/*.js)은 리포 .mcp.json(개인 PAT)으로 돈다 — 사람 설정이 가벼운이어도 심의 · 리스크 워크플로의 목록이 줄지 않게
+    머리가 늘 full 을 청한다(design-e2-e4 E4-5 · mcp-app-toggle D-7). 형제 포털 리포를 읽는다(HWAX_PORTAL_ROOT 로 작업 가지를 준다)."""
+    import os
+    root = gw.Path(os.environ.get("HWAX_PORTAL_ROOT") or gw.Path(gw.__file__).resolve().parent.parent / "HWAXPortal")
+    p = root / ".mcp.json"
+    if not p.exists():
+        pytest.skip("형제 포털 리포가 없다")
+    hdrs = {k.lower(): v for k, v in json.loads(p.read_text(encoding="utf-8"))["mcpServers"]["hwax"].get("headers", {}).items()}
+    if gw.VIEW_HEADER not in hdrs:
+        pytest.skip("형제 포털이 보기 이전 판이다(.mcp.json 에 보기 머리가 없다)")
+    assert hdrs[gw.VIEW_HEADER] == "${HWAX_GATEWAY_VIEW:-full}"
+    assert gw._parse_view("full") == ("full", ())
+
+
 def test_search_tools_의미_순위를_끄면_답이_master_와_바이트까지_같다(monkeypatch):
     """옵션을 끈 것이 기본값이다 — 그때 search_tools 는 종전 코드와 글자 하나 다르지 않아야 하고 임베더를 부르지 않는다.
     질의는 손으로 고른 가장자리(짧음·빈 낱말·대소문자·조사·limit)와 평가셋의 질의 전부다."""

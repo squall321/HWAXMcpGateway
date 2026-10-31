@@ -275,6 +275,12 @@ PURPOSE_HEADER = "x-hwax-purpose"
 # 실어 보낸 사본은 버린다. 권한(x-hwax-groups)에 섞지 않는다 — 섞으면 응답 캐시 키가 사람마다 쪼개지고 심의 백엔드로
 # 전달되며 '권한 없음' 과 구분이 안 된다(HWAXPortal docs/mcp-app-toggle D-5·D-6).
 MUTED_HEADER = "x-hwax-muted-apps"
+# 개인 Claude 의 보기(HWAXPortal docs/request-1029 E-4) — full(전체) · bundle:<영역>,…(묶음) · light(가벼운). **tools/list 에만** 건다 —
+# 검색 · 부르기 · 이름 · 권한은 그대로다(보기는 선호다, 권한이 아니다). 게이트웨이가 PAT 분기에서 정해 갈아 끼운다 — 클라이언트 머리(꼴이
+# 맞으면 — 리포 .mcp.json 은 늘 full) > 포털 사람 설정(권한 응답의 view) > 전체. 출처(header · portal · default · exempt, 틀린 머리는
+# ';bad-header')는 둘째 머리에 싣는다. 웹 챗 · 절차 PAT 는 늘 전체이고(끄기 면제와 같은 까닭), GW_TOKEN 분기는 두 머리를 버린다.
+VIEW_HEADER = "x-hwax-view"
+VIEW_SRC_HEADER = "x-hwax-view-src"
 # 끄기를 적용하지 않는 PAT — 포털 웹 챗(에이전트서버가 tools/list 에서 이름으로 찾아 코드로 부르는 도구가 있다)
 CHAT_PAT_NAME = "chat-session"
 PROCEDURE_PURPOSE = "procedure"
@@ -289,6 +295,26 @@ READONLY_HEADER = "x-hwax-readonly"
 # 헤더는 게이트웨이가 처음부터 짓는다). 심의 백엔드의 같은 소속 열람이 견준다(결정 6).
 AFF_FWD_HEADER = "x-hwax-affiliation"
 AFF_PROOF_TTL_S = int(os.environ.get("GATEWAY_AFF_PROOF_TTL", "120"))
+# 보기 글의 꼴 — 영역 키는 tool_areas.json 의 키 꼴이다. 포털이 같은 꼴로 저장한다(HWAXPortal backend/app/access/hub_view.py — 시험이 맞댄다).
+_VIEW_AREA_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+_VIEW_AREAS_MAX = 32
+
+
+def _parse_view(raw) -> tuple[str, tuple[str, ...]] | None:
+    """보기 글 → (보기, 영역들). full · light · bundle:<영역>,<영역>… 만 받고 틀린 꼴이면 None 이다. 영역 이름이 이 박스에 있는지는 보지
+    않는다(모르는 영역은 list_tool_apps 의 view 가 말한다)."""
+    s = str(raw or "").strip().lower()
+    if s in ("full", "light"):
+        return s, ()
+    if s.startswith("bundle:"):
+        areas = tuple(dict.fromkeys(a.strip() for a in s[len("bundle:"):].split(",") if a.strip()))
+        if areas and len(areas) <= _VIEW_AREAS_MAX and all(_VIEW_AREA_RE.fullmatch(a) for a in areas):
+            return "bundle", areas
+    return None
+
+
+def _view_text(mode: str, areas: tuple[str, ...] = ()) -> str:
+    return f"bundle:{','.join(areas)}" if mode == "bundle" else mode
 
 
 def _aff_proof(secret: str, email: str, aff: str, now: float | None = None) -> str:
@@ -3816,6 +3842,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
                 "권한 없는 앱은 목록에 없고 denied_apps 에 라벨·사유·필요 권한·요청 경로만 있다 — 각 항목의 "
                 "reason/how 를 따른다(portal_access 만 포털 '내 권한' 요청, policy_not_ready 는 잠시 뒤 재시도). "
                 "특정 앱의 도구 설명은 list_tool_apps(app='<키>') 로 조회.",
+        # 이 연결의 개인 보기(E-4) — tools/list 에 실은 수 · 보기로 뺀 수(목록 밖도 search_tools → invoke_tool 로 닿는다)
+        "view": _view_info(groups),
     }
     if want_app and not apps:
         if denied:
@@ -3866,7 +3894,8 @@ def _list_by_area(by_app: dict, groups: list[str], want_area: str, include: bool
     payload = {"areas": areas, "area_count": len(areas), "total_tools": sum(a["tool_count"] for a in areas),
                "hidden_no_access_or_down": hidden,
                "hidden_muted": hidden_muted,
-               "note": "영역 = 하는 일. 특정 영역의 도구 설명은 list_tool_apps(by='area', area='<키>')."}
+               "note": "영역 = 하는 일. 특정 영역의 도구 설명은 list_tool_apps(by='area', area='<키>').",
+               "view": _view_info(groups)}
     if want_area and not areas:
         payload["error"] = f"unknown area: {want_area} — 가능한 키: {', '.join(meta)}"
     return types.CallToolResult(
@@ -5340,6 +5369,64 @@ def _visible_tools(groups: list[str]) -> list[types.Tool]:
             if _backend_allowed(route[t.name][0], groups) and route[t.name][0] not in hidden] + _local_tools()
 
 
+# 가벼운 보기의 두 도구(E-4 · L-A) — 찾고 부른다. 앱 목록 · 패널 도구 · 그 밖은 invoke_tool 로 닿는다(파괴 · 제어 도구 막이는 그대로다).
+_VIEW_LIGHT_TOOLS = (SEARCH_TOOLS_TOOL, INVOKE_TOOL)
+
+
+def _listed_tools(groups: list[str]) -> list[types.Tool]:
+    """tools/list 가 내는 목록 — 검색 시야(_visible_tools)에 이 요청의 보기를 얹는다(HWAXPortal docs/request-1029 E-4). **보기는 빼기만 한다** —
+    이름을 바꾸지 않고, 검색 · 평가 · 앱 목록은 _visible_tools 를 그대로 쓴다(여기에 걸면 가벼운 보기의 search_tools 가 빈손이 된다).
+      · 전체 — 지금 그대로(형제 사본도 싣는다 — 결정 Q-4).
+      · 가벼운 — search_tools · invoke_tool 둘.
+      · 묶음 — 고른 영역(tool_areas.json)의 백엔드 도구 + 정본 읽기 도구(어휘표 검색 칸의 도구 — (정본 키, 원래 이름)으로 고른다) + 로컬 도구
+        전부. 형제 사본은 싣지 않는다(X-B — 정본이 대표하고, 형제는 search_tools 에서 앱 이름을 부르면 나온다). 미분류 도구는 어느 묶음에도
+        들지 않는다(찾기로 닿는다).
+    끈 앱 · 시험 앱은 _visible_tools 가 이미 뺐다 — 어느 보기에서도 빠진다(끄기가 더 세다)."""
+    vis = _visible_tools(groups)
+    mode, areas, _src = _request_view()
+    if mode == "full":
+        return vis
+    if mode == "light":
+        return list(_VIEW_LIGHT_TOOLS)
+    d = _CORE_VOCAB["data"] or {}
+    canon, sib, reads = d.get("canonical"), d.get("siblings") or frozenset(), d.get("core_reads") or frozenset()
+    want, local = set(areas), {id(t) for t in _local_tools()}
+    out = []
+    for t in vis:
+        if id(t) in local:
+            out.append(t)
+            continue
+        key, orig = route.get(t.name, ("", ""))
+        if key in sib:
+            continue
+        if (key == canon and orig in reads) or _area_of(t.name, key) in want:
+            out.append(t)
+    return out
+
+
+def _view_info(groups: list[str]) -> dict:
+    """list_tool_apps 의 view — 이 연결의 보기 · 영역 · 목록에 실은 수 · 보기로 뺀 수 · 모르는 영역 · 출처(E-4 E4-2). 개인 Claude 는 역할(role)과
+    이것을 한 응답에서 읽는다."""
+    mode, areas, src = _request_view()
+    vis, listed = _visible_tools(groups), _listed_tools(groups)
+    out: dict = {"mode": mode}
+    if mode == "bundle":
+        known = {m["area"] for m in _area_meta()}
+        out["areas"] = [a for a in areas if a in known]
+        unknown = [a for a in areas if a not in known]
+        if unknown:
+            out["unknown_areas"] = unknown
+    out.update(listed=len(listed), hidden_by_view=len(vis) - len(listed))
+    if src:
+        out["source"] = src.split(";", 1)[0]
+    if "bad-header" in src:
+        out["error"] = "연결 머리 X-HWAX-View 의 꼴이 틀려 포털 설정을 썼다 — full · light · bundle:<영역>,<영역> 가운데 하나다"
+    if mode != "full":
+        out["note"] = ("보기는 tools/list 만 줄인다 — 목록 밖 도구도 search_tools 로 찾아 invoke_tool 로 부른다(권한 · 이름은 그대로). "
+                       "보기는 포털 '개인 토큰 › 허브에 보일 앱'(/tokens?tab=apps)에서 바꾸고, 열린 세션은 재연결해야 목록이 바뀐다.")
+    return out
+
+
 def _request_groups() -> list[str]:
     """현재 요청 헤더(X-HWAX-Groups)에서 caller groups 추출.
     요청 컨텍스트·헤더가 없으면 [](=제한 백엔드는 숨김 → fail-closed)."""
@@ -5359,6 +5446,17 @@ def _request_muted() -> set[str]:
         return set()
     raw = req.headers.get(MUTED_HEADER) if req is not None else None
     return {a for a in unquote(raw or "").split(",") if a}
+
+
+def _request_view() -> tuple[str, tuple[str, ...], str]:
+    """이 요청의 개인 보기 · 영역 · 출처(E-4) — 게이트웨이가 PAT 분기에서 정해 싣는다. 머리가 없으면(GW_TOKEN · 웹 챗 · 절차 · 요청 문맥 없음) 전체다."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return "full", (), ""
+    h = req.headers if req is not None else {}
+    mode, areas = _parse_view(h.get(VIEW_HEADER)) or ("full", ())
+    return mode, areas, str(h.get(VIEW_SRC_HEADER) or "").strip()[:40]
 
 
 def _request_purpose() -> str:
@@ -6262,10 +6360,19 @@ async def _read_ui_resource(req: types.ReadResourceRequest):
 _low.request_handlers[types.ReadResourceRequest] = _read_ui_resource
 
 
+# 기동 뒤 보기별 tools/list 수 — /health 가 싣는다(개인 보기의 채택을 잰다, E-4 E4-2)
+_VIEW_LISTS = {"full": 0, "bundle": 0, "light": 0}
+
+
 @_low.list_tools()
-async def _list_tools():
-    # 도구 목록을 caller groups로 필터(보이지 않는 도구는 LLM이 알 수도 없음).
-    return _visible_tools(_request_groups())
+async def _list_tools(req: types.ListToolsRequest):
+    # 도구 목록을 caller groups로 필터(보이지 않는 도구는 LLM이 알 수도 없음) + 개인 보기(E-4 — tools/list 에만, _listed_tools).
+    # req 가 None 이면 클라이언트의 목록 요청이 아니라 SDK 가 호출 검증용 캐시를 채우려 부른 것이다(_get_cached_tool_definition) — 그때는 보기를
+    # 얹지 않고 세지도 않는다. 보기는 목록만 줄이고 호출은 지금 그대로여야 한다(목록 밖 도구를 이름으로 부를 때 출력 검증도 그대로다).
+    if req is None:
+        return _visible_tools(_request_groups())
+    _VIEW_LISTS[_request_view()[0]] += 1
+    return _listed_tools(_request_groups())
 
 
 # 게이트웨이 자체 도구 가운데 조회만 하는 것 — 읽기 전용 토큰도 부른다. save_conversation(쓰기)은 빠지고, rest_call 은 메서드로,
@@ -6696,6 +6803,8 @@ def _bearer_gate(app, pat_verifier=None):
                 "core_vocab": _core_vocab_health(),
                 # 검색 손잡이 — 지문(덧씌운 값 · 기본값) · 꺼 둔 묶음 · 박스 덧씌우기(있나 · 건드린 칸 · 버린 까닭). dev 와 cae00 이 다르게 도는 것을 보인다(E-7)
                 "search_tuning": _tuning_health(),
+                # 기동 뒤 개인 보기별 tools/list 수 — 보기(전체 · 묶음 · 가벼운)를 누가 얼마나 쓰나(E-4 E4-2). 수만 싣는다
+                "tools_list_by_view": dict(_VIEW_LISTS),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
@@ -6903,9 +7012,11 @@ def _bearer_gate(app, pat_verifier=None):
             # 사람 권한 정책(포털)에서 뺀다. 권한 정책 이전과 같은 시야를 지킨다.
             # 목적 헤더는 **검증된 PAT 에서만** 나온다 — 이 경로(GW_TOKEN)는 PAT 검증을 안 하므로
             # 클라이언트가 실어 보낸 값을 버린다. 안 버리면 GW_TOKEN 을 쥔 쪽이 차단을 면제받는다.
+            # 보기 머리(E-4)도 버린다 — 에이전트 서버 · 심의는 늘 전체 목록이다.
             _kept = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
-                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode())]
+                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode(),
+                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode())]
             if GROUPS_HEADER.encode() not in headers:
                 _kept.append((GROUPS_HEADER.encode(), SERVICE_GROUP.encode()))
             _kept.append((VIA_HEADER.encode(), b"gw-token"))
@@ -6949,7 +7060,8 @@ def _bearer_gate(app, pat_verifier=None):
             fresh = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (GROUPS_HEADER.encode(), USER_HEADER.encode(),
                                           PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
-                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode())]
+                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode(),
+                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode())]
             if is_read_only(claims):
                 fresh.append((READONLY_HEADER.encode(), b"1"))
             # PAT 의 groups 에도 한글이 올 수 있다 — 같은 규칙으로 인코딩해 실어야 헤더가 안 깨진다.
@@ -6970,6 +7082,20 @@ def _bearer_gate(app, pat_verifier=None):
                         and str(claims.get("jti") or "").startswith("chat-"))
             if _muted and not _is_chat and str(claims.get("purpose") or "") != PROCEDURE_PURPOSE:
                 fresh.append((MUTED_HEADER.encode(), quote(",".join(_muted), safe=",").encode("latin-1")))
+            # 개인 보기(E-4 E4-2) — 클라이언트 머리가 꼴에 맞으면 그것(연결마다 덮는다 — 리포 .mcp.json 은 늘 full), 아니면 포털 사람 설정(권한 응답의
+            # view), 없으면 전체. 정한 값으로 갈아 끼운다. 웹 챗 · 절차 PAT 는 늘 전체다(끄기 면제와 같은 까닭). 틀린 꼴의 머리는 포털 값으로 가고
+            # 출처에 표시를 남긴다(list_tool_apps 의 view.error). 넓어지는 것은 그 사람이 이미 쓸 수 있는 목록뿐이다(보기는 권한이 아니다).
+            _cv = headers.get(VIEW_HEADER.encode(), b"").decode("latin-1").strip()
+            if _is_chat or str(claims.get("purpose") or "") == PROCEDURE_PURPOSE:
+                _view, _vsrc = ("full", ()), "exempt"
+            else:
+                _hv = _parse_view(_cv) if _cv else None
+                _pv = _parse_view((_ent or {}).get("view"))
+                _view, _vsrc = (_hv, "header") if _hv else (_pv, "portal") if _pv else (("full", ()), "default")
+                if _cv and not _hv:
+                    _vsrc += ";bad-header"
+            fresh.append((VIEW_HEADER.encode(), _view_text(*_view).encode("latin-1")))
+            fresh.append((VIEW_SRC_HEADER.encode(), _vsrc.encode()))
             fresh.append((VIA_HEADER.encode(), b"chat" if _is_chat else
                           b"procedure" if str(claims.get("purpose") or "") == PROCEDURE_PURPOSE else b"pat"))
             await app({**scope, "headers": fresh}, receive, send)

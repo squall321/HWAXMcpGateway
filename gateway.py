@@ -6922,6 +6922,9 @@ def _bearer_gate(app, pat_verifier=None):
                 # 루틴 단계에서 부를 수 있는 읽기 도구의 노출 이름(정렬, 백엔드 도구만) — 닫힌 쪽 판정 _routine_read(표지 · 읽기 목록 · 조회 낱말),
                 # routine_call 과 같은 판정이다. 포털 계획은 이것과 겹치는 도구만 단계에 묶는다(R3 리뷰 #0 — 모르는 도구는 쓰기로 본다).
                 "routine_read": sorted(_n for _n, (_bk, _orig) in route.items() if _routine_read(_tool_of.get(_n), _bk, _orig)),
+                # 이 게이트웨이가 아는 개인 보기(E-4) — 포털이 보기를 저장 · 보일 때 본다. 이 칸이 없는 옛 게이트웨이는 보기를 읽지 않아 늘 전체로 돈다
+                # (포털 화면이 '저장했습니다' 만 말하던 것을 막는다, 검토 10-31). 위 칸들은 그대로다.
+                "views": ["full", "bundle", "light"],
             }, ensure_ascii=False).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

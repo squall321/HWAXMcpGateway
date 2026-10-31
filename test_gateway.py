@@ -6085,8 +6085,8 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
                                "q": None})
     _aggregate_tools(monkeypatch, {"reportarchive": [leaky, _stool("ra_get", {"id": "보고서 id"})]})
     body = tools_map()
-    assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read"], \
-        "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0)은 맨 뒤에 덧붙는다"
+    assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read", "views"], \
+        "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4)는 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
     assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 14, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6
@@ -7344,6 +7344,16 @@ def test_E4_사람의_토큰으로_도는_서버_앱은_그_사람이_가벼운�
     listed = _listed()
     _view_kit(monkeypatch, "full")
     assert listed == _listed() and len(listed) > len(gw._local_tools()), "전체 보기와 같은 목록"
+
+
+def test_E4_도구_지도는_게이트웨이가_보기를_안다고_말한다(monkeypatch):
+    """포털은 보기를 저장할 때 이것을 본다 — 보기를 모르는 옛 게이트웨이와 붙으면 화면이 '저장했습니다' 만 말하고 목록은 전체로 돌았다(검토 10-31)."""
+    _view_kit(monkeypatch, "full")
+    sent = []
+
+    async def send(m): sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/tools-map", "headers": []}, None, send))
+    assert json.loads(sent[1]["body"])["views"] == ["full", "bundle", "light"]
 
 
 def test_E4_list_tool_apps_의_view_는_보기_영역_수_모르는_영역_출처를_말한다(monkeypatch):

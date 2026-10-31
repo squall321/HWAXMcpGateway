@@ -7174,6 +7174,17 @@ def test_read_tools_파일이_온전하고_리스크_앱_도구를_담는다():
     assert gw.READ_TOOLS == frozenset(tools)
 
 
+def test_read_tools_deny_는_StepForge_mesh_size_advice_를_루틴_단계에서_닫는다(monkeypatch):
+    """이름의 조회 낱말(advice)로 루틴 단계에 열리지만 기본값(store=true)으로 부품 메타데이터를 쓴다 — 10-31 StepForge 세션의 도구 나눔
+    (쓰기 33 · 늘 확인 8)과 포털 HA-29 운영자 목록. 닫기 목록이 이름 꼴보다 먼저다."""
+    data = json.load(open(gw.Path(gw.__file__).with_name("read_tools.json"), encoding="utf-8"))
+    assert data["deny"] == sorted(set(data["deny"])) and all(t.count(":") == 1 and all(t.split(":")) for t in data["deny"])
+    assert "heax-step_forge:mesh_size_advice" in data["deny"] and gw.READ_DENY == frozenset(data["deny"])
+    assert not gw._routine_read(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice")
+    monkeypatch.setattr(gw, "READ_DENY", frozenset())
+    assert gw._routine_read(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice"), "닫기 목록이 없으면 이름 꼴(advice)로 열린다"
+
+
 def test_REST_다리도_읽기_전용_PAT_는_GET_HEAD_만(monkeypatch):
     """`/api/<site>/` 는 MCP 를 거치지 않는다 — 같은 규칙을 다리가 따로 건다(rest_proxy.is_read_only)."""
     import asyncio

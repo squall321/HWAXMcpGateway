@@ -200,7 +200,8 @@ def search_stats(queries: dict, outs: dict) -> tuple[dict, dict, dict]:
             app, orig = _split(key)
             b = boost[app]
             b["queries"].add(qid)
-            for rule in via.get(key) or ["(규칙 없음)"]:
+            # 비코어 낮추기(demote: — 코어 질문의 감점, HWAXPortal docs/request-1029 E-2 E2-5)는 점수를 뺀 규칙이다 — '보정 덕에' 의 규칙이 아니다
+            for rule in [x for x in via.get(key) or [] if not str(x).startswith("demote:")] or ["(규칙 없음)"]:
                 e = b["rules"][rule]
                 e["n"] += 1
                 e["tools"][orig] += 1
@@ -264,6 +265,8 @@ def _rule_text(rule: str, app: str, tuning: dict) -> tuple[str, str]:
         return f"코어 어휘표 낱말 '{_cell(word)}'", "(코어 질문을 허브로 잇는 정책 — 그쪽이 고칠 것이 아닐 수 있다)"
     if kind == "quality":
         return "품질 낱말 가중", "(품질 · VOC 질의를 그 영역 도구로 올리는 정책)"
+    if kind == "demote":
+        return "비코어 낮추기(코어 질문의 감점)", "(코어 질문을 정본으로 보내는 정책 — 그쪽이 고칠 것이 아니다)"
     if kind == "embedding":
         return "의미 순위(임베딩)", "도구 설명에 질의의 낱말이 없다 — 질의 예의 낱말을 설명 · 별칭에"
     return _cell(rule), "—"

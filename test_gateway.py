@@ -6085,8 +6085,8 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
                                "q": None})
     _aggregate_tools(monkeypatch, {"reportarchive": [leaky, _stool("ra_get", {"id": "보고서 id"})]})
     body = tools_map()
-    assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read"], \
-        "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0)은 맨 뒤에 덧붙는다"
+    assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read", "views"], \
+        "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4)는 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
     assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 14, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6
@@ -6741,6 +6741,709 @@ def test_R6_시험_사본은_목록_검색에서_빠지고_이름으로_부르�
     assert staged in {t.name for t in gw._visible_tools([])}, "어휘표가 없으면 지금 동작이다(숨기지 않는다)"
 
 
+# ── 앱 역할로 순위 · 접기 · 노출(HWAXPortal docs/request-1029 E-2 · design-e2-e4.md 1.4 — 사용자 결정 10-31, 권장안 그대로) ──────────────────
+# 역할은 어휘표에 있다 — 가족(정본 + 형제) · 비코어 · 시험. 게이트웨이가 다 읽어 /health · 앱 목록 · 검색 줄에 싣고(E2-1), 가족 줄은 원래 이름으로
+# 접고(E2-2 · F-A), 가족 도구는 늘 접두를 단다(E2-3 · N-A · Q-2). 형제 소개 줄은 칸만 짓는다(E2-4 · S-B — 문안은 운영자가 cae00 덧씌우기에, Q-3).
+# 비코어 낮추기는 손잡이로 짓고 기본은 끈다(E2-5 · C-A · Q-1).
+def _vocab_overlay(monkeypatch, tmp_path, patch: dict):
+    """어휘표 박스 덧씌우기(core_vocab.local.json)를 쓴다 — 바뀐 시각을 앞 판보다 밀어 다시 읽게 한다(파일 시각의 눈금이 거칠어 잇달아 쓰면 같다)."""
+    p = tmp_path / "core_vocab.local.json"
+    prev = p.stat().st_mtime_ns if p.exists() else 0
+    p.write_text(json.dumps(patch, ensure_ascii=False), encoding="utf-8")
+    st = p.stat()
+    gw.os.utime(p, ns=(st.st_atime_ns, max(st.st_mtime_ns, prev) + 1_000_000_000))
+    monkeypatch.setattr(gw, "CORE_VOCAB_LOCAL_PATH", p)
+    return p
+
+
+def _role_catalog(monkeypatch, *, hub_tools=_CORE_HUB_TOOLS, hubs=_CORE_HUBS, other=_CORE_OTHER, hub_desc=None):
+    """실제 어휘표 + 합성 카탈로그(_core_search 와 같은 꼴 — 집계를 실제로 돌린다). hub_desc(키, 라벨, 설명) 로 허브마다 설명을 바꾼다."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    spec = {k: [types.Tool(name=n, description=hub_desc(k, lab, d) if hub_desc else d,
+                           inputSchema={"type": "object", "properties": {"q": {"type": "string"}}}) for n, d in hub_tools]
+            for k, lab in hubs}
+    spec.update({k: [types.Tool(name=n, description=d, inputSchema={"type": "object", "properties": {}}) for n, d in ts]
+                 for k, (_l, ts) in other.items()})
+    _aggregate_tools(monkeypatch, spec)
+    monkeypatch.setattr(gw, "DISCOVERED_META", {**{k: {"label": lab, "description": "코어 온톨로지 허브"} for k, lab in hubs},
+                                                **{k: {"label": lab, "description": ""} for k, (lab, _t) in other.items()}})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    _no_embed(monkeypatch)
+
+
+def _role_kit(monkeypatch, **kw):
+    """_role_catalog + 서비스 시야의 요청 문맥 — 돌려주는 것은 질의 → 답(JSON). raw=True 면 응답 글 그대로, fn 으로 다른 판(기준본)을 부른다."""
+    _role_catalog(monkeypatch, **kw)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+
+    def search(q, limit=8, fn=None, raw=False):
+        text = asyncio.run((fn or gw._search_tools)({"query": q, "limit": limit})).content[0].text
+        return text if raw else json.loads(text)
+    return search
+
+
+def _agent_onto_core() -> tuple[str, ...]:
+    """에이전트 서버 웹 챗 고정 묶음(_ONTO_CORE) — 형제 리포의 실제 파일을 AST 로 읽는다(C-11 과 같은 자세 — 소비자와 어긋나지 않게)."""
+    import ast
+    src = gw.Path(gw.__file__).resolve().parent.parent / "HWAXAgentServer" / "app.py"
+    if not src.exists():
+        pytest.skip("형제 HWAXAgentServer 리포가 없다 — 웹 챗 고정 묶음(_ONTO_CORE)을 못 읽는다")
+    for node in ast.parse(src.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "_ONTO_CORE" for t in node.targets):
+            return tuple(ast.literal_eval(node.value))
+    raise AssertionError("에이전트 app.py 에서 _ONTO_CORE 를 못 찾았다(이름이 바뀌었나)")
+
+
+def test_E2_1_역할을_다_읽고_health_가_키마다_이_박스에_있는지_말한다(monkeypatch, tmp_path):
+    """종전엔 정본 · 시험만 읽어 형제 · 비코어 키를 덧씌우기에 틀리게 적어도 어디서도 보이지 않았다(G6). 실제 어휘표 + 형제 하나를 더한 덧씌우기로
+    가족 · 비코어 · 시험 셋이 맞고, /health 가 키마다 이 박스 백엔드에 있는지 말한다."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    _vocab_overlay(monkeypatch, tmp_path, {"apps": {"newhub": {"role": "sibling", "label": "새 허브"}}})
+    d = gw._core_vocab()
+    assert d["family"] == ("rootdesigndatahub", "failuretrace", "caegroupdatahub", "newhub"), "정본이 앞, 형제는 어휘표 차례"
+    assert set(d["noncore"]) == {"reportarchive", "matnexus", "componentcore", "fmea", "arp", "odb-hub"}
+    assert d["noncore"]["fmea"] == "사내 규격 · 사례" and d["noncore"]["matnexus"] == ""
+    assert d["staging"] == frozenset() and d["sib_tags"] == {}, "기본 표의 형제 소개 줄은 비었다(문안은 운영자 몫 — Q-3)"
+    assert d["core_reads"] == {"object_resolve", "objects_list", "objects_summary", "graph_neighbors", "object_get"}
+    monkeypatch.setattr(gw, "backends", {"rootdesigndatahub": _B([]), "failuretrace": _B([]), "fmea": _B([])})
+    roles = gw._core_vocab_health()["roles"]
+    assert roles["family"] == {"rootdesigndatahub": True, "failuretrace": True, "caegroupdatahub": False, "newhub": False}
+    assert roles["noncore"]["fmea"] is True and roles["noncore"]["arp"] is False and len(roles["noncore"]) == 6
+    assert roles["sibling_taglines"] == [] and roles["family_prefixed"] == {"count": 0, "names": []}
+
+
+def test_E2_1_앱_목록_도구_지도_검색_줄은_가족_비코어에만_role_을_싣는다(monkeypatch):
+    """list_tool_apps · /tools-map 의 앱 줄은 가족 · 비코어에(비코어는 note 를 role_note 로), 검색 결과 줄은 형제 · 비코어에만 — 정본은 설명 앞
+    소개 줄이 말한다. 개인 Claude · 심의 좌석은 웹 챗 규칙 ⑦ 을 받지 않아 이 칸으로 코어가 아닌 것을 읽는다(G4 · C-B)."""
+    search = _role_kit(monkeypatch)
+    want = {"rootdesigndatahub": "canonical", "failuretrace": "sibling", "caegroupdatahub": "sibling",
+            "fmea": "noncore", "arp": "noncore", "odb-hub": "noncore", "matnexus": "noncore"}
+    body = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    got = {a["app"]: a.get("role") for a in body["apps"]}
+    assert got == {k: want.get(k) for k in got} and set(want) <= set(got), got
+    assert {a["app"]: a["role_note"] for a in body["apps"] if a.get("role_note")} == {"fmea": "사내 규격 · 사례", "arp": "해석 실측",
+                                                                                      "odb-hub": "보드 규칙"}
+    sent = []
+
+    async def send(m): sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/tools-map", "headers": []}, None, send))
+    tmap = {a["app"]: a.get("role") for a in json.loads(sent[1]["body"])["apps"]}
+    assert tmap == {k: want.get(k) for k in tmap} and set(want) <= set(tmap), tmap
+    seen = set()
+    for q in ("FailureTrace 고장모드 목록", "규격 실패모드", "고장모드 목록"):
+        for m in search(q, 20)["matches"]:
+            r = want.get(m["app"])
+            assert m.get("role") == (r if r in ("sibling", "noncore") else None), (q, m["tool"], m.get("role"))
+            seen.add(m.get("role"))
+    assert seen == {"sibling", "noncore", None}, "전제 — 형제 · 비코어 · 역할 없는 줄(정본 포함)이 다 지나갔다"
+
+
+def test_E2_1_실제_어휘표에서도_dev_카탈로그의_search_tools_답은_지금_코드와_바이트까지_같다(monkeypatch):
+    """dev 에는 가족 · 비코어 앱이 붙어 있지 않다 — 역할 칸 · 가족 접기 · 가족 접두 · 비코어 낮추기(기본 끔)가 들어와도 실제 어휘표 아래 답이 기준본
+    (_SEARCH_TOOLS_MASTER)과 한 글자도 다르지 않다. 의미 순위를 끈 바이트 시험(아래)은 어휘표 없이 같은 것을 본다."""
+    _search_catalog(monkeypatch)
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    _no_embed(monkeypatch)
+    legacy = _search_tools_master()
+    queries = ["심의", "보고서를 요약해줘", "MESH Quality check", "낙하 충격 에너지", "물성 곡선 그래프", "VOC 검색", "잡 상태 조회", "안 선택",
+               "고장모드 목록", "관리 기준 개수", "규격 실패모드", "기준 판정 설계 선택"]
+    pairs = gw.Path(gw.__file__).with_name("tool_search_eval") / "pairs.jsonl"
+    if pairs.exists():
+        queries += [json.loads(line)["query"] for line in pairs.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert gw._core_vocab() is not None, "전제 — 실제 어휘표를 읽었다"
+    for q in queries:
+        for extra in ({}, {"limit": 20}):
+            args = {"query": q, **extra}
+            new, old = asyncio.run(gw._search_tools(args)), asyncio.run(legacy(args))
+            assert (new.isError, new.content[0].text) == (old.isError, old.content[0].text), args
+
+
+def test_E2_2_가족_줄은_설명이_달라도_원래_이름으로_한_줄에_접히고_differs_가_붙는다(monkeypatch, tmp_path):
+    """Datahub DP-03(설치별 소개를 도구 설명에) 꼴 — 허브마다 제 소개를 설명 머리에 단다. 종전 열쇠(원래 이름 + 설명)로는 세 줄로 돌아가 C-12 접기가
+    되돌려졌다(G1 — 고치라고 청한 것이 접기를 되돌린다). 가족은 원래 이름만으로 접고, 설명이 다른 사본에 differs 를 단다."""
+    search = _role_kit(monkeypatch, hub_desc=lambda k, label, d: f"[{label} — 이 설치의 소개] {d}")
+    out = search("고장모드 목록")
+    rows = [m for m in out["matches"] if m["tool"].endswith("_objects_list")]
+    assert [m["app"] for m in rows] == ["rootdesigndatahub"], out["ranked"]
+    assert sorted((x["app"], x.get("differs")) for x in rows[0]["same_in"]) == [("caegroupdatahub", True), ("failuretrace", True)]
+    assert "형제 허브의 같은 이름 도구" in out["note"] and "담은 데이터가 다르다" in out["note"]
+    old = search("고장모드 목록", 20, fn=_search_tools_master())
+    assert len([m for m in old["matches"] if m["tool"].endswith("_objects_list")]) == 3, "기준본(고치기 전)은 세 줄이다 — G1"
+    # 사본의 앱을 부르면 그 사본이 대표한다(OT-12 허브 건너기) — 정본은 접힌 쪽에 있다
+    named = search("FailureTrace 고장모드 목록")
+    rows = [m for m in named["matches"] if m["tool"].endswith("_objects_list")]
+    assert [m["app"] for m in rows] == ["failuretrace"] and {x["app"] for x in rows[0]["same_in"]} == {"rootdesigndatahub", "caegroupdatahub"}
+    _tune(monkeypatch, tmp_path, {"switches": {"copy_fold": False}})
+    assert len([m for m in search("고장모드 목록", 20)["matches"] if m["tool"].endswith("_objects_list")]) == 3, "copy_fold 를 끄면 접지 않는다"
+
+
+def test_E2_2_설명이_같으면_가족_접기는_지금_코드와_바이트까지_같다(monkeypatch):
+    """설명이 같은 합성 카탈로그(cae00 의 지금 꼴) — 가족 접기의 답이 기준본과 같다. 검색 줄의 역할 칸(role — E2-1 이 더한 것)만 빼고 응답 글을
+    견준다. 사본 앱 이름을 부르는 질의(OT-12)와 비코어 · 심의 질의를 함께 지난다."""
+    search = _role_kit(monkeypatch)
+    legacy = _search_tools_master()
+
+    def without_role(text):
+        o = json.loads(text)
+        for m in o["matches"]:
+            m.pop("role", None)
+        return json.dumps(o, ensure_ascii=False, indent=2)
+    seen = {"same_in": 0, "role": 0}
+    for q in ("고장모드 목록", "FailureTrace 고장모드 목록", "CAE 그룹 Datahub 객체 요약", "Which test items detect drop failure modes",
+              "솔더 접합 불량 고장모드 원인 대책", "관리 기준 개수", "규격 실패모드", "이 모델의 전작", "가상검증", "심의 시작", "철판 낙하 기준"):
+        for limit in (3, 8, 20):
+            new, old = search(q, limit, raw=True), search(q, limit, fn=legacy, raw=True)
+            assert without_role(new) == old, (q, limit)
+            seen["same_in"] += '"same_in"' in old
+            seen["role"] += '"role"' in new
+    assert seen["same_in"] and seen["role"], f"전제 — 접힌 무리와 역할 칸이 다 지나갔다: {seen}"
+
+
+def test_E2_2_가족_밖_키의_허브_사본이_있어도_정본은_한_번만_서고_형제는_접힌_쪽에_남는다(monkeypatch):
+    """셋째 허브가 가족 밖 키로 붙어(덧씌우기 오타 · 어휘표에 아직 없는 새 설치 — G6) 정본과 같은 설명을 내는데 형제가 판을 올려 설명이 질의에 더
+    맞으면, 형제가 연 가족 무리와 가족 밖 사본의 무리(정본 설명의 열쇠)가 따로 서서 정본이 두 번 오르고 늦게 선 무리가 접힌 표를 덮어 형제가 답에서
+    사라졌다(검토 10-31 — 고치기 전 판은 형제를 제 줄로 냈다). 정본 · 가족 줄과 설명이 같은 가족 밖 줄은 그 이름의 가족 무리로 간다."""
+    hubs = (("rootdesigndatahub", "자주검증 Datahub(rootdesign)"), ("failuretrace", "FailureTrace"), ("cae-group-datahub", "CAE 그룹 Datahub"))
+    base = dict(_CORE_HUB_TOOLS)["objects_list"]
+    newer = "고장모드 목록 — 한 타입의 객체 목록을 준다(새 판 — 고장모드 · 목록)."
+    search = _role_kit(monkeypatch, hubs=hubs, hub_desc=lambda k, lab, d: newer if (k == "failuretrace" and d == base) else d)
+    out = search("고장모드 목록", 20)
+    assert len(out["ranked"]) == len(set(out["ranked"])), out["ranked"]
+    rows = [m for m in out["matches"] if m["tool"].endswith("_objects_list")]
+    assert [m["app"] for m in rows] == ["rootdesigndatahub"], out["ranked"]
+    assert {x["app"]: x.get("differs") for x in rows[0]["same_in"]} == {"failuretrace": True, "cae-group-datahub": None}
+    # 가족 밖 사본이 형제(새 판)와 같은 설명이면 — 가족 무리에 들고 정본과 다르니 differs 다. 안내는 그것을 형제 허브라고만 말하지 않는다
+    search = _role_kit(monkeypatch, hubs=hubs, hub_desc=lambda k, lab, d: newer if (k != "rootdesigndatahub" and d == base) else d)
+    out = search("고장모드 목록", 20)
+    rows = [m for m in out["matches"] if m["tool"].endswith("_objects_list")]
+    assert len(out["ranked"]) == len(set(out["ranked"])) and [m["app"] for m in rows] == ["rootdesigndatahub"], out["ranked"]
+    assert {x["app"]: x.get("differs") for x in rows[0]["same_in"]} == {"failuretrace": True, "cae-group-datahub": True}
+    assert "설명이 다른" in out["note"], out["note"]
+    # 정본이 점수 0 이라 줄에 없어도 같다 — 형제(새 판)가 연 무리와 정본 설명의 가족 밖 사본이 한 무리라 정본은 한 번만 세운다(C-12 의 대표)
+    fresh = "zqx 신형판 — 한 타입의 객체를 준다."                            # 동의어가 없는 낱말 — 정본 줄은 점수 0 이다
+    search = _role_kit(monkeypatch, hubs=hubs, hub_desc=lambda k, lab, d: fresh if (k == "failuretrace" and d == base) else d)
+    out = search("caegroup zqx", 20)
+    assert "rootdesigndatahub_objects_list" in out["ranked"] and len(out["ranked"]) == len(set(out["ranked"])), out["ranked"]
+    rows = [m for m in out["matches"] if m["tool"].endswith("_objects_list")]
+    assert [m["app"] for m in rows] == ["rootdesigndatahub"], out["ranked"]
+    assert {x["app"]: x.get("differs") for x in rows[0]["same_in"]} == {"failuretrace": True, "cae-group-datahub": None}
+
+
+def test_E2_3_허브_가족은_늘_접두를_달고_옛_맨_이름은_알리며_부르면_닿는다(monkeypatch, caplog):
+    """허브가 하나뿐인 박스 — 종전 규칙(지금 붙은 백엔드끼리 겹칠 때만)은 허브 도구를 맨 이름으로 냈다. 다른 허브가 붙는 순간 접두 이름으로 바뀌어
+    그 이름을 외운 쪽이 unknown tool 이 됐다(G2). 늘 접두를 단다. 가족 밖 앱은 그대로다. 옛 규칙이면 맨 이름이던 것은 /health · 로그로 한 번
+    알리고 그 맨 이름도 부르면 닿는다(호출 별칭 — 목록에는 안 올린다, 결정 Q-2)."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    hub, sf = _CallB(["object_resolve", "objects_list"]), _CallB(["search_voc"])
+    monkeypatch.setattr(gw, "backends", {"rootdesigndatahub": hub, "signalforge": sf})
+    for k in ("exposed_tools", "route", "alias_route"):
+        monkeypatch.setattr(gw, k, [] if k == "exposed_tools" else {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    gw._RESP_CACHE.clear()
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        asyncio.run(gw._aggregate())
+        asyncio.run(gw._aggregate())              # 같은 이름이면 다시 알리지 않는다(재집계는 60초마다 돈다)
+    assert {t.name for t in gw.exposed_tools} == {"rootdesigndatahub_object_resolve", "rootdesigndatahub_objects_list", "search_voc"}
+    assert sum("늘 접두" in r.getMessage() for r in caplog.records) == 1
+    assert gw._core_vocab_health()["roles"]["family_prefixed"] == {
+        "count": 2, "names": ["rootdesigndatahub_object_resolve", "rootdesigndatahub_objects_list"]}
+    assert "object_resolve" not in gw.route and gw.alias_route["object_resolve"] == ("rootdesigndatahub", "object_resolve")
+    assert asyncio.run(gw._call_tool("object_resolve", {})).content[0].text == "ok"
+    assert asyncio.run(gw._call_tool("invoke_tool", {"name": "objects_list", "arguments": {}})).content[0].text == "ok"
+    assert hub.session.calls == ["object_resolve", "objects_list"] and sf.session.calls == []
+    # 어휘표를 한 번도 읽지 못한 박스(새로 뜬 프로세스)는 지금 규칙이다 — 읽던 표가 사라진 때는 아래 시험(마지막 가족을 쥔다)
+    monkeypatch.setattr(gw, "_CORE_VOCAB", {"mtime": None, "data": None, "error": "없음", "tag_applied": None, "overlay": None})
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB.with_name("__none__.json"))
+    asyncio.run(gw._aggregate())
+    assert {t.name for t in gw.exposed_tools} == {"object_resolve", "objects_list", "search_voc"}, "어휘표가 없으면 지금 규칙이다"
+
+
+def test_E2_3_어휘표를_잠깐_못_읽어도_노출_이름은_그대로고_소개_줄만_빠진다(monkeypatch, tmp_path):
+    """늘 접두는 이름이 남의 사정으로 뒤집히지 않게 하려는 것이다(G2). 어휘표를 못 읽는 사이(update-all 의 checkout · stash 와 재활 회차가 겹침 · 기본
+    표를 깨게 고침 · 포털 리포를 옮김) 가족을 잊으면 허브 하나에만 있는 도구가 맨 이름으로 뒤집혔다가 표가 돌아오면 다시 접두로 바뀌었다(검토 10-31).
+    노출 이름은 마지막으로 온전히 읽은 표(덧씌우기 포함)의 가족대로 두고, 바뀌는 것은 소개 줄뿐이다."""
+    p, away = tmp_path / "core_vocab.json", tmp_path / "away.json"
+    p.write_text(_REAL_CORE_VOCAB.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", p)
+    monkeypatch.setattr(gw, "CORE_VOCAB_LOCAL_PATH", tmp_path / "core_vocab.local.json")
+
+    def bump(f, s):
+        st = f.stat()
+        gw.os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + s * 1_000_000_000))
+
+    def again():
+        gw._core_vocab()
+        asyncio.run(gw._aggregate())
+        return sorted(t.name for t in gw.exposed_tools), {t.name for t in gw.exposed_tools if (t.description or "").startswith("[")}
+    spec = {"rootdesigndatahub": [_tool("object_resolve"), _tool("objects_list")], "newhub": [_tool("hub_extra")],
+            "smart-twin-mcp": [_tool("single_drop_simulation")]}
+    _vocab_overlay(monkeypatch, tmp_path, {"apps": {"newhub": {"role": "sibling", "label": "새 허브"}}})
+    _aggregate_tools(monkeypatch, spec)
+    names = sorted(t.name for t in gw.exposed_tools)
+    assert names == ["newhub_hub_extra", "rootdesigndatahub_object_resolve", "rootdesigndatahub_objects_list", "single_drop_simulation"]
+    canon = {"rootdesigndatahub_object_resolve", "rootdesigndatahub_objects_list"}
+    monkeypatch.setattr(gw, "_REAGG", {})
+    p.rename(away)                                                        # 기본 표가 없어졌다
+    gw._core_vocab()
+    assert gw._REAGG.get("pending") is True, "정본 소개 줄은 빠져야 한다 — 다시 집계한다"
+    assert again() == (names, set()), "이름은 그대로 · 소개 줄만 빠진다"
+    assert gw.alias_route.get("object_resolve") == ("rootdesigndatahub", "object_resolve"), "옛 맨 이름의 별칭도 그대로다"
+    gw._REAGG.clear()
+    gw._core_vocab()
+    assert not gw._REAGG, "다시 집계한 뒤에는 또 예약하지 않는다 — 쥔 가족과 집계가 쓴 가족이 같다(재활 회차마다 다시 집계하지 않게)"
+    p.write_text("{깨진", encoding="utf-8")                                # 깨진 채 돌아왔다
+    bump(p, 5)
+    assert again() == (names, set())
+    away.replace(p)                                                       # 온전히 돌아왔다
+    bump(p, 10)
+    assert again() == (names, canon)
+    lp = tmp_path / "core_vocab.local.json"                               # 덧씌우기를 버린 사이 — 덧씌우기가 더한 형제도 이름이 그대로다
+    lp.write_text("{깨진", encoding="utf-8")
+    bump(lp, 20)
+    assert again() == (names, canon) and gw._core_vocab_health()["overlay"]["error"]
+    _vocab_overlay(monkeypatch, tmp_path, {})                              # 덧씌우기에서 형제를 일부러 뺐다 — 온전히 읽은 표라 이름이 따른다
+    assert again()[0] == ["hub_extra", "rootdesigndatahub_object_resolve", "rootdesigndatahub_objects_list", "single_drop_simulation"]
+    # 소개 줄이 없는 표가 사라지면 바뀔 것이 없다 — 빠진 표를 가족이 바뀐 것으로 보고 다시 집계를 예약하지 않는다(바뀌는 것은 소개 줄뿐이다)
+    d = json.loads(_REAL_CORE_VOCAB.read_text(encoding="utf-8"))
+    d["canonical"].pop("tagline", None)
+    p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    bump(p, 30)
+    assert again()[1] == set()
+    gw._REAGG.clear()
+    p.unlink()
+    gw._core_vocab()
+    assert not gw._REAGG
+
+
+def test_E2_3_판이_어긋난_도구만_접두로_바뀌고_허브_셋_카탈로그의_이름은_지금_규칙과_같다(monkeypatch):
+    """허브 셋이 같은 도구를 내는 지금 꼴은 이름이 하나도 안 바뀐다(cae00 — 셋 다 이미 접두, M-2 로 다시 잰다). 한 허브에만 있는 새 도구(판 어긋남)만
+    맨 이름 대신 접두다 — 나머지 허브가 올라와도 그 이름 그대로다."""
+    same = [_tool("object_resolve"), _tool("objects_list")]
+    spec = {k: list(same) for k, _l in _CORE_HUBS}
+    spec["rootdesigndatahub"] = same + [_tool("objects_new")]
+    spec["signalforge"] = [_tool("search_voc")]
+    _aggregate_tools(monkeypatch, spec)                                  # 어휘표 없음 — 지금 규칙
+    old = {t.name for t in gw.exposed_tools}
+    assert "objects_new" in old, "전제 — 지금 규칙은 한 허브에만 있는 도구를 맨 이름으로 낸다(G2)"
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    _aggregate_tools(monkeypatch, spec)
+    new = {t.name for t in gw.exposed_tools}
+    assert new == (old - {"objects_new"}) | {"rootdesigndatahub_objects_new"}, sorted(new ^ old)
+    spec = {k: same + [_tool("objects_new")] for k, _l in _CORE_HUBS}     # 나머지가 올라왔다
+    _aggregate_tools(monkeypatch, spec)
+    assert "rootdesigndatahub_objects_new" in {t.name for t in gw.exposed_tools}, "이름이 뒤집히지 않는다"
+
+
+def test_E2_3_에이전트_웹_챗_묶음의_허브_이름은_허브_셋에서도_허브_하나에서도_목록에_있다(monkeypatch):
+    """에이전트 _ONTO_CORE(웹 챗 고정 묶음)는 허브 접두 이름 열둘을 박아 둔다. 허브가 하나뿐인 박스에서 종전 규칙은 맨 이름을 내 그 이름이 목록에
+    없었다(G2 — 에이전트 _hub_tool 만 그 경우를 안다). 늘 접두면 어느 박스에서나 있다."""
+    names = _agent_onto_core()
+    hub_names = [n for n in names if n.startswith(("rootdesigndatahub_", "failuretrace_"))]
+    assert len(hub_names) == 12, hub_names
+    base = {k: [n.split("_", 1)[1] for n in hub_names if n.startswith(k + "_")] for k in ("rootdesigndatahub", "failuretrace")}
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    every = sorted({b for bs in base.values() for b in bs})
+    _aggregate_tools(monkeypatch, {k: [_tool(b) for b in every] for k, _l in _CORE_HUBS})
+    assert set(hub_names) <= {t.name for t in gw.exposed_tools}
+    for k, bs in base.items():
+        _aggregate_tools(monkeypatch, {k: [_tool(b) for b in bs], "signalforge": [_tool("search_voc")]})
+        listed = {t.name for t in gw.exposed_tools}
+        assert {f"{k}_{b}" for b in bs} <= listed, (k, sorted(listed))
+
+
+def test_E2_3_가족이나_형제_소개_줄이_바뀌면_다시_집계를_예약한다(monkeypatch, tmp_path):
+    """늘 접두 · 형제 소개 줄은 집계가 노출 이름 · 설명에 굽는다 — 덧씌우기로 바뀌면 정본 소개 줄처럼 다음 재활 회차에 다시 집계한다."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    _aggregate_tools(monkeypatch, {"rootdesigndatahub": [_tool("object_resolve")]})
+    monkeypatch.setattr(gw, "_REAGG", {})
+    gw._core_vocab()
+    assert not gw._REAGG, "집계가 쓴 것과 같으면 다시 집계하지 않는다"
+    _vocab_overlay(monkeypatch, tmp_path, {"apps": {"newhub": {"role": "sibling", "label": "새 허브"}}})
+    gw._core_vocab()
+    assert gw._REAGG.get("pending") is True, "가족이 바뀌었다"
+    asyncio.run(gw._aggregate())
+    gw._REAGG.clear()
+    gw._core_vocab()
+    assert not gw._REAGG
+    _vocab_overlay(monkeypatch, tmp_path, {"apps": {"newhub": {"role": "sibling", "label": "새 허브"},
+                                                    "failuretrace": {"tagline": "FailureTrace — 시장 불량 사례"}}})
+    gw._core_vocab()
+    assert gw._REAGG.get("pending") is True, "형제 소개 줄이 바뀌었다"
+
+
+def test_E2_4_형제_소개_줄은_칸이_찬_형제에만_붙고_떼면_원문이며_접기는_그대로다(monkeypatch, tmp_path):
+    """칸(apps.<키>.tagline)만 짓는다 — 문안은 운영자가 cae00 덧씌우기에 쓴다(결정 Q-3, 공개 리포에 안 남는다). 비면 지금과 같다. 형제가 아닌
+    앱의 칸은 쓰지 않는다(비코어 설명은 그쪽 몫 — C-C)."""
+    line = "FailureTrace — 시장 불량 사례 · 원인 · 대책"
+    _vocab_overlay(monkeypatch, tmp_path, {"apps": {"failuretrace": {"tagline": line}, "fmea": {"tagline": "비코어에는 붙지 않는다"}}})
+    search = _role_kit(monkeypatch)
+    desc = {t.name: t.description for t in gw.exposed_tools}
+    base = dict(_CORE_HUB_TOOLS)["object_resolve"]
+    assert desc["failuretrace_object_resolve"] == f"[{line}] {base}"
+    assert desc["caegroupdatahub_object_resolve"] == base, "칸이 빈 형제는 그대로"
+    assert desc["rootdesigndatahub_object_resolve"].startswith("[사내 코어 정본")
+    assert desc["gather_evidence_tool"] == dict(_CORE_OTHER["fmea"][1])["gather_evidence_tool"], "형제가 아닌 앱의 칸은 쓰지 않는다"
+    assert gw._core_untagged("failuretrace", desc["failuretrace_object_resolve"]) == base
+    assert gw._core_vocab_health()["roles"]["sibling_taglines"] == ["failuretrace"]
+    rows = [m for m in search("고장모드 목록")["matches"] if m["tool"].endswith("_objects_list")]
+    assert [m["app"] for m in rows] == ["rootdesigndatahub"], "소개 줄은 떼고 견준다 — 같은 원래 이름이라 한 줄로 접힌다"
+    assert {x["app"]: (x.get("differs"), x.get("tagline")) for x in rows[0]["same_in"]} == {
+        "failuretrace": (True, line), "caegroupdatahub": (None, None)}, "접힌 형제가 제 소개 줄을 싣는다 — 같은 데이터의 사본이 아니다"
+
+
+def test_E2_4_형제_소개_줄은_순위를_바꾸지_않고_접힌_형제가_그_줄을_싣는다(monkeypatch, tmp_path):
+    """S-B 는 '순위는 그대로' 다(설계 1.3 — 형제 순위 신호 S-A 는 미뤘다). 소개 줄의 낱말이 점수에 들면 형제 줄이 오르고 접기가 그 줄을 정본 아래로
+    접어, 그 데이터를 갖지 않은 정본이 덕을 봤다 — '시장 불량 사례 원인 대책' 의 상위 다섯이 정본 허브로 바뀌었고 소개 줄은 답 어디에도 없었다(검토
+    10-31). 점수는 줄을 뗀 설명으로 내고, 접힌 형제의 same_in 이 소개 줄(tagline)과 differs 를 싣는다 — '설명까지 같은 사본' 이 아니다."""
+    line = "FailureTrace — 시장 불량 사례 · 원인 · 대책"
+    queries = ("시장 불량 사례 원인 대책", "고장모드 목록", "FailureTrace 고장모드 목록", "솔더 접합 불량 고장모드 원인 대책",
+               "Which test items detect drop failure modes", "관리 기준 개수", "규격 실패모드")
+    search = _role_kit(monkeypatch)
+    before = {(q, n): search(q, n)["ranked"] for q in queries for n in (3, 8, 20)}
+    _vocab_overlay(monkeypatch, tmp_path, {"apps": {"failuretrace": {"tagline": line}}})
+    search = _role_kit(monkeypatch)
+    assert gw._core_vocab_health()["roles"]["sibling_taglines"] == ["failuretrace"], "전제 — 소개 줄이 붙었다"
+    assert {k: search(*k)["ranked"] for k in before} == before
+    out = search("시장 불량 사례 원인 대책", 20)
+    folded = [x for m in out["matches"] for x in m.get("same_in") or ()]
+    ft = [x for x in folded if x["app"] == "failuretrace"]
+    assert ft and all(x.get("differs") is True and x.get("tagline") == line for x in ft), ft
+    assert not [x for x in folded if x["app"] == "caegroupdatahub" and ("differs" in x or "tagline" in x)], "칸이 빈 형제는 종전대로"
+    assert "형제 허브의 같은 이름 도구" in out["note"] and "tagline" in out["note"]
+    named = search("FailureTrace 고장모드 목록")["matches"][0]
+    assert named["tool"] == "failuretrace_objects_list" and named["description"].startswith(f"[{line}] "), \
+        "형제를 부르면 그 형제가 대표하고 설명 머리에 제 소개 줄이 보인다"
+    tool = {t.name: t for t in gw.exposed_tools}
+    assert line not in gw._tool_doc(tool["failuretrace_objects_list"]), "의미 순위(켜면)의 색인 글도 형제 소개 줄을 뗀다"
+    assert gw._CORE_VOCAB["tag_applied"][1] in gw._tool_doc(tool["rootdesigndatahub_objects_list"]), "정본 소개 줄은 종전대로 든다(R-3)"
+
+
+def test_E2_4_웹_챗_묶음의_failuretrace_넷은_소개_줄_몫만큼만_는다(monkeypatch, tmp_path):
+    """웹 챗 고정 묶음(에이전트 _ONTO_CORE)에 형제 FailureTrace 도구 넷이 늘 묶인다(에이전트 app.py) — 소개 줄을 켜면 그 넷의 설명만 줄 길이 + 3자
+    ('[' · '] ')씩 는다. 웹 챗 도구 예산에 드는 몫이다."""
+    ft = [n for n in _agent_onto_core() if n.startswith("failuretrace_")]
+    assert len(ft) == 4, ft
+    bases = [n.split("_", 1)[1] for n in ft]
+    spec = {k: [types.Tool(name=b, description=f"{b} 를 한다.", inputSchema={"type": "object"}) for b in bases] for k, _l in _CORE_HUBS}
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    _aggregate_tools(monkeypatch, spec)
+    before = {t.name: len(t.description) for t in gw.exposed_tools}
+    line = "FailureTrace — 시장 불량 사례 · 원인 · 대책"
+    _vocab_overlay(monkeypatch, tmp_path, {"apps": {"failuretrace": {"tagline": line}}})
+    _aggregate_tools(monkeypatch, spec)
+    after = {t.name: len(t.description) for t in gw.exposed_tools}
+    grew = {n: after[n] - before[n] for n in after if after[n] != before[n]}
+    assert grew == {n: len(line) + 3 for n in ft}, grew
+    assert sum(grew.values()) == 4 * (len(line) + 3) == 144
+
+
+# 코어 질문을 가로채는 비코어 도구 — 설명에 코어 낱말(관리 기준 · 기준)이 짙다(10-29 OT-06 ~ 10 꼴: FMEA · ARP 가 코어 질문에 먼저 불렸다)
+_NONCORE_HEAVY = {**_CORE_OTHER,
+                  "fmea": ("FMEA", [("count_criteria", "관리 기준 개수 — 사내 규격의 관리 기준 개수 · 관리 기준 개수를 센다."),
+                                    ("gather_evidence_tool", "고장모드 · 원인 · 대책의 사례 근거를 모은다(FMEA 사례 · 규격).")]),
+                  "arp": ("ARP", [("criteria_items", "해석 관리 기준 항목과 실측 — 기준 개수 · 기준 값.")])}
+
+
+def test_E2_5_비코어_낮추기는_기본_끔이고_켜면_코어_질문의_비코어_줄이_정본_읽기_도구_아래로_간다(monkeypatch, tmp_path):
+    """손잡이 noncore_demote(기본 끔 — 결정 Q-1, cae00 검색 평가의 +noncore_demote 판을 본 뒤 박스 덧씌우기로 켠다). 켜면 코어 질문(어휘표 검색 낱말이
+    든 질의)에서 비코어 앱 도구 점수에 weights.noncore 를 곱한다. 앱 이름을 부르면 · 코어 낱말이 없으면 그대로다. 질의 기록 via 에 남는다."""
+    hub_tools = tuple((n, d) for n, d in _CORE_HUB_TOOLS if n in ("object_resolve", "objects_summary"))
+    search = _role_kit(monkeypatch, hub_tools=hub_tools, other=_NONCORE_HEAVY)
+    t = gw._tuning()
+    assert t["switches"]["noncore_demote"] is False and t["weights"]["noncore"] == 0.5 and "switches_on" not in gw._tuning_health()
+    nc_names = {"count_criteria", "gather_evidence_tool", "criteria_items"}
+
+    def split(out):
+        reads = [i for i, m in enumerate(out["matches"]) if m["app"] == "rootdesigndatahub"]
+        nc = [i for i, m in enumerate(out["matches"]) if m["tool"] in nc_names]
+        return reads, nc
+    reads, nc = split(search("관리 기준 개수", 10))
+    assert reads and nc and min(nc) < max(reads), "전제 — 끈 채로는 비코어 줄이 정본 읽기 도구보다 앞선다(OT-06 ~ 10 꼴)"
+    _tune(monkeypatch, tmp_path, {"switches": {"noncore_demote": True}})
+    assert gw._tuning_health()["switches_on"] == ["noncore_demote"]
+    out = search("관리 기준 개수", 10)
+    reads, nc = split(out)
+    assert max(reads) < min(nc), out["ranked"]
+    rec = [r for r in gw._qlog_read() if "q" in r][-1]
+    assert any("demote:noncore" in v for v in (rec.get("via") or {}).values()), rec
+    on = {q: search(q, 10)["ranked"] for q in ("FMEA 관리 기준 개수", "해석 실측 데이터 비교")}
+    _tune(monkeypatch, tmp_path, None)
+    off = {q: search(q, 10)["ranked"] for q in on}
+    drop_arp = lambda r: [n for n in r if n != "criteria_items"]  # noqa: E731 — FMEA 를 부른 질의에서도 ARP 는 낮춘다
+    assert drop_arp(on["FMEA 관리 기준 개수"]) == drop_arp(off["FMEA 관리 기준 개수"]), "앱 이름을 부르면 그 앱은 낮추지 않는다"
+    assert on["해석 실측 데이터 비교"] == off["해석 실측 데이터 비교"], "코어 낱말이 없는 질의는 그대로다"
+    _tune(monkeypatch, tmp_path, {"switches": {"noncore_demote": None}})
+    assert gw._tuning()["switches"]["noncore_demote"] is False, "칸이 없으면(null 로 지움 · 기본값을 못 읽음) 끔으로 읽는다 — 기본이 켬인 묶음과 다르다"
+
+
+def test_E2_5_앱_이름을_부른_질의는_어휘표_라벨과_키로도_알아보고_낮추지_않는다(monkeypatch, tmp_path):
+    """외부 연결 앱의 게이트웨이 라벨은 포털 플랫폼 라벨이다(FMEA — 'FMEA Agent' · ARP — 'AI Ready Portal'). 그 라벨의 이름(fmeaagent · aireadyportal)만
+    보면 'FMEA 관리 기준 개수' 가 앱을 부르지 않는 것이 되어, 손잡이를 켜면 1위가 정본 읽기 도구 아래로 밀렸다(검토 10-31 — 위 시험의 라벨 'FMEA' 는
+    운영과 달라 가렸다). 어휘표의 앱 라벨(apps.<키>.label)과 백엔드 키도 그 앱의 이름이다. 부르지 않은 비코어는 그대로 낮춘다."""
+    other = {**_NONCORE_HEAVY, "fmea": ("FMEA Agent", _NONCORE_HEAVY["fmea"][1]), "arp": ("AI Ready Portal", _NONCORE_HEAVY["arp"][1])}
+    hub_tools = tuple((n, d) for n, d in _CORE_HUB_TOOLS if n in ("object_resolve", "objects_summary"))
+    search = _role_kit(monkeypatch, hub_tools=hub_tools, other=other)
+    own = {"FMEA 관리 기준 개수": {"count_criteria", "gather_evidence_tool"}, "fmea 기준 개수": {"count_criteria", "gather_evidence_tool"},
+           "ARP 관리 기준 개수": {"criteria_items"}}
+    off = {q: search(q, 10)["ranked"] for q in own}
+    assert off["FMEA 관리 기준 개수"][0] == "count_criteria", "전제 — 끈 채로는 FMEA 도구가 1위다"
+    _tune(monkeypatch, tmp_path, {"switches": {"noncore_demote": True}})
+    for q, mine in own.items():
+        on = search(q, 10)["ranked"]
+        others = {"count_criteria", "gather_evidence_tool", "criteria_items"} - mine     # 부르지 않은 비코어 — 낮춘다
+        keep = [n for n in on if n not in others]
+        assert keep == [n for n in off[q] if n not in others], (q, on, off[q])
+        via = [r for r in gw._qlog_read() if "q" in r][-1].get("via") or {}
+        assert not [k for k, v in via.items() if "demote:noncore" in v and k.split(":", 1)[1] in mine], (q, via)
+
+
+def test_E2_5_검색_평가는_꺼진_손잡이를_하나씩_켠_판도_잰다(monkeypatch, tmp_path):
+    v = gw._eval_variants()
+    assert v["+noncore_demote"]["switches"]["noncore_demote"] is True and "-noncore_demote" not in v
+    assert v["-copy_fold"]["switches"]["copy_fold"] is False and v["-copy_fold"]["switches"]["noncore_demote"] is False
+    _tune(monkeypatch, tmp_path, {"switches": {"noncore_demote": True, "quality": False}})
+    v = gw._eval_variants()
+    assert v["-noncore_demote"]["switches"]["noncore_demote"] is False and "+noncore_demote" not in v, "박스에서 켰으면 끈 판을 잰다"
+    assert v["+quality"]["switches"]["quality"] is True, "박스에서 끈 묶음은 켠 판을 잰다"
+
+
+# ── 개인 Claude 보기(HWAXPortal docs/request-1029 E-4 · design-e2-e4.md 2.4 — 사용자 결정 10-31, 권장안 그대로) ───────────────────────────────
+# 보기 셋(전체 · 묶음 · 가벼운)은 tools/list 에만 건다 — 검색 · 부르기 · 이름 · 권한은 그대로다. 포털 사람 설정(권한 응답 view)으로 고르고 연결 머리
+# X-HWAX-View 가 덮는다(리포 .mcp.json 은 늘 full). 포털 설정은 머리 portal 로 청한 연결에만 얹는다(포털 등록 배치 · 명령 — 검토 10-31). 머리가 없는
+# 연결 · 웹 챗 · 절차 · GW_TOKEN 은 늘 전체다.
+def _view_kit(monkeypatch, view=None, *, muted="", src=""):
+    """보기 머리를 세운 요청 문맥 + 실제 어휘표 + 합성 카탈로그(허브 셋 · 비코어 · 심의 · 낙하). _request_* 는 진짜로 머리를 읽는다."""
+    _role_catalog(monkeypatch)
+    hdrs = {gw.GROUPS_HEADER: "", gw.MUTED_HEADER: muted}
+    if view is not None:
+        hdrs[gw.VIEW_HEADER] = view
+    if src:
+        hdrs[gw.VIEW_SRC_HEADER] = src
+    _set_request_headers(monkeypatch, hdrs)
+
+
+def _listed() -> list[str]:
+    return [t.name for t in asyncio.run(gw._list_tools(types.ListToolsRequest()))]
+
+
+_HUB_READS = {f"rootdesigndatahub_{n}" for n in ("object_resolve", "objects_list", "objects_summary", "graph_neighbors", "object_get")}
+
+
+def test_E4_가벼운_보기는_두_도구만_싣고_검색은_전체_보기와_바이트까지_같다(monkeypatch):
+    _view_kit(monkeypatch, "full")
+    full_list = _listed()
+    queries = ("고장모드 목록", "규격 실패모드", "심의 시작", "철판 낙하 기준")
+    full = {q: asyncio.run(gw._search_tools({"query": q, "limit": 20})).content[0].text for q in queries}
+    _view_kit(monkeypatch, "light")
+    assert _listed() == ["search_tools", "invoke_tool"]
+    for q in queries:
+        assert asyncio.run(gw._search_tools({"query": q, "limit": 20})).content[0].text == full[q], \
+            "보기를 검색 시야(_visible_tools)에 걸면 가벼운 보기의 search_tools 가 빈손이 된다"
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert v["mode"] == "light" and v["listed"] == 2 and v["hidden_by_view"] == len(full_list) - 2
+    assert "search_tools" in v["note"] and "invoke_tool" in v["note"]
+
+
+def test_E4_보기는_선호다_목록_밖_도구도_invoke_tool_로_닿고_권한_검사는_그대로다(monkeypatch):
+    _view_kit(monkeypatch, "light")
+    hub, fmea = _CallB(["object_resolve"]), _CallB(["gather_evidence_tool"])
+    monkeypatch.setattr(gw, "backends", {**gw.backends, "rootdesigndatahub": hub, "fmea": fmea})
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    gw._RESP_CACHE.clear()
+    r = asyncio.run(gw._call_tool("invoke_tool", {"name": "rootdesigndatahub_object_resolve", "arguments": {}}))
+    assert not r.isError and hub.session.calls == ["object_resolve"]
+    monkeypatch.setattr(gw, "POLICY", {"fmea": ["fmea-only"]})
+    r = asyncio.run(gw._call_tool("invoke_tool", {"name": "gather_evidence_tool", "arguments": {}}))
+    assert r.isError and r.content[0].text.startswith("forbidden") and fmea.session.calls == [], "보기가 전체여도 같다 — 권한은 보기와 무관하다"
+
+
+def test_E4_묶음_보기는_고른_영역과_정본_읽기_다섯만_싣고_형제_사본은_뺀다(monkeypatch):
+    _view_kit(monkeypatch, "full")
+    full = set(_listed())
+    assert {n for n in full if n.startswith(("failuretrace_", "caegroupdatahub_"))}, "전체 보기는 형제 사본도 싣는다(결정 Q-4)"
+    _view_kit(monkeypatch, "bundle:sim")
+    got = _listed()
+    assert set(got) <= full, "보기는 빼기만 한다 — 이름을 바꾸지 않는다"
+    assert _HUB_READS <= set(got), "정본 읽기 다섯은 어느 묶음에나 든다((정본 키, 원래 이름)으로 고른다)"
+    assert "rootdesigndatahub_objects_upsert" not in got, "정본이라도 고르지 않은 영역(data)의 그 밖 도구는 아니다"
+    assert not [n for n in got if n.startswith(("failuretrace_", "caegroupdatahub_"))], "형제 사본은 묶음에 없다(X-B)"
+    assert {"single_drop_simulation", "fullangle_drop_simulation"} <= set(got) and "deliberate_start" not in got
+    assert {t.name for t in gw._local_tools()} <= set(got), "로컬 도구는 늘 싣는다"
+    _view_kit(monkeypatch, "bundle:data,knowledge")
+    got = set(_listed())
+    assert "rootdesigndatahub_objects_upsert" in got and not [n for n in got if n.startswith(("failuretrace_", "caegroupdatahub_"))]
+
+
+def test_E4_끈_앱은_어느_보기에서도_빠진다(monkeypatch):
+    """끄기가 더 세다 — 정본 읽기 다섯도 정본 허브를 끄면 묶음에 없다."""
+    for view in ("full", "bundle:sim,data", "light"):
+        _view_kit(monkeypatch, view, muted="smart-twin-mcp,rootdesigndatahub")
+        got = _listed()
+        assert got and not [n for n in got if gw.route.get(n, ("",))[0] in {"smart-twin-mcp", "rootdesigndatahub"}], (view, got)
+
+
+def _view_gate(monkeypatch, portal_view):
+    """인증 미들웨어를 실제로 태워 **앱이 받는 보기 머리**를 본다 — 포털 응답(view)만 가짜. 클라이언트가 실어 보낸 출처 머리는 위조로 둔다."""
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["headers"] = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+
+    async def fake_access(email, base, **_kw):
+        return {"keys": [], **({"view": portal_view} if portal_view is not None else {})}
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        def __init__(self, claims): self.claims = claims
+        async def verify(self, token, aud): return self.claims
+
+    def run(auth, claims, client_view=None):
+        seen.clear()
+        hdrs = [(b"authorization", auth), (gw.VIEW_SRC_HEADER.encode(), b"header")]
+        if client_view is not None:
+            hdrs.append((gw.VIEW_HEADER.encode(), client_view.encode()))
+        asyncio.run(gw._bearer_gate(app, _V(claims))({"type": "http", "path": "/mcp", "headers": hdrs}, None, None))
+        h = seen.get("headers", {})
+        return h.get(gw.VIEW_HEADER), h.get(gw.VIEW_SRC_HEADER)
+    return run
+
+
+def test_E4_보기는_연결이_청할_때만_포털_설정이고_머리가_없으면_전체다_챗_절차_서비스는_늘_전체다(monkeypatch):
+    """포털 사람 설정은 연결 머리 X-HWAX-View: portal 로 청한 연결에만 얹는다(포털 배치 · 등록 명령이 Claude Code · Desktop 에 단다). 종전엔 머리가 없는
+    개인 PAT 전부에 얹어, 사람의 토큰으로 tools/list 를 읽는 서버 앱(리스크 심사 unit_live · MXWP 위키)과 스크립트가 그 사람의 보기로 도구를 잃었다(검토 10-31)."""
+    run = _view_gate(monkeypatch, "light")
+    me = {"email": "u@x.io", "groups": []}
+    assert run(b"Bearer me", me) == ("full", "default"), "포털 가벼운 + 머리 없음 → 전체(보기를 청하지 않은 연결)"
+    assert run(b"Bearer me", me, "portal") == ("light", "portal"), "머리 portal → 포털 사람 설정"
+    assert run(b"Bearer me", me, " Portal ") == ("light", "portal")
+    assert run(b"Bearer me", me, "full") == ("full", "header"), "머리 full 이 사람 설정을 덮는다(리포 .mcp.json)"
+    assert run(b"Bearer me", me, "Bundle:cad, mesh") == ("bundle:cad,mesh", "header")
+    assert run(b"Bearer me", me, "everything") == ("full", "default;bad-header"), "틀린 꼴의 머리 → 전체 + 표시(list_tool_apps 의 view.error)"
+    chat = {**me, "pat_name": gw.CHAT_PAT_NAME, "jti": "chat-u-1790000000"}
+    assert run(b"Bearer chat", chat, "portal") == ("full", "exempt"), "웹 챗 PAT 는 늘 전체(에이전트 서버가 이름으로 찾아 코드로 부르는 도구가 있다)"
+    assert run(b"Bearer proc", {**me, "purpose": gw.PROCEDURE_PURPOSE}, "portal") == ("full", "exempt"), "절차는 tools/list 로 카탈로그를 만든다"
+    assert run(b"Bearer gw-secret", None, "portal") == (None, None), "GW_TOKEN(에이전트 서버 · 심의)은 두 머리를 버린다 — 늘 전체"
+    assert _view_gate(monkeypatch, None)(b"Bearer me", me, "portal") == ("full", "default"), "포털이 보기를 모르면(옛 포털) 전체"
+    assert _view_gate(monkeypatch, "bundle:")(b"Bearer me", me, "portal") == ("full", "default"), "포털 값이 틀린 꼴이면 전체"
+
+
+def test_E4_사람의_토큰으로_도는_서버_앱은_그_사람이_가벼운을_골라도_목록_전체를_받는다(monkeypatch):
+    """리스크 심사 앱(unit_live — tools/list 에 그 도구가 있나로 근거 조회를 판정하고, 없으면 그 단위를 live_denied 로 굳힌다)과 MXWP 위키(tools/list 에
+    있는 허용 도구만 쓴다)는 사람의 PAT(웹 챗 · 절차가 아닌 보통 이름 · 임의 jti · 목적 없음)로 붙고 보기 머리를 싣지 않는다. 그 사람이 가벼운을
+    골라도 목록은 전체다 — 호출만 되고 목록에 없으면 이 앱들은 '없다' 로 읽는다(검토 10-31 실주행: 목록 2개 · 직접 호출은 성공)."""
+    run = _view_gate(monkeypatch, "light")
+    view, src = run(b"Bearer risk", {"email": "u@x.io", "groups": [], "pat_name": "hwax-risk", "jti": "3f9c2a7e5d"})
+    assert (view, src) == ("full", "default")
+    _view_kit(monkeypatch, view, src=src)
+    listed = _listed()
+    _view_kit(monkeypatch, "full")
+    assert listed == _listed() and len(listed) > len(gw._local_tools()), "전체 보기와 같은 목록"
+
+
+def test_E4_도구_지도는_게이트웨이가_보기를_안다고_말한다(monkeypatch):
+    """포털은 보기를 저장할 때 이것을 본다 — 보기를 모르는 옛 게이트웨이와 붙으면 화면이 '저장했습니다' 만 말하고 목록은 전체로 돌았다(검토 10-31)."""
+    _view_kit(monkeypatch, "full")
+    sent = []
+
+    async def send(m): sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/tools-map", "headers": []}, None, send))
+    assert json.loads(sent[1]["body"])["views"] == ["full", "bundle", "light"]
+
+
+def test_E4_list_tool_apps_의_view_는_보기_영역_수_모르는_영역_출처를_말한다(monkeypatch):
+    _view_kit(monkeypatch, "bundle:sim,nosuch", src="header")
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert (v["mode"], v["areas"], v["unknown_areas"], v["source"]) == ("bundle", ["sim"], ["nosuch"], "header")
+    assert v["listed"] == len(_listed()) and v["hidden_by_view"] == len(gw._visible_tools([])) - v["listed"] > 0
+    area = json.loads(asyncio.run(gw._list_tool_apps({"by": "area"})).content[0].text)
+    assert area["view"] == v, "영역 보기도 같은 칸을 싣는다"
+    _view_kit(monkeypatch, "full", src="default;bad-header")
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert v["source"] == "default" and "X-HWAX-View" in v["error"] and "portal" in v["error"]
+    _view_kit(monkeypatch, "light", src="portal")
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert "/tokens?tab=apps" in v["note"], "포털 설정에서 온 보기는 포털에서 바꾼다"
+    _view_kit(monkeypatch, "light", src="header")
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert "/tokens?tab=apps" not in v["note"] and "X-HWAX-View" in v["note"], "연결 머리가 정한 보기는 클라이언트 설정에서 바꾼다"
+    _view_kit(monkeypatch, None)
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert v == {"mode": "full", "listed": len(gw._visible_tools([])), "hidden_by_view": 0}, "머리가 없으면(서비스 · 옛 클라이언트) 전체"
+
+
+def test_E4_SDK_목록_처리기는_요청이면_보기를_얹고_캐시_채우기는_세지도_얹지도_않는다(monkeypatch):
+    """SDK 는 호출 검증용 캐시가 비면 목록 처리기를 요청 없이(None) 부른다(_get_cached_tool_definition) — 그 길에 보기를 얹으면 목록 밖 도구를 이름으로
+    부를 때의 출력 검증이 지금과 달라진다. 보기는 목록만 줄이고 호출은 그대로다. /health 는 클라이언트의 tools/list 만 보기별로 센다."""
+    real = gw.fm._mcp_server
+    monkeypatch.setattr(real, "_tool_cache", {})
+    handler = real.request_handlers[types.ListToolsRequest]
+    monkeypatch.setattr(gw, "_VIEW_LISTS", {"full": 0, "bundle": 0, "light": 0})
+    _view_kit(monkeypatch, "light")
+    res = asyncio.run(handler(types.ListToolsRequest()))
+    assert [t.name for t in res.root.tools] == ["search_tools", "invoke_tool"]
+    res = asyncio.run(handler(None))
+    assert len(res.root.tools) == len(gw._visible_tools([])) > 2
+    _view_kit(monkeypatch, "bundle:sim")
+    _listed()
+    _listed()
+    sent = []
+
+    async def send(m): sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/health", "headers": []}, None, send))
+    assert json.loads(sent[1]["body"])["tools_list_by_view"] == {"full": 0, "bundle": 2, "light": 1}
+
+
+def test_E4_보기_글의_꼴(monkeypatch):
+    for raw, want in (("full", ("full", ())), (" LIGHT ", ("light", ())), ("bundle:cad", ("bundle", ("cad",))),
+                      ("bundle:cad,mesh,cad", ("bundle", ("cad", "mesh"))), ("bundle:", None), ("bundle:CAD!", None),
+                      ("bundle:" + ",".join(f"a{i}" for i in range(33)), None), ("all", None), ("", None), (None, None)):
+        assert gw._parse_view(raw) == want, raw
+    assert gw._view_text("bundle", ("cad", "mesh")) == "bundle:cad,mesh" and gw._view_text("light") == "light"
+
+
+def test_E4_포털이_저장하는_보기_글을_게이트웨이가_같은_뜻으로_읽는다():
+    """포털 hub_view(사람 설정의 저장 꼴 — 권한 응답 view 로 온다)와 게이트웨이 _parse_view 가 어긋나면 사람 설정이 조용히 전체로 떨어진다. 형제 포털
+    리포의 실제 모듈을 읽는다(표준 라이브러리만 쓴다). 형제가 보기 이전 판이면 건너뛴다 — 작업 가지에서는 HWAX_PORTAL_ROOT 로 그 자리를 준다."""
+    import importlib.util
+    import os
+    root = gw.Path(os.environ.get("HWAX_PORTAL_ROOT") or gw.Path(gw.__file__).resolve().parent.parent / "HWAXPortal")
+    src = root / "backend" / "app" / "access" / "hub_view.py"
+    if not src.exists():
+        pytest.skip(f"형제 포털({root.name})에 backend/app/access/hub_view.py 가 없다 — 보기 이전 판이다")
+    spec = importlib.util.spec_from_file_location("portal_hub_view", src)
+    hv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hv)
+    assert tuple(hv.MODES) == ("full", "bundle", "light")
+    for mode, areas in (("full", ()), ("light", ()), ("bundle", ("cad",)), ("bundle", ("cad", "mesh", "data"))):
+        text = hv.format_view(mode, list(areas))
+        assert gw._parse_view(text) == (mode, areas) and hv.parse_view(text) == (mode, list(areas)), text
+    for bad in ("bundle:", "everything", "bundle:CAD!", gw.VIEW_PORTAL):
+        assert gw._parse_view(bad) is None and hv.parse_view(bad) is None, bad       # portal 은 보기 글이 아니다 — 연결 머리의 표지다
+    if hasattr(hv, "HEADER_PORTAL"):
+        assert (hv.HEADER_NAME.lower(), hv.HEADER_PORTAL) == (gw.VIEW_HEADER, gw.VIEW_PORTAL), "포털 등록 배치가 다는 표지와 같은 값이다"
+
+
+def test_E4_리포_mcp_json_은_보기_머리로_늘_전체를_청한다():
+    """리포 파이프라인(infra/pipeline/*.js)은 리포 .mcp.json(개인 PAT)으로 돈다 — 사람 설정이 가벼운이어도 심의 · 리스크 워크플로의 목록이 줄지 않게
+    머리가 늘 full 을 청한다(design-e2-e4 E4-5 · mcp-app-toggle D-7). 형제 포털 리포를 읽는다(HWAX_PORTAL_ROOT 로 작업 가지를 준다)."""
+    import os
+    root = gw.Path(os.environ.get("HWAX_PORTAL_ROOT") or gw.Path(gw.__file__).resolve().parent.parent / "HWAXPortal")
+    p = root / ".mcp.json"
+    if not p.exists():
+        pytest.skip("형제 포털 리포가 없다")
+    hdrs = {k.lower(): v for k, v in json.loads(p.read_text(encoding="utf-8"))["mcpServers"]["hwax"].get("headers", {}).items()}
+    if gw.VIEW_HEADER not in hdrs:
+        pytest.skip("형제 포털이 보기 이전 판이다(.mcp.json 에 보기 머리가 없다)")
+    assert hdrs[gw.VIEW_HEADER] == "${HWAX_GATEWAY_VIEW:-full}"
+    assert gw._parse_view("full") == ("full", ())
+
+
 def test_search_tools_의미_순위를_끄면_답이_master_와_바이트까지_같다(monkeypatch):
     """옵션을 끈 것이 기본값이다 — 그때 search_tools 는 종전 코드와 글자 하나 다르지 않아야 하고 임베더를 부르지 않는다.
     질의는 손으로 고른 가장자리(짧음·빈 낱말·대소문자·조사·limit)와 평가셋의 질의 전부다."""
@@ -7338,8 +8041,10 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     assert d["delib_ask"] == ('심의', '토의', '회의')
     assert d["quality_words"] == ('불량', '시장', '원인', '대책', '사례') and d["quality_areas"] == ("quality", "voc")
     assert d["write_intent"] == ('등록', '생성', '만들', '추가', '수정', '고치', '고쳐', '바꾸', '바꿔', '변경', '삭제', '지우', '지워', '저장', '올리', '올려', '업로드', '반입', '가져오', '실행', '돌리', '돌려', '제출', '시작', '걸어', '적용', '반영', '보내', '발행', '게시', '취소', '중지', '멈추', '멈춰', '학습', '이어서', '다시 돌', '채워', '채우', '넣어', '넣고', '남기', '남겨', '붙여', '붙이', '기각', '승인', '심의', '토의', '심사', '회의', 'create', 'add ', 'update', 'edit', 'modify', 'delete', 'remove', 'save', 'register', 'upload', 'import', 'run ', 'execute', 'submit', 'start', 'launch', 'apply', 'publish', 'send', 'cancel', 'stop', 'train', 'rename')
-    assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2}
-    assert all(d["switches"].values()) and len(d["synonyms"]) == 73 and d["synonyms"]["요약"] == ("digest", "summary")
+    # noncore(0.5) · noncore_demote(끔)는 10-31 E2-5 가 더한 새 손잡이다 — 끈 채로 들어와 순위는 그대로다(옮긴 값이 아니다)
+    assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2, "noncore": 0.5}
+    assert all(v for k, v in d["switches"].items() if k != "noncore_demote") and d["switches"]["noncore_demote"] is False
+    assert len(d["synonyms"]) == 73 and d["synonyms"]["요약"] == ("digest", "summary")
     assert d["fingerprint"] == d["base_fingerprint"] and gw._tuning_health()["overlay"] == {"present": False}
 
 
@@ -8706,7 +9411,9 @@ def test_E9_평가는_떠_있는_카탈로그로_판마다_재고_기록을_남�
     assert st == 200, body
     assert body["pairs"]["total"] == 3 and body["pairs"]["measured"] == 2 and body["pairs"]["missing_gold"] == 1
     assert body["pairs"]["box"] == 1 and body["pairs"]["doc"] == 1
-    assert set(body["variants"]) == {"effective", "base", "off", *[f"-{k}" for k in gw._TUNING_SWITCHES]}
+    # 켜진 묶음은 하나씩 끈 판(-), 꺼진 손잡이(기본 끔인 noncore_demote — E2-5)는 하나씩 켠 판(+)
+    assert set(body["variants"]) == {"effective", "base", "off", *[f"-{k}" for k in gw._TUNING_SWITCHES if k != "noncore_demote"],
+                                     "+noncore_demote"}
     assert body["variants"]["effective"]["전체"]["n"] == 2 and body["variants"]["effective"]["box"]["hit@5"] == 1.0
     assert body["fingerprint"] == gw._tuning()["fingerprint"]
     assert not [r for r in gw._qlog_read() if "q" in r], "평가 질의는 실사용 질의 기록에 섞이지 않는다"

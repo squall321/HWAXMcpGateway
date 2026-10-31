@@ -275,6 +275,15 @@ PURPOSE_HEADER = "x-hwax-purpose"
 # 실어 보낸 사본은 버린다. 권한(x-hwax-groups)에 섞지 않는다 — 섞으면 응답 캐시 키가 사람마다 쪼개지고 심의 백엔드로
 # 전달되며 '권한 없음' 과 구분이 안 된다(HWAXPortal docs/mcp-app-toggle D-5·D-6).
 MUTED_HEADER = "x-hwax-muted-apps"
+# 개인 Claude 의 보기(HWAXPortal docs/request-1029 E-4) — full(전체) · bundle:<영역>,…(묶음) · light(가벼운). **tools/list 에만** 건다 —
+# 검색 · 부르기 · 이름 · 권한은 그대로다(보기는 선호다, 권한이 아니다). 게이트웨이가 PAT 분기에서 정해 갈아 끼운다 — 연결 머리가 보기 글이면
+# 그것(리포 .mcp.json 은 늘 full), 머리가 `portal` 이면 포털 사람 설정(권한 응답의 view — 포털 등록 배치 · 명령이 Claude Code · Desktop 에 단다),
+# 머리가 없으면 전체. 포털 설정은 청한 연결에만 얹는다 — 사람의 PAT 로 tools/list 를 읽는 서버 앱(리스크 심사 · MXWP 위키)과 스크립트가 그 사람의
+# 보기로 도구를 잃지 않게(검토 10-31). 출처(header · portal · default · exempt, 틀린 머리는 ';bad-header')는 둘째 머리에 싣는다. 웹 챗 · 절차
+# PAT 는 늘 전체이고(끄기 면제와 같은 까닭), GW_TOKEN 분기는 두 머리를 버린다.
+VIEW_HEADER = "x-hwax-view"
+VIEW_SRC_HEADER = "x-hwax-view-src"
+VIEW_PORTAL = "portal"                    # 연결 머리의 이 값 — '포털에서 고른 보기를 따른다'(보기 글이 아니다 — 포털은 이 글을 저장하지 않는다)
 # 끄기를 적용하지 않는 PAT — 포털 웹 챗(에이전트서버가 tools/list 에서 이름으로 찾아 코드로 부르는 도구가 있다)
 CHAT_PAT_NAME = "chat-session"
 PROCEDURE_PURPOSE = "procedure"
@@ -289,6 +298,26 @@ READONLY_HEADER = "x-hwax-readonly"
 # 헤더는 게이트웨이가 처음부터 짓는다). 심의 백엔드의 같은 소속 열람이 견준다(결정 6).
 AFF_FWD_HEADER = "x-hwax-affiliation"
 AFF_PROOF_TTL_S = int(os.environ.get("GATEWAY_AFF_PROOF_TTL", "120"))
+# 보기 글의 꼴 — 영역 키는 tool_areas.json 의 키 꼴이다. 포털이 같은 꼴로 저장한다(HWAXPortal backend/app/access/hub_view.py — 시험이 맞댄다).
+_VIEW_AREA_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+_VIEW_AREAS_MAX = 32
+
+
+def _parse_view(raw) -> tuple[str, tuple[str, ...]] | None:
+    """보기 글 → (보기, 영역들). full · light · bundle:<영역>,<영역>… 만 받고 틀린 꼴이면 None 이다. 영역 이름이 이 박스에 있는지는 보지
+    않는다(모르는 영역은 list_tool_apps 의 view 가 말한다)."""
+    s = str(raw or "").strip().lower()
+    if s in ("full", "light"):
+        return s, ()
+    if s.startswith("bundle:"):
+        areas = tuple(dict.fromkeys(a.strip() for a in s[len("bundle:"):].split(",") if a.strip()))
+        if areas and len(areas) <= _VIEW_AREAS_MAX and all(_VIEW_AREA_RE.fullmatch(a) for a in areas):
+            return "bundle", areas
+    return None
+
+
+def _view_text(mode: str, areas: tuple[str, ...] = ()) -> str:
+    return f"bundle:{','.join(areas)}" if mode == "bundle" else mode
 
 
 def _aff_proof(secret: str, email: str, aff: str, now: float | None = None) -> str:
@@ -1299,7 +1328,20 @@ async def _aggregate():
     route.clear()
     alias_route.clear()
     _core_vocab()
-    core_tag = (_CORE_VOCAB["data"] or {}).get("tag")
+    cv = _CORE_VOCAB["data"] or {}
+    core_tag = cv.get("tag")
+    # 도구 설명 앞 소개 줄 — 정본(R-3)과 소개 줄 칸이 찬 형제(E2-4 · S-B — 문안은 운영자가 박스 덧씌우기에 쓴다, 결정 Q-3)
+    sib_tags = dict(cv.get("sib_tags") or {})
+    tags = {**({core_tag[0]: core_tag[1]} if core_tag else {}), **sib_tags}
+    # 허브 가족(정본 + 형제)은 겹침과 상관없이 늘 접두를 단다(E2-3 · N-A, 결정 Q-2). '지금 붙은 백엔드끼리 겹치나' 로만 정하면 판이 어긋난
+    # 사이 한 허브에만 있는 도구가 맨 이름으로 나왔다가 나머지가 올라오면 접두 이름으로 바뀐다 — 그 이름을 외운 클라이언트 · 허용 규칙 ·
+    # 운영자 정의가 unknown tool 이 된다(G2). 옛 규칙이면 맨 이름이던 가족 도구는 그 맨 이름도 호출 별칭으로 남기고(목록에는 안 올린다 — 아래)
+    # 그 이름들을 /health · 로그로 알린다. ⚠ 별칭이 지키는 것은 게이트웨이를 거쳐 그 이름으로 **부르는** 쪽뿐이다(직접 호출 · invoke_tool). 목록에
+    # 실린 이름에 묶는 쪽 — Claude Code · Desktop 의 도구 이름(mcp__hwax__<이름>)과 허용 규칙, 운영자 정의 동기화(/tools-map 대조 — 접두 도구의
+    # 맨 이름은 '이 앱에 없는 도구' 다), 에이전트 서버의 목록 이름 묶음 — 은 접두 이름으로 고쳐야 한다(검토 10-31, C-33).
+    # 가족은 마지막으로 온전히 읽은 표의 것이다(_core_family) — 표를 잠깐 못 읽는 사이에 이름이 맨 이름으로 뒤집히지 않게(그동안 빠지는 것은 소개 줄뿐이다).
+    family = frozenset(_core_family())
+    fam_renamed: dict[str, tuple[str, str]] = {}          # 옛 맨 이름 → (백엔드, 원래 이름)
     for key, t in collected:
         # 충돌 여부와 **무관하게** 별칭을 등록한다(호출 전용).
         _alias = f"{key.replace('-', '')}_{t.name}"
@@ -1311,9 +1353,11 @@ async def _aggregate():
             log.warning("alias collision %s: %s ← %s", _alias, alias_route[_alias], (key, t.name))
         alias_route[_alias] = (key, t.name)
         clash = name_counts[t.name] > 1 if key in _CONN_ACTIVE else base_counts[t.name] > 1
-        if clash:
+        if clash or key in family:
             prefix = key.replace("-", "")  # mx-white-paper -> mxwhitepaper
             exposed_name = f"{prefix}_{t.name}"
+            if not clash:
+                fam_renamed[t.name] = (key, t.name)
         else:
             exposed_name = t.name
         ann = getattr(t, "annotations", None)
@@ -1323,7 +1367,7 @@ async def _aggregate():
         exposed_tools.append(
             types.Tool(
                 name=exposed_name,
-                description=_core_tagged(key, t.description, core_tag),
+                description=_core_tagged(key, t.description, tags),
                 inputSchema=t.inputSchema,
                 **({"outputSchema": t.outputSchema} if getattr(t, "outputSchema", None) else {}),
                 **({"annotations": ann} if ann else {}),
@@ -1334,7 +1378,19 @@ async def _aggregate():
             )
         )
         route[exposed_name] = (key, t.name)
+    # 오늘의 맨 이름 — 노출 이름이 이기고(route 를 먼저 본다), 이미 있는 별칭은 그대로 둔다. 겹치지 않아 맨 이름이던 것이라 다른 백엔드와 갈리지 않는다.
+    for bare, target in fam_renamed.items():
+        if bare not in route:
+            alias_route.setdefault(bare, target)
+    renamed = sorted(f"{k.replace('-', '')}_{n}" for k, n in fam_renamed.values())
+    if renamed and renamed != _CORE_VOCAB.get("family_prefixed"):
+        log.warning("허브 가족은 늘 접두를 단다(E2-3) — 옛 규칙(겹칠 때만)이면 맨 이름이던 가족 도구 %d개를 접두 이름으로 낸다. 옛 맨 이름도 부르면 "
+                    "닿는다(호출 별칭 — 목록에는 접두 이름만). 그 이름을 외운 클라이언트 · 허용 규칙은 접두 이름으로 고친다: %s%s", len(renamed),
+                    ", ".join(renamed[:20]), " …" if len(renamed) > 20 else "")
+    _CORE_VOCAB["family_prefixed"] = renamed
     _CORE_VOCAB["tag_applied"] = core_tag
+    _CORE_VOCAB["sib_tags_applied"] = sib_tags
+    _CORE_VOCAB["agg_applied"] = _core_agg_sig(cv)
     log.info("AGGREGATED %d exposed tools (unique names: %d, call-only aliases: %d)",
              len(exposed_tools), len(set(route)), len(alias_route))
     _rebuild_ui_resources()
@@ -2681,8 +2737,13 @@ _TOOL_VEC_JOB = {"running": False, "again": False}
 
 
 def _tool_doc(t: types.Tool) -> str:
-    """임베딩할 글 — '앱 라벨 · 이름: 설명'. 설명은 자르지 않는다 — 모델 입력 한도(e5 512 토큰)에서 넘친 수는 색인 줄이 말한다."""
-    return f"{_app_meta(route.get(t.name, ('_gateway',))[0])['label']} · {t.name}: {(t.description or '').strip()}"
+    """임베딩할 글 — '앱 라벨 · 이름: 설명'. 설명은 자르지 않는다 — 모델 입력 한도(e5 512 토큰)에서 넘친 수는 색인 줄이 말한다.
+    형제 소개 줄(E2-4)은 뗀다 — 부분문자열 순위와 같이 의미 순위도 그 줄로 바뀌지 않는다(S-B '순위는 그대로')."""
+    key = route.get(t.name, ("_gateway",))[0]
+    desc = (t.description or "").strip()
+    if key in (_CORE_VOCAB.get("sib_tags_applied") or {}):
+        desc = _core_untagged(key, desc)
+    return f"{_app_meta(key)['label']} · {t.name}: {desc}"
 
 
 def _doc_key(doc: str) -> str:
@@ -2987,7 +3048,8 @@ def _search_review_write(body: dict) -> dict:
 
 
 def _eval_variants() -> dict[str, dict]:
-    """재는 판 — 지금 값(덧씌운 것) · 기본값 · 보정 끔 · 묶음 하나씩 끔."""
+    """재는 판 — 지금 값(덧씌운 것) · 기본값 · 보정 끔 · 켜진 묶음 하나씩 끔(-) · 꺼진 손잡이 하나씩 켬(+ — 비코어 낮추기 noncore_demote 를
+    켠 값을 같은 쌍으로 잰다, E2-5)."""
     eff = _tuning()
     try:
         base_raw = json.loads(SEARCH_TUNING_PATH.read_text(encoding="utf-8"))
@@ -2997,7 +3059,8 @@ def _eval_variants() -> dict[str, dict]:
     out = {"effective": eff, "base": base,
            "off": {**eff, "switches": {k: False for k in _TUNING_SWITCHES}}}
     for k in _TUNING_SWITCHES:
-        out[f"-{k}"] = {**eff, "switches": {**eff["switches"], k: False}}
+        on = eff["switches"][k]
+        out[f"{'-' if on else '+'}{k}"] = {**eff, "switches": {**eff["switches"], k: not on}}
     return out
 
 
@@ -3111,9 +3174,13 @@ _COPY_LABEL = re.compile(r"[(\[](?:시험|사본|테스트|test|copy|staging|dev
 # 그것도 없으면 손 동의어 없는 _TUNING_FALLBACK 으로 돈다. 고리는 cae00 에서 닫힌다 — 거기서 고치고 그 자리에서 잰다(C-31).
 SEARCH_TUNING_PATH = Path(__file__).with_name("search_tuning.json")
 SEARCH_TUNING_LOCAL_PATH = Path(__file__).with_name("search_tuning.local.json")
-_TUNING_SWITCHES = ("synonyms", "core_vocab", "delib_narrow", "quality", "write_penalty", "copy_fold")
-_TUNING_WEIGHTS = ("name", "desc_cap", "app", "coverage", "write_penalty", "quality_per_word")
-_TUNING_FALLBACK = {"weights": {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2}}
+_TUNING_SWITCHES = ("synonyms", "core_vocab", "delib_narrow", "quality", "write_penalty", "copy_fold", "noncore_demote")
+# 기본이 끔인 손잡이 — 칸이 없으면(덧씌우기가 null 로 지웠거나 기본값 파일을 못 읽었다) 끔으로 읽는다. 나머지는 칸이 없으면 켬이다.
+# noncore_demote(E2-5) 는 cae00 검색 평가(+noncore_demote 판)를 본 뒤 박스 덧씌우기로 켠다(결정 Q-1).
+_TUNING_OPT_IN = ("noncore_demote",)
+_TUNING_WEIGHTS = ("name", "desc_cap", "app", "coverage", "write_penalty", "quality_per_word", "noncore")
+_TUNING_FALLBACK = {"weights": {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2,
+                                "noncore": 0.5}}
 _TUNING: dict = {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None}
 
 
@@ -3164,7 +3231,8 @@ def _tuning_parse(d: dict) -> dict:
         syn[str(k).lower()] = tuple(str(x).lower() for x in to)
     words = lambda key: tuple(str(x).lower() for x in (d.get(key) or ()))  # noqa: E731
     quality = d.get("quality") or {}
-    return {"switches": {k: sw.get(k, True) is not False for k in _TUNING_SWITCHES}, "weights": weights, "synonyms": syn,
+    return {"switches": {k: (sw.get(k) is True if k in _TUNING_OPT_IN else sw.get(k, True) is not False) for k in _TUNING_SWITCHES},
+            "weights": weights, "synonyms": syn,
             "owners": {str(k).lower(): {"owner": (e or {}).get("owner"), "source_fix": (e or {}).get("source_fix")}
                        for k, e in (d.get("synonyms") or {}).items()},
             "quality_words": tuple(str(x).lower() for x in quality.get("words") or ()),
@@ -3217,8 +3285,12 @@ def _tuning_health() -> dict:
     """/health 의 search_tuning — 지문(덧씌운 값 · 기본값) · 꺼 둔 묶음 · 덧씌우기(있나 · 지문 · 건드린 칸 · 버린 까닭). 경로는 싣지 않는다."""
     d = _tuning()
     out = {"fingerprint": d["fingerprint"], "base": d["base_fingerprint"],
-           "switches_off": [k for k in _TUNING_SWITCHES if not d["switches"][k]], "synonyms": len(d["synonyms"]),
+           "switches_off": [k for k in _TUNING_SWITCHES if not d["switches"][k] and k not in _TUNING_OPT_IN], "synonyms": len(d["synonyms"]),
            "overlay": dict(_TUNING["overlay"] or {"present": False})}
+    # 기본이 끔인 손잡이는 켰을 때만 말한다 — 끈 것은 기본이라 알릴 것이 아니다(박스가 켰으면 dev 와 다르게 돈다)
+    on = [k for k in _TUNING_OPT_IN if d["switches"][k]]
+    if on:
+        out["switches_on"] = on
     if _TUNING["error"]:
         out["error"] = _TUNING["error"]
     return out
@@ -3234,7 +3306,9 @@ _CORE_VOCAB: dict = {"mtime": None, "data": None, "error": "아직 읽지 않음
 
 
 def _core_vocab_parse(d: dict) -> dict:
-    """정본 꼴에서 게이트웨이가 쓰는 것만 — 검색 낱말(띄어 쓴 꼴은 조각까지) · 정본 앱과 소개 줄 · 앱 역할. 꼴이 틀리면 예외."""
+    """정본 꼴에서 게이트웨이가 쓰는 것만 — 검색 낱말(띄어 쓴 꼴은 조각까지) · 정본 앱과 소개 줄 · 앱 역할. 꼴이 틀리면 예외.
+    역할은 다 읽는다(E2-1) — 가족(정본 + 형제, 어휘표 차례) · 비코어(note 와 함께) · 시험. 형제의 소개 줄 칸(apps.<키>.tagline)은 형제에만
+    쓰고 비면 없다(E2-4). 정본 읽기 도구는 검색 칸이 잇는 도구 이름들이다(묶음 보기가 늘 싣는다 — E-4)."""
     syn = []
     for e in d["search"]:
         tools = tuple(str(t).lower() for t in e["tools"])
@@ -3244,18 +3318,59 @@ def _core_vocab_parse(d: dict) -> dict:
             syn.append((re.sub(r"\s+", "", w), parts, tools))
     can = d["canonical"]
     app, tagline = str(can["app"]), str(can.get("tagline") or "").strip()
+    apps = {str(k): v for k, v in (d.get("apps") or {}).items()}
+    role = {k: str(v.get("role")) for k, v in apps.items()}
+    siblings = tuple(k for k, r in role.items() if r == "sibling" and k != app)
     return {"version": d.get("version"), "canonical": app, "tag": (app, tagline) if tagline else None, "syn": syn,
-            "staging": frozenset(str(k) for k, v in (d.get("apps") or {}).items() if str(v.get("role")) == "staging")}
+            "staging": frozenset(k for k, r in role.items() if r == "staging"),
+            "family": (app, *siblings), "siblings": frozenset(siblings),
+            "noncore": {k: str(apps[k].get("note") or "").strip() for k, r in role.items() if r == "noncore"},
+            # 비코어 앱을 부르는 이름 — 어휘표 라벨의 이름과 백엔드 키(비코어 낮추기가 비켜 갈 때 게이트웨이 라벨과 함께 본다, E2-5)
+            "noncore_names": {k: frozenset(_label_names(str(apps[k].get("label") or "")) | {k.lower()})
+                              for k, r in role.items() if r == "noncore"},
+            "sib_tags": {k: s for k in siblings if (s := str(apps[k].get("tagline") or "").strip())},
+            "core_reads": frozenset(t for _f, _p, tools in syn for t in tools)}
+
+
+def _core_family() -> tuple:
+    """늘 접두(노출 이름)에 쓰는 허브 가족 — 마지막으로 온전히 읽은 표(덧씌우기 포함)의 것이다. 표가 없거나 깨졌거나 덧씌우기를 버린 사이에는 그 앞의
+    가족을 쥔다(E2-3 · G2 — 읽기 실패가 이름을 뒤집지 않게, 그동안 빠지는 것은 소개 줄뿐이다. 검토 10-31). 한 번도 온전히 읽지 못했으면 지금 읽힌 표의
+    것(없으면 빈 가족 — 지금 규칙)이다. 새로 뜬 프로세스는 쥔 것이 없다 — 표 없이 뜨면 지금 규칙으로 돈다."""
+    held = _CORE_VOCAB.get("family_ok")
+    if held is not None:
+        return held
+    return tuple((_CORE_VOCAB["data"] or {}).get("family") or ())
+
+
+def _core_agg_sig(d: dict | None) -> tuple:
+    """집계가 쓰는 역할 몫 — 가족(늘 접두 — _core_family, 표를 못 읽는 사이에도 쥔 것)과 형제 소개 줄. 정본 소개 줄은 따로 견준다(tag_applied)."""
+    return tuple(_core_family()), tuple(sorted(((d or {}).get("sib_tags") or {}).items()))
+
+
+def _app_role(key: str) -> tuple[str, str] | None:
+    """어휘표의 앱 역할 — (canonical · sibling · noncore, 비코어의 note). 가족과 비코어만 — 그 밖(시험 포함)은 None 이다(E2-1 · C-B)."""
+    d = _CORE_VOCAB["data"]
+    if not d:
+        return None
+    if key == d["canonical"]:
+        return "canonical", ""
+    if key in d.get("siblings", ()):
+        return "sibling", ""
+    if key in (d.get("noncore") or {}):
+        return "noncore", d["noncore"][key]
+    return None
 
 
 def _core_vocab() -> dict | None:
     """코어 어휘표 — 바뀐 시각이 다르면 다시 읽는다. 없거나 못 읽으면 None 이고 까닭은 _CORE_VOCAB['error'] 다.
-    정본 소개 줄은 집계(_aggregate) 때 도구 설명에 붙으므로, 붙어 있는 것과 달라지면 다음 재활 회차에 다시 집계하게 예약한다."""
+    정본 소개 줄은 집계(_aggregate) 때 도구 설명에 붙으므로, 붙어 있는 것과 달라지면 다음 재활 회차에 다시 집계하게 예약한다.
+    늘 접두의 가족은 온전히 읽은 표에서만 바꾼다(_CORE_VOCAB['family_ok'] — _core_family). 못 읽은 사이에 바뀌는 것은 소개 줄뿐이다."""
     try:
         mt = CORE_VOCAB_PATH.stat().st_mtime_ns
     except OSError:
         if _CORE_VOCAB["error"] != "없음":
-            log.warning("코어 어휘표가 없다(%s) — search_tools 손 낱말 · 소개 줄 없이 돈다", CORE_VOCAB_PATH)
+            log.warning("코어 어휘표가 없다(%s) — search_tools 손 낱말 · 소개 줄 없이 돈다%s", CORE_VOCAB_PATH,
+                        " · 허브 가족 접두(노출 이름)는 마지막으로 온전히 읽은 표대로 둔다" if _CORE_VOCAB.get("family_ok") else "")
         _CORE_VOCAB.update(mtime=None, data=None, error="없음")
     else:
         try:
@@ -3267,7 +3382,8 @@ def _core_vocab() -> dict | None:
                 raw = json.loads(CORE_VOCAB_PATH.read_text(encoding="utf-8"))
                 data = _core_vocab_parse(raw)
             except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
-                log.warning("코어 어휘표를 못 읽었다(%s) — 손 낱말로 돈다: %r", CORE_VOCAB_PATH, exc)
+                log.warning("코어 어휘표를 못 읽었다(%s) — 손 낱말로 돈다%s: %r", CORE_VOCAB_PATH,
+                            " · 허브 가족 접두(노출 이름)는 마지막으로 온전히 읽은 표대로 둔다" if _CORE_VOCAB.get("family_ok") else "", exc)
                 _CORE_VOCAB.update(mtime=(mt, lmt), data=None, error=f"못 읽음({type(exc).__name__})", overlay=None)
             else:
                 eff, overlay = raw, {"present": lmt is not None}
@@ -3281,11 +3397,19 @@ def _core_vocab() -> dict | None:
                         overlay.update(fingerprint=_json_fp(patch), changed=_patch_paths(patch)[:40])
                     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
                         overlay["error"] = f"덧씌우기를 버렸다({type(exc).__name__}: {str(exc)[:120]})"
-                        log.warning("코어 어휘표 덧씌우기(%s)를 버리고 기본 표로 돈다: %r", CORE_VOCAB_LOCAL_PATH, exc)
+                        log.warning("코어 어휘표 덧씌우기(%s)를 버리고 기본 표로 돈다%s: %r", CORE_VOCAB_LOCAL_PATH,
+                                    " · 허브 가족 접두(노출 이름)는 마지막으로 온전히 읽은 표대로 둔다"
+                                    if _CORE_VOCAB.get("family_ok") else "", exc)
                 data = {**data, "fingerprint": _json_fp(eff), "base_fingerprint": _json_fp(raw)}
                 _CORE_VOCAB.update(mtime=(mt, lmt), data=data, error=None, overlay=overlay)
+                if "error" not in overlay:
+                    _CORE_VOCAB["family_ok"] = data["family"]   # 온전히 읽은 표 — 늘 접두의 가족을 이것으로 바꾼다(_core_family)
     tag = (_CORE_VOCAB["data"] or {}).get("tag")
-    if tag != _CORE_VOCAB["tag_applied"] and exposed_tools:
+    # 가족 · 형제 소개 줄도 집계가 노출 이름 · 설명에 굽는다(E2-3 · E2-4) — 덧씌우기로 바뀌면 정본 소개 줄처럼 다시 집계한다. 집계가 아직 적어 두지
+    # 않았으면(agg_applied 없음) 정본 소개 줄만 본다.
+    applied = _CORE_VOCAB.get("agg_applied")
+    if exposed_tools and (tag != _CORE_VOCAB["tag_applied"]
+                          or (applied is not None and _core_agg_sig(_CORE_VOCAB["data"]) != applied)):
         _REAGG["pending"] = True
     return _CORE_VOCAB["data"]
 
@@ -3296,30 +3420,42 @@ def _core_vocab_health() -> dict:
     d = _core_vocab()
     if d is None:
         return {"loaded": False, "error": _CORE_VOCAB["error"]}
+    sib_on = _CORE_VOCAB.get("sib_tags_applied") or {}
     return {"loaded": True, "version": d["version"], "words": len(d["syn"]), "canonical": d["canonical"],
             "canonical_backend": d["canonical"] in backends, "staging_hidden": sorted(d["staging"] & set(backends)),
             "tagline_applied": _CORE_VOCAB["tag_applied"] is not None and _CORE_VOCAB["tag_applied"] == d["tag"],
             # 덧씌운 표의 지문 · 기본 표의 지문 · 박스 덧씌우기 — 에이전트 서버 /health 의 지문과 같아야 한다(update-all §6 이 견준다, E-7 ③)
             "fingerprint": d["fingerprint"], "base": d["base_fingerprint"],
-            "overlay": dict(_CORE_VOCAB.get("overlay") or {"present": False})}
+            "overlay": dict(_CORE_VOCAB.get("overlay") or {"present": False}),
+            # 역할(E2-1 · G6) — 가족 · 비코어 키마다 이 박스 백엔드에 있나(덧씌우기에 키를 틀리게 적으면 여기서 false 로 보인다), 소개 줄이 붙은 형제,
+            # 늘 접두 규칙으로 이름이 바뀐 가족 도구(옛 규칙이면 맨 이름 — 옛 이름도 호출 별칭으로 닿는다, E2-3)
+            "roles": {"family": {k: k in backends for k in d.get("family") or ()},
+                      "noncore": {k: k in backends for k in sorted(d.get("noncore") or {})},
+                      "sibling_taglines": sorted(k for k, s in sib_on.items() if (d.get("sib_tags") or {}).get(k) == s),
+                      "family_prefixed": {"count": len(_CORE_VOCAB.get("family_prefixed") or ()),
+                                          "names": list((_CORE_VOCAB.get("family_prefixed") or ())[:20])}}}
 
 
 def _core_untagged(key: str, desc: str) -> str:
-    """집계가 붙인 정본 소개 줄을 뗀 설명 — 검색이 같은 도구의 사본을 알아볼 때 쓴다(소개 줄 하나로 사본이 아닌 것이 되지 않게)."""
+    """집계가 붙인 소개 줄(정본 · 형제)을 뗀 설명 — 검색이 같은 도구의 사본을 알아볼 때 쓴다(소개 줄 하나로 사본이 아닌 것이 되지 않게)."""
     tag = _CORE_VOCAB["tag_applied"]
-    if tag and key == tag[0]:
-        head = f"[{tag[1]}]"
+    line = tag[1] if tag and key == tag[0] else (_CORE_VOCAB.get("sib_tags_applied") or {}).get(key)
+    if line:
+        head = f"[{line}]"
         if desc.startswith(head):
             return desc[len(head):].lstrip()
     return desc
 
 
-def _core_tagged(key: str, desc: str | None, tag: tuple | None) -> str | None:
+def _core_tagged(key: str, desc: str | None, tags: dict | None) -> str | None:
     """정본 앱 도구 설명 앞에 소개 한 줄(R-3) — 웹 챗 · 심의 좌석 · 개인 Claude 가 같은 설명을 받는다. 검색은 이 줄을 떼고 사본을 알아본다
-    (_core_untagged — 정본이 사본 무리를 대표한다). 근본은 Datahub 플랫폼 DP-03(설치별 tagline)이다 — 그것이 들어오면 이 줄을 걷는다."""
-    if not tag or key != tag[0]:
+    (_core_untagged — 정본이 사본 무리를 대표한다). 근본은 Datahub 플랫폼 DP-03(설치별 tagline)이다 — 그것이 들어오면 이 줄을 걷는다.
+    형제도 소개 줄 칸이 차면 같은 길로 붙는다(E2-4 — 칸은 {앱 키: 줄}). 줄은 라벨로 시작하게 쓴다 — 에이전트 서버 _tag_tool_app 은 '[' 로
+    시작하는 설명에 앱 라벨을 다시 붙이지 않는다."""
+    line = (tags or {}).get(key)
+    if not line:
         return desc
-    return f"[{tag[1]}] {desc or ''}".rstrip()
+    return f"[{line}] {desc or ''}".rstrip()
 
 
 def _label_names(label: str) -> set[str]:
@@ -3415,15 +3551,23 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                     src[w].setdefault(v, []).append(f"vocab:{flat}")
     canon = (vocab or {}).get("canonical")
     quality_n = sum(1 for w in tun["quality_words"] if w in q) if sw["quality"] else 0
+    # 코어 질문(R-5 와 같은 판정 — 어휘표 검색 낱말이 든 질의)에서는 비코어 앱 도구의 점수를 낮춘다(E2-5 · C-A — 손잡이 noncore_demote, 기본 끔 ·
+    # 결정 Q-1, 켜기는 박스 덧씌우기로). 설명에 '고장모드 · 시험항목' 이 든 FMEA · ARP 도구가 코어 질문에 정본보다 앞섰다(OT-06 ~ 10). 질의가 그 앱
+    # 이름을 부르면 낮추지 않는다 — 값은 {앱 키: 어휘표가 아는 그 앱의 이름(라벨 · 키)}이다(아래 줄마다 게이트웨이 라벨의 이름과 함께 본다).
+    demote = (vocab.get("noncore_names") or {}) if (sw.get("noncore_demote") and vocab
+                                                   and any(f in q_flat for f, _p, _t in vocab["syn"])) else {}
     w_name, w_app, cap, w_cov = wt["name"], wt["app"], wt["desc_cap"], wt["coverage"]
     groups = _request_groups() if groups is None else groups
     visible = _visible_tools(groups)
+    # 형제 소개 줄(E2-4 · S-B)은 순위를 바꾸지 않는다 — 점수는 줄을 뗀 설명으로 낸다. 줄의 낱말이 점수에 들면 형제 줄이 오르고, 아래 접기가 그 줄을
+    # 정본 아래로 접어 그 데이터를 갖지 않은 정본이 덕을 봤다(검토 10-31 — 형제 순위 신호는 S-A 로 미뤘다). 정본 소개 줄(R-3)은 종전대로 점수에 든다.
+    sib_lines = _CORE_VOCAB.get("sib_tags_applied") or {}
     rows = []
     named_apps: set[str] = set()          # 질의가 이름을 부른 앱 — 사본 무리에서 그 앱 줄을 올린다
     for t in visible:
         name = t.name.lower()
-        desc = (t.description or "").lower()
         app, original = route.get(t.name, ("_gateway", t.name))[:2]
+        desc = (_core_untagged(app, t.description or "") if app in sib_lines else (t.description or "")).lower()
         meta = _app_meta(app) if app != "_gateway" else {"label": "gateway", "description": ""}
         label = str(meta.get("label") or "")
         hay_app = (label + " " + str(meta.get("description") or "")).lower()
@@ -3431,6 +3575,7 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
         score, covered = 0, 0
         base, base_cov = 0, 0             # 보정 없이 — 질의 낱말 그 자체만으로 낸 점수(귀속 · boost_only 판정)
         via: set[str] = set()
+        row_named = False                 # 질의가 이 줄의 앱 이름을 불렀나(비코어 낮추기를 비켜 간다)
         for w, variants in expand.items():
             name_hit = any(v in name for v in variants)
             desc_freq = max(min(desc.count(v), cap) for v in variants)
@@ -3439,6 +3584,7 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
             named = any(_named(names, v, q_flat) for v in variants)
             if named:
                 named_apps.add(app)
+                row_named = True
             if name_hit or desc_freq or app_hit or named:
                 covered += 1
                 score += w_name * (name_hit or named) + desc_freq + w_app * app_hit
@@ -3449,6 +3595,10 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                 for v in variants[1:]:
                     if v in name or v in desc or v in hay_app or _named(names, v, q_flat):
                         via.update(src[w].get(v, ()))
+        if app in demote and not row_named:
+            # 낮추기를 비켜 갈 이름 — 게이트웨이 라벨의 이름에 더해 어휘표의 앱 라벨 · 백엔드 키. 외부 연결 앱의 라벨은 포털 플랫폼 라벨(FMEA Agent)이라
+            # 그 이름(fmeaagent)만 보면 'FMEA …' 가 앱을 부르지 않는 것이 됐다(검토 10-31). 점수(이름 적중)는 종전대로 게이트웨이 라벨만 본다.
+            row_named = any(_named(demote[app], v, q_flat) for vs in expand.values() for v in vs)
         if score > 0:
             if quality_n and _area_of(t.name, app) in tun["quality_areas"]:
                 score += wt["quality_per_word"] * quality_n          # 품질 질의 — 품질 · VOC 도구를 위로(HG-01)
@@ -3460,6 +3610,10 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
             if is_write and not write_intent and sw["write_penalty"]:
                 final *= wt["write_penalty"]                     # 쓰기 낱말이 없는 질문 — 쓰기 · 잡 시작 도구를 내린다(HG-01)
                 base_final *= wt["write_penalty"]
+            if app in demote and not row_named:
+                final *= wt["noncore"]                           # 코어 질문의 비코어 앱 도구(E2-5) — 보정 뺀 점수도 곱해 boost_only 판정은 그대로다
+                base_final *= wt["noncore"]
+                via.add("demote:noncore")
             # 줄 꼴 — (점수, 이름, 앱, 설명, 도구, 쓰기, 원래 이름, 사본 표지, 보정 뺀 점수, 점수를 보탠 규칙)
             rows.append((final, t.name, app, (t.description or "").strip(), t, is_write, original,
                          1 if _COPY_LABEL.search(label) else 0, base_final, tuple(sorted(via))))
@@ -3473,26 +3627,50 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     # 형제 사본은 겹침 접두 · 라벨 낱말(failuretrace 의 failure)이 동의어에 맞아 정본보다 앞서고, 정본 사본은 점수가 0 이라 줄에 없기도
     # 하다 — 점수로는 정본을 못 세운다. 그래서 정본에 같은 도구가 있으면 그 도구가 무리를 대표한다.
     # 접힌 것도 이름으로 부를 수 있다(호출 별칭은 그대로다). 순위에서만 빠진다. 손잡이 copy_fold 를 끄면 접지 않는다.
-    folded: dict[tuple, list] = {}
+    # 허브 가족(정본 + 형제)의 줄은 **원래 이름만으로** 한 무리다 — 설명은 보지 않는다(E2-2 · F-A). 설명 글자에 기대면 허브 판이 어긋난 사이의
+    # 도구와, 우리가 청한 설치별 소개(Datahub DP-03)가 들어오는 날의 모든 허브 도구가 세 줄로 돌아간다(G1). 그 밖의 앱은 지금 열쇠 그대로다.
+    # 무리의 열쇠는 그 이름의 첫 가족 줄이 연 것이라, 설명이 같으면 지금과 글자 하나 다르지 않다. 설명이 다른 사본만 same_in 에 differs 가 붙는다.
+    # 소개 줄이 붙은 형제(E2-4)도 differs 이고 그 줄(tagline)을 싣는다 — 같은 데이터의 사본이 아니라고 운영자가 적은 것이다(검토 10-31).
+    folded: dict[int, list] = {}             # 대표 줄(id) → 접힌 것. 무리마다 따로다 — 원래 이름 · 설명이 같은 대표가 둘이어도 서로 덮지 않는다
     if sw["copy_fold"]:
-        copies: dict[tuple, list] = {}
-        for r in rows:
-            copies.setdefault((r[6], _core_untagged(r[2], r[3])), []).append(r)
+        family = frozenset((vocab or {}).get("family") or ())
         canon_tools = {(route[t.name][1], _core_untagged(canon, (t.description or "").strip())): t
                        for t in visible if route.get(t.name, ("",))[0] == canon} if canon else {}
+        canon_named = {route[t.name][1]: t for t in visible if route.get(t.name, ("",))[0] == canon} if canon and family else {}
+        # 가족 밖 줄도 소개 줄을 뗀 설명이 그 이름의 가족 줄이나 정본 도구와 같으면 그 이름의 가족 무리로 간다 — 따로 서면 정본이 두 무리를 대표해 두 번
+        # 오르고, 형제는 어느 접힌 표에도 없었다(검토 10-31 — 가족 밖 키로 붙은 허브 사본 + 판을 올린 형제). 그 이름의 가족 줄이 없으면 종전대로다.
+        fam_slot: dict[str, tuple] = {}          # 원래 이름 → 그 이름의 첫 가족 줄이 연 무리(순위 차례로 먼저 한 번 훑는다)
+        fam_keys: set[tuple] = set(canon_tools)  # 가족 줄 · 정본 도구의 (원래 이름, 소개 줄을 뗀 설명)
+        for r in rows:
+            if r[2] in family:
+                k = (r[6], _core_untagged(r[2], r[3]))
+                fam_slot.setdefault(r[6], k)
+                fam_keys.add(k)
+        copies: dict[tuple, list] = {}
+        for r in rows:
+            k = (r[6], _core_untagged(r[2], r[3]))
+            if r[2] in family or k in fam_keys:
+                k = fam_slot.get(r[6], k)
+            copies.setdefault(k, []).append(r)
         kept = []
         for k, g in copies.items():              # 넣은 차례 — 무리의 가장 앞선 줄 순서다
             head = g[0]
             if head[2] != canon and head[2] not in named_apps:
                 mine = next((r for r in g if r[2] == canon), None)
-                if mine is None and k in canon_tools:          # 정본 사본이 점수 0 이라 줄에 없다 — 이 무리의 자리에 세운다
-                    ct = canon_tools[k]
+                ct = canon_tools.get(k)
+                if ct is None and any(r[2] in family for r in g):
+                    ct = canon_named.get(k[0])                # 가족 무리 — 정본은 같은 이름이면 설명이 달라도 그 무리의 정본이다
+                if mine is None and ct is not None:            # 정본 사본이 점수 0 이라 줄에 없다 — 이 무리의 자리에 세운다
                     mine = (head[0], ct.name, canon, (ct.description or "").strip(), ct, _tool_is_write(ct, k[0]), k[0],
                             1 if _COPY_LABEL.search(str(_app_meta(canon).get("label") or "")) else 0, head[8], head[9])
                     g = [mine] + g
                 head = mine or head
             kept.append(head)
-            folded[(head[6], head[3])] = [{"tool": r[1], "app": r[2]} for r in g if r is not head]
+            own = _core_untagged(head[2], head[3])
+            folded[id(head)] = [{"tool": r[1], "app": r[2],
+                                 **({"differs": True} if _core_untagged(r[2], r[3]) != own or r[2] in sib_lines else {}),
+                                 **({"tagline": sib_lines[r[2]]} if r[2] in sib_lines else {})}
+                                for r in g if r is not head]
         rows = kept
 
     def _args_summary(t) -> dict:
@@ -3530,13 +3708,17 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
         return out
 
     matches = []
-    for _, n, a, d, t, w, orig, _c, *_attr in rows[:limit]:
-        m = {"tool": n, "app": a, "description": d if detail else _brief_desc(d),
-             "args": _args_summary(t) if detail else _args_brief(t)}
+    for r in rows[:limit]:
+        _, n, a, d, t, w, _orig, _c, *_attr = r
+        m = {"tool": n, "app": a}
+        role = _app_role(a)
+        if role and role[0] != "canonical":
+            m["role"] = role[0]                  # 형제 · 비코어만(E2-1 · C-B) — 정본은 설명 앞 소개 줄이 말한다
+        m.update(description=d if detail else _brief_desc(d), args=_args_summary(t) if detail else _args_brief(t))
         if w:
             m["write"] = True                    # 쓰기 · 잡 시작 — 사람에게 확인한 뒤 부른다(지침 5)
-        if folded.get((orig, d)):
-            m["same_in"] = folded[(orig, d)]
+        if folded.get(id(r)):
+            m["same_in"] = folded[id(r)]
         matches.append(m)
     # 귀속 — 보정 뺀 점수로 줄을 세워, 보여 준 결과 가운데 보정 덕에만 든 것(boost_only — 보정을 빼면 0점이거나 limit 밖)을 가린다(E-9 ①)
     base_order = {r[1]: i for i, r in enumerate(sorted(rows, key=lambda r: (-r[8], r[7], r[1])), 1)}
@@ -3560,7 +3742,12 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                        "다시 검색하거나 list_tool_apps(app='<키>') 로 앱 상세를 보라."
                        + ("" if detail else " 설명은 한 줄 요약이고 args 는 필수 인자만 스키마를 싣는다 — 선택 인자(optional)까지 "
                                             "쓰려면 detail=true 로 다시 찾아라.")
-                       + (" same_in 은 설명까지 같은 사본이다 — 위 도구를 먼저 쓴다." if any("same_in" in m for m in matches) else ""))
+                       + (" same_in 은 설명까지 같은 사본이다 — 위 도구를 먼저 쓴다." if any("same_in" in m for m in matches) else "")
+                       + (" 그 가운데 differs 가 붙은 것은 사본이 아니라 이름만 같은 도구다 — 형제 허브의 같은 이름 도구(담은 데이터가 다르다)이거나 "
+                          "설명이 다른 판이다."
+                          if any(x.get("differs") for m in matches for x in m.get("same_in") or ()) else "")
+                       + (" tagline 은 그 형제 허브가 담은 데이터다 — 질문이 그 데이터에 대한 것이면 그 도구를 부른다."
+                          if any("tagline" in x for m in matches for x in m.get("same_in") or ()) else ""))
     payload["matches"] = matches
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
@@ -3608,6 +3795,7 @@ async def _needs_connect(keys) -> set[str]:
 
 async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     groups = _request_groups()
+    _core_vocab()                                    # 앱 역할(role)을 지금 어휘표로 — 덧씌우기를 고쳤으면 다시 읽는다
     want_app = str((arguments or {}).get("app") or "").strip()
     include = (arguments or {}).get("include_tools")
     include = True if include is None else bool(include)
@@ -3666,6 +3854,12 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             "status": "ok" if (accessible and reachable) else
                       ("no_access" if not accessible else "backend_down"),
         }
+        role = None if local else _app_role(key)
+        if role:
+            # 어휘표의 앱 역할(E2-1 · C-B) — 정본 · 형제(같은 허브 도구, 담은 데이터가 다르다) · 비코어(코어 객체가 없다 — note 는 그 앱이 갖는 것)
+            entry["role"] = role[0]
+            if role[1]:
+                entry["role_note"] = role[1]
         if key in need:
             entry["status"] = "needs_connect"
             entry["needs_connect"] = True
@@ -3700,6 +3894,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
                 "권한 없는 앱은 목록에 없고 denied_apps 에 라벨·사유·필요 권한·요청 경로만 있다 — 각 항목의 "
                 "reason/how 를 따른다(portal_access 만 포털 '내 권한' 요청, policy_not_ready 는 잠시 뒤 재시도). "
                 "특정 앱의 도구 설명은 list_tool_apps(app='<키>') 로 조회.",
+        # 이 연결의 개인 보기(E-4) — tools/list 에 실은 수 · 보기로 뺀 수(목록 밖도 search_tools → invoke_tool 로 닿는다)
+        "view": _view_info(groups),
     }
     if want_app and not apps:
         if denied:
@@ -3750,7 +3946,8 @@ def _list_by_area(by_app: dict, groups: list[str], want_area: str, include: bool
     payload = {"areas": areas, "area_count": len(areas), "total_tools": sum(a["tool_count"] for a in areas),
                "hidden_no_access_or_down": hidden,
                "hidden_muted": hidden_muted,
-               "note": "영역 = 하는 일. 특정 영역의 도구 설명은 list_tool_apps(by='area', area='<키>')."}
+               "note": "영역 = 하는 일. 특정 영역의 도구 설명은 list_tool_apps(by='area', area='<키>').",
+               "view": _view_info(groups)}
     if want_area and not areas:
         payload["error"] = f"unknown area: {want_area} — 가능한 키: {', '.join(meta)}"
     return types.CallToolResult(
@@ -5224,6 +5421,68 @@ def _visible_tools(groups: list[str]) -> list[types.Tool]:
             if _backend_allowed(route[t.name][0], groups) and route[t.name][0] not in hidden] + _local_tools()
 
 
+# 가벼운 보기의 두 도구(E-4 · L-A) — 찾고 부른다. 앱 목록 · 패널 도구 · 그 밖은 invoke_tool 로 닿는다(파괴 · 제어 도구 막이는 그대로다).
+_VIEW_LIGHT_TOOLS = (SEARCH_TOOLS_TOOL, INVOKE_TOOL)
+
+
+def _listed_tools(groups: list[str]) -> list[types.Tool]:
+    """tools/list 가 내는 목록 — 검색 시야(_visible_tools)에 이 요청의 보기를 얹는다(HWAXPortal docs/request-1029 E-4). **보기는 빼기만 한다** —
+    이름을 바꾸지 않고, 검색 · 평가 · 앱 목록은 _visible_tools 를 그대로 쓴다(여기에 걸면 가벼운 보기의 search_tools 가 빈손이 된다).
+      · 전체 — 지금 그대로(형제 사본도 싣는다 — 결정 Q-4).
+      · 가벼운 — search_tools · invoke_tool 둘.
+      · 묶음 — 고른 영역(tool_areas.json)의 백엔드 도구 + 정본 읽기 도구(어휘표 검색 칸의 도구 — (정본 키, 원래 이름)으로 고른다) + 로컬 도구
+        전부. 형제 사본은 싣지 않는다(X-B — 정본이 대표하고, 형제는 search_tools 에서 앱 이름을 부르면 나온다). 미분류 도구는 어느 묶음에도
+        들지 않는다(찾기로 닿는다).
+    끈 앱 · 시험 앱은 _visible_tools 가 이미 뺐다 — 어느 보기에서도 빠진다(끄기가 더 세다)."""
+    vis = _visible_tools(groups)
+    mode, areas, _src = _request_view()
+    if mode == "full":
+        return vis
+    if mode == "light":
+        return list(_VIEW_LIGHT_TOOLS)
+    d = _CORE_VOCAB["data"] or {}
+    canon, sib, reads = d.get("canonical"), d.get("siblings") or frozenset(), d.get("core_reads") or frozenset()
+    want, local = set(areas), {id(t) for t in _local_tools()}
+    out = []
+    for t in vis:
+        if id(t) in local:
+            out.append(t)
+            continue
+        key, orig = route.get(t.name, ("", ""))
+        if key in sib:
+            continue
+        if (key == canon and orig in reads) or _area_of(t.name, key) in want:
+            out.append(t)
+    return out
+
+
+def _view_info(groups: list[str]) -> dict:
+    """list_tool_apps 의 view — 이 연결의 보기 · 영역 · 목록에 실은 수 · 보기로 뺀 수 · 모르는 영역 · 출처(E-4 E4-2). 개인 Claude 는 역할(role)과
+    이것을 한 응답에서 읽는다."""
+    mode, areas, src = _request_view()
+    vis, listed = _visible_tools(groups), _listed_tools(groups)
+    out: dict = {"mode": mode}
+    if mode == "bundle":
+        known = {m["area"] for m in _area_meta()}
+        out["areas"] = [a for a in areas if a in known]
+        unknown = [a for a in areas if a not in known]
+        if unknown:
+            out["unknown_areas"] = unknown
+    out.update(listed=len(listed), hidden_by_view=len(vis) - len(listed))
+    if src:
+        out["source"] = src.split(";", 1)[0]
+    if "bad-header" in src:
+        out["error"] = ("연결 머리 X-HWAX-View 의 꼴이 틀려 전체 목록을 냈다 — full · light · bundle:<영역>,<영역> · portal(포털에서 고른 보기를 따른다) "
+                        "가운데 하나다")
+    if mode != "full":
+        # 바꾸는 자리는 출처를 따른다 — 포털 설정에서 온 보기는 포털에서, 연결 머리가 정한 보기는 그 클라이언트 설정에서(머리가 포털 설정을 덮는다)
+        where = ("포털 '개인 토큰 › 허브에 보일 앱'(/tokens?tab=apps)에서 바꾸고" if out.get("source") == "portal" else
+                 "이 연결의 머리 X-HWAX-View 가 정했다 — 클라이언트 설정에서 바꾸고")
+        out["note"] = ("보기는 tools/list 만 줄인다 — 목록 밖 도구도 search_tools 로 찾아 invoke_tool 로 부른다(권한 · 이름은 그대로). "
+                       f"보기는 {where}, 열린 세션은 재연결해야 목록이 바뀐다.")
+    return out
+
+
 def _request_groups() -> list[str]:
     """현재 요청 헤더(X-HWAX-Groups)에서 caller groups 추출.
     요청 컨텍스트·헤더가 없으면 [](=제한 백엔드는 숨김 → fail-closed)."""
@@ -5243,6 +5502,17 @@ def _request_muted() -> set[str]:
         return set()
     raw = req.headers.get(MUTED_HEADER) if req is not None else None
     return {a for a in unquote(raw or "").split(",") if a}
+
+
+def _request_view() -> tuple[str, tuple[str, ...], str]:
+    """이 요청의 개인 보기 · 영역 · 출처(E-4) — 게이트웨이가 PAT 분기에서 정해 싣는다. 머리가 없으면(GW_TOKEN · 웹 챗 · 절차 · 요청 문맥 없음) 전체다."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return "full", (), ""
+    h = req.headers if req is not None else {}
+    mode, areas = _parse_view(h.get(VIEW_HEADER)) or ("full", ())
+    return mode, areas, str(h.get(VIEW_SRC_HEADER) or "").strip()[:40]
 
 
 def _request_purpose() -> str:
@@ -6146,10 +6416,19 @@ async def _read_ui_resource(req: types.ReadResourceRequest):
 _low.request_handlers[types.ReadResourceRequest] = _read_ui_resource
 
 
+# 기동 뒤 보기별 tools/list 수 — /health 가 싣는다(개인 보기의 채택을 잰다, E-4 E4-2)
+_VIEW_LISTS = {"full": 0, "bundle": 0, "light": 0}
+
+
 @_low.list_tools()
-async def _list_tools():
-    # 도구 목록을 caller groups로 필터(보이지 않는 도구는 LLM이 알 수도 없음).
-    return _visible_tools(_request_groups())
+async def _list_tools(req: types.ListToolsRequest):
+    # 도구 목록을 caller groups로 필터(보이지 않는 도구는 LLM이 알 수도 없음) + 개인 보기(E-4 — tools/list 에만, _listed_tools).
+    # req 가 None 이면 클라이언트의 목록 요청이 아니라 SDK 가 호출 검증용 캐시를 채우려 부른 것이다(_get_cached_tool_definition) — 그때는 보기를
+    # 얹지 않고 세지도 않는다. 보기는 목록만 줄이고 호출은 지금 그대로여야 한다(목록 밖 도구를 이름으로 부를 때 출력 검증도 그대로다).
+    if req is None:
+        return _visible_tools(_request_groups())
+    _VIEW_LISTS[_request_view()[0]] += 1
+    return _listed_tools(_request_groups())
 
 
 # 게이트웨이 자체 도구 가운데 조회만 하는 것 — 읽기 전용 토큰도 부른다. save_conversation(쓰기)은 빠지고, rest_call 은 메서드로,
@@ -6580,6 +6859,8 @@ def _bearer_gate(app, pat_verifier=None):
                 "core_vocab": _core_vocab_health(),
                 # 검색 손잡이 — 지문(덧씌운 값 · 기본값) · 꺼 둔 묶음 · 박스 덧씌우기(있나 · 건드린 칸 · 버린 까닭). dev 와 cae00 이 다르게 도는 것을 보인다(E-7)
                 "search_tuning": _tuning_health(),
+                # 기동 뒤 개인 보기별 tools/list 수 — 보기(전체 · 묶음 · 가벼운)를 누가 얼마나 쓰나(E-4 E4-2). 수만 싣는다
+                "tools_list_by_view": dict(_VIEW_LISTS),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
@@ -6606,6 +6887,7 @@ def _bearer_gate(app, pat_verifier=None):
             for _bk in _map.values():
                 _counts[_bk] = _counts.get(_bk, 0) + 1
             _apps = []
+            _core_vocab()                        # 앱 역할(role)을 지금 어휘표로(E2-1)
             for _k in sorted(_counts, key=lambda k: -_counts[k]):
                 _m = _app_meta(_k)
                 _apps.append({
@@ -6614,6 +6896,12 @@ def _bearer_gate(app, pat_verifier=None):
                     "reachable": _k == "_gateway" or (
                         _k in backends and backends[_k].session is not None),
                 })
+                # 어휘표의 앱 역할(가족 · 비코어만 — E2-1). 포털의 보기 화면이 형제를 묶음 수에서 뺄 때도 이것을 본다(E-4)
+                _r = None if _k == "_gateway" else _app_role(_k)
+                if _r:
+                    _apps[-1]["role"] = _r[0]
+                    if _r[1]:
+                        _apps[-1]["role_note"] = _r[1]
             # 영역 — 하는 일로 묶은 두 번째 축(tool_areas.json). 미분류는 숨기지 않고 따로 준다:
             # 새 앱이 붙어 분류표에 한 줄이 빠지면 그 도구들이 UI 에서 '미분류 N' 으로 보여야 한다.
             _areas = {n: _area_of(n, bk) for n, bk in _map.items()}
@@ -6634,6 +6922,9 @@ def _bearer_gate(app, pat_verifier=None):
                 # 루틴 단계에서 부를 수 있는 읽기 도구의 노출 이름(정렬, 백엔드 도구만) — 닫힌 쪽 판정 _routine_read(표지 · 읽기 목록 · 조회 낱말),
                 # routine_call 과 같은 판정이다. 포털 계획은 이것과 겹치는 도구만 단계에 묶는다(R3 리뷰 #0 — 모르는 도구는 쓰기로 본다).
                 "routine_read": sorted(_n for _n, (_bk, _orig) in route.items() if _routine_read(_tool_of.get(_n), _bk, _orig)),
+                # 이 게이트웨이가 아는 개인 보기(E-4) — 포털이 보기를 저장 · 보일 때 본다. 이 칸이 없는 옛 게이트웨이는 보기를 읽지 않아 늘 전체로 돈다
+                # (포털 화면이 '저장했습니다' 만 말하던 것을 막는다, 검토 10-31). 위 칸들은 그대로다.
+                "views": ["full", "bundle", "light"],
             }, ensure_ascii=False).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
@@ -6780,9 +7071,11 @@ def _bearer_gate(app, pat_verifier=None):
             # 사람 권한 정책(포털)에서 뺀다. 권한 정책 이전과 같은 시야를 지킨다.
             # 목적 헤더는 **검증된 PAT 에서만** 나온다 — 이 경로(GW_TOKEN)는 PAT 검증을 안 하므로
             # 클라이언트가 실어 보낸 값을 버린다. 안 버리면 GW_TOKEN 을 쥔 쪽이 차단을 면제받는다.
+            # 보기 머리(E-4)도 버린다 — 에이전트 서버 · 심의는 늘 전체 목록이다.
             _kept = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
-                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode())]
+                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode(),
+                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode())]
             if GROUPS_HEADER.encode() not in headers:
                 _kept.append((GROUPS_HEADER.encode(), SERVICE_GROUP.encode()))
             _kept.append((VIA_HEADER.encode(), b"gw-token"))
@@ -6826,7 +7119,8 @@ def _bearer_gate(app, pat_verifier=None):
             fresh = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (GROUPS_HEADER.encode(), USER_HEADER.encode(),
                                           PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
-                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode())]
+                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode(),
+                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode())]
             if is_read_only(claims):
                 fresh.append((READONLY_HEADER.encode(), b"1"))
             # PAT 의 groups 에도 한글이 올 수 있다 — 같은 규칙으로 인코딩해 실어야 헤더가 안 깨진다.
@@ -6847,6 +7141,22 @@ def _bearer_gate(app, pat_verifier=None):
                         and str(claims.get("jti") or "").startswith("chat-"))
             if _muted and not _is_chat and str(claims.get("purpose") or "") != PROCEDURE_PURPOSE:
                 fresh.append((MUTED_HEADER.encode(), quote(",".join(_muted), safe=",").encode("latin-1")))
+            # 개인 보기(E-4 E4-2) — 연결이 청한 것만 얹는다. 머리가 보기 글이면 그것(연결마다 덮는다 — 리포 .mcp.json 은 늘 full), 머리가 `portal` 이면
+            # 포털 사람 설정(권한 응답의 view — 포털 등록 배치 · 명령이 단다), 머리가 없으면 전체. 정한 값으로 갈아 끼운다. 포털 설정을 머리 없는 개인 PAT
+            # 에도 얹던 때는 사람의 토큰으로 tools/list 를 읽는 서버 앱이 그 사람의 보기로 도구를 잃었다 — 리스크 심사 unit_live 가 live_denied 를 영구히
+            # 적고 MXWP 위키의 도구 걸음이 조용히 비었다(검토 10-31). 웹 챗 · 절차 PAT 는 늘 전체다(끄기 면제와 같은 까닭). 틀린 꼴의 머리는 전체로 가고
+            # 출처에 표시를 남긴다(list_tool_apps 의 view.error). 넓어지는 것은 그 사람이 이미 쓸 수 있는 목록뿐이다(보기는 권한이 아니다).
+            _cv = headers.get(VIEW_HEADER.encode(), b"").decode("latin-1").strip()
+            if _is_chat or str(claims.get("purpose") or "") == PROCEDURE_PURPOSE:
+                _view, _vsrc = ("full", ()), "exempt"
+            elif _cv.lower() == VIEW_PORTAL:
+                _pv = _parse_view((_ent or {}).get("view"))
+                _view, _vsrc = (_pv, "portal") if _pv else (("full", ()), "default")
+            else:
+                _hv = _parse_view(_cv) if _cv else None
+                _view, _vsrc = (_hv, "header") if _hv else (("full", ()), "default;bad-header" if _cv else "default")
+            fresh.append((VIEW_HEADER.encode(), _view_text(*_view).encode("latin-1")))
+            fresh.append((VIEW_SRC_HEADER.encode(), _vsrc.encode()))
             fresh.append((VIA_HEADER.encode(), b"chat" if _is_chat else
                           b"procedure" if str(claims.get("purpose") or "") == PROCEDURE_PURPOSE else b"pat"))
             await app({**scope, "headers": fresh}, receive, send)

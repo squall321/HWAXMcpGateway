@@ -703,14 +703,18 @@ def test_DynaForge_위임의_KOORM_SEND_PLAT_은_적혀_있을_때만_plat_전�
     assert krm(env).get("send_plat") is True, "안 적은 실행은 이어받는다 — 비밀을 다시 읽어 항목을 새로 써도"
     _force_backup(tmp_path)
     assert "send_plat" not in krm({**env, "KOORM_SEND_PLAT": "0"}), "0 이면 끈다"
-    # 비밀을 못 읽은 실행(KooRemapper 리포가 없는 박스의 손 --force) — 항목째 이어받고, 적었으면 거기에도 그 값이 정한다
     _force_backup(tmp_path)
-    assert krm({**env, "KOORM_SEND_PLAT": "yes"}).get("send_plat") is True
+    assert krm({**env, "KOORM_SEND_PLAT": "yes"}).get("send_plat") is True, "yes 도 켠다"
+    # 비밀을 못 읽은 실행(KooRemapper 리포가 없는 박스의 손 --force) — 항목째 이어받고, 적었으면 거기에도 그 값이 정한다(끔도 켬도)
     _force_backup(tmp_path)
     assert krm({"HEAX_MCP_TOKEN": "heax-svc"}).get("send_plat") is True
     _force_backup(tmp_path)
     carried = krm({"HEAX_MCP_TOKEN": "heax-svc", "KOORM_SEND_PLAT": "0"})
     assert carried["secret"] == "koorm-secret-xyz" and "send_plat" not in carried
+    _force_backup(tmp_path)
+    carried = krm({"HEAX_MCP_TOKEN": "heax-svc", "KOORM_SEND_PLAT": "1"})
+    assert carried["secret"] == "koorm-secret-xyz" and carried.get("send_plat") is True, \
+        "send_plat 이 없는 채 이어받은 항목도 켠다 — 비밀이 있을 때만 켜면 이 위임은 비밀을 못 읽는 박스에서 켤 길이 없다"
     # 위임이 없으면 칸만 만들지 않는다 — 켜려 한 것이 안 된 까닭을 말하되, 이 블록이 모르는 까닭을 단정하지 않는다. 셸은 heax 토큰이
     # 없거나 KooRemapper 리포가 없으면 .env 를 읽지도 않는다 — 그때 '.env 에 비밀이 없다' 고 하면 비밀이 든 .env 를 연 사람이 길을 잃는다
     (tmp_path / "gateway_config.json").unlink()

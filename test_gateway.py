@@ -5622,7 +5622,8 @@ def test_앱이_바라지_않으면_교환하지_않는다(monkeypatch):
 
 
 @pytest.mark.parametrize("via, auth", [("gw-token", "Bearer gw-secret"), ("chat", f"Bearer {_PP_CALLER_PAT}"),
-                                       ("procedure", f"Bearer {_PP_CALLER_PAT}"), ("", f"Bearer {_PP_CALLER_PAT}")])
+                                       ("procedure", f"Bearer {_PP_CALLER_PAT}"), ("", f"Bearer {_PP_CALLER_PAT}"),
+                                       ("mcp-app", f"Bearer {_PP_CALLER_PAT}")])     # 패널 PAT(HA-20) 도 원이 될 수 없다 — 넓은 PAT 로 바꿔 주지 않는다
 def test_포털_PAT_로_들어온_호출이_아니면_교환하지_않는다(monkeypatch, via, auth):
     """GW_TOKEN(에이전트 서버)은 넘길 사람의 PAT 가 없다 — Authorization 이 GW_TOKEN 이다. 웹 챗·절차 PAT 는 포털이 원으로 받지 않으니
     (기록되지 않은 PAT) 부르지 않는다 — 그 거절을 앱에 알리면 앱이 실패 쉼에 들어 Claude 길의 교환까지 막힌다."""
@@ -9857,3 +9858,261 @@ def test_루틴_도구_설명이_심의_차례_쓰기_거절_대화_이어서를
         assert must in start.description, must
     props = start.inputSchema["properties"]
     assert props["conversation_id"]["maxLength"] == 64 and props["run_id"]["description"].strip()
+
+
+# ── 포털 챗 MCP Apps 패널의 패널 PAT(HWAXPortal docs/request-1027 HA-20 · HP-42 · 설계 B5.3 · B6 P2) ─────────────────────────────
+# 패널의 tools/call · resources/read 는 포털 백엔드가 패널 PAT(그 앱 · 그 ui:// 주소 · 15분)로 보낸다. 게이트웨이가 두 번째 막이다 —
+# via=mcp-app 과 주소를 감사에 남기고, 앱 밖 도구 · 리소스와 막음 목록을 거절하고, 꼴이 어긋난 패널 PAT 는 일반 PAT 로 받지 않는다.
+import importlib.util  # noqa: E402
+import time as _ptime  # noqa: E402
+
+_P_APP, _P_URI = "simflow", "ui://simflow/workflow"
+
+
+def _panel_claims(**over):
+    now = int(_ptime.time())
+    body = {"sub": "S-1", "email": "u@corp.com", "name": "U", "groups": ["mes-user"], "aud": [gw.PANEL_AUDIENCE], "scope": "api",
+            "scopes": [gw.PANEL_PURPOSE], "pat_name": "mcp-app", "purpose": gw.PANEL_PURPOSE, "panel": {"app": _P_APP, "uri": _P_URI},
+            "iat": now, "nbf": now, "exp": now + 900, "jti": gw.PANEL_JTI_PREFIX + "0123abcd"}
+    body.update(over)
+    return {k: v for k, v in body.items() if v is not _DROP}
+
+
+_DROP = object()
+
+
+def _gate_headers(monkeypatch, auth, claims, extra=()):
+    """인증 미들웨어를 태워 앱이 받은 헤더({이름: [값…]})와 응답(401 이면 그 몸)을 돌려준다."""
+    seen, sent = {}, []
+
+    async def app(scope, receive, send):
+        seen["h"] = list(scope["headers"])
+
+    async def fake_access(email, base, **_kw):
+        return {"keys": []}
+
+    async def send(m):
+        sent.append(m)
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        async def verify(self, token, aud):
+            assert isinstance(aud, list) and gw.MCP_AUDIENCE in aud and gw.PANEL_AUDIENCE in aud, "두 청중으로 검증한다"
+            return claims
+    mw = gw._bearer_gate(app, _V())
+    asyncio.run(mw({"type": "http", "method": "POST", "path": "/mcp", "headers": [(b"authorization", auth), *extra],
+                    "client": ("198.51.100.4", 0)}, None, send))
+    out: dict = {}
+    for k, v in seen.get("h", []):
+        out.setdefault(k.decode().lower(), []).append(v.decode())
+    status = next((m["status"] for m in sent if m["type"] == "http.response.start"), None)
+    return out, status
+
+
+def _panel_hdr(h):
+    from urllib.parse import unquote
+    vals = h.get(gw.PANEL_HEADER, [])
+    return [json.loads(unquote(v)) for v in vals]
+
+
+def test_HA20_패널_PAT_는_via_mcp_app_과_범위를_싣고_클라이언트가_보낸_사본은_버린다(monkeypatch):
+    forged = ((gw.PANEL_HEADER.encode(), b"%7B%22app%22%3A%22arp%22%2C%22uri%22%3A%22ui%3A%2F%2Farp%2Fx%22%7D"),
+              (gw.VIA_HEADER.encode(), b"chat"))
+    h, st = _gate_headers(monkeypatch, b"Bearer p", _panel_claims(), forged)
+    assert st is None and h[gw.VIA_HEADER] == ["mcp-app"] and _panel_hdr(h) == [{"app": _P_APP, "uri": _P_URI}], h
+    assert gw.MUTED_HEADER not in h and gw.PURPOSE_HEADER not in h and gw.READONLY_HEADER not in h, "끄기 · 절차 면제 · 읽기 전용이 붙지 않는다"
+    # 일반 PAT · GW_TOKEN 길에서도 클라이언트가 실은 범위 사본은 버린다 — 남으면 일반 요청이 '패널' 로 읽혀 범위가 흔들린다
+    h2, _ = _gate_headers(monkeypatch, b"Bearer me", {"email": "u@corp.com", "groups": [], "jti": "j"}, forged)
+    assert gw.PANEL_HEADER not in h2 and h2[gw.VIA_HEADER] == ["pat"]
+    h3, _ = _gate_headers(monkeypatch, b"Bearer gw-secret", None, forged)
+    assert gw.PANEL_HEADER not in h3 and h3[gw.VIA_HEADER] == ["gw-token"]
+
+
+def test_HA20_챗_PAT_와_섞이지_않는다(monkeypatch):
+    chat = {"email": "u@corp.com", "groups": [], "pat_name": gw.CHAT_PAT_NAME, "jti": "chat-S-1-1800", "aud": [gw.MCP_AUDIENCE]}
+    h, _ = _gate_headers(monkeypatch, b"Bearer c", chat)
+    assert h[gw.VIA_HEADER] == ["chat"] and gw.PANEL_HEADER not in h, "챗 PAT 는 패널 범위를 갖지 않는다"
+    _, st = _gate_headers(monkeypatch, b"Bearer c", {**chat, "panel": {"app": _P_APP, "uri": _P_URI}})
+    assert st == 401, "챗 PAT 에 panel 칸이 붙어 오면 패널로도 챗으로도 받지 않는다"
+    _, st2 = _gate_headers(monkeypatch, b"Bearer p", _panel_claims(pat_name=gw.CHAT_PAT_NAME))
+    assert st2 == 401, "패널 PAT 가 챗 PAT 이름을 달면 받지 않는다"
+
+
+@pytest.mark.parametrize("over,why", [
+    ({"purpose": "procedure"}, "purpose 가 패널이 아니다 — 절차 면제로 떨어지면 안 된다"),
+    ({"purpose": _DROP}, "purpose 없음"),
+    ({"jti": "j-plain"}, "jti 머리"),
+    ({"aud": ["mcp-gateway", "mcp-app-panel"]}, "두 청중을 함께 — 일반 PAT 와 섞인 꼴"),
+    ({"aud": ["mcp-gateway"]}, "패널 청중 없음"),
+    ({"panel": {"app": "", "uri": _P_URI}}, "앱 없음"),
+    ({"panel": {"app": "_gateway", "uri": _P_URI}}, "게이트웨이 자체 도구 묶음"),
+    ({"panel": {"app": _P_APP, "uri": "https://evil.example/x.html"}}, "ui:// 아님"),
+    ({"panel": "simflow"}, "panel 꼴"),
+    ({"panel": _DROP}, "panel 없음"),
+    ({"exp": int(_ptime.time()) + 3600}, "15분보다 길다"),
+    ({"iat": _DROP}, "수명을 셀 수 없다"),
+])
+def test_HA20_꼴이_어긋난_패널_PAT_는_401_이고_일반_PAT_로_떨어지지_않는다(monkeypatch, over, why):
+    open(gw.AUDIT_PATH, "w").close()
+    h, st = _gate_headers(monkeypatch, b"Bearer p", _panel_claims(**over))
+    assert st == 401 and not h, why
+    assert [r["error"] for r in _rows()] == ["unauthorized: bad-panel-token"], why
+
+
+def test_HA20_진짜_RS256_패널_PAT_는_두_청중으로만_통하고_옛_게이트웨이_검증으로는_닫힌다(monkeypatch):
+    """청중을 따로 둔 까닭 — 패널 판별을 모르는 옛 게이트웨이(MCP_AUDIENCE 하나로 검증)는 패널 PAT 를 받지 않는다. 만료는 만료로 답한다."""
+    v = _verifier(monkeypatch)
+
+    async def none_revoked():
+        return set()
+    monkeypatch.setattr(v, "_revoked_set", none_revoked)
+    c = _panel_claims()
+    tok = _jwt.encode(c, _rsa()[0], algorithm="RS256", headers={"kid": "k1"})
+    assert asyncio.run(v.verify(tok, gw.MCP_AUDIENCE)) is None, "옛 게이트웨이 검증(MCP 청중 하나)으로는 통하지 않는다"
+    got = asyncio.run(v.verify(tok, [gw.MCP_AUDIENCE, gw.PANEL_AUDIENCE]))
+    assert got is not None and gw._panel_scope(got) == (True, {"app": _P_APP, "uri": _P_URI})
+    old = _jwt.encode(_panel_claims(iat=int(_ptime.time()) - 1000, nbf=int(_ptime.time()) - 1000, exp=int(_ptime.time()) - 100),
+                      _rsa()[0], algorithm="RS256", headers={"kid": "k1"})
+    sent = []
+
+    async def app(scope, receive, send):
+        raise AssertionError("만료된 패널 PAT 가 앱까지 갔다")
+
+    async def send(m):
+        sent.append(m)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    asyncio.run(gw._bearer_gate(app, v)({"type": "http", "method": "POST", "path": "/mcp", "client": ("198.51.100.9", 0),
+                                          "headers": [(b"authorization", b"Bearer " + old.encode())]}, None, send))
+    assert [m["status"] for m in sent if m["type"] == "http.response.start"] == [401]
+    assert json.loads([m["body"] for m in sent if m["type"] == "http.response.body"][0])["error"] == "expired"
+
+
+class _PanelCallSess(_PanelSess):
+    """ui:// 리소스와 도구 호출을 함께 내는 백엔드 — 받은 호출을 남긴다(반환값이 아니라 피호출자 기록으로 판정한다)."""
+
+    def __init__(self, tools, resources):
+        super().__init__(tools, resources)
+        self.calls: list[str] = []
+
+    async def call_tool(self, original, args, read_timeout_seconds=None):
+        self.calls.append(original)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=f"ok {original}")],
+                                    _meta={"viewer": {"token": "t"}})
+
+
+def _scope_kit(monkeypatch):
+    sf = _PanelCallSess([_panel_tool("open_workflow_panel", _P_URI), _tool("panel_upload_begin"), _tool("trash_report"),
+                         _tool("review_task_next"), _tool("list_runs")],
+                        [types.Resource(uri=_P_URI, name="w"), types.Resource(uri="ui://simflow/status", name="s")])
+    arp = _PanelCallSess([_panel_tool("open_arp_panel", "ui://arp/board"), _tool("arp_list")], [types.Resource(uri="ui://arp/board", name="b")])
+    _panel_kit(monkeypatch, {"simflow": sf, "arp": arp}, user="u@corp.com")
+    gw._RESP_CACHE.clear()
+    return sf, arp
+
+
+def _as_panel(monkeypatch, panel=None, raw=None):
+    from urllib.parse import quote as _q
+    hdrs = {gw.VIA_HEADER: "mcp-app", gw.USER_HEADER: "u%40corp.com",
+            gw.PANEL_HEADER: raw if raw is not None else _q(json.dumps(panel or {"app": _P_APP, "uri": _P_URI}), safe="")}
+    _set_request(monkeypatch, hdrs, "198.51.100.4")
+
+
+def test_HA20_패널은_그_앱의_도구만_부르고_막음_목록과_게이트웨이_도구는_앱과_무관하게_거절한다(monkeypatch):
+    sf, arp = _scope_kit(monkeypatch)
+    _as_panel(monkeypatch)
+    open(gw.AUDIT_PATH, "w").close()
+
+    def call(name, args=None):
+        res = asyncio.run(gw._call_tool(name, args or {}))
+        return not res.isError, res.content[0].text
+    assert call("open_workflow_panel")[0] and call("simflow_list_runs")[0], "그 앱의 도구는 노출 이름 · 별칭으로 부른다"
+    for name, args in (("open_arp_panel", {}), ("arp_list", {}),                        # 앱 밖
+                       ("invoke_tool", {"name": "open_workflow_panel", "arguments": {}}),   # 경유 — 안쪽이 그 앱이어도
+                       ("invoke_tool", {"name": "arp_list", "arguments": {}}),
+                       ("rest_call", {"site": "x", "path": "/"}), ("search_tools", {"query": "q"}),
+                       ("save_conversation", {}), ("routine_list", {}),                    # 게이트웨이 자체
+                       ("trash_report", {}), ("review_task_next", {}),                     # 막음 목록(그 앱의 도구라도)
+                       ("no_such_tool", {})):
+        ok, text = call(name, args)
+        assert not ok and text.startswith("panel:"), (name, text)
+    assert sf.calls == ["open_workflow_panel", "list_runs"] and arp.calls == [], (sf.calls, arp.calls)
+    rows = _rows()
+    assert all(r["via"] == "mcp-app" and r["uri"] == _P_URI and r["caller"] == "u@corp.com" for r in rows), rows
+    assert [r["ok"] for r in rows[:2]] == [True, True] and all(r["error"].startswith("panel-denied:") for r in rows[2:])
+    assert {r["error"] for r in rows[2:]} == {"panel-denied:out-of-app", "panel-denied:gateway-tool", "panel-denied:deny-list",
+                                              "panel-denied:unknown-tool"}
+
+
+def test_HA20_패널이_아니면_같은_호출이_통한다_대조군(monkeypatch):
+    sf, arp = _scope_kit(monkeypatch)
+    _set_request(monkeypatch, {gw.VIA_HEADER: "pat"}, "198.51.100.4")
+    assert not asyncio.run(gw._call_tool("arp_list", {})).isError and arp.calls == ["arp_list"], "막은 것은 패널 범위다"
+
+
+def test_HA20_패널의_목록과_리소스는_그_앱만_보이고_다른_앱_주소는_없는_주소와_같다(monkeypatch):
+    sf, arp = _scope_kit(monkeypatch)
+    monkeypatch.setattr(gw, "_local_tools", lambda: [gw.INVOKE_TOOL, gw.SEARCH_TOOLS_TOOL, gw.SAVE_CONV_TOOL])
+    _as_panel(monkeypatch)
+    names = {t.name for t in asyncio.run(gw._list_tools())}
+    assert names == {"open_workflow_panel", "panel_upload_begin", "list_runs"}, names
+    assert sorted(str(r.uri) for r in asyncio.run(gw._list_resources())) == ["ui://simflow/status", _P_URI]
+    assert _read(_P_URI).root.contents[0].text == _PANEL_HTML and _read("ui://simflow/status").root.contents
+    with pytest.raises(gw.McpError) as ei:
+        _read("ui://arp/board")
+    assert ei.value.error.code == -32002 and arp.reads == []
+    assert asyncio.run(gw._list_prompts()) == [], "루틴 프롬프트는 패널에 보이지 않는다"
+
+
+def test_HA20_범위_머리를_못_읽으면_아무것도_열지_않는다(monkeypatch):
+    sf, arp = _scope_kit(monkeypatch)
+    _as_panel(monkeypatch, raw="%7Bbroken")
+    assert gw._request_panel() == {"app": "", "uri": ""}
+    assert asyncio.run(gw._call_tool("open_workflow_panel", {})).isError and sf.calls == [], "일반 요청으로 떨어지면 시야 전부가 열린다"
+    assert {t.name for t in asyncio.run(gw._list_tools())} == set()
+
+
+def _portal_panel_mod():
+    """형제 포털 리포의 패널 PAT 발급기(backend/app/agent/panel_pat.py — 표준 라이브러리만 쓴다). 워크트리에서는 HWAX_PORTAL_REPO 로 가리킨다."""
+    import os as _os
+    from pathlib import Path
+    root = Path(_os.environ.get("HWAX_PORTAL_REPO") or Path(gw.__file__).resolve().parent.parent / "HWAXPortal")
+    p = root / "backend" / "app" / "agent" / "panel_pat.py"
+    if not p.exists():
+        pytest.skip(f"형제 포털 리포에 패널 PAT 발급기가 없다({p}) — 그 리포가 아직 패널을 모르면 패널 PAT 도 없다")
+    spec = importlib.util.spec_from_file_location("portal_panel_pat", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_HA20_두_리포_계약_포털이_찍는_패널_PAT_를_게이트웨이가_같은_범위로_가른다(monkeypatch):
+    """한쪽만 바꾸면 양쪽 시험이 각자 초록인 채 패널이 401 로 죽거나(닫힌 쪽), 판별이 넓어진다. 포털 발급기의 클레임을 진짜 RS256 으로 서명해
+    진짜 검증기 · 진짜 미들웨어에 넣는다."""
+    mod = _portal_panel_mod()
+    assert (mod.PANEL_PURPOSE, mod.PANEL_JTI_PREFIX, mod.PANEL_AUDIENCE) == (gw.PANEL_PURPOSE, gw.PANEL_JTI_PREFIX, gw.PANEL_AUDIENCE)
+    assert 0 < mod.PANEL_TTL_S <= gw.PANEL_MAX_TTL_S
+    claims = mod.panel_claims(iss="https://portal.example", sub="S-1", email="u@corp.com", name="U", groups=["mes-user"],
+                              app=_P_APP, uri=_P_URI, now=int(_ptime.time()))
+    assert gw._panel_scope(claims) == (True, {"app": _P_APP, "uri": _P_URI})
+    v = _verifier(monkeypatch)
+
+    async def none_revoked():
+        return set()
+    monkeypatch.setattr(v, "_revoked_set", none_revoked)
+    tok = _jwt.encode(claims, _rsa()[0], algorithm="RS256", headers={"kid": "k1"})
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["h"] = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+
+    async def fake_access(email, base, **_kw):
+        return {"keys": ["plat:simflow"]}
+    monkeypatch.setattr(gw, "_portal_access", fake_access)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    asyncio.run(gw._bearer_gate(app, v)({"type": "http", "method": "POST", "path": "/mcp", "client": ("198.51.100.4", 0),
+                                          "headers": [(b"authorization", b"Bearer " + tok.encode())]}, None, None))
+    assert seen["h"][gw.VIA_HEADER] == "mcp-app" and _panel_hdr({gw.PANEL_HEADER: [seen["h"][gw.PANEL_HEADER]]}) == [
+        {"app": _P_APP, "uri": _P_URI}]
+    assert claims["jti"] != mod.panel_claims(iss="x", sub="S-1", email="u@corp.com", name="U", groups=[], app=_P_APP, uri=_P_URI,
+                                              now=int(_ptime.time()))["jti"], "jti 는 매번 새것이다(하나씩 폐기할 수 있다)"

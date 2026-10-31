@@ -6901,6 +6901,36 @@ def test_E2_2_설명이_같으면_가족_접기는_지금_코드와_바이트까
     assert seen["same_in"] and seen["role"], f"전제 — 접힌 무리와 역할 칸이 다 지나갔다: {seen}"
 
 
+def test_E2_2_가족_밖_키의_허브_사본이_있어도_정본은_한_번만_서고_형제는_접힌_쪽에_남는다(monkeypatch):
+    """셋째 허브가 가족 밖 키로 붙어(덧씌우기 오타 · 어휘표에 아직 없는 새 설치 — G6) 정본과 같은 설명을 내는데 형제가 판을 올려 설명이 질의에 더
+    맞으면, 형제가 연 가족 무리와 가족 밖 사본의 무리(정본 설명의 열쇠)가 따로 서서 정본이 두 번 오르고 늦게 선 무리가 접힌 표를 덮어 형제가 답에서
+    사라졌다(검토 10-31 — 고치기 전 판은 형제를 제 줄로 냈다). 정본 · 가족 줄과 설명이 같은 가족 밖 줄은 그 이름의 가족 무리로 간다."""
+    hubs = (("rootdesigndatahub", "자주검증 Datahub(rootdesign)"), ("failuretrace", "FailureTrace"), ("cae-group-datahub", "CAE 그룹 Datahub"))
+    base = dict(_CORE_HUB_TOOLS)["objects_list"]
+    newer = "고장모드 목록 — 한 타입의 객체 목록을 준다(새 판 — 고장모드 · 목록)."
+    search = _role_kit(monkeypatch, hubs=hubs, hub_desc=lambda k, lab, d: newer if (k == "failuretrace" and d == base) else d)
+    out = search("고장모드 목록", 20)
+    assert len(out["ranked"]) == len(set(out["ranked"])), out["ranked"]
+    rows = [m for m in out["matches"] if m["tool"].endswith("_objects_list")]
+    assert [m["app"] for m in rows] == ["rootdesigndatahub"], out["ranked"]
+    assert {x["app"]: x.get("differs") for x in rows[0]["same_in"]} == {"failuretrace": True, "cae-group-datahub": None}
+    # 가족 밖 사본이 형제(새 판)와 같은 설명이면 — 가족 무리에 들고 정본과 다르니 differs 다. 안내는 그것을 형제 허브라고만 말하지 않는다
+    search = _role_kit(monkeypatch, hubs=hubs, hub_desc=lambda k, lab, d: newer if (k != "rootdesigndatahub" and d == base) else d)
+    out = search("고장모드 목록", 20)
+    rows = [m for m in out["matches"] if m["tool"].endswith("_objects_list")]
+    assert len(out["ranked"]) == len(set(out["ranked"])) and [m["app"] for m in rows] == ["rootdesigndatahub"], out["ranked"]
+    assert {x["app"]: x.get("differs") for x in rows[0]["same_in"]} == {"failuretrace": True, "cae-group-datahub": True}
+    assert "설명이 다른" in out["note"], out["note"]
+    # 정본이 점수 0 이라 줄에 없어도 같다 — 형제(새 판)가 연 무리와 정본 설명의 가족 밖 사본이 한 무리라 정본은 한 번만 세운다(C-12 의 대표)
+    fresh = "zqx 신형판 — 한 타입의 객체를 준다."                            # 동의어가 없는 낱말 — 정본 줄은 점수 0 이다
+    search = _role_kit(monkeypatch, hubs=hubs, hub_desc=lambda k, lab, d: fresh if (k == "failuretrace" and d == base) else d)
+    out = search("caegroup zqx", 20)
+    assert "rootdesigndatahub_objects_list" in out["ranked"] and len(out["ranked"]) == len(set(out["ranked"])), out["ranked"]
+    rows = [m for m in out["matches"] if m["tool"].endswith("_objects_list")]
+    assert [m["app"] for m in rows] == ["rootdesigndatahub"], out["ranked"]
+    assert {x["app"]: x.get("differs") for x in rows[0]["same_in"]} == {"failuretrace": True, "cae-group-datahub": None}
+
+
 def test_E2_3_허브_가족은_늘_접두를_달고_옛_맨_이름은_알리며_부르면_닿는다(monkeypatch, caplog):
     """허브가 하나뿐인 박스 — 종전 규칙(지금 붙은 백엔드끼리 겹칠 때만)은 허브 도구를 맨 이름으로 냈다. 다른 허브가 붙는 순간 접두 이름으로 바뀌어
     그 이름을 외운 쪽이 unknown tool 이 됐다(G2). 늘 접두를 단다. 가족 밖 앱은 그대로다. 옛 규칙이면 맨 이름이던 것은 /health · 로그로 한 번
@@ -7002,8 +7032,36 @@ def test_E2_4_형제_소개_줄은_칸이_찬_형제에만_붙고_떼면_원문�
     assert gw._core_untagged("failuretrace", desc["failuretrace_object_resolve"]) == base
     assert gw._core_vocab_health()["roles"]["sibling_taglines"] == ["failuretrace"]
     rows = [m for m in search("고장모드 목록")["matches"] if m["tool"].endswith("_objects_list")]
-    assert [m["app"] for m in rows] == ["rootdesigndatahub"] and not any(x.get("differs") for x in rows[0]["same_in"]), \
-        "소개 줄은 떼고 견준다 — 같은 데이터의 사본이 아니라 다른 허브라는 것은 소개 줄이 말한다"
+    assert [m["app"] for m in rows] == ["rootdesigndatahub"], "소개 줄은 떼고 견준다 — 같은 원래 이름이라 한 줄로 접힌다"
+    assert {x["app"]: (x.get("differs"), x.get("tagline")) for x in rows[0]["same_in"]} == {
+        "failuretrace": (True, line), "caegroupdatahub": (None, None)}, "접힌 형제가 제 소개 줄을 싣는다 — 같은 데이터의 사본이 아니다"
+
+
+def test_E2_4_형제_소개_줄은_순위를_바꾸지_않고_접힌_형제가_그_줄을_싣는다(monkeypatch, tmp_path):
+    """S-B 는 '순위는 그대로' 다(설계 1.3 — 형제 순위 신호 S-A 는 미뤘다). 소개 줄의 낱말이 점수에 들면 형제 줄이 오르고 접기가 그 줄을 정본 아래로
+    접어, 그 데이터를 갖지 않은 정본이 덕을 봤다 — '시장 불량 사례 원인 대책' 의 상위 다섯이 정본 허브로 바뀌었고 소개 줄은 답 어디에도 없었다(검토
+    10-31). 점수는 줄을 뗀 설명으로 내고, 접힌 형제의 same_in 이 소개 줄(tagline)과 differs 를 싣는다 — '설명까지 같은 사본' 이 아니다."""
+    line = "FailureTrace — 시장 불량 사례 · 원인 · 대책"
+    queries = ("시장 불량 사례 원인 대책", "고장모드 목록", "FailureTrace 고장모드 목록", "솔더 접합 불량 고장모드 원인 대책",
+               "Which test items detect drop failure modes", "관리 기준 개수", "규격 실패모드")
+    search = _role_kit(monkeypatch)
+    before = {(q, n): search(q, n)["ranked"] for q in queries for n in (3, 8, 20)}
+    _vocab_overlay(monkeypatch, tmp_path, {"apps": {"failuretrace": {"tagline": line}}})
+    search = _role_kit(monkeypatch)
+    assert gw._core_vocab_health()["roles"]["sibling_taglines"] == ["failuretrace"], "전제 — 소개 줄이 붙었다"
+    assert {k: search(*k)["ranked"] for k in before} == before
+    out = search("시장 불량 사례 원인 대책", 20)
+    folded = [x for m in out["matches"] for x in m.get("same_in") or ()]
+    ft = [x for x in folded if x["app"] == "failuretrace"]
+    assert ft and all(x.get("differs") is True and x.get("tagline") == line for x in ft), ft
+    assert not [x for x in folded if x["app"] == "caegroupdatahub" and ("differs" in x or "tagline" in x)], "칸이 빈 형제는 종전대로"
+    assert "형제 허브의 같은 이름 도구" in out["note"] and "tagline" in out["note"]
+    named = search("FailureTrace 고장모드 목록")["matches"][0]
+    assert named["tool"] == "failuretrace_objects_list" and named["description"].startswith(f"[{line}] "), \
+        "형제를 부르면 그 형제가 대표하고 설명 머리에 제 소개 줄이 보인다"
+    tool = {t.name: t for t in gw.exposed_tools}
+    assert line not in gw._tool_doc(tool["failuretrace_objects_list"]), "의미 순위(켜면)의 색인 글도 형제 소개 줄을 뗀다"
+    assert gw._CORE_VOCAB["tag_applied"][1] in gw._tool_doc(tool["rootdesigndatahub_objects_list"]), "정본 소개 줄은 종전대로 든다(R-3)"
 
 
 def test_E2_4_웹_챗_묶음의_failuretrace_넷은_소개_줄_몫만큼만_는다(monkeypatch, tmp_path):

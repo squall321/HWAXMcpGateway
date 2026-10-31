@@ -2731,8 +2731,13 @@ _TOOL_VEC_JOB = {"running": False, "again": False}
 
 
 def _tool_doc(t: types.Tool) -> str:
-    """임베딩할 글 — '앱 라벨 · 이름: 설명'. 설명은 자르지 않는다 — 모델 입력 한도(e5 512 토큰)에서 넘친 수는 색인 줄이 말한다."""
-    return f"{_app_meta(route.get(t.name, ('_gateway',))[0])['label']} · {t.name}: {(t.description or '').strip()}"
+    """임베딩할 글 — '앱 라벨 · 이름: 설명'. 설명은 자르지 않는다 — 모델 입력 한도(e5 512 토큰)에서 넘친 수는 색인 줄이 말한다.
+    형제 소개 줄(E2-4)은 뗀다 — 부분문자열 순위와 같이 의미 순위도 그 줄로 바뀌지 않는다(S-B '순위는 그대로')."""
+    key = route.get(t.name, ("_gateway",))[0]
+    desc = (t.description or "").strip()
+    if key in (_CORE_VOCAB.get("sib_tags_applied") or {}):
+        desc = _core_untagged(key, desc)
+    return f"{_app_meta(key)['label']} · {t.name}: {desc}"
 
 
 def _doc_key(doc: str) -> str:
@@ -3532,12 +3537,15 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     w_name, w_app, cap, w_cov = wt["name"], wt["app"], wt["desc_cap"], wt["coverage"]
     groups = _request_groups() if groups is None else groups
     visible = _visible_tools(groups)
+    # 형제 소개 줄(E2-4 · S-B)은 순위를 바꾸지 않는다 — 점수는 줄을 뗀 설명으로 낸다. 줄의 낱말이 점수에 들면 형제 줄이 오르고, 아래 접기가 그 줄을
+    # 정본 아래로 접어 그 데이터를 갖지 않은 정본이 덕을 봤다(검토 10-31 — 형제 순위 신호는 S-A 로 미뤘다). 정본 소개 줄(R-3)은 종전대로 점수에 든다.
+    sib_lines = _CORE_VOCAB.get("sib_tags_applied") or {}
     rows = []
     named_apps: set[str] = set()          # 질의가 이름을 부른 앱 — 사본 무리에서 그 앱 줄을 올린다
     for t in visible:
         name = t.name.lower()
-        desc = (t.description or "").lower()
         app, original = route.get(t.name, ("_gateway", t.name))[:2]
+        desc = (_core_untagged(app, t.description or "") if app in sib_lines else (t.description or "")).lower()
         meta = _app_meta(app) if app != "_gateway" else {"label": "gateway", "description": ""}
         label = str(meta.get("label") or "")
         hay_app = (label + " " + str(meta.get("description") or "")).lower()
@@ -3600,19 +3608,28 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     # 허브 가족(정본 + 형제)의 줄은 **원래 이름만으로** 한 무리다 — 설명은 보지 않는다(E2-2 · F-A). 설명 글자에 기대면 허브 판이 어긋난 사이의
     # 도구와, 우리가 청한 설치별 소개(Datahub DP-03)가 들어오는 날의 모든 허브 도구가 세 줄로 돌아간다(G1). 그 밖의 앱은 지금 열쇠 그대로다.
     # 무리의 열쇠는 그 이름의 첫 가족 줄이 연 것이라, 설명이 같으면 지금과 글자 하나 다르지 않다. 설명이 다른 사본만 same_in 에 differs 가 붙는다.
-    folded: dict[tuple, list] = {}
+    # 소개 줄이 붙은 형제(E2-4)도 differs 이고 그 줄(tagline)을 싣는다 — 같은 데이터의 사본이 아니라고 운영자가 적은 것이다(검토 10-31).
+    folded: dict[int, list] = {}             # 대표 줄(id) → 접힌 것. 무리마다 따로다 — 원래 이름 · 설명이 같은 대표가 둘이어도 서로 덮지 않는다
     if sw["copy_fold"]:
         family = frozenset((vocab or {}).get("family") or ())
-        copies: dict[tuple, list] = {}
-        fam_slot: dict[str, tuple] = {}          # 원래 이름 → 그 이름의 첫 가족 줄이 연 무리
-        for r in rows:
-            k = (r[6], _core_untagged(r[2], r[3]))
-            if r[2] in family:
-                k = fam_slot.setdefault(r[6], k)
-            copies.setdefault(k, []).append(r)
         canon_tools = {(route[t.name][1], _core_untagged(canon, (t.description or "").strip())): t
                        for t in visible if route.get(t.name, ("",))[0] == canon} if canon else {}
         canon_named = {route[t.name][1]: t for t in visible if route.get(t.name, ("",))[0] == canon} if canon and family else {}
+        # 가족 밖 줄도 소개 줄을 뗀 설명이 그 이름의 가족 줄이나 정본 도구와 같으면 그 이름의 가족 무리로 간다 — 따로 서면 정본이 두 무리를 대표해 두 번
+        # 오르고, 형제는 어느 접힌 표에도 없었다(검토 10-31 — 가족 밖 키로 붙은 허브 사본 + 판을 올린 형제). 그 이름의 가족 줄이 없으면 종전대로다.
+        fam_slot: dict[str, tuple] = {}          # 원래 이름 → 그 이름의 첫 가족 줄이 연 무리(순위 차례로 먼저 한 번 훑는다)
+        fam_keys: set[tuple] = set(canon_tools)  # 가족 줄 · 정본 도구의 (원래 이름, 소개 줄을 뗀 설명)
+        for r in rows:
+            if r[2] in family:
+                k = (r[6], _core_untagged(r[2], r[3]))
+                fam_slot.setdefault(r[6], k)
+                fam_keys.add(k)
+        copies: dict[tuple, list] = {}
+        for r in rows:
+            k = (r[6], _core_untagged(r[2], r[3]))
+            if r[2] in family or k in fam_keys:
+                k = fam_slot.get(r[6], k)
+            copies.setdefault(k, []).append(r)
         kept = []
         for k, g in copies.items():              # 넣은 차례 — 무리의 가장 앞선 줄 순서다
             head = g[0]
@@ -3628,8 +3645,10 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                 head = mine or head
             kept.append(head)
             own = _core_untagged(head[2], head[3])
-            folded[(head[6], head[3])] = [{"tool": r[1], "app": r[2], **({"differs": True} if _core_untagged(r[2], r[3]) != own else {})}
-                                          for r in g if r is not head]
+            folded[id(head)] = [{"tool": r[1], "app": r[2],
+                                 **({"differs": True} if _core_untagged(r[2], r[3]) != own or r[2] in sib_lines else {}),
+                                 **({"tagline": sib_lines[r[2]]} if r[2] in sib_lines else {})}
+                                for r in g if r is not head]
         rows = kept
 
     def _args_summary(t) -> dict:
@@ -3667,7 +3686,8 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
         return out
 
     matches = []
-    for _, n, a, d, t, w, orig, _c, *_attr in rows[:limit]:
+    for r in rows[:limit]:
+        _, n, a, d, t, w, _orig, _c, *_attr = r
         m = {"tool": n, "app": a}
         role = _app_role(a)
         if role and role[0] != "canonical":
@@ -3675,8 +3695,8 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
         m.update(description=d if detail else _brief_desc(d), args=_args_summary(t) if detail else _args_brief(t))
         if w:
             m["write"] = True                    # 쓰기 · 잡 시작 — 사람에게 확인한 뒤 부른다(지침 5)
-        if folded.get((orig, d)):
-            m["same_in"] = folded[(orig, d)]
+        if folded.get(id(r)):
+            m["same_in"] = folded[id(r)]
         matches.append(m)
     # 귀속 — 보정 뺀 점수로 줄을 세워, 보여 준 결과 가운데 보정 덕에만 든 것(boost_only — 보정을 빼면 0점이거나 limit 밖)을 가린다(E-9 ①)
     base_order = {r[1]: i for i, r in enumerate(sorted(rows, key=lambda r: (-r[8], r[7], r[1])), 1)}
@@ -3701,8 +3721,11 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                        + ("" if detail else " 설명은 한 줄 요약이고 args 는 필수 인자만 스키마를 싣는다 — 선택 인자(optional)까지 "
                                             "쓰려면 detail=true 로 다시 찾아라.")
                        + (" same_in 은 설명까지 같은 사본이다 — 위 도구를 먼저 쓴다." if any("same_in" in m for m in matches) else "")
-                       + (" 그 가운데 differs 가 붙은 것은 형제 허브의 같은 이름 도구다 — 담은 데이터가 다르다."
-                          if any(x.get("differs") for m in matches for x in m.get("same_in") or ()) else ""))
+                       + (" 그 가운데 differs 가 붙은 것은 사본이 아니라 이름만 같은 도구다 — 형제 허브의 같은 이름 도구(담은 데이터가 다르다)이거나 "
+                          "설명이 다른 판이다."
+                          if any(x.get("differs") for m in matches for x in m.get("same_in") or ()) else "")
+                       + (" tagline 은 그 형제 허브가 담은 데이터다 — 질문이 그 데이터에 대한 것이면 그 도구를 부른다."
+                          if any("tagline" in x for m in matches for x in m.get("same_in") or ()) else ""))
     payload["matches"] = matches
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]

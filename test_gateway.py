@@ -7214,7 +7214,8 @@ def test_E2_5_검색_평가는_꺼진_손잡이를_하나씩_켠_판도_잰다(m
 
 # ── 개인 Claude 보기(HWAXPortal docs/request-1029 E-4 · design-e2-e4.md 2.4 — 사용자 결정 10-31, 권장안 그대로) ───────────────────────────────
 # 보기 셋(전체 · 묶음 · 가벼운)은 tools/list 에만 건다 — 검색 · 부르기 · 이름 · 권한은 그대로다. 포털 사람 설정(권한 응답 view)으로 고르고 연결 머리
-# X-HWAX-View 가 덮는다(리포 .mcp.json 은 늘 full). 웹 챗 · 절차 · GW_TOKEN 은 늘 전체다.
+# X-HWAX-View 가 덮는다(리포 .mcp.json 은 늘 full). 포털 설정은 머리 portal 로 청한 연결에만 얹는다(포털 등록 배치 · 명령 — 검토 10-31). 머리가 없는
+# 연결 · 웹 챗 · 절차 · GW_TOKEN 은 늘 전체다.
 def _view_kit(monkeypatch, view=None, *, muted="", src=""):
     """보기 머리를 세운 요청 문맥 + 실제 어휘표 + 합성 카탈로그(허브 셋 · 비코어 · 심의 · 낙하). _request_* 는 진짜로 머리를 읽는다."""
     _role_catalog(monkeypatch)
@@ -7313,19 +7314,36 @@ def _view_gate(monkeypatch, portal_view):
     return run
 
 
-def test_E4_보기는_머리가_꼴에_맞으면_그것_아니면_포털_설정이고_챗_절차_서비스는_늘_전체다(monkeypatch):
+def test_E4_보기는_연결이_청할_때만_포털_설정이고_머리가_없으면_전체다_챗_절차_서비스는_늘_전체다(monkeypatch):
+    """포털 사람 설정은 연결 머리 X-HWAX-View: portal 로 청한 연결에만 얹는다(포털 배치 · 등록 명령이 Claude Code · Desktop 에 단다). 종전엔 머리가 없는
+    개인 PAT 전부에 얹어, 사람의 토큰으로 tools/list 를 읽는 서버 앱(리스크 심사 unit_live · MXWP 위키)과 스크립트가 그 사람의 보기로 도구를 잃었다(검토 10-31)."""
     run = _view_gate(monkeypatch, "light")
     me = {"email": "u@x.io", "groups": []}
-    assert run(b"Bearer me", me) == ("light", "portal"), "포털 가벼운 + 머리 없음 → 가벼운"
+    assert run(b"Bearer me", me) == ("full", "default"), "포털 가벼운 + 머리 없음 → 전체(보기를 청하지 않은 연결)"
+    assert run(b"Bearer me", me, "portal") == ("light", "portal"), "머리 portal → 포털 사람 설정"
+    assert run(b"Bearer me", me, " Portal ") == ("light", "portal")
     assert run(b"Bearer me", me, "full") == ("full", "header"), "머리 full 이 사람 설정을 덮는다(리포 .mcp.json)"
     assert run(b"Bearer me", me, "Bundle:cad, mesh") == ("bundle:cad,mesh", "header")
-    assert run(b"Bearer me", me, "everything") == ("light", "portal;bad-header"), "틀린 꼴의 머리 → 포털 값 + 표시(list_tool_apps 의 view.error)"
+    assert run(b"Bearer me", me, "everything") == ("full", "default;bad-header"), "틀린 꼴의 머리 → 전체 + 표시(list_tool_apps 의 view.error)"
     chat = {**me, "pat_name": gw.CHAT_PAT_NAME, "jti": "chat-u-1790000000"}
-    assert run(b"Bearer chat", chat, "light") == ("full", "exempt"), "웹 챗 PAT 는 늘 전체(에이전트 서버가 이름으로 찾아 코드로 부르는 도구가 있다)"
-    assert run(b"Bearer proc", {**me, "purpose": gw.PROCEDURE_PURPOSE}, "light") == ("full", "exempt"), "절차는 tools/list 로 카탈로그를 만든다"
-    assert run(b"Bearer gw-secret", None, "light") == (None, None), "GW_TOKEN(에이전트 서버 · 심의)은 두 머리를 버린다 — 늘 전체"
-    assert _view_gate(monkeypatch, None)(b"Bearer me", me) == ("full", "default"), "포털이 보기를 모르면(옛 포털) 전체"
-    assert _view_gate(monkeypatch, "bundle:")(b"Bearer me", me) == ("full", "default"), "포털 값이 틀린 꼴이면 전체"
+    assert run(b"Bearer chat", chat, "portal") == ("full", "exempt"), "웹 챗 PAT 는 늘 전체(에이전트 서버가 이름으로 찾아 코드로 부르는 도구가 있다)"
+    assert run(b"Bearer proc", {**me, "purpose": gw.PROCEDURE_PURPOSE}, "portal") == ("full", "exempt"), "절차는 tools/list 로 카탈로그를 만든다"
+    assert run(b"Bearer gw-secret", None, "portal") == (None, None), "GW_TOKEN(에이전트 서버 · 심의)은 두 머리를 버린다 — 늘 전체"
+    assert _view_gate(monkeypatch, None)(b"Bearer me", me, "portal") == ("full", "default"), "포털이 보기를 모르면(옛 포털) 전체"
+    assert _view_gate(monkeypatch, "bundle:")(b"Bearer me", me, "portal") == ("full", "default"), "포털 값이 틀린 꼴이면 전체"
+
+
+def test_E4_사람의_토큰으로_도는_서버_앱은_그_사람이_가벼운을_골라도_목록_전체를_받는다(monkeypatch):
+    """리스크 심사 앱(unit_live — tools/list 에 그 도구가 있나로 근거 조회를 판정하고, 없으면 그 단위를 live_denied 로 굳힌다)과 MXWP 위키(tools/list 에
+    있는 허용 도구만 쓴다)는 사람의 PAT(웹 챗 · 절차가 아닌 보통 이름 · 임의 jti · 목적 없음)로 붙고 보기 머리를 싣지 않는다. 그 사람이 가벼운을
+    골라도 목록은 전체다 — 호출만 되고 목록에 없으면 이 앱들은 '없다' 로 읽는다(검토 10-31 실주행: 목록 2개 · 직접 호출은 성공)."""
+    run = _view_gate(monkeypatch, "light")
+    view, src = run(b"Bearer risk", {"email": "u@x.io", "groups": [], "pat_name": "hwax-risk", "jti": "3f9c2a7e5d"})
+    assert (view, src) == ("full", "default")
+    _view_kit(monkeypatch, view, src=src)
+    listed = _listed()
+    _view_kit(monkeypatch, "full")
+    assert listed == _listed() and len(listed) > len(gw._local_tools()), "전체 보기와 같은 목록"
 
 
 def test_E4_list_tool_apps_의_view_는_보기_영역_수_모르는_영역_출처를_말한다(monkeypatch):
@@ -7335,9 +7353,15 @@ def test_E4_list_tool_apps_의_view_는_보기_영역_수_모르는_영역_출�
     assert v["listed"] == len(_listed()) and v["hidden_by_view"] == len(gw._visible_tools([])) - v["listed"] > 0
     area = json.loads(asyncio.run(gw._list_tool_apps({"by": "area"})).content[0].text)
     assert area["view"] == v, "영역 보기도 같은 칸을 싣는다"
-    _view_kit(monkeypatch, "light", src="portal;bad-header")
+    _view_kit(monkeypatch, "full", src="default;bad-header")
     v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
-    assert v["source"] == "portal" and "X-HWAX-View" in v["error"]
+    assert v["source"] == "default" and "X-HWAX-View" in v["error"] and "portal" in v["error"]
+    _view_kit(monkeypatch, "light", src="portal")
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert "/tokens?tab=apps" in v["note"], "포털 설정에서 온 보기는 포털에서 바꾼다"
+    _view_kit(monkeypatch, "light", src="header")
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert "/tokens?tab=apps" not in v["note"] and "X-HWAX-View" in v["note"], "연결 머리가 정한 보기는 클라이언트 설정에서 바꾼다"
     _view_kit(monkeypatch, None)
     v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
     assert v == {"mode": "full", "listed": len(gw._visible_tools([])), "hidden_by_view": 0}, "머리가 없으면(서비스 · 옛 클라이언트) 전체"
@@ -7389,8 +7413,10 @@ def test_E4_포털이_저장하는_보기_글을_게이트웨이가_같은_뜻�
     for mode, areas in (("full", ()), ("light", ()), ("bundle", ("cad",)), ("bundle", ("cad", "mesh", "data"))):
         text = hv.format_view(mode, list(areas))
         assert gw._parse_view(text) == (mode, areas) and hv.parse_view(text) == (mode, list(areas)), text
-    for bad in ("bundle:", "everything", "bundle:CAD!"):
-        assert gw._parse_view(bad) is None and hv.parse_view(bad) is None, bad
+    for bad in ("bundle:", "everything", "bundle:CAD!", gw.VIEW_PORTAL):
+        assert gw._parse_view(bad) is None and hv.parse_view(bad) is None, bad       # portal 은 보기 글이 아니다 — 연결 머리의 표지다
+    if hasattr(hv, "HEADER_PORTAL"):
+        assert (hv.HEADER_NAME.lower(), hv.HEADER_PORTAL) == (gw.VIEW_HEADER, gw.VIEW_PORTAL), "포털 등록 배치가 다는 표지와 같은 값이다"
 
 
 def test_E4_리포_mcp_json_은_보기_머리로_늘_전체를_청한다():

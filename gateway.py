@@ -276,11 +276,14 @@ PURPOSE_HEADER = "x-hwax-purpose"
 # 전달되며 '권한 없음' 과 구분이 안 된다(HWAXPortal docs/mcp-app-toggle D-5·D-6).
 MUTED_HEADER = "x-hwax-muted-apps"
 # 개인 Claude 의 보기(HWAXPortal docs/request-1029 E-4) — full(전체) · bundle:<영역>,…(묶음) · light(가벼운). **tools/list 에만** 건다 —
-# 검색 · 부르기 · 이름 · 권한은 그대로다(보기는 선호다, 권한이 아니다). 게이트웨이가 PAT 분기에서 정해 갈아 끼운다 — 클라이언트 머리(꼴이
-# 맞으면 — 리포 .mcp.json 은 늘 full) > 포털 사람 설정(권한 응답의 view) > 전체. 출처(header · portal · default · exempt, 틀린 머리는
-# ';bad-header')는 둘째 머리에 싣는다. 웹 챗 · 절차 PAT 는 늘 전체이고(끄기 면제와 같은 까닭), GW_TOKEN 분기는 두 머리를 버린다.
+# 검색 · 부르기 · 이름 · 권한은 그대로다(보기는 선호다, 권한이 아니다). 게이트웨이가 PAT 분기에서 정해 갈아 끼운다 — 연결 머리가 보기 글이면
+# 그것(리포 .mcp.json 은 늘 full), 머리가 `portal` 이면 포털 사람 설정(권한 응답의 view — 포털 등록 배치 · 명령이 Claude Code · Desktop 에 단다),
+# 머리가 없으면 전체. 포털 설정은 청한 연결에만 얹는다 — 사람의 PAT 로 tools/list 를 읽는 서버 앱(리스크 심사 · MXWP 위키)과 스크립트가 그 사람의
+# 보기로 도구를 잃지 않게(검토 10-31). 출처(header · portal · default · exempt, 틀린 머리는 ';bad-header')는 둘째 머리에 싣는다. 웹 챗 · 절차
+# PAT 는 늘 전체이고(끄기 면제와 같은 까닭), GW_TOKEN 분기는 두 머리를 버린다.
 VIEW_HEADER = "x-hwax-view"
 VIEW_SRC_HEADER = "x-hwax-view-src"
+VIEW_PORTAL = "portal"                    # 연결 머리의 이 값 — '포털에서 고른 보기를 따른다'(보기 글이 아니다 — 포털은 이 글을 저장하지 않는다)
 # 끄기를 적용하지 않는 PAT — 포털 웹 챗(에이전트서버가 tools/list 에서 이름으로 찾아 코드로 부르는 도구가 있다)
 CHAT_PAT_NAME = "chat-session"
 PROCEDURE_PURPOSE = "procedure"
@@ -5469,10 +5472,14 @@ def _view_info(groups: list[str]) -> dict:
     if src:
         out["source"] = src.split(";", 1)[0]
     if "bad-header" in src:
-        out["error"] = "연결 머리 X-HWAX-View 의 꼴이 틀려 포털 설정을 썼다 — full · light · bundle:<영역>,<영역> 가운데 하나다"
+        out["error"] = ("연결 머리 X-HWAX-View 의 꼴이 틀려 전체 목록을 냈다 — full · light · bundle:<영역>,<영역> · portal(포털에서 고른 보기를 따른다) "
+                        "가운데 하나다")
     if mode != "full":
+        # 바꾸는 자리는 출처를 따른다 — 포털 설정에서 온 보기는 포털에서, 연결 머리가 정한 보기는 그 클라이언트 설정에서(머리가 포털 설정을 덮는다)
+        where = ("포털 '개인 토큰 › 허브에 보일 앱'(/tokens?tab=apps)에서 바꾸고" if out.get("source") == "portal" else
+                 "이 연결의 머리 X-HWAX-View 가 정했다 — 클라이언트 설정에서 바꾸고")
         out["note"] = ("보기는 tools/list 만 줄인다 — 목록 밖 도구도 search_tools 로 찾아 invoke_tool 로 부른다(권한 · 이름은 그대로). "
-                       "보기는 포털 '개인 토큰 › 허브에 보일 앱'(/tokens?tab=apps)에서 바꾸고, 열린 세션은 재연결해야 목록이 바뀐다.")
+                       f"보기는 {where}, 열린 세션은 재연결해야 목록이 바뀐다.")
     return out
 
 
@@ -7131,18 +7138,20 @@ def _bearer_gate(app, pat_verifier=None):
                         and str(claims.get("jti") or "").startswith("chat-"))
             if _muted and not _is_chat and str(claims.get("purpose") or "") != PROCEDURE_PURPOSE:
                 fresh.append((MUTED_HEADER.encode(), quote(",".join(_muted), safe=",").encode("latin-1")))
-            # 개인 보기(E-4 E4-2) — 클라이언트 머리가 꼴에 맞으면 그것(연결마다 덮는다 — 리포 .mcp.json 은 늘 full), 아니면 포털 사람 설정(권한 응답의
-            # view), 없으면 전체. 정한 값으로 갈아 끼운다. 웹 챗 · 절차 PAT 는 늘 전체다(끄기 면제와 같은 까닭). 틀린 꼴의 머리는 포털 값으로 가고
+            # 개인 보기(E-4 E4-2) — 연결이 청한 것만 얹는다. 머리가 보기 글이면 그것(연결마다 덮는다 — 리포 .mcp.json 은 늘 full), 머리가 `portal` 이면
+            # 포털 사람 설정(권한 응답의 view — 포털 등록 배치 · 명령이 단다), 머리가 없으면 전체. 정한 값으로 갈아 끼운다. 포털 설정을 머리 없는 개인 PAT
+            # 에도 얹던 때는 사람의 토큰으로 tools/list 를 읽는 서버 앱이 그 사람의 보기로 도구를 잃었다 — 리스크 심사 unit_live 가 live_denied 를 영구히
+            # 적고 MXWP 위키의 도구 걸음이 조용히 비었다(검토 10-31). 웹 챗 · 절차 PAT 는 늘 전체다(끄기 면제와 같은 까닭). 틀린 꼴의 머리는 전체로 가고
             # 출처에 표시를 남긴다(list_tool_apps 의 view.error). 넓어지는 것은 그 사람이 이미 쓸 수 있는 목록뿐이다(보기는 권한이 아니다).
             _cv = headers.get(VIEW_HEADER.encode(), b"").decode("latin-1").strip()
             if _is_chat or str(claims.get("purpose") or "") == PROCEDURE_PURPOSE:
                 _view, _vsrc = ("full", ()), "exempt"
+            elif _cv.lower() == VIEW_PORTAL:
+                _pv = _parse_view((_ent or {}).get("view"))
+                _view, _vsrc = (_pv, "portal") if _pv else (("full", ()), "default")
             else:
                 _hv = _parse_view(_cv) if _cv else None
-                _pv = _parse_view((_ent or {}).get("view"))
-                _view, _vsrc = (_hv, "header") if _hv else (_pv, "portal") if _pv else (("full", ()), "default")
-                if _cv and not _hv:
-                    _vsrc += ";bad-header"
+                _view, _vsrc = (_hv, "header") if _hv else (("full", ()), "default;bad-header" if _cv else "default")
             fresh.append((VIEW_HEADER.encode(), _view_text(*_view).encode("latin-1")))
             fresh.append((VIEW_SRC_HEADER.encode(), _vsrc.encode()))
             fresh.append((VIA_HEADER.encode(), b"chat" if _is_chat else

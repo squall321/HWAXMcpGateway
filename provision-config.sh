@@ -41,7 +41,8 @@
 #      heax-hub 밖에서 도는 앱(MatNexus 처럼 다른 조직 서버)은 <접두>_MCP_URL 을 더 적으면 MCP 백엔드도 같은 키로 붙는다
 #      (서비스 토큰 없음 — 사람별 호출은 그 위임으로. 주소가 없는 실행은 직전 config 의 백엔드를 그대로 둔다).
 #      DynaForge(kooremapper_mcp) 위임은 env 가 아니라 KooRemapper .env 의 게이트웨이 비밀로 생긴다 — KOORM_SEND_PLAT=1 이면 그 위임 호출에
-#      호출자의 plat: 권한을 서명과 함께 싣는다(0 이면 끔, 안 적으면 직전 config — 일반 앱의 <접두>_SEND_PLAT 과 같은 규칙).
+#      호출자의 plat: 권한을 서명과 함께 싣는다(0 이면 끔, 안 적으면 직전 config). 일반 앱의 <접두>_SEND_PLAT 과 한 곳이 다르다 — 그것은
+#      그 앱의 비밀이 있는 실행에서만 읽히고, 이것은 비밀 없이 항목째 이어받은 실행에도 먹는다.
 #   9) TestScope: TESTSCOPE_MCP_URL(> 직전 config 주소)이 있으면 testscope 백엔드(서비스 토큰 없음).
 #      사람별 호출은 RA 처럼 두 방식 중 하나다 — 기본은 사람이 포털 '개인 토큰 › 외부 연결' 에 등록한
 #      TestScope 토큰(게이트웨이 PORTAL_CONN_BACKENDS), TESTSCOPE_SSO_SECRET 이 있으면 8)의 위임(게이트웨이에서 먼저 탄다).
@@ -706,9 +707,12 @@ if e.get("KOORM_SSO_SECRET"):
         **({"send_plat": _krm_prev["send_plat"]} if "send_plat" in _krm_prev else {})}
 # KOORM_SEND_PLAT — DynaForge 위임 호출에도 호출자의 plat: 권한을 서명과 함께 싣는다(gateway PLAT_HEADER — DynaForge 가 해석 잡을 내기 전에
 # 그 사람의 권한을 본다, HWAXPortal docs/followups-1017/requests §2 · 사용자 결정 8). 이 위임은 아래 일반 순회가 덮지 않아 <접두>_SEND_PLAT 이
-# 닿지 않는다. 규칙은 그것과 같다 — 적혀 있을 때만 이 값이 정하고(1 · true · yes · on 이면 켬, 그 밖의 값이면 끔), 안 적었으면 직전 config 를
-# 잇는다. 비밀을 못 읽어 항목째 이어받은 실행에도 적은 값이 정한다. 값은 환경에서 그대로 물려받는다 — 위 ▶ 4) 의 대입어 사슬에 `${…:-}` 로
-# 넣으면 안 적은 실행이 빈 값으로 넘어와 '적었다 → 끔' 이 된다(일반 앱의 <접두>_SEND_PLAT 과 같은 길).
+# 닿지 않는다. 적혀 있을 때만 이 값이 정하고(1 · true · yes · on 이면 켬, 그 밖의 값이면 — 빈 값도 — 끔), 안 적었으면 직전 config 를 잇는다.
+# <접두>_SEND_PLAT 과 다른 곳이 하나다 — 그것은 그 앱의 비밀이 있는 실행에서만 읽혀 비밀 없는 실행에서는 0 도 끄지 못하고, 이것은 비밀을
+# 못 읽어 항목째 이어받은 실행에도 먹는다. 이 비밀은 provision.env 가 아니라 KooRemapper .env 에 있어 손잡이를 적은 실행이 비밀을 읽는다는
+# 보장이 없다(heax 토큰이 없거나 그 리포가 없는 박스). 이것을 본떠 판정하는 쪽(포털 update-all 의 드리프트 판정 등)은 비밀이 아니라 항목이
+# 있는지로 가른다. 값은 환경에서 그대로 물려받는다 — 위 ▶ 4) 의 대입어 사슬에 `${…:-}` 로 넣으면 안 적은 실행이 빈 값으로 넘어와
+# '적었다 → 끔' 이 된다(일반 앱의 <접두>_SEND_PLAT 과 같은 길).
 _krm_sp = e.get("KOORM_SEND_PLAT")
 _krm = per_user.get("kooremapper_mcp")
 if _krm_sp is not None:

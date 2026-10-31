@@ -686,8 +686,9 @@ def test_일반_앱의_SEND_PLAT_은_적혀_있을_때만_plat_전달을_정한�
 def test_DynaForge_위임의_KOORM_SEND_PLAT_은_적혀_있을_때만_plat_전달을_정한다(tmp_path):
     """DynaForge 가 해석 잡을 내기 전에 그 사람의 plat: 권한을 보려면 위임 호출에 권한 목록이 서명과 함께 실려야 한다(HWAXPortal
     docs/followups-1017/requests §2 · 사용자 결정 8). 이 위임은 일반 순회가 아니라 이 파일이 직접 만들어 <접두>_SEND_PLAT 이 닿지 않는다 —
-    KOORM_SEND_PLAT 이 같은 규칙으로 정한다(적었으면 그 값, 안 적었으면 직전 config). 전에는 비밀을 다시 읽은 실행이 항목을 새로 쓰며
-    send_plat 을 떨궜다. 게이트웨이는 `send_plat is True` 만 읽는다(gateway.py `_call_tool` · `_proof_headers`)."""
+    KOORM_SEND_PLAT 이 정한다(적었으면 그 값, 안 적었으면 직전 config). 전에는 비밀을 다시 읽은 실행이 항목을 새로 쓰며
+    send_plat 을 떨궜다. <접두>_SEND_PLAT 과 달리 비밀 없이 항목째 이어받은 실행에도 먹는다(켬 · 끔 둘 다) — 이 비밀은 provision.env 가
+    아니라 KooRemapper .env 에 있다. 게이트웨이는 `send_plat is True` 만 읽는다(gateway.py `_call_tool` · `_proof_headers`)."""
     env = {"HEAX_MCP_TOKEN": "heax-svc", "KOORM_SSO_SECRET": "koorm-secret-xyz",
            "KOORM_SSO_URL": "http://127.0.0.1:8700/api/v1/auth/sso"}
 

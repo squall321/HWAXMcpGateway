@@ -711,13 +711,17 @@ def test_DynaForge_위임의_KOORM_SEND_PLAT_은_적혀_있을_때만_plat_전�
     _force_backup(tmp_path)
     carried = krm({"HEAX_MCP_TOKEN": "heax-svc", "KOORM_SEND_PLAT": "0"})
     assert carried["secret"] == "koorm-secret-xyz" and "send_plat" not in carried
-    # 위임이 없으면 칸만 만들지 않는다 — 켜려 한 것이 안 된 까닭을 말한다
+    # 위임이 없으면 칸만 만들지 않는다 — 켜려 한 것이 안 된 까닭을 말하되, 이 블록이 모르는 까닭을 단정하지 않는다. 셸은 heax 토큰이
+    # 없거나 KooRemapper 리포가 없으면 .env 를 읽지도 않는다 — 그때 '.env 에 비밀이 없다' 고 하면 비밀이 든 .env 를 연 사람이 길을 잃는다
     (tmp_path / "gateway_config.json").unlink()
     (tmp_path / "gateway_config.json.bak").unlink()
     log = []
-    out = _run_provision(tmp_path, {"HEAX_MCP_TOKEN": "heax-svc", "KOORM_SEND_PLAT": "1"}, log)
+    out = _run_provision(tmp_path, {"KOORM_SEND_PLAT": "1"}, log)      # heax 토큰 없음 — 셸이 KooRemapper .env 를 읽지 않은 실행
     assert "kooremapper_mcp" not in ((out.get("heax_registry") or {}).get("per_user_sso") or {})
-    assert "KOORM_SEND_PLAT" in log[0] and "DynaForge 사람별 위임이 없다" in log[0]
+    warn = [ln for ln in log[0].splitlines() if "KOORM_SEND_PLAT" in ln]
+    assert len(warn) == 1 and "DynaForge 사람별 위임이 없다" in warn[0], log[0]
+    assert "heax 토큰이 없어 읽지 않았다" in warn[0] and "직전 config 에도 항목이 없다" in warn[0], warn[0]
+    assert ".env 의 KOORM_HEAX_GATEWAY_SECRET 도" not in warn[0], "읽지 않은 .env 에 비밀이 없다고 단정한다"
     (tmp_path / "gateway_config.json").unlink()
     assert "send_plat" not in krm(env), "기본은 끔 — 쓰지 않는 앱에 권한 목록을 보내지 않는다"
 

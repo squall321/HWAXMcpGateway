@@ -719,8 +719,10 @@ if _krm_sp is not None:
         else:
             _krm.pop("send_plat", None)
     elif _krm_on:
-        print("  ⚠ KOORM_SEND_PLAT 을 켰는데 DynaForge 사람별 위임이 없다(KooRemapper .env 의 KOORM_HEAX_GATEWAY_SECRET 도, 직전 config 의 "
-              "항목도 없다) — plat 권한 전달 생략")
+        # 까닭을 하나로 단정하지 않는다 — 이 블록은 비밀이 비었다는 것만 안다. 셸은 heax 토큰이 없거나 KooRemapper 리포가 없으면 .env 를
+        # 읽지도 않는다(그 .env 에는 비밀이 있을 수 있다 — '.env 에 없다' 를 믿고 열어 본 사람은 비밀을 보고 길을 잃는다). 까닭은 위 셸 줄이 말한다.
+        print("  ⚠ KOORM_SEND_PLAT 을 켰는데 DynaForge 사람별 위임이 없다 — 이번 실행이 위임을 만들지 못했고(KooRemapper 비밀을 읽지 "
+              "못했거나 heax 토큰이 없어 읽지 않았다 — 까닭은 위 heax 토큰 · KooRemapper 줄) 직전 config 에도 항목이 없다 — plat 권한 전달 생략")
 if isinstance(_krm, dict) and _krm.get("send_plat") is True:
     # ✓ 가 아니다 — 설정에 적었다는 뜻일 뿐, 앱이 응답했는지는 위 셸 줄이 말한다(앱이 죽은 실행의 ⚠ 바로 밑에 초록을 찍지 않는다).
     print("  · DynaForge 사람별 위임 — plat 권한 전달 켬(send_plat)")

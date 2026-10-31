@@ -6956,9 +6956,68 @@ def test_E2_3_허브_가족은_늘_접두를_달고_옛_맨_이름은_알리며_
     assert asyncio.run(gw._call_tool("object_resolve", {})).content[0].text == "ok"
     assert asyncio.run(gw._call_tool("invoke_tool", {"name": "objects_list", "arguments": {}})).content[0].text == "ok"
     assert hub.session.calls == ["object_resolve", "objects_list"] and sf.session.calls == []
+    # 어휘표를 한 번도 읽지 못한 박스(새로 뜬 프로세스)는 지금 규칙이다 — 읽던 표가 사라진 때는 아래 시험(마지막 가족을 쥔다)
+    monkeypatch.setattr(gw, "_CORE_VOCAB", {"mtime": None, "data": None, "error": "없음", "tag_applied": None, "overlay": None})
     monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB.with_name("__none__.json"))
     asyncio.run(gw._aggregate())
     assert {t.name for t in gw.exposed_tools} == {"object_resolve", "objects_list", "search_voc"}, "어휘표가 없으면 지금 규칙이다"
+
+
+def test_E2_3_어휘표를_잠깐_못_읽어도_노출_이름은_그대로고_소개_줄만_빠진다(monkeypatch, tmp_path):
+    """늘 접두는 이름이 남의 사정으로 뒤집히지 않게 하려는 것이다(G2). 어휘표를 못 읽는 사이(update-all 의 checkout · stash 와 재활 회차가 겹침 · 기본
+    표를 깨게 고침 · 포털 리포를 옮김) 가족을 잊으면 허브 하나에만 있는 도구가 맨 이름으로 뒤집혔다가 표가 돌아오면 다시 접두로 바뀌었다(검토 10-31).
+    노출 이름은 마지막으로 온전히 읽은 표(덧씌우기 포함)의 가족대로 두고, 바뀌는 것은 소개 줄뿐이다."""
+    p, away = tmp_path / "core_vocab.json", tmp_path / "away.json"
+    p.write_text(_REAL_CORE_VOCAB.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", p)
+    monkeypatch.setattr(gw, "CORE_VOCAB_LOCAL_PATH", tmp_path / "core_vocab.local.json")
+
+    def bump(f, s):
+        st = f.stat()
+        gw.os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + s * 1_000_000_000))
+
+    def again():
+        gw._core_vocab()
+        asyncio.run(gw._aggregate())
+        return sorted(t.name for t in gw.exposed_tools), {t.name for t in gw.exposed_tools if (t.description or "").startswith("[")}
+    spec = {"rootdesigndatahub": [_tool("object_resolve"), _tool("objects_list")], "newhub": [_tool("hub_extra")],
+            "smart-twin-mcp": [_tool("single_drop_simulation")]}
+    _vocab_overlay(monkeypatch, tmp_path, {"apps": {"newhub": {"role": "sibling", "label": "새 허브"}}})
+    _aggregate_tools(monkeypatch, spec)
+    names = sorted(t.name for t in gw.exposed_tools)
+    assert names == ["newhub_hub_extra", "rootdesigndatahub_object_resolve", "rootdesigndatahub_objects_list", "single_drop_simulation"]
+    canon = {"rootdesigndatahub_object_resolve", "rootdesigndatahub_objects_list"}
+    monkeypatch.setattr(gw, "_REAGG", {})
+    p.rename(away)                                                        # 기본 표가 없어졌다
+    gw._core_vocab()
+    assert gw._REAGG.get("pending") is True, "정본 소개 줄은 빠져야 한다 — 다시 집계한다"
+    assert again() == (names, set()), "이름은 그대로 · 소개 줄만 빠진다"
+    assert gw.alias_route.get("object_resolve") == ("rootdesigndatahub", "object_resolve"), "옛 맨 이름의 별칭도 그대로다"
+    gw._REAGG.clear()
+    gw._core_vocab()
+    assert not gw._REAGG, "다시 집계한 뒤에는 또 예약하지 않는다 — 쥔 가족과 집계가 쓴 가족이 같다(재활 회차마다 다시 집계하지 않게)"
+    p.write_text("{깨진", encoding="utf-8")                                # 깨진 채 돌아왔다
+    bump(p, 5)
+    assert again() == (names, set())
+    away.replace(p)                                                       # 온전히 돌아왔다
+    bump(p, 10)
+    assert again() == (names, canon)
+    lp = tmp_path / "core_vocab.local.json"                               # 덧씌우기를 버린 사이 — 덧씌우기가 더한 형제도 이름이 그대로다
+    lp.write_text("{깨진", encoding="utf-8")
+    bump(lp, 20)
+    assert again() == (names, canon) and gw._core_vocab_health()["overlay"]["error"]
+    _vocab_overlay(monkeypatch, tmp_path, {})                              # 덧씌우기에서 형제를 일부러 뺐다 — 온전히 읽은 표라 이름이 따른다
+    assert again()[0] == ["hub_extra", "rootdesigndatahub_object_resolve", "rootdesigndatahub_objects_list", "single_drop_simulation"]
+    # 소개 줄이 없는 표가 사라지면 바뀔 것이 없다 — 빠진 표를 가족이 바뀐 것으로 보고 다시 집계를 예약하지 않는다(바뀌는 것은 소개 줄뿐이다)
+    d = json.loads(_REAL_CORE_VOCAB.read_text(encoding="utf-8"))
+    d["canonical"].pop("tagline", None)
+    p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    bump(p, 30)
+    assert again()[1] == set()
+    gw._REAGG.clear()
+    p.unlink()
+    gw._core_vocab()
+    assert not gw._REAGG
 
 
 def test_E2_3_판이_어긋난_도구만_접두로_바뀌고_허브_셋_카탈로그의_이름은_지금_규칙과_같다(monkeypatch):

@@ -1332,9 +1332,12 @@ async def _aggregate():
     tags = {**({core_tag[0]: core_tag[1]} if core_tag else {}), **sib_tags}
     # 허브 가족(정본 + 형제)은 겹침과 상관없이 늘 접두를 단다(E2-3 · N-A, 결정 Q-2). '지금 붙은 백엔드끼리 겹치나' 로만 정하면 판이 어긋난
     # 사이 한 허브에만 있는 도구가 맨 이름으로 나왔다가 나머지가 올라오면 접두 이름으로 바뀐다 — 그 이름을 외운 클라이언트 · 허용 규칙 ·
-    # 운영자 정의가 unknown tool 이 된다(G2). 옛 규칙이면 맨 이름이던 가족 도구는 그 맨 이름도 호출 별칭으로 남겨(목록에는 안 올린다 — 아래)
-    # 오늘의 이름을 부르던 쪽이 깨지지 않게 하고, 그 이름들을 /health · 로그로 알린다.
-    family = frozenset(cv.get("family") or ())
+    # 운영자 정의가 unknown tool 이 된다(G2). 옛 규칙이면 맨 이름이던 가족 도구는 그 맨 이름도 호출 별칭으로 남기고(목록에는 안 올린다 — 아래)
+    # 그 이름들을 /health · 로그로 알린다. ⚠ 별칭이 지키는 것은 게이트웨이를 거쳐 그 이름으로 **부르는** 쪽뿐이다(직접 호출 · invoke_tool). 목록에
+    # 실린 이름에 묶는 쪽 — Claude Code · Desktop 의 도구 이름(mcp__hwax__<이름>)과 허용 규칙, 운영자 정의 동기화(/tools-map 대조 — 접두 도구의
+    # 맨 이름은 '이 앱에 없는 도구' 다), 에이전트 서버의 목록 이름 묶음 — 은 접두 이름으로 고쳐야 한다(검토 10-31, C-33).
+    # 가족은 마지막으로 온전히 읽은 표의 것이다(_core_family) — 표를 잠깐 못 읽는 사이에 이름이 맨 이름으로 뒤집히지 않게(그동안 빠지는 것은 소개 줄뿐이다).
+    family = frozenset(_core_family())
     fam_renamed: dict[str, tuple[str, str]] = {}          # 옛 맨 이름 → (백엔드, 원래 이름)
     for key, t in collected:
         # 충돌 여부와 **무관하게** 별칭을 등록한다(호출 전용).
@@ -3326,10 +3329,19 @@ def _core_vocab_parse(d: dict) -> dict:
             "core_reads": frozenset(t for _f, _p, tools in syn for t in tools)}
 
 
+def _core_family() -> tuple:
+    """늘 접두(노출 이름)에 쓰는 허브 가족 — 마지막으로 온전히 읽은 표(덧씌우기 포함)의 것이다. 표가 없거나 깨졌거나 덧씌우기를 버린 사이에는 그 앞의
+    가족을 쥔다(E2-3 · G2 — 읽기 실패가 이름을 뒤집지 않게, 그동안 빠지는 것은 소개 줄뿐이다. 검토 10-31). 한 번도 온전히 읽지 못했으면 지금 읽힌 표의
+    것(없으면 빈 가족 — 지금 규칙)이다. 새로 뜬 프로세스는 쥔 것이 없다 — 표 없이 뜨면 지금 규칙으로 돈다."""
+    held = _CORE_VOCAB.get("family_ok")
+    if held is not None:
+        return held
+    return tuple((_CORE_VOCAB["data"] or {}).get("family") or ())
+
+
 def _core_agg_sig(d: dict | None) -> tuple:
-    """집계가 쓰는 역할 몫 — 가족(늘 접두)과 형제 소개 줄. 정본 소개 줄은 따로 견준다(tag_applied)."""
-    d = d or {}
-    return tuple(d.get("family") or ()), tuple(sorted((d.get("sib_tags") or {}).items()))
+    """집계가 쓰는 역할 몫 — 가족(늘 접두 — _core_family, 표를 못 읽는 사이에도 쥔 것)과 형제 소개 줄. 정본 소개 줄은 따로 견준다(tag_applied)."""
+    return tuple(_core_family()), tuple(sorted(((d or {}).get("sib_tags") or {}).items()))
 
 
 def _app_role(key: str) -> tuple[str, str] | None:
@@ -3348,12 +3360,14 @@ def _app_role(key: str) -> tuple[str, str] | None:
 
 def _core_vocab() -> dict | None:
     """코어 어휘표 — 바뀐 시각이 다르면 다시 읽는다. 없거나 못 읽으면 None 이고 까닭은 _CORE_VOCAB['error'] 다.
-    정본 소개 줄은 집계(_aggregate) 때 도구 설명에 붙으므로, 붙어 있는 것과 달라지면 다음 재활 회차에 다시 집계하게 예약한다."""
+    정본 소개 줄은 집계(_aggregate) 때 도구 설명에 붙으므로, 붙어 있는 것과 달라지면 다음 재활 회차에 다시 집계하게 예약한다.
+    늘 접두의 가족은 온전히 읽은 표에서만 바꾼다(_CORE_VOCAB['family_ok'] — _core_family). 못 읽은 사이에 바뀌는 것은 소개 줄뿐이다."""
     try:
         mt = CORE_VOCAB_PATH.stat().st_mtime_ns
     except OSError:
         if _CORE_VOCAB["error"] != "없음":
-            log.warning("코어 어휘표가 없다(%s) — search_tools 손 낱말 · 소개 줄 없이 돈다", CORE_VOCAB_PATH)
+            log.warning("코어 어휘표가 없다(%s) — search_tools 손 낱말 · 소개 줄 없이 돈다%s", CORE_VOCAB_PATH,
+                        " · 허브 가족 접두(노출 이름)는 마지막으로 온전히 읽은 표대로 둔다" if _CORE_VOCAB.get("family_ok") else "")
         _CORE_VOCAB.update(mtime=None, data=None, error="없음")
     else:
         try:
@@ -3365,7 +3379,8 @@ def _core_vocab() -> dict | None:
                 raw = json.loads(CORE_VOCAB_PATH.read_text(encoding="utf-8"))
                 data = _core_vocab_parse(raw)
             except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
-                log.warning("코어 어휘표를 못 읽었다(%s) — 손 낱말로 돈다: %r", CORE_VOCAB_PATH, exc)
+                log.warning("코어 어휘표를 못 읽었다(%s) — 손 낱말로 돈다%s: %r", CORE_VOCAB_PATH,
+                            " · 허브 가족 접두(노출 이름)는 마지막으로 온전히 읽은 표대로 둔다" if _CORE_VOCAB.get("family_ok") else "", exc)
                 _CORE_VOCAB.update(mtime=(mt, lmt), data=None, error=f"못 읽음({type(exc).__name__})", overlay=None)
             else:
                 eff, overlay = raw, {"present": lmt is not None}
@@ -3379,9 +3394,13 @@ def _core_vocab() -> dict | None:
                         overlay.update(fingerprint=_json_fp(patch), changed=_patch_paths(patch)[:40])
                     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
                         overlay["error"] = f"덧씌우기를 버렸다({type(exc).__name__}: {str(exc)[:120]})"
-                        log.warning("코어 어휘표 덧씌우기(%s)를 버리고 기본 표로 돈다: %r", CORE_VOCAB_LOCAL_PATH, exc)
+                        log.warning("코어 어휘표 덧씌우기(%s)를 버리고 기본 표로 돈다%s: %r", CORE_VOCAB_LOCAL_PATH,
+                                    " · 허브 가족 접두(노출 이름)는 마지막으로 온전히 읽은 표대로 둔다"
+                                    if _CORE_VOCAB.get("family_ok") else "", exc)
                 data = {**data, "fingerprint": _json_fp(eff), "base_fingerprint": _json_fp(raw)}
                 _CORE_VOCAB.update(mtime=(mt, lmt), data=data, error=None, overlay=overlay)
+                if "error" not in overlay:
+                    _CORE_VOCAB["family_ok"] = data["family"]   # 온전히 읽은 표 — 늘 접두의 가족을 이것으로 바꾼다(_core_family)
     tag = (_CORE_VOCAB["data"] or {}).get("tag")
     # 가족 · 형제 소개 줄도 집계가 노출 이름 · 설명에 굽는다(E2-3 · E2-4) — 덧씌우기로 바뀌면 정본 소개 줄처럼 다시 집계한다. 집계가 아직 적어 두지
     # 않았으면(agg_applied 없음) 정본 소개 줄만 본다.

@@ -191,11 +191,11 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 
 - `search_tools` — 코어 낱말(`search.words`)이 든 질의는 허브 읽기 도구 이름(`search.tools`)에 이름 적중을 준다(R-4). 띄어 쓴 꼴('관리 기준')은 붙여 쓴 꼴이 질의에 있으면 그 조각을 담은 낱말마다 잇는다.
 - 정본 소개 줄 — 정본 앱(`canonical.app`)의 도구 설명 앞에 `[canonical.tagline]` 을 집계 때 붙인다(R-3). 줄이 바뀌면 다음 재활 회차(60초)에 다시 집계한다.
-- 사본 접기 — 원래 이름과 설명(소개 줄은 떼고 본다)이 같은 사본은 정본 한 줄로 접고 나머지는 `same_in` 이다. 질의가 사본의 앱 이름을 부르면 그 사본이 무리를 대표한다(허브 건너기). 허브 가족(정본 + 역할 `sibling` 인 형제)의 줄은 설명이 달라도 **원래 이름만으로** 접는다(E-2 E2-2 — 허브 판이 어긋나거나 설치별 소개가 설명에 들어와도 한 줄). 무리는 그 이름의 첫 가족 줄이 연 것이라 설명이 같으면 종전과 바이트까지 같고, 설명이 다른 사본만 `same_in` 에 `differs: true` 가 붙는다.
+- 사본 접기 — 원래 이름과 설명(소개 줄은 떼고 본다)이 같은 사본은 정본 한 줄로 접고 나머지는 `same_in` 이다. 질의가 사본의 앱 이름을 부르면 그 사본이 무리를 대표한다(허브 건너기). 허브 가족(정본 + 역할 `sibling` 인 형제)의 줄은 설명이 달라도 **원래 이름만으로** 접는다(E-2 E2-2 — 허브 판이 어긋나거나 설치별 소개가 설명에 들어와도 한 줄). 무리는 그 이름의 첫 가족 줄이 연 것이라 설명이 같으면 종전과 바이트까지 같고, 설명이 다른 사본만 `same_in` 에 `differs: true` 가 붙는다. 가족 밖 줄(가족 밖 키로 붙은 허브 사본 등)도 소개 줄을 뗀 설명이 그 이름의 가족 줄이나 정본 도구와 같으면 그 가족 무리로 간다 — 정본은 이름마다 한 번만 선다(검토 10-31). 접힌 표는 무리마다 따로다.
 - 심의 가중 — 코어 질문(코어 낱말이 든 질의)에 '심의 · 토의 · 회의' 가 없으면 일반 업무 낱말(원인 · 판정 · 설계 …)을 `deliberate_start` 에 잇지 않는다(R-5). 코어 낱말이 없는 질의는 종전대로다.
 - 앱 역할(E-2 E2-1) — 가족(정본 + 형제, 어휘표 차례) · 비코어(`noncore` — `note` 는 그 앱이 갖는 것) · 시험(`staging`)을 다 읽는다. `list_tool_apps` · `/tools-map` 의 앱 줄에 `role`(canonical · sibling · noncore)과 비코어의 `role_note`, `search_tools` 결과 줄에는 형제 · 비코어에만 `role` 이 실린다(정본은 설명 앞 소개 줄이 말한다).
-- 가족은 늘 접두(E2-3) — 가족 도구는 겹침과 상관없이 `<키>_<이름>` 으로 낸다(허브 하나 박스 · 한 허브에만 있는 도구도 — 나머지 허브가 올라와도 이름이 뒤집히지 않는다). 옛 규칙(겹칠 때만)이면 맨 이름이던 가족 도구는 그 맨 이름을 **호출 별칭**으로 남기고(목록에는 안 올린다) 이름들을 `/health core_vocab.roles.family_prefixed` · 로그 한 줄로 알린다.
-- 형제 소개 줄(E2-4) — 형제의 `apps.<키>.tagline` 이 차면 정본과 같은 길로 그 형제 도구 설명 앞에 붙는다(비코어 · 시험 앱의 칸은 쓰지 않는다). 문안은 운영자가 박스 덧씌우기에 쓴다. 가족 · 형제 소개 줄이 바뀌면 다음 재활 회차에 다시 집계한다.
+- 가족은 늘 접두(E2-3) — 가족 도구는 겹침과 상관없이 `<키>_<이름>` 으로 낸다(허브 하나 박스 · 한 허브에만 있는 도구도 — 나머지 허브가 올라와도 이름이 뒤집히지 않는다). 옛 규칙(겹칠 때만)이면 맨 이름이던 가족 도구는 그 맨 이름을 **호출 별칭**으로 남기고(목록에는 안 올린다) 이름들을 `/health core_vocab.roles.family_prefixed` · 로그 한 줄로 알린다. 별칭이 지키는 것은 게이트웨이를 거쳐 그 이름으로 **부르는** 쪽(직접 호출 · `invoke_tool`)뿐이다 — 목록에 실린 이름에 묶는 쪽(Claude Code · Desktop 의 도구 이름 `mcp__hwax__<이름>` · 허용 규칙 · 운영자 정의 동기화 · 에이전트 서버의 목록 이름 묶음)은 접두 이름으로 고친다. 가족은 마지막으로 온전히 읽은 표(덧씌우기 포함)의 것이다 — 표가 없거나 깨졌거나 덧씌우기를 버린 사이에도 노출 이름은 그대로고 소개 줄만 빠진다(표 없이 새로 뜬 프로세스는 지금 규칙).
+- 형제 소개 줄(E2-4) — 형제의 `apps.<키>.tagline` 이 차면 정본과 같은 길로 그 형제 도구 설명 앞에 붙는다(비코어 · 시험 앱의 칸은 쓰지 않는다). 문안은 운영자가 박스 덧씌우기에 쓴다. 가족 · 형제 소개 줄이 바뀌면 다음 재활 회차에 다시 집계한다. 순위는 그대로다 — 점수(부분문자열 · 의미 순위 둘 다)는 그 줄을 뗀 설명으로 내고, 형제가 정본 아래로 접히면 `same_in` 의 그 형제 칸이 `differs: true` 와 `tagline`(그 줄)을 싣는다(검토 10-31).
 - 시험 사본 숨김 — 앱 역할이 `staging` 인 앱(`apps.<키>.role`)은 tools/list · `search_tools` 에서 빠진다(R-6). 웹 챗 묶음 · 개인 Claude 기본 목록 · 검색 결과가 한 번에 빠진다. `invoke_tool` · 노출 이름 호출은 경로가 그대로다(숨김만 — 허브 앱 켜고 끄기와 같은 자리).
 - 박스 덧씌우기 — 같은 자리의 `core_vocab.local.json`(포털 리포 gitignore)을 JSON merge patch 로 얹는다(아래 '검색 손잡이' 와 같은 규칙). 코어 낱말 · 정본 · 앱 역할을 cae00 에서 커밋 없이 고친다. 깨지면 버리고 기본 표로 돈다. 에이전트 서버도 같은 파일을 같은 규칙으로 읽는다 — 두 쪽의 `/health` `core_vocab.fingerprint` 가 같아야 한다(포털 update-all §6 이 견준다).
 - 표가 없거나 꼴이 틀리면 지금 동작(손 낱말 · 소개 줄 없음 · 숨기지 않음)으로 돈다. `/health` 의 `core_vocab` 이 `{loaded, version, words, canonical, canonical_backend, staging_hidden, tagline_applied}` 또는 `{loaded: false, error}` 를 싣고, 실린 표에는 지문 `fingerprint`(덧씌운 표) · `base`(기본 표) · 덧씌우기 `overlay`(`present` · 건드린 칸 · 버린 까닭)가 붙는다(경로는 싣지 않는다). `canonical_backend` 가 false 면 정본 키가 이 박스의 백엔드 키와 달라 소개 줄 · 정본 대표 접기가 꺼져 있다. `staging_hidden` 은 이 박스에서 숨긴 백엔드다. `roles` 는 `{family: {키: 이 박스에 있나}, noncore: {키: 있나}, sibling_taglines, family_prefixed: {count, names}}` 다 — 덧씌우기에 키를 틀리게 적으면 여기서 false 로 보인다.
@@ -206,7 +206,7 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 
 - 박스 튜닝 — 같은 자리의 `search_tuning.local.json`(gitignore)에 바꿀 칸만 적는다. **JSON merge patch(RFC 7386)** — 객체는 재귀로 합치고 그 밖은 바꾸며 `null` 은 지운다(목록은 통째로 바뀐다). 두 파일의 바뀐 시각을 보고 **재기동 없이** 다음 검색부터 탄다. 덧씌우기가 깨지면(JSON 아님 · 객체 아님 · 가중치가 수가 아님 · `to` 가 목록이 아님) 버리고 기본값으로 돌며 까닭을 `/health` 에 싣는다.
 - 묶음별 끄기 `switches` — `synonyms`(손 동의어) · `core_vocab`(코어 어휘표 낱말) · `delib_narrow`(코어 질문의 심의 가중 끔) · `quality`(품질 낱말 가중) · `write_penalty`(쓰기 도구 감점) · `copy_fold`(같은 도구 사본 접기).
-- 기본이 끔인 손잡이 `noncore_demote`(E-2 E2-5 — 칸이 없어도 끔으로 읽는다) — 켜면 코어 질문(어휘표 검색 낱말이 든 질의)에서 비코어 앱 도구의 점수에 `weights.noncore`(0.5)를 곱한다. 질의가 그 앱 이름을 부르면 낮추지 않고, 질의 기록 `via` 에 `demote:noncore` 가 남는다. 켜기는 cae00 `/search-eval` 의 `+noncore_demote` 판을 본 뒤 박스 덧씌우기로 한다.
+- 기본이 끔인 손잡이 `noncore_demote`(E-2 E2-5 — 칸이 없어도 끔으로 읽는다) — 켜면 코어 질문(어휘표 검색 낱말이 든 질의)에서 비코어 앱 도구의 점수에 `weights.noncore`(0.5)를 곱한다. 질의가 그 앱 이름을 부르면 낮추지 않고(게이트웨이 라벨의 이름에 더해 어휘표의 앱 라벨 · 백엔드 키도 이름이다 — 외부 연결 앱의 라벨은 포털 플랫폼 라벨 'FMEA Agent' 다), 질의 기록 `via` 에 `demote:noncore` 가 남는다. 켜기는 cae00 `/search-eval` 의 `+noncore_demote` 판을 본 뒤 박스 덧씌우기로 한다.
 - 손 동의어 한 줄은 `{to: [이을 낱말 · 도구 이름 조각], owner, source_fix}` 다. `owner` 는 그 낱말이 도구 설명에 없어 우리가 보정하는 플랫폼(백엔드 키, 일반 낱말은 null), `source_fix` 는 그쪽이 고칠 것이다 — 아래 피드백 보고서가 읽는다. 보정은 비계다 — 그쪽이 설명을 고치면 걷는다.
 - 지문 — `/health` 의 `search_tuning` 이 `{fingerprint(덧씌운 값), base(기본값), switches_off, synonyms, overlay{present, fingerprint, changed, error}}` 를 싣는다(기본이 끔인 손잡이를 켰으면 `switches_on` 이 더 붙는다). 지문은 `_doc` 을 뺀 키 차례 JSON 의 sha256 앞 12자이고 질의 기록 줄(`fp`) · 평가 결과에도 실린다 — dev 와 cae00 이 다르게 도는 것을 숫자 곁에서 보인다.
 
@@ -220,10 +220,11 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 | `bundle:<영역>,…` | 고른 영역(`tool_areas.json`)의 백엔드 도구 + 정본 읽기 도구(어휘표 검색 칸의 도구 — (정본 키, 원래 이름)) + 로컬 도구 전부. 형제 사본은 뺀다 · 미분류 도구는 안 든다 |
 | `light` | `search_tools` · `invoke_tool` 둘 |
 
-- 정하는 차례 — 연결 머리 `X-HWAX-View`(꼴이 맞으면) > 포털 사람 설정(`/internal/access/entitlements` 의 `view`) > 전체. 게이트웨이가 PAT 분기에서 정해 `x-hwax-view` · `x-hwax-view-src` 를 갈아 끼운다(클라이언트 사본은 버린다). 웹 챗 · 절차 PAT 는 늘 전체, GW_TOKEN 분기는 두 머리를 버린다. 틀린 꼴의 머리는 포털 값으로 간다.
+- 정하는 차례 — 연결 머리 `X-HWAX-View` 가 보기 글이면 그것, `portal` 이면 포털 사람 설정(`/internal/access/entitlements` 의 `view`), 머리가 없으면 전체. 포털 설정은 머리로 청한 연결에만 얹는다 — 포털 등록 배치 · 명령이 Claude Code · Desktop 에 `X-HWAX-View: portal` 을 단다. 머리 없는 개인 PAT 에도 얹던 때는 사람의 토큰으로 tools/list 를 읽는 서버 앱(리스크 심사 · MXWP 위키)과 스크립트가 그 사람의 보기로 도구를 잃었다(검토 10-31). 게이트웨이가 PAT 분기에서 정해 `x-hwax-view` · `x-hwax-view-src` 를 갈아 끼운다(클라이언트 사본은 버린다). 웹 챗 · 절차 PAT 는 늘 전체, GW_TOKEN 분기는 두 머리를 버린다. 틀린 꼴의 머리는 전체로 간다(`view.error`).
 - 리포 `.mcp.json`(HWAXPortal)은 `X-HWAX-View: ${HWAX_GATEWAY_VIEW:-full}` 이다 — 리포 파이프라인은 사람 설정과 상관없이 늘 전체다.
 - `list_tool_apps`(앱 · 영역 둘 다)의 `view` — 보기 · 영역 · 목록에 실은 수(`listed`) · 보기로 뺀 수(`hidden_by_view`) · 모르는 영역 · 출처 · 틀린 머리(`error`) · 안내. `/health` 의 `tools_list_by_view` 는 기동 뒤 보기별 tools/list 수다(SDK 가 호출 검증 캐시를 채우려 부르는 길은 세지 않고 보기도 얹지 않는다).
 - 끈 앱은 어느 보기에서도 빠진다. 열린 세션의 목록은 재연결해야 바뀐다(listChanged 를 알리지 않는다). 보기 글의 꼴은 포털 `backend/app/access/hub_view.py` 와 같다(시험이 맞댄다).
+- `/tools-map` 의 `views`(`["full", "bundle", "light"]`)가 이 게이트웨이가 보기를 안다고 말한다 — 포털 보기 화면이 이것이 없는 옛 게이트웨이와 붙으면 '저장했지만 아직 전체로 돈다' 고 알린다.
 
 ## 검색 고리 창구 — `/search-log` · `/search-review` · `/search-eval`(E-9)
 

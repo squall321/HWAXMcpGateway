@@ -40,6 +40,9 @@
 #      목록이 비었다고 스스로 지우지 않는다. 넘기는 쪽은 provision.env 를 읽은 호출자다(update-all, 손으로는 PER_USER_SSO_OFF=<키>).
 #      heax-hub 밖에서 도는 앱(MatNexus 처럼 다른 조직 서버)은 <접두>_MCP_URL 을 더 적으면 MCP 백엔드도 같은 키로 붙는다
 #      (서비스 토큰 없음 — 사람별 호출은 그 위임으로. 주소가 없는 실행은 직전 config 의 백엔드를 그대로 둔다).
+#      DynaForge(kooremapper_mcp) 위임은 env 가 아니라 KooRemapper .env 의 게이트웨이 비밀로 생긴다 — KOORM_SEND_PLAT=1 이면 그 위임 호출에
+#      호출자의 plat: 권한을 서명과 함께 싣는다(0 이면 끔, 안 적으면 직전 config). 일반 앱의 <접두>_SEND_PLAT 과 한 곳이 다르다 — 그것은
+#      그 앱의 비밀이 있는 실행에서만 읽히고, 이것은 비밀 없이 항목째 이어받은 실행에도 먹는다.
 #   9) TestScope: TESTSCOPE_MCP_URL(> 직전 config 주소)이 있으면 testscope 백엔드(서비스 토큰 없음).
 #      사람별 호출은 RA 처럼 두 방식 중 하나다 — 기본은 사람이 포털 '개인 토큰 › 외부 연결' 에 등록한
 #      TestScope 토큰(게이트웨이 PORTAL_CONN_BACKENDS), TESTSCOPE_SSO_SECRET 이 있으면 8)의 위임(게이트웨이에서 먼저 탄다).
@@ -695,10 +698,38 @@ if e.get("HEAX_MCP_TOKEN"):
 # 못 읽었다고 기존 설정을 지우면(레포 미체크아웃 등) 멀쩡하던 위임이 조용히 꺼진다.
 per_user = dict(_prev("heax_registry", "per_user_sso") or {})
 if e.get("KOORM_SSO_SECRET"):
+    _krm_prev = per_user.get("kooremapper_mcp") if isinstance(per_user.get("kooremapper_mcp"), dict) else {}
     per_user["kooremapper_mcp"] = {
         "sso_url": e.get("KOORM_SSO_URL") or "http://127.0.0.1:8700/api/v1/auth/sso",
         "secret": e["KOORM_SSO_SECRET"],
-        "client": "deliberation"}
+        "client": "deliberation",
+        # 새로 쓰는 항목도 직전 send_plat 을 잇는다 — 안 그러면 KOORM_SEND_PLAT 을 안 적은 실행(손으로 돌린 --force)이 끈다.
+        **({"send_plat": _krm_prev["send_plat"]} if "send_plat" in _krm_prev else {})}
+# KOORM_SEND_PLAT — DynaForge 위임 호출에도 호출자의 plat: 권한을 서명과 함께 싣는다(gateway PLAT_HEADER — DynaForge 가 해석 잡을 내기 전에
+# 그 사람의 권한을 본다, HWAXPortal docs/followups-1017/requests §2 · 사용자 결정 8). 이 위임은 아래 일반 순회가 덮지 않아 <접두>_SEND_PLAT 이
+# 닿지 않는다. 적혀 있을 때만 이 값이 정하고(1 · true · yes · on 이면 켬, 그 밖의 값이면 — 빈 값도 — 끔), 안 적었으면 직전 config 를 잇는다.
+# <접두>_SEND_PLAT 과 다른 곳이 하나다 — 그것은 그 앱의 비밀이 있는 실행에서만 읽혀 비밀 없는 실행에서는 0 도 끄지 못하고, 이것은 비밀을
+# 못 읽어 항목째 이어받은 실행에도 먹는다. 이 비밀은 provision.env 가 아니라 KooRemapper .env 에 있어 손잡이를 적은 실행이 비밀을 읽는다는
+# 보장이 없다(heax 토큰이 없거나 그 리포가 없는 박스). 이것을 본떠 판정하는 쪽(포털 update-all 의 드리프트 판정 등)은 비밀이 아니라 항목이
+# 있는지로 가른다. 값은 환경에서 그대로 물려받는다 — 위 ▶ 4) 의 대입어 사슬에 `${…:-}` 로 넣으면 안 적은 실행이 빈 값으로 넘어와
+# '적었다 → 끔' 이 된다(일반 앱의 <접두>_SEND_PLAT 과 같은 길).
+_krm_sp = e.get("KOORM_SEND_PLAT")
+_krm = per_user.get("kooremapper_mcp")
+if _krm_sp is not None:
+    _krm_on = _krm_sp.strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(_krm, dict):
+        if _krm_on:
+            _krm["send_plat"] = True
+        else:
+            _krm.pop("send_plat", None)
+    elif _krm_on:
+        # 까닭을 하나로 단정하지 않는다 — 이 블록은 비밀이 비었다는 것만 안다. 셸은 heax 토큰이 없거나 KooRemapper 리포가 없으면 .env 를
+        # 읽지도 않는다(그 .env 에는 비밀이 있을 수 있다 — '.env 에 없다' 를 믿고 열어 본 사람은 비밀을 보고 길을 잃는다). 까닭은 위 셸 줄이 말한다.
+        print("  ⚠ KOORM_SEND_PLAT 을 켰는데 DynaForge 사람별 위임이 없다 — 이번 실행이 위임을 만들지 못했고(KooRemapper 비밀을 읽지 "
+              "못했거나 heax 토큰이 없어 읽지 않았다 — 까닭은 위 heax 토큰 · KooRemapper 줄) 직전 config 에도 항목이 없다 — plat 권한 전달 생략")
+if isinstance(_krm, dict) and _krm.get("send_plat") is True:
+    # ✓ 가 아니다 — 설정에 적었다는 뜻일 뿐, 앱이 응답했는지는 위 셸 줄이 말한다(앱이 죽은 실행의 ⚠ 바로 밑에 초록을 찍지 않는다).
+    print("  · DynaForge 사람별 위임 — plat 권한 전달 켬(send_plat)")
 if e.get("HWAXRISK_SSO_SECRET"):
     per_user["hwax_risk"] = {
         "sso_url": e.get("HWAXRISK_SSO_URL") or (

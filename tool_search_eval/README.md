@@ -163,7 +163,7 @@ dev 의 카탈로그 · 정답은 운영과 달라 잰 것이 운영을 말하�
 
 - 보기 — `GET /search-log?days=&limit=&q=`(게이트웨이 공유 비밀 `_gateway.token` — `/conn-invalidate` 와 같다): 최근 질의(새것 먼저)마다 상위 다섯 · 보정 표지 · 뒤이은 호출과, 그 질의에 박스 표시가 있으면 그것.
 - 표시 — `POST /search-review {q, verdict: ok|gold|remove, gold: ["앱키:원래 이름", …], memo?, qid?}` 가 **박스 정답쌍** `tool_search_eval/pairs.local.jsonl` 에 `source: "box"` 로 둔다(같은 질의는 바꿔 쓴다 · `remove` 는 지운다 · gitignore). 포털 관리자 '도구 검색 검토' 화면이 이 창구를 부른다 — claude.ai 아티팩트 → Claude → 리포를 거치던 길(위 '평가셋')은 dev 가 지은 기본 정답에만 쓴다.
-- 재기 — `POST /search-eval` 은 떠 있는 카탈로그 · 서비스 시야로 정답쌍(추적 `pairs.jsonl` + 박스 `pairs.local.jsonl`)을 판마다 잰다 — 덧씌운 값(`effective`) · 기본값(`base`) · 보정 끔(`off`) · 묶음 하나씩 끔(`-synonyms` · `-core_vocab` · `-delib_narrow` · `-quality` · `-write_penalty` · `-copy_fold`). 부분문자열 순위만이고(임베딩 끔) 질의 기록에 섞지 않는다. 한 번에 하나다(돌고 있으면 409).
+- 재기 — `POST /search-eval` 은 떠 있는 카탈로그 · 서비스 시야로 정답쌍(추적 `pairs.jsonl` + 박스 `pairs.local.jsonl`)을 판마다 잰다 — 덧씌운 값(`effective`) · 기본값(`base`) · 보정 끔(`off`) · 묶음 하나씩 끔(`-synonyms` · `-core_vocab` · `-delib_narrow` · `-quality` · `-write_penalty` · `-copy_fold`) · 꺼진 손잡이 하나씩 켬(`+noncore_demote` — 코어 질문의 비코어 낮추기, HWAXPortal docs/request-1029 E-2 E2-5). 박스에서 끈 묶음은 `+`, 켠 손잡이는 `-` 로 잰다. 부분문자열 순위만이고(임베딩 끔) 질의 기록에 섞지 않는다. 한 번에 하나다(돌고 있으면 409).
 
 ```bash
 PY=../HWAXAgentServer/.venv/bin/python

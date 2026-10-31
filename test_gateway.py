@@ -6086,8 +6086,9 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
                                "q": None})
     _aggregate_tools(monkeypatch, {"reportarchive": [leaky, _stool("ra_get", {"id": "보고서 id"})]})
     body = tools_map()
-    assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read"], \
-        "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0)은 맨 뒤에 덧붙는다"
+    assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read",
+                          "panel_read"], \
+        "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 패널 확인용 읽기 목록(HA-20 B-2)은 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
     assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 14, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6
@@ -9541,6 +9542,37 @@ def test_tools_map_은_루틴_읽기_도구의_노출_이름을_routine_read_로
     for unknown in ("risk_job_action", "single_drop_simulation"):
         assert unknown not in body["routine_read"] and unknown not in body["write"], unknown
     assert not {x.name for x in gw._local_tools()} & set(body["routine_read"]), "로컬 도구는 백엔드 도구가 아니다"
+
+
+def test_tools_map_은_패널_첫_쓰기_확인의_읽기를_panel_read_로_싣고_이름_낱말로는_열지_않는다(monkeypatch, _fresh_scores):
+    """포털 패널의 첫 쓰기 확인(HWAXPortal docs/request-1027 HA-20 · B-2 (가))이 읽기로 보는 도구 — 확인된 읽기만이다. 닫기 목록(deny)이 맨 먼저고,
+    앱 표지(readOnlyHint=True · destructiveHint 아님)와 읽기 목록(read_tools.json ∪ 박스 덧씌우기)만 연다. routine_read 의 마지막 갈래(원래 이름의
+    조회 낱말)는 쓰지 않는다 — 이름 규칙은 울타리가 아니다(반대 검토 10-31: job_info_cleanup · case_compare_export · mesh_preview_and_queue ·
+    case_detail_archive 가 이름 낱말로 읽기가 되어 패널이 처음 불러도 포털이 확인을 묻지 않았다)."""
+    ann = types.ToolAnnotations
+
+    def t(name, **a):
+        return types.Tool(name=name, description="", inputSchema={"type": "object"}, **({"annotations": ann(**a)} if a else {}))
+    monkeypatch.setattr(gw, "READ_TOOLS", frozenset({"sf:corpus_check", "sf:risk_view"}))
+    monkeypatch.setattr(gw, "READ_DENY", frozenset({"sf:risk_view"}))
+    gw.READ_TOOLS_LOCAL_PATH.write_text(json.dumps({"tools": ["ft:risk_next_step"], "deny": ["sf:start_view_x"]}),
+                                        encoding="utf-8")   # autouse 가 tmp 로 건 자리
+    words = ["job_info_cleanup", "case_compare_export", "mesh_preview_and_queue", "case_detail_archive", "list_runs"]
+    _aggregate_tools(monkeypatch, {"sf": [*(t(n) for n in words), t("start_view", readOnlyHint=True), t("corpus_check"), t("risk_view"),
+                                          t("start_view_x", readOnlyHint=True), t("wipe_view", readOnlyHint=True, destructiveHint=True),
+                                          t("list_rows", readOnlyHint=False)],
+                                   "ft": [t("risk_next_step"), t("job_status")]})
+    st, body = _gate_call(monkeypatch, "/tools-map")
+    assert st == 200
+    assert body["panel_read"] == ["corpus_check", "risk_next_step", "start_view"], body["panel_read"]
+    for n in [*words, "job_status"]:
+        assert n in body["routine_read"] and n not in body["panel_read"], ("이름 낱말로만 읽기인 도구는 패널 확인에서 쓰기로 본다", n)
+    for n in ("risk_view", "start_view_x", "wipe_view", "list_rows"):
+        assert n not in body["panel_read"], ("닫기 목록 · 파괴 표지 · readOnlyHint=False 는 읽기가 아니다", n)
+    assert body["panel_read"] == sorted(n for n, (bk, o) in gw.route.items()
+                                        if gw._panel_read(next(x for x in gw.exposed_tools if x.name == n), bk, o))
+    assert set(body["panel_read"]) <= set(body["routine_read"]), "같은 차례에서 이름 갈래만 뺀다 — routine_read 의 부분이다"
+    assert not {x.name for x in gw._local_tools()} & set(body["panel_read"]), "로컬 도구는 백엔드 도구가 아니다"
 
 
 def test_동사로도_쓰이는_fetch_resolve_trace_는_조회_낱말이_아니고_그_낱말로만_열리던_진짜_읽기는_읽기_목록으로_연다(monkeypatch):

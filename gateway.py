@@ -4879,12 +4879,13 @@ def _routine_read_deny() -> frozenset:
     return READ_DENY | _read_tools_local()["deny"]
 
 
-def _routine_read(t, backend: str, original: str) -> bool:
+def _routine_read(t, backend: str, original: str, *, by_name: bool = True) -> bool:
     """루틴 단계에서 부를 수 있는 읽기 도구인가 — 확인된 것만 참이다(모르면 거짓). 닫기 목록(deny)이 맨 먼저다 — 거기 있으면 표지와 무관하게
     거짓. 다음은 앱 표지 — readOnlyHint=False · destructiveHint 면 거짓, readOnlyHint=True 면 참. 다음은 읽기 목록('백엔드키:원래 이름'), 끝으로
     원래 이름의 조회 낱말(밑줄로 가른 조각) — 쓰기 동사(_WRITE_NAME)가 없을 때만이다. _tool_is_write 의 안내 · 미리보기 예외(_READ_NAME_HINT —
     status · history · preview …)는 쓰지 않는다 — update_status · delete_history · apply_preview 같은 쓰기가 읽기로 열렸다(R3 리뷰 2차 #5). 그 예외로만
-    열리던 진짜 읽기(upload_instructions · report_upload_instructions · preview_publish — 소스로 확인)는 읽기 목록에 있다."""
+    열리던 진짜 읽기(upload_instructions · report_upload_instructions · preview_publish — 소스로 확인)는 읽기 목록에 있다.
+    by_name 이 거짓이면 마지막 갈래(이름의 조회 낱말)를 건너뛴다 — 패널 첫 쓰기 확인의 판정이다(_panel_read)."""
     key = f"{backend}:{original}"
     if key in _routine_read_deny():
         return False
@@ -4895,7 +4896,15 @@ def _routine_read(t, backend: str, original: str) -> bool:
         return True
     if key in _routine_read_tools():
         return True
-    return any(tok in _ROUTINE_READ_TOKENS for tok in original.split("_")) and not _WRITE_NAME.search(original)
+    return by_name and any(tok in _ROUTINE_READ_TOKENS for tok in original.split("_")) and not _WRITE_NAME.search(original)
+
+
+def _panel_read(t, backend: str, original: str) -> bool:
+    """포털 MCP Apps 패널의 첫 쓰기 확인(HWAXPortal docs/request-1027 HA-20 · B-2 (가))이 읽기로 보는 도구인가 — 확인된 읽기만이다. 닫기 목록(deny)
+    다음 앱 표지(readOnlyHint=True · destructiveHint 아님)와 읽기 목록(read_tools.json ∪ 박스 덧씌우기)만 연다. _routine_read 의 이름 낱말 갈래는
+    쓰지 않는다 — 이름 규칙은 울타리가 아니다(job_info_cleanup · case_detail_archive 같은 쓰기 꼴이 조회 낱말로 읽기가 됐다 — 반대 검토 10-31).
+    읽기가 아니면 포털은 그 패널 세션의 첫 호출에 확인을 묻는다(모르면 묻는다)."""
+    return _routine_read(t, backend, original, by_name=False)
 
 
 async def _routine_call(a: dict) -> types.CallToolResult:
@@ -6738,6 +6747,9 @@ def _bearer_gate(app, pat_verifier=None):
                 # 루틴 단계에서 부를 수 있는 읽기 도구의 노출 이름(정렬, 백엔드 도구만) — 닫힌 쪽 판정 _routine_read(표지 · 읽기 목록 · 조회 낱말),
                 # routine_call 과 같은 판정이다. 포털 계획은 이것과 겹치는 도구만 단계에 묶는다(R3 리뷰 #0 — 모르는 도구는 쓰기로 본다).
                 "routine_read": sorted(_n for _n, (_bk, _orig) in route.items() if _routine_read(_tool_of.get(_n), _bk, _orig)),
+                # 패널 첫 쓰기 확인이 읽기로 보는 도구의 노출 이름(정렬, 백엔드 도구만) — _panel_read(표지 · 읽기 목록, 이름 낱말 없이). 포털 패널 창구는
+                # routine_read 가 아니라 이것을 본다 — 이것 밖이면 그 패널 세션의 첫 호출에 확인을 묻는다(HWAXPortal docs/request-1027 HA-20 B-2).
+                "panel_read": sorted(_n for _n, (_bk, _orig) in route.items() if _panel_read(_tool_of.get(_n), _bk, _orig)),
             }, ensure_ascii=False).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

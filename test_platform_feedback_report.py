@@ -137,6 +137,20 @@ def test_보정_덕에만은_규칙마다_고칠_것을_붙인다(tmp_path):
     assert "낙하 옛날" not in kr, "창 밖 질의"
 
 
+def test_비코어_낮추기는_보정_덕에만의_규칙이_아니다(tmp_path):
+    """게이트웨이가 검색 손잡이 noncore_demote 를 켜면 질의 기록 via 에 demote:noncore 가 남는다(HWAXPortal docs/request-1029 E-2 E2-5). 점수를 뺀
+    규칙이라 '보정 덕에만 찾아진' 규칙 칸에 싣지 않는다 — 실으면 그쪽에 고칠 것이 없는 줄을 고치라고 내민다."""
+    qlog = {"queries-2026-10-29.local.jsonl": [
+        _q("2026-10-29", "b1", "불량 고장모드 현황", [f"{SF}:search_voc"], via={f"{SF}:search_voc": ["demote:noncore", "syn:불량"]},
+           boost=[f"{SF}:search_voc"])]}
+    sf = _section(_run(tmp_path, qlog=qlog), SF)
+    assert "### 1. 보정 덕에만 찾아진 질의 — 1개" in sf
+    row = next(ln for ln in sf.splitlines() if ln.startswith("| 손 동의어 '불량'"))
+    assert "| 1 |" in row, row
+    assert "demote" not in sf and "비코어 낮추기" not in sf, sf
+    assert pfr._rule_text("demote:noncore", SF, pfr.load_tuning(pfr.TUNING, pfr.TUNING.with_name("없음.local.json")))[0].startswith("비코어 낮추기")
+
+
 def test_보이고도_안_불림과_밖에서_불림을_가른다(tmp_path):
     kr, sf = _section(_run(tmp_path), KR), _section(_run(tmp_path), SF)
     row = next(ln for ln in kr.splitlines() if ln.startswith("| `run_drop` | 3 |"))

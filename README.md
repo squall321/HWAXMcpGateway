@@ -244,7 +244,7 @@ python3 platform_feedback_report.py                                        # 이
 python3 platform_feedback_report.py --platform heax-step_forge --out stepforge.md
 ```
 
-- 일곱 절 — ① 보정 덕에만 찾아진 질의(규칙마다 · 손 동의어는 `owner` · `source_fix`) ② 상위 다섯에 보이고도 안 불림(다른 도구를 불렀나 · 아무것도 안 불렀나) ③ 상위 다섯 밖에서 불림(결과에 없었는데 불림 · 6위 아래) ④ 실패(플랫폼 쪽 — 게이트웨이 · 권한에서 막힌 forbidden · refused · per-user 는 따로 센다) ⑤ 큰 응답(감사 `chars`, `--big-chars` 기본 50,000) ⑥ 인자 설명(`/tools-map` `arg_scores`) ⑦ 안 불린 도구(`tool_usage_report.py` 와 같은 셈). 맨 위 요약표는 피드백이 많은 플랫폼이 먼저다.
+- 일곱 절 — ① 보정 덕에만 찾아진 질의(규칙마다 · 손 동의어는 `owner` · `source_fix` — 비코어 낮추기 `demote:noncore` 는 점수를 뺀 규칙이라 싣지 않는다) ② 상위 다섯에 보이고도 안 불림(다른 도구를 불렀나 · 아무것도 안 불렀나) ③ 상위 다섯 밖에서 불림(결과에 없었는데 불림 · 6위 아래) ④ 실패(플랫폼 쪽 — 게이트웨이 · 권한에서 막힌 forbidden · refused · per-user 는 따로 센다) ⑤ 큰 응답(감사 `chars`, `--big-chars` 기본 50,000) ⑥ 인자 설명(`/tools-map` `arg_scores`) ⑦ 안 불린 도구(`tool_usage_report.py` 와 같은 셈). 맨 위 요약표는 피드백이 많은 플랫폼이 먼저다.
 - 질의 원문은 싣는다(고칠 낱말이 거기 있다). 부른 사람 · 주소는 싣지 않는다 — 실패 사유 글에 `@` 가 들었으면 싣지 않고, 사유의 숫자는 `#` 로 접는다. 표마다 `--rows`(기본 10)를 넘으면 '그 밖 N개' 로 적는다.
 - 손잡이 읽기는 게이트웨이와 같은 규칙이고 지문이 같다(`test_gateway.py` 가 맞댄다). 질의 기록은 KST 날짜로, 감사는 UTC 시각으로 기간을 끊는다. 표준 라이브러리만 쓴다(`python3` 로 돈다).
 

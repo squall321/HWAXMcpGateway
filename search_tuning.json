@@ -2,9 +2,9 @@
  "_doc": [
   "search_tools 순위의 손잡이 — 게이트웨이 코드 상수를 옮긴 기본값이다(HWAXPortal docs/request-1029 E-7 · 설계 2.5 ①). 이 판의 순위는 옮기기 전과 바이트까지 같다.",
   "박스에서 튜닝하려면 같은 자리의 search_tuning.local.json(gitignore)에 바꿀 칸만 적는다 — JSON merge patch(RFC 7386): 객체는 합치고 그 밖은 바꾸며 null 은 지운다(목록은 통째로 바뀐다). 바뀐 시각을 보고 재기동 없이 다시 읽는다.",
-  "switches — 묶음별 끄기(synonyms 손 동의어 · core_vocab 코어 어휘표 낱말 · delib_narrow 코어 질문의 심의 가중 끔 · quality 품질 낱말 가중 · write_penalty 쓰기 도구 감점 · copy_fold 같은 도구 사본 접기).",
+  "switches — 묶음별 끄기(synonyms 손 동의어 · core_vocab 코어 어휘표 낱말 · delib_narrow 코어 질문의 심의 가중 끔 · quality 품질 낱말 가중 · write_penalty 쓰기 도구 감점 · copy_fold 같은 도구 사본 접기 — 허브 가족은 원래 이름으로 접는다) · noncore_demote 코어 질문의 비코어 앱 도구 낮추기(기본 끔 — 칸이 없어도 끔이다. 켜기는 cae00 검색 평가의 +noncore_demote 판을 본 뒤 박스 덧씌우기로, HWAXPortal docs/request-1029 E-2 · 결정 Q-1).",
   "synonyms — {낱말: {to: [이을 낱말 · 도구 이름 조각], owner, source_fix}}. 질의 낱말이 이 낱말을 담으면 to 를 함께 맞춘다. owner 는 그 낱말이 도구 설명에 없어 우리가 보정하는 플랫폼(백엔드 키 — 일반 낱말은 null), source_fix 는 그쪽이 고칠 것(비면 '설명 · 별칭에 그 낱말을 넣는다'). 플랫폼별 피드백 보고서(platform_feedback_report.py)가 읽는다.",
-  "weights — 낱말 하나의 점수 = name × (이름 적중 또는 앱 이름 적중) + min(설명 빈도, desc_cap) + app × 앱 라벨 · 설명 적중, 도구 점수 = 합 × (1 + coverage × 맞힌 낱말 비율). 쓰기 낱말이 없는 질의의 쓰기 도구는 × write_penalty, 품질 질의는 품질 · VOC 영역 도구에 + quality_per_word × 품질 낱말 수."
+  "weights — 낱말 하나의 점수 = name × (이름 적중 또는 앱 이름 적중) + min(설명 빈도, desc_cap) + app × 앱 라벨 · 설명 적중, 도구 점수 = 합 × (1 + coverage × 맞힌 낱말 비율). 쓰기 낱말이 없는 질의의 쓰기 도구는 × write_penalty, 품질 질의는 품질 · VOC 영역 도구에 + quality_per_word × 품질 낱말 수, noncore_demote 를 켜면 코어 질문(어휘표 검색 낱말이 든 질의)의 비코어 앱 도구는 × noncore(질의가 그 앱 이름을 부르면 낮추지 않는다)."
  ],
  "version": 1,
  "switches": {
@@ -13,7 +13,8 @@
   "delib_narrow": true,
   "quality": true,
   "write_penalty": true,
-  "copy_fold": true
+  "copy_fold": true,
+  "noncore_demote": false
  },
  "weights": {
   "name": 4,
@@ -21,7 +22,8 @@
   "app": 1,
   "coverage": 1,
   "write_penalty": 0.5,
-  "quality_per_word": 2
+  "quality_per_word": 2,
+  "noncore": 0.5
  },
  "synonyms": {
   "보고서": {

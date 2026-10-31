@@ -683,6 +683,45 @@ def test_일반_앱의_SEND_PLAT_은_적혀_있을_때만_plat_전달을_정한�
     assert "send_plat" not in plain, "기본은 끔 — 쓰지 않는 앱에 권한 목록을 보내지 않는다"
 
 
+def test_DynaForge_위임의_KOORM_SEND_PLAT_은_적혀_있을_때만_plat_전달을_정한다(tmp_path):
+    """DynaForge 가 해석 잡을 내기 전에 그 사람의 plat: 권한을 보려면 위임 호출에 권한 목록이 서명과 함께 실려야 한다(HWAXPortal
+    docs/followups-1017/requests §2 · 사용자 결정 8). 이 위임은 일반 순회가 아니라 이 파일이 직접 만들어 <접두>_SEND_PLAT 이 닿지 않는다 —
+    KOORM_SEND_PLAT 이 같은 규칙으로 정한다(적었으면 그 값, 안 적었으면 직전 config). 전에는 비밀을 다시 읽은 실행이 항목을 새로 쓰며
+    send_plat 을 떨궜다. 게이트웨이는 `send_plat is True` 만 읽는다(gateway.py `_call_tool` · `_proof_headers`)."""
+    env = {"HEAX_MCP_TOKEN": "heax-svc", "KOORM_SSO_SECRET": "koorm-secret-xyz",
+           "KOORM_SSO_URL": "http://127.0.0.1:8700/api/v1/auth/sso"}
+
+    def krm(run_env, log=None):
+        return _run_provision(tmp_path, run_env, log)["heax_registry"]["per_user_sso"]["kooremapper_mcp"]
+
+    log: list = []
+    on = krm({**env, "KOORM_SEND_PLAT": "1"}, log)
+    assert on == {"sso_url": "http://127.0.0.1:8700/api/v1/auth/sso", "secret": "koorm-secret-xyz",
+                  "client": "deliberation", "send_plat": True}
+    assert "DynaForge 사람별 위임 — plat 권한 전달" in log[0] and "koorm-secret-xyz" not in log[0]
+    _force_backup(tmp_path)
+    assert krm(env).get("send_plat") is True, "안 적은 실행은 이어받는다 — 비밀을 다시 읽어 항목을 새로 써도"
+    _force_backup(tmp_path)
+    assert "send_plat" not in krm({**env, "KOORM_SEND_PLAT": "0"}), "0 이면 끈다"
+    # 비밀을 못 읽은 실행(KooRemapper 리포가 없는 박스의 손 --force) — 항목째 이어받고, 적었으면 거기에도 그 값이 정한다
+    _force_backup(tmp_path)
+    assert krm({**env, "KOORM_SEND_PLAT": "yes"}).get("send_plat") is True
+    _force_backup(tmp_path)
+    assert krm({"HEAX_MCP_TOKEN": "heax-svc"}).get("send_plat") is True
+    _force_backup(tmp_path)
+    carried = krm({"HEAX_MCP_TOKEN": "heax-svc", "KOORM_SEND_PLAT": "0"})
+    assert carried["secret"] == "koorm-secret-xyz" and "send_plat" not in carried
+    # 위임이 없으면 칸만 만들지 않는다 — 켜려 한 것이 안 된 까닭을 말한다
+    (tmp_path / "gateway_config.json").unlink()
+    (tmp_path / "gateway_config.json.bak").unlink()
+    log = []
+    out = _run_provision(tmp_path, {"HEAX_MCP_TOKEN": "heax-svc", "KOORM_SEND_PLAT": "1"}, log)
+    assert "kooremapper_mcp" not in ((out.get("heax_registry") or {}).get("per_user_sso") or {})
+    assert "KOORM_SEND_PLAT" in log[0] and "DynaForge 사람별 위임이 없다" in log[0]
+    (tmp_path / "gateway_config.json").unlink()
+    assert "send_plat" not in krm(env), "기본은 끔 — 쓰지 않는 앱에 권한 목록을 보내지 않는다"
+
+
 def test_일반_앱의_SSO_CLIENT_는_발급처가_같은_위임끼리_이름을_가른다(tmp_path):
     """한 발급처(KooSlurm)가 smart-twin-mcp · smart-twin-cluster 둘에 kst_ 를 낸다 — 같은 이름의 직전 토큰을 회수하는 발급처라 둘이
     gateway 한 이름으로 받으면 같은 사람의 토큰을 서로 죽인다(SimFlow HG-03 과 같은 꼴, HWAXPortal 낙하 트윈 10-29). 비면 gateway 그대로."""

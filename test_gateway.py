@@ -7064,6 +7064,27 @@ def test_E2_5_비코어_낮추기는_기본_끔이고_켜면_코어_질문의_�
     assert gw._tuning()["switches"]["noncore_demote"] is False, "칸이 없으면(null 로 지움 · 기본값을 못 읽음) 끔으로 읽는다 — 기본이 켬인 묶음과 다르다"
 
 
+def test_E2_5_앱_이름을_부른_질의는_어휘표_라벨과_키로도_알아보고_낮추지_않는다(monkeypatch, tmp_path):
+    """외부 연결 앱의 게이트웨이 라벨은 포털 플랫폼 라벨이다(FMEA — 'FMEA Agent' · ARP — 'AI Ready Portal'). 그 라벨의 이름(fmeaagent · aireadyportal)만
+    보면 'FMEA 관리 기준 개수' 가 앱을 부르지 않는 것이 되어, 손잡이를 켜면 1위가 정본 읽기 도구 아래로 밀렸다(검토 10-31 — 위 시험의 라벨 'FMEA' 는
+    운영과 달라 가렸다). 어휘표의 앱 라벨(apps.<키>.label)과 백엔드 키도 그 앱의 이름이다. 부르지 않은 비코어는 그대로 낮춘다."""
+    other = {**_NONCORE_HEAVY, "fmea": ("FMEA Agent", _NONCORE_HEAVY["fmea"][1]), "arp": ("AI Ready Portal", _NONCORE_HEAVY["arp"][1])}
+    hub_tools = tuple((n, d) for n, d in _CORE_HUB_TOOLS if n in ("object_resolve", "objects_summary"))
+    search = _role_kit(monkeypatch, hub_tools=hub_tools, other=other)
+    own = {"FMEA 관리 기준 개수": {"count_criteria", "gather_evidence_tool"}, "fmea 기준 개수": {"count_criteria", "gather_evidence_tool"},
+           "ARP 관리 기준 개수": {"criteria_items"}}
+    off = {q: search(q, 10)["ranked"] for q in own}
+    assert off["FMEA 관리 기준 개수"][0] == "count_criteria", "전제 — 끈 채로는 FMEA 도구가 1위다"
+    _tune(monkeypatch, tmp_path, {"switches": {"noncore_demote": True}})
+    for q, mine in own.items():
+        on = search(q, 10)["ranked"]
+        others = {"count_criteria", "gather_evidence_tool", "criteria_items"} - mine     # 부르지 않은 비코어 — 낮춘다
+        keep = [n for n in on if n not in others]
+        assert keep == [n for n in off[q] if n not in others], (q, on, off[q])
+        via = [r for r in gw._qlog_read() if "q" in r][-1].get("via") or {}
+        assert not [k for k, v in via.items() if "demote:noncore" in v and k.split(":", 1)[1] in mine], (q, via)
+
+
 def test_E2_5_검색_평가는_꺼진_손잡이를_하나씩_켠_판도_잰다(monkeypatch, tmp_path):
     v = gw._eval_variants()
     assert v["+noncore_demote"]["switches"]["noncore_demote"] is True and "-noncore_demote" not in v

@@ -3314,6 +3314,9 @@ def _core_vocab_parse(d: dict) -> dict:
             "staging": frozenset(k for k, r in role.items() if r == "staging"),
             "family": (app, *siblings), "siblings": frozenset(siblings),
             "noncore": {k: str(apps[k].get("note") or "").strip() for k, r in role.items() if r == "noncore"},
+            # 비코어 앱을 부르는 이름 — 어휘표 라벨의 이름과 백엔드 키(비코어 낮추기가 비켜 갈 때 게이트웨이 라벨과 함께 본다, E2-5)
+            "noncore_names": {k: frozenset(_label_names(str(apps[k].get("label") or "")) | {k.lower()})
+                              for k, r in role.items() if r == "noncore"},
             "sib_tags": {k: s for k in siblings if (s := str(apps[k].get("tagline") or "").strip())},
             "core_reads": frozenset(t for _f, _p, tools in syn for t in tools)}
 
@@ -3523,9 +3526,9 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     quality_n = sum(1 for w in tun["quality_words"] if w in q) if sw["quality"] else 0
     # 코어 질문(R-5 와 같은 판정 — 어휘표 검색 낱말이 든 질의)에서는 비코어 앱 도구의 점수를 낮춘다(E2-5 · C-A — 손잡이 noncore_demote, 기본 끔 ·
     # 결정 Q-1, 켜기는 박스 덧씌우기로). 설명에 '고장모드 · 시험항목' 이 든 FMEA · ARP 도구가 코어 질문에 정본보다 앞섰다(OT-06 ~ 10). 질의가 그 앱
-    # 이름을 부르면 낮추지 않는다.
-    demote = (vocab.get("noncore") or {}) if (sw.get("noncore_demote") and vocab
-                                             and any(f in q_flat for f, _p, _t in vocab["syn"])) else {}
+    # 이름을 부르면 낮추지 않는다 — 값은 {앱 키: 어휘표가 아는 그 앱의 이름(라벨 · 키)}이다(아래 줄마다 게이트웨이 라벨의 이름과 함께 본다).
+    demote = (vocab.get("noncore_names") or {}) if (sw.get("noncore_demote") and vocab
+                                                   and any(f in q_flat for f, _p, _t in vocab["syn"])) else {}
     w_name, w_app, cap, w_cov = wt["name"], wt["app"], wt["desc_cap"], wt["coverage"]
     groups = _request_groups() if groups is None else groups
     visible = _visible_tools(groups)
@@ -3562,6 +3565,10 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                 for v in variants[1:]:
                     if v in name or v in desc or v in hay_app or _named(names, v, q_flat):
                         via.update(src[w].get(v, ()))
+        if app in demote and not row_named:
+            # 낮추기를 비켜 갈 이름 — 게이트웨이 라벨의 이름에 더해 어휘표의 앱 라벨 · 백엔드 키. 외부 연결 앱의 라벨은 포털 플랫폼 라벨(FMEA Agent)이라
+            # 그 이름(fmeaagent)만 보면 'FMEA …' 가 앱을 부르지 않는 것이 됐다(검토 10-31). 점수(이름 적중)는 종전대로 게이트웨이 라벨만 본다.
+            row_named = any(_named(demote[app], v, q_flat) for vs in expand.values() for v in vs)
         if score > 0:
             if quality_n and _area_of(t.name, app) in tun["quality_areas"]:
                 score += wt["quality_per_word"] * quality_n          # 품질 질의 — 품질 · VOC 도구를 위로(HG-01)

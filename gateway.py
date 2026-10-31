@@ -175,6 +175,16 @@ HOST = GW.get("host", "127.0.0.1")
 PORT = int(os.environ.get("GATEWAY_PORT") or GW.get("port", 9110))
 # /mcp 를 GW_TOKEN(내부 에이전트) 외에 포털 PAT(개인 Claude 등)로도 열 때 요구하는 audience.
 MCP_AUDIENCE = PORTAL.get("mcp_audience", "mcp-gateway")
+# 포털 챗의 MCP Apps 패널(HWAXPortal docs/request-1027 HA-20 · HP-42 · 설계 B5.3) — 패널 PAT 는 포털 백엔드가 패널 세션마다 찍는 짧은 토큰이다
+# (그 앱 하나 · 그 ui:// 주소 · 15분). 패널의 tools/call 은 이 토큰으로만 오고 감사에 via=mcp-app 과 주소가 남는다. 판별 셋(purpose · jti 머리 ·
+# 청중)은 포털 backend/app/agent/panel_pat.py 와 같은 글자다(두 리포 계약 시험). 청중을 따로 둔 까닭 — 이 판별을 모르는 옛 게이트웨이는 청중이
+# 맞지 않아 401 로 닫힌다(패널 PAT 가 그 사람의 일반 PAT 시야로 새지 않는다).
+PANEL_AUDIENCE = PORTAL.get("panel_audience", "mcp-app-panel")
+PANEL_PURPOSE = "mcp-app"
+PANEL_JTI_PREFIX = "mcpapp-"
+PANEL_MAX_TTL_S = 900               # 포털이 찍는 수명(15분) — 더 길게 찍힌 패널 PAT 는 받지 않는다
+# 패널 PAT 로 들어온 요청의 범위 {app, uri}(JSON, 퍼센트 인코딩) — **게이트웨이가 패널 분기에서만** 싣고 클라이언트가 보낸 사본은 두 분기 모두 버린다.
+PANEL_HEADER = "x-hwax-panel"
 AUDIT_PATH = os.environ.get("GATEWAY_AUDIT", str(Path(__file__).with_name("audit.jsonl")))
 # 백엔드 도구 호출 타임아웃(초) — 행 걸린 백엔드가 챗 SSE 를 무기한 붙잡지 않게.
 # 기본 600. 종전 120 은 실사용에서 걸렸다 — dev 감사 15,429건 중 검색 5건이 재시도까지 약 240초에 실패했고 13건은 첫 시도가
@@ -990,7 +1000,8 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
       ip     : 어디서 불렀나. 개인 Claude(nginx `/mcp-gw/`)는 사용자 PC 주소, 박스 안 호출은 127.0.0.1 이다.
                주소 형식일 때만 남긴다. ⚠ 박스 안에서 게이트웨이로 직접 붙는 프로세스는 X-Forwarded-For 로
                아무 주소나 주장할 수 있다 — 127.0.0.1 을 믿는 uvicorn 기본값이다(docs/gateway-audit-ip).
-      via    : 어느 자격으로 들어왔나(gw-token · chat · procedure · pat). 127.0.0.1 을 읽는 열쇠다.
+      via    : 어느 자격으로 들어왔나(gw-token · chat · procedure · pat · mcp-app). 127.0.0.1 을 읽는 열쇠다.
+      uri    : 패널 PAT(via=mcp-app) 호출이면 그 패널의 ui:// 주소 — 요청에서 읽는다(_request_panel).
       chars  : 호출자에게 돌려준 도구 결과의 글자 수(`res` 를 준 자리만). 게이트웨이는 결과를 자르지 않는다 —
                이 칸이 '그때 얼마나 컸나' 를 남긴다.
     `res` 를 준 자리에서 `isError` 는 아닌데 본문이 오류 봉투면 `ok` 를 false 로 고쳐 적고 사유를 `error` 에 싣는다
@@ -1028,6 +1039,13 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
         via = via or _request_via()
         if via:
             rec["via"] = via
+        # 패널 PAT 호출(via=mcp-app)이면 그 패널의 ui:// 주소 — 어느 패널이 부른 호출인지(HWAXPortal docs/request-1027 HA-20 · 설계 B5.3)
+        try:
+            _pnl = _request_panel()
+        except Exception:  # noqa: BLE001 — 주소 칸 하나 때문에 줄 전체를 잃지 않는다(D-4 와 같은 자세)
+            _pnl = None
+        if _pnl is not None:
+            rec["uri"] = _clip(_pnl.get("uri") or "", 200)
         with open(AUDIT_PATH, "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001
@@ -5058,12 +5076,13 @@ def _routine_read_deny() -> frozenset:
     return READ_DENY | _read_tools_local()["deny"]
 
 
-def _routine_read(t, backend: str, original: str) -> bool:
+def _routine_read(t, backend: str, original: str, *, by_name: bool = True) -> bool:
     """루틴 단계에서 부를 수 있는 읽기 도구인가 — 확인된 것만 참이다(모르면 거짓). 닫기 목록(deny)이 맨 먼저다 — 거기 있으면 표지와 무관하게
     거짓. 다음은 앱 표지 — readOnlyHint=False · destructiveHint 면 거짓, readOnlyHint=True 면 참. 다음은 읽기 목록('백엔드키:원래 이름'), 끝으로
     원래 이름의 조회 낱말(밑줄로 가른 조각) — 쓰기 동사(_WRITE_NAME)가 없을 때만이다. _tool_is_write 의 안내 · 미리보기 예외(_READ_NAME_HINT —
     status · history · preview …)는 쓰지 않는다 — update_status · delete_history · apply_preview 같은 쓰기가 읽기로 열렸다(R3 리뷰 2차 #5). 그 예외로만
-    열리던 진짜 읽기(upload_instructions · report_upload_instructions · preview_publish — 소스로 확인)는 읽기 목록에 있다."""
+    열리던 진짜 읽기(upload_instructions · report_upload_instructions · preview_publish — 소스로 확인)는 읽기 목록에 있다.
+    by_name 이 거짓이면 마지막 갈래(이름의 조회 낱말)를 건너뛴다 — 패널 첫 쓰기 확인의 판정이다(_panel_read)."""
     key = f"{backend}:{original}"
     if key in _routine_read_deny():
         return False
@@ -5074,7 +5093,15 @@ def _routine_read(t, backend: str, original: str) -> bool:
         return True
     if key in _routine_read_tools():
         return True
-    return any(tok in _ROUTINE_READ_TOKENS for tok in original.split("_")) and not _WRITE_NAME.search(original)
+    return by_name and any(tok in _ROUTINE_READ_TOKENS for tok in original.split("_")) and not _WRITE_NAME.search(original)
+
+
+def _panel_read(t, backend: str, original: str) -> bool:
+    """포털 MCP Apps 패널의 첫 쓰기 확인(HWAXPortal docs/request-1027 HA-20 · B-2 (가))이 읽기로 보는 도구인가 — 확인된 읽기만이다. 닫기 목록(deny)
+    다음 앱 표지(readOnlyHint=True · destructiveHint 아님)와 읽기 목록(read_tools.json ∪ 박스 덧씌우기)만 연다. _routine_read 의 이름 낱말 갈래는
+    쓰지 않는다 — 이름 규칙은 울타리가 아니다(job_info_cleanup · case_detail_archive 같은 쓰기 꼴이 조회 낱말로 읽기가 됐다 — 반대 검토 10-31).
+    읽기가 아니면 포털은 그 패널 세션의 첫 호출에 확인을 묻는다(모르면 묻는다)."""
+    return _routine_read(t, backend, original, by_name=False)
 
 
 async def _routine_call(a: dict) -> types.CallToolResult:
@@ -5303,7 +5330,7 @@ def _rt_chain(steps) -> str:
 async def _list_prompts() -> list[types.Prompt]:
     """부른 사람이 볼 수 있는 루틴(내 것 + 공개된 것, 보관 제외)마다 routine-<루틴 id>. 공유 비밀(GW_TOKEN) · 익명은 사람이 아니라 빈 목록이고
     포털이 답하지 않아도 빈 목록이다 — 클라이언트가 붙을 때 부르는 목록이라 여기서 터지면 연결이 오류로 보인다."""
-    if not _caller_bearer():
+    if not _caller_bearer() or _request_panel() is not None:     # 패널 PAT 는 루틴 프롬프트를 보지 않는다(HA-20)
         return []
     try:
         got = await _routine_portal("GET", "/routines")
@@ -5372,7 +5399,7 @@ def _rt_prompt_text(rid: str, plan: dict, inputs: dict) -> str:
 @_low.get_prompt()
 async def _get_prompt(name: str, arguments: dict[str, str] | None) -> types.GetPromptResult:
     """routine-<루틴 id> → 계획(GET /routines/{id}/plan)의 vars 로 인자를 본다 — 없는 입력 · 빠진 필수는 실행을 만들기 전에 오류로 말한다."""
-    rid = name[len(_RT_PROMPT_PREFIX):] if name.startswith(_RT_PROMPT_PREFIX) else ""
+    rid = name[len(_RT_PROMPT_PREFIX):] if name.startswith(_RT_PROMPT_PREFIX) and _request_panel() is None else ""
     if not rid:
         raise McpError(types.ErrorData(code=types.INVALID_PARAMS,
                                        message=f"모르는 프롬프트: {name} — 이 게이트웨이의 프롬프트는 routine-<루틴 id> 다"))
@@ -5597,6 +5624,75 @@ def _request_via() -> str:
         return ""
     raw = req.headers.get(VIA_HEADER) if req is not None else None
     return (raw or "").strip()[:20]
+
+
+def _panel_scope(claims: dict) -> tuple[bool, dict | None]:
+    """검증된 PAT 클레임이 패널 PAT 인가 — (패널이라 주장하나, 범위 {app, uri} 또는 None). 패널 표지(purpose · 청중 · jti 머리 · panel 칸) 가운데
+    하나라도 있으면 패널로 다룬다. 그때 꼴이 하나라도 어긋나면 범위가 None 이라 미들웨어가 401 로 닫는다 — 일반 PAT 로 떨어뜨리면 패널 PAT 가
+    그 사람의 시야 전부를 얻는다(닫힌 쪽). 꼴 — purpose=mcp-app · jti 머리 mcpapp- · 청중에 패널 청중만(MCP 청중과 함께 오면 거절) · panel 은
+    {app: 백엔드 키, uri: ui://…} · 수명은 PANEL_MAX_TTL_S 안 · 챗 PAT 이름이 아니다. 포털 panel_pat.panel_claims 가 찍는 꼴과 같다(두 리포 계약 시험)."""
+    aud = claims.get("aud")
+    auds = [aud] if isinstance(aud, str) else [str(x) for x in aud] if isinstance(aud, list) else []
+    jti = str(claims.get("jti") or "")
+    if not (str(claims.get("purpose") or "") == PANEL_PURPOSE or PANEL_AUDIENCE in auds or jti.startswith(PANEL_JTI_PREFIX)
+            or "panel" in claims):
+        return False, None
+    p = claims.get("panel")
+    app_key = p.get("app") if isinstance(p, dict) else None
+    uri = p.get("uri") if isinstance(p, dict) else None
+    try:
+        ttl = int(claims.get("exp")) - int(claims.get("iat"))
+    except (TypeError, ValueError):
+        ttl = -1
+    ok = (str(claims.get("purpose") or "") == PANEL_PURPOSE and jti.startswith(PANEL_JTI_PREFIX)
+          and PANEL_AUDIENCE in auds and MCP_AUDIENCE not in auds
+          and isinstance(app_key, str) and 0 < len(app_key) <= 120 and app_key != "_gateway"
+          and isinstance(uri, str) and uri.startswith("ui://") and len(uri) <= 2048
+          and 0 < ttl <= PANEL_MAX_TTL_S
+          and str(claims.get("pat_name") or "") != CHAT_PAT_NAME)
+    return True, ({"app": app_key, "uri": uri} if ok else None)
+
+
+def _request_panel() -> dict | None:
+    """이 요청이 패널 PAT 로 들어왔으면 그 범위 {app, uri}, 아니면 None. 헤더는 게이트웨이가 패널 분기에서만 싣는다(클라이언트 사본은 버린다).
+    ⚠ 헤더가 있는데 못 읽으면 **아무것도 열지 않는 범위**를 돌려준다 — None(일반 요청)으로 떨어뜨리면 패널 요청이 그 사람의 시야 전부가 된다."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return None
+    raw = req.headers.get(PANEL_HEADER) if req is not None else None
+    if not raw:
+        return None
+    try:
+        v = json.loads(unquote(raw))
+    except (ValueError, TypeError):
+        v = None
+    if isinstance(v, dict) and isinstance(v.get("app"), str) and isinstance(v.get("uri"), str) and v["app"] and v["uri"]:
+        return {"app": v["app"], "uri": v["uri"]}
+    return {"app": "", "uri": ""}
+
+
+# 패널이 앱과 무관하게 부르지 못하는 도구(설계 B4) — 게이트웨이 자체 도구 전부(invoke_tool · rest_call · rest_catalog · 대화 · 검색 · 루틴 …,
+# _local_tools 가 그 목록이다) · 되돌리기 어려운 정확 이름(_INVOKE_DENY_EXACT — 절차 면제는 패널에 없다) · 외부 응답자 과제 도구(에이전트 서버
+# external_llm.TASK_TOOLS 와 같은 이름).
+_PANEL_DENY_EXACT = frozenset({"review_task_next", "review_task_read", "review_task_submit"})
+
+
+def _panel_denial(name: str, panel: dict) -> str | None:
+    """패널 PAT 호출의 거절 사유 — 그 앱의 도구이고 막음 목록 밖일 때만 None. 노출 이름 → 백엔드는 route · 별칭 표로 본다."""
+    local = {t.name for t in _local_tools()} | {REST_CATALOG_TOOL.name, REST_CALL_TOOL.name, SAVE_CONV_TOOL.name}
+    if name in local:
+        return "gateway-tool"
+    resolved = route.get(name) or alias_route.get(name)
+    if resolved is None:
+        return "unknown-tool"
+    backend_key, original = resolved
+    if backend_key != panel.get("app"):
+        return "out-of-app"
+    if (name in _INVOKE_DENY_EXACT or original in _INVOKE_DENY_EXACT
+            or name in _PANEL_DENY_EXACT or original in _PANEL_DENY_EXACT):
+        return "deny-list"
+    return None
 
 
 def _request_readonly() -> bool:
@@ -6335,14 +6431,14 @@ def _res_visible(key: str, groups: list[str], muted: set[str]) -> bool:
 
 @_low.list_resources()
 async def _list_resources():
-    groups, muted = _request_groups(), _request_muted()
-    return [r for k, r in _UI_RESOURCES.values() if _res_visible(k, groups, muted)]
+    groups, muted, pnl = _request_groups(), _request_muted(), _request_panel()
+    return [r for k, r in _UI_RESOURCES.values() if _res_visible(k, groups, muted) and (pnl is None or k == pnl["app"])]
 
 
 @_low.list_resource_templates()
 async def _list_resource_templates():
-    groups, muted = _request_groups(), _request_muted()
-    return [t for k, t in _UI_TEMPLATES if _res_visible(k, groups, muted)]
+    groups, muted, pnl = _request_groups(), _request_muted(), _request_panel()
+    return [t for k, t in _UI_TEMPLATES if _res_visible(k, groups, muted) and (pnl is None or k == pnl["app"])]
 
 
 def _res_bytes_of(res) -> int:
@@ -6360,8 +6456,10 @@ async def _read_ui_resource(req: types.ReadResourceRequest):
     t0 = time.monotonic()
     hit = _UI_RESOURCES.get(uri)
     groups = _request_groups()
+    _pnl = _request_panel()
     # 끈 앱도 읽기는 막지 않는다 — 도구 호출과 같다(숨김만). 권한 없는 백엔드는 없는 주소와 같은 말을 한다.
-    if hit is None or not _backend_allowed(hit[0], groups):
+    # 패널 PAT 는 그 앱이 내는 ui:// 만 읽는다(HA-20) — 다른 앱의 주소도 없는 주소와 같은 말이다.
+    if hit is None or not _backend_allowed(hit[0], groups) or (_pnl is not None and hit[0] != _pnl["app"]):
         _audit(f"resources/read {_clip(uri, 160)}", hit[0] if hit else None, False, "not found", 0)
         raise McpError(types.ErrorData(code=_RES_NOT_FOUND, message=f"Resource not found: {uri}"))
     key = hit[0]
@@ -6425,6 +6523,11 @@ async def _list_tools(req: types.ListToolsRequest):
     # 도구 목록을 caller groups로 필터(보이지 않는 도구는 LLM이 알 수도 없음) + 개인 보기(E-4 — tools/list 에만, _listed_tools).
     # req 가 None 이면 클라이언트의 목록 요청이 아니라 SDK 가 호출 검증용 캐시를 채우려 부른 것이다(_get_cached_tool_definition) — 그때는 보기를
     # 얹지 않고 세지도 않는다. 보기는 목록만 줄이고 호출은 지금 그대로여야 한다(목록 밖 도구를 이름으로 부를 때 출력 검증도 그대로다).
+    # 패널 PAT 면 그 앱의 도구에서 막음 목록을 뺀 것만 보인다(HA-20) — 호출 관문(_panel_denial)과 같은 판정이다. 패널은 그 앱 안만 보므로
+    # 개인 보기(E-4)는 얹지 않는다.
+    pnl = _request_panel()
+    if pnl is not None:
+        return [t for t in _visible_tools(_request_groups()) if _panel_denial(t.name, pnl) is None]
     if req is None:
         return _visible_tools(_request_groups())
     _VIEW_LISTS[_request_view()[0]] += 1
@@ -6454,6 +6557,17 @@ async def _call_tool(name: str, arguments: dict):
 
 async def _call_tool_body(name: str, arguments: dict):
     t0 = time.monotonic()
+    # 패널 PAT(HA-20 · 설계 B5.3) — 그 앱의 도구만, 막음 목록(게이트웨이 자체 도구 · 되돌리기 어려운 정확 이름 · 외부 응답자 과제)은 앱과 무관하게
+    # 거절한다. invoke_tool 도 게이트웨이 자체 도구라 여기서 끝난다(안쪽 이름으로 앱 밖을 부르는 길이 없다). 포털이 먼저 막고 여기가 두 번째 막이다.
+    _pnl = _request_panel()
+    if _pnl is not None:
+        _why = _panel_denial(name, _pnl)
+        if _why:
+            _audit(name, (route.get(name) or alias_route.get(name) or (None,))[0], False, f"panel-denied:{_why}", 0,
+                   caller=_request_user() or None, corr=_request_corr())
+            return types.CallToolResult(content=[types.TextContent(type="text", text=(
+                f"panel: {name} — 패널은 그 앱({_pnl.get('app') or '?'})의 도구만 부른다({_why}). 게이트웨이 자체 도구 · 다른 앱 · 막은 도구는 "
+                "패널에서 부르지 않는다"))], isError=True)
     # 범용 실행기 — 이름·인자를 안쪽 도구로 바꿔 끼우고 **아래 정상 경로를 그대로 탄다**
     # (인가·캐시·사용자 위임·감사 전부 기존 로직 적용). 재귀·파괴 도구만 여기서 차단.
     if name == INVOKE_TOOL.name:
@@ -6925,6 +7039,9 @@ def _bearer_gate(app, pat_verifier=None):
                 # 이 게이트웨이가 아는 개인 보기(E-4) — 포털이 보기를 저장 · 보일 때 본다. 이 칸이 없는 옛 게이트웨이는 보기를 읽지 않아 늘 전체로 돈다
                 # (포털 화면이 '저장했습니다' 만 말하던 것을 막는다, 검토 10-31). 위 칸들은 그대로다.
                 "views": ["full", "bundle", "light"],
+                # 패널 첫 쓰기 확인이 읽기로 보는 도구의 노출 이름(정렬, 백엔드 도구만) — _panel_read(표지 · 읽기 목록, 이름 낱말 없이). 포털 패널 창구는
+                # routine_read 가 아니라 이것을 본다 — 이것 밖이면 그 패널 세션의 첫 호출에 확인을 묻는다(HWAXPortal docs/request-1027 HA-20 B-2).
+                "panel_read": sorted(_n for _n, (_bk, _orig) in route.items() if _panel_read(_tool_of.get(_n), _bk, _orig)),
             }, ensure_ascii=False).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
@@ -7075,7 +7192,7 @@ def _bearer_gate(app, pat_verifier=None):
             _kept = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
                                           DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode(),
-                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode())]
+                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode())]
             if GROUPS_HEADER.encode() not in headers:
                 _kept.append((GROUPS_HEADER.encode(), SERVICE_GROUP.encode()))
             _kept.append((VIA_HEADER.encode(), b"gw-token"))
@@ -7084,11 +7201,19 @@ def _bearer_gate(app, pat_verifier=None):
         # GW_TOKEN 이 아니면 포털 PAT(개인 Claude 등) 로 검증 시도 → 성공 시 PAT 의 groups 로 도구 필터.
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         _expired = False
+        _bad_panel = False
         try:
-            claims = await pat_verifier.verify(token, MCP_AUDIENCE) if (token and pat_verifier) else None
+            # 청중은 둘 중 하나 — 일반 · 챗 · 절차 PAT(MCP_AUDIENCE)와 패널 PAT(PANEL_AUDIENCE). 어느 쪽인지는 아래 _panel_scope 가 가른다.
+            claims = await pat_verifier.verify(token, [MCP_AUDIENCE, PANEL_AUDIENCE]) if (token and pat_verifier) else None
         except PatExpired:
             # 서명은 맞고 수명만 끝났다 — 아래 401 과 감사 줄이 틀린 토큰과 다르게 말한다(gateway-23).
             claims, _expired = None, True
+        _panel = None
+        if claims is not None:
+            _is_panel, _panel = _panel_scope(claims)
+            if _is_panel and _panel is None:
+                # 패널이라 주장하는데 꼴이 어긋난다 — 일반 PAT 로 받지 않는다(그 사람의 시야 전부가 된다). 401 로 닫는다.
+                claims, _bad_panel = None, True
         if claims is not None:
             # 권한(feat:·plat:)은 PAT 에 박힌 발급 때 값이 아니라 포털의 **지금** 값으로 바꾼다 —
             # 거둔 권한이 PAT 수명(최대 100년) 동안 남지 않게. 포털이 모르면(None) PAT 값 그대로.
@@ -7120,7 +7245,7 @@ def _bearer_gate(app, pat_verifier=None):
                      if k.lower() not in (GROUPS_HEADER.encode(), USER_HEADER.encode(),
                                           PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
                                           DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode(),
-                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode())]
+                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode())]
             if is_read_only(claims):
                 fresh.append((READONLY_HEADER.encode(), b"1"))
             # PAT 의 groups 에도 한글이 올 수 있다 — 같은 규칙으로 인코딩해 실어야 헤더가 안 깨진다.
@@ -7138,8 +7263,11 @@ def _bearer_gate(app, pat_verifier=None):
             # 챗 PAT 판별은 pat_name 만으로 하지 않는다 — 개인 토큰 이름은 사용자가 정하므로 'chat-session' 으로 지으면
             # 끄기를 피해 간다(검토 2026-09-29). jti 는 서버가 정하고 챗 PAT 만 'chat-' 로 시작한다(포털 _chat_user_pat).
             _is_chat = (str(claims.get("pat_name") or "") == CHAT_PAT_NAME
-                        and str(claims.get("jti") or "").startswith("chat-"))
-            if _muted and not _is_chat and str(claims.get("purpose") or "") != PROCEDURE_PURPOSE:
+                        and str(claims.get("jti") or "").startswith("chat-") and _panel is None)
+            if _panel is not None:
+                # 패널 PAT(HA-20) — 범위를 싣고 끄기는 걸지 않는다(사람이 그 패널을 열었다). 범위는 도구 · 리소스 처리기가 본다(_request_panel).
+                fresh.append((PANEL_HEADER.encode(), quote(json.dumps(_panel, ensure_ascii=False), safe="").encode("latin-1")))
+            elif _muted and not _is_chat and str(claims.get("purpose") or "") != PROCEDURE_PURPOSE:
                 fresh.append((MUTED_HEADER.encode(), quote(",".join(_muted), safe=",").encode("latin-1")))
             # 개인 보기(E-4 E4-2) — 연결이 청한 것만 얹는다. 머리가 보기 글이면 그것(연결마다 덮는다 — 리포 .mcp.json 은 늘 full), 머리가 `portal` 이면
             # 포털 사람 설정(권한 응답의 view — 포털 등록 배치 · 명령이 단다), 머리가 없으면 전체. 정한 값으로 갈아 끼운다. 포털 설정을 머리 없는 개인 PAT
@@ -7157,7 +7285,7 @@ def _bearer_gate(app, pat_verifier=None):
                 _view, _vsrc = (_hv, "header") if _hv else (("full", ()), "default;bad-header" if _cv else "default")
             fresh.append((VIEW_HEADER.encode(), _view_text(*_view).encode("latin-1")))
             fresh.append((VIEW_SRC_HEADER.encode(), _vsrc.encode()))
-            fresh.append((VIA_HEADER.encode(), b"chat" if _is_chat else
+            fresh.append((VIA_HEADER.encode(), b"mcp-app" if _panel is not None else b"chat" if _is_chat else
                           b"procedure" if str(claims.get("purpose") or "") == PROCEDURE_PURPOSE else b"pat"))
             await app({**scope, "headers": fresh}, receive, send)
             return
@@ -7172,6 +7300,7 @@ def _bearer_gate(app, pat_verifier=None):
             _m = _m if _m in ("GET", "POST", "DELETE", "PUT", "PATCH", "HEAD", "OPTIONS") else "OTHER"
             _audit(f"{_m} {scope.get('path')}", None, False,
                    "unauthorized: " + ("duplicate-authorization" if _dup_auth else "expired" if _expired else
+                                       "bad-panel-token" if _bad_panel else
                                        "unverified-token" if token else "no-bearer"), 0,
                    ip=(scope.get("client") or (None,))[0])
         await send({

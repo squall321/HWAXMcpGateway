@@ -10045,6 +10045,26 @@ def test_심의_시작은_정한_칸만_넘기고_save_report_wiki_는_늘_false
     assert inner[-2][1] == {"job_id": "j", "tools": ["x"]} and inner[-1][1] == {"q": "x", "wiki": True}, "시작 말고는 손대지 않는다"
 
 
+def test_심의_결과는_routine_call_에서_view_를_버려_전문을_읽고_진행의_wait_s_brief_는_그대로다(monkeypatch):
+    """HWAXPortal docs/token-saving TS-4 — 루틴의 심의 단계는 결정문을 쪽마다 다 읽는다. deliberate_result(view="summary") 는 개인 Claude 의 골라
+    쓰기(에이전트 서버 wt1102/token-wait — 기본 full)라, 루틴 실행자(개인 Claude)가 routine_call 로 view 를 주면 단계가 말없이 요약만 받았다.
+    안쪽 호출 · 원장 쓰기 전에 view 만 뺀다 — 쪽(part)과 다른 칸은 그대로, 부른 쪽의 인자 사전도 그대로다. 진행(deliberate_status)의 wait_s · brief 는
+    루틴이 코드로 묻는 길이라 손대지 않는다."""
+    seen, inner = _rt_kit(monkeypatch)
+    sent = {"job_id": "j", "part": 2, "view": "summary"}
+    res, text = _rt_run("routine_call", {"run_id": "r1", "step": "delib", "name": "deliberate_result", "arguments": sent})
+    assert not res.isError, text
+    assert inner[-1][0] == "deliberate_result" and inner[-1][1] == {"job_id": "j", "part": 2}, inner[-1][1]
+    post = [b for m, p, b, _ in seen if (m, p) == ("POST", "/runs/r1/calls")][-1]
+    assert post["tool"] == "deliberate_result" and post["args"] == {"job_id": "j", "part": 2}, "원장에도 거른 인자가 남는다"
+    assert sent == {"job_id": "j", "part": 2, "view": "summary"}, "부른 쪽의 인자 사전은 그대로다"
+    _rt_run("routine_call", {"run_id": "r1", "step": "delib", "name": "hwax-deliberation:deliberate_result",
+                             "arguments": {"job_id": "j", "view": "full"}})
+    assert inner[-1][1] == {"job_id": "j"}, "'백엔드:원래 이름' 으로 불러도 · full 이어도 뺀다(엔진 기본이 full 이다)"
+    _rt_run("routine_call", {"run_id": "r1", "step": "delib", "name": "deliberate_status", "arguments": {"job_id": "j", "wait_s": 120, "brief": True}})
+    assert inner[-1][:2] == ("deliberate_status", {"job_id": "j", "wait_s": 120, "brief": True}), "진행의 wait_s · brief 는 그대로다"
+
+
 def test_시간_상한_뒤에도_심의_결과는_읽고_호출_상한_옛_포털은_그대로_막는다(monkeypatch):
     """심의는 분 ~ 시간이라 시간 상한(기본 60분)이 먼저 닿는다 — 결과 읽기까지 막으면 이미 쓴 GLM 시간이 루틴에서 사라진다(R3-D5).
     여는 것은 시간 상한 × deliberate_result 하나다. 호출 상한은 그대로이고 limit_kind 를 모르는 옛 포털이면 종전대로 막는다(단계 호출 예산은

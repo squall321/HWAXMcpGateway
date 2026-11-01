@@ -305,7 +305,8 @@ python3 tool_usage_report.py --days 60 --out unused.md
   `evidence` · `personas` · `human_note` · `search_sources` · `options` · `stop_after_round` · `advanced` 만 남기고(`tools` — 엔진이 시작 전에 읽기 판정
   없이 부르는 도구 · `apps` 같은 그 밖은 버린다), `save_report` · `wiki` 는 늘 `false` 다(보고서 · RA 초안은 루틴이 낸다). `advanced` 는 엔진이 통째로
   덮어 합치므로 그 안의 `tools` · `apps` · `save_report` · `wiki` 도 빼고(JSON 글이면 풀어서 보고, 사전이 아니면 버린다), `evidence` 가 비면 앞 단계 원
-  근거로 채운다. 원장에는 거른 인자가 남는다.
+  근거로 채운다. 원장에는 거른 인자가 남는다. `deliberate_result` 는 `view` 만 버린다(11-02, HWAXPortal docs/token-saving TS-4 — 루틴은 결정문을
+  전문으로 쪽마다 읽는다. `view="summary"` 는 개인 Claude 의 골라 쓰기다). 진행(`deliberate_status`)의 `wait_s` · `brief` 는 그대로다.
   심의 단계의 `deliberate_result` 는 단계 호출 예산 밖이다(시작이 예산을 다 써도 결정문을 읽는다). 실행 보기의 `run.limit_kind` 가 `time` 이면
   `deliberate_result` 는 시간 상한 뒤에도 부른다(실행 호출 상한은 그대로, 그 칸이 없는 옛 포털이면 종전대로 막는다). 심의 진행(`deliberate_status`)은
   `routine_call` 없이 직접 부른다(원장 · 예산을 쓰지 않는다). `deliberate_start` 가 됐는데 원장 쓰기(`POST /runs/{id}/calls`)가 거절되거나

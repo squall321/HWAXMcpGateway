@@ -5262,6 +5262,11 @@ async def _routine_call(a: dict) -> types.CallToolResult:
             inner["evidence"] = ev.get("evidence") or []
         # 보고서 · RA 초안은 루틴이 낸다(R3-D5) — 심의가 따로 RA 초안 · 위키를 쓰면 겹치고 단계 안 쓰기 금지(v1)를 넘는다. 호출자가 true 를 줘도 false 다
         inner.update(save_report=False, wiki=False)
+    elif resolved == ("hwax-deliberation", "deliberate_result"):
+        # 결과는 전문으로 읽는다(HWAXPortal docs/token-saving TS-4) — 루틴의 심의 단계는 결정문을 쪽마다 다 읽는다. view(summary)는 개인 Claude 의
+        # 골라 쓰기(엔진 기본 full)라 루틴 실행자가 주면 단계가 말없이 요약만 받는다 — 버린다(쪽 part 와 다른 칸은 그대로, 원장에는 거른 인자).
+        # 진행(deliberate_status)의 wait_s · brief 는 손대지 않는다 — 루틴은 코드가 묻는다
+        inner = {k: v for k, v in inner.items() if k != "view"}
     tok = _ROUTINE_CORR.set(f"routine:{run_id}:{step}"[:120])
     t0 = time.monotonic()
     try:

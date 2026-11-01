@@ -159,8 +159,9 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 운영 모델의 창은 1,048,576 토큰(GLM-5.2)이다. Claude 사용자는 이 게이트웨이를 거쳐 받은 결과로 심의하므로 여기서 잘리면 잘린 근거로 심의한다. 그래서 게이트웨이는 **생산자로서 자르지 않고**, 작은 창이 필요한 소비자(에이전트 서버의 웹 챗)가 자기 쪽에서 자른다(`TOOL_RESULT_MAX`).
 
 - 백엔드 도구 결과(직접 호출·`invoke_tool`·캐시 적중)는 본문을 그대로 준다. 감사 줄의 `chars` 가 돌려준 결과의 글자 수다.
-- `search_tools` 는 찾은 도구의 설명 전문과 인자 스키마 전부(`$defs` 포함)를, `list_tool_apps` 는 도구·앱 설명 전문을, `use_experts` 는 역할 문서 전문을, `rest_catalog` 는 경로의 인자(`params`)·본문(`body`) 스키마를 준다. `rest_call` 은 JSON 이 아닌 본문도 통째로 준다.
-- 순위·목록은 이름을 먼저 싣는다 — `search_tools` 의 `ranked`(그다음 `truncated`·`note`, 전문 `matches` 는 맨 뒤), `list_tool_apps(app=)` 의 `tool_names`. 작은 창의 소비자가 앞에서부터 글자로 잘라도(dev 웹 챗 6,000자) 뒤 순위 도구가 '없다' 로 읽히지 않는다.
+- `search_tools` 는 `detail=true` 일 때 찾은 도구의 설명 전문과 인자 스키마 전부(`$defs` 포함)를(아래 표의 상한 안에서 — 기본은 한 줄 요약 · 필수 인자), `list_tool_apps` 는 도구·앱 설명 전문을, `use_experts` 는 역할 문서 전문을, `rest_catalog` 는 경로의 인자(`params`)·본문(`body`) 스키마를 준다. `rest_call` 은 JSON 이 아닌 본문도 통째로 준다.
+- 순위·목록은 이름을 먼저 싣는다 — `search_tools` 의 `ranked`(그다음 `truncated`·`detail_capped`·`note`, 전문 `matches` 는 맨 뒤), `list_tool_apps(app=)` 의 `tool_names`. 작은 창의 소비자가 앞에서부터 글자로 잘라도(dev 웹 챗 6,000자) 뒤 순위 도구가 '없다' 로 읽히지 않는다.
+- `search_tools` 의 답은 촘촘한 JSON 이다(빈칸 없는 구분자 · 한글 그대로 — 11-02, HWAXPortal docs/token-saving TS-5). 들여쓴 꼴(indent=2)은 같은 내용을 10-16 카탈로그 스냅샷 · 평가셋 150 질의에서 기본 1.55배 · `detail=true` 1.33배로 불렸다. 받는 쪽은 JSON 으로 읽거나(`/search-eval` · `tool_search_eval/run.py`) 글을 그대로 모델에 준다(Claude Code · 웹 챗 안내대) — 줄 · 빈칸 꼴에 기대는 곳이 없어 골라 쓰기가 아니라 기본이다.
 - `save_conversation` 은 포털 입력 한도(발언 20,000자·한 번에 200건 — 포털 `ConvMessageIn`·`ConvCreate` 가 정본, 시험이 대조한다)를 넘는 것을 버리지 않는다. 긴 발언은 `(긴 발언 나눔 k/N)` 로 이어 싣고, 200건 넘는 것은 덧붙이기로 보낸다. 도중에 멈추면 `CONV_PARTIAL:` 이다.
 
 남는 상한 — 창이 아닌 까닭이 있는 것만 두고, 넘으면 말한다.
@@ -172,6 +173,7 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 | `EVID_MAX_CHARS` | 1,048,576 | `verify_answer` 근거 원장의 호출자 한 칸(원문이 아니라 숫자 줄기). 메모리 보호. 넘치면 오래된 조회부터 버리고 `evidence_trimmed` 로 말한다 |
 | `EVID_MAX_CALLS` | 없음(0) | 적으면 건수 천장이다 — 낮출 때만 쓴다 |
 | 결과 건수 `search_tools`·`browse_experts`·`rest_catalog` | 8(≤20)·40(≤200)·40(≤200) | 순위·목록이다. 넘으면 `truncated` 가 말한다 |
+| `GATEWAY_SEARCH_DETAIL_MAX_CHARS` | 25,000자 | `search_tools(detail=true)` 한 응답. Claude Code 의 MCP 결과 문턱(`MAX_MCP_OUTPUT_TOKENS` 기본 25,000토큰 — 넘으면 본문 대신 파일로 빼거나 앞 100,000자에서 자른다)을 1자≈1토큰으로 잡은 값이다(에이전트 서버 `DELIB_MCP_PAGE_CHARS`·리스크 앱 `CLAUDE_MCP_RESULT_CHARS` 와 같은 환산). 10-16 스냅샷에서 limit 8 은 150 질의 중 4건, limit 20 은 92건이 넘었다. 넘으면 자르지 않고 상위부터 전문을 싣다가 넘칠 자리부터 기본 꼴(한 줄 요약)로 내며, `detail_capped`(`max_chars` · 전문으로 실은 건수 `full_count`(`ranked` 의 앞에서부터) · 요약으로 남긴 이름 `brief` · 한 도구의 전문을 받는 호출 `how`)가 전문(`matches`) 앞에서 말한다. 첫 줄은 상한보다 커도 늘 전문이다. `detail=true` 이고 질의가 보이는 도구의 노출 이름과 같으면(대소문자 무시) 그 도구가 순위 · 사본 접기와 상관없이 첫 줄이다 — `search_tools(query="<이름>", detail=true, limit=1)` 이 늘 그 도구의 전문을 준다(순위로는 446개 중 10개가 1위가 아니었다). 기본 꼴(`detail` 없음)에는 걸리지 않는다. 0 이하면 끈다. 사용자 PC 가 `MAX_MCP_OUTPUT_TOKENS` 를 낮춰 쓰는 것은 이 값이 따라가지 못한다(서버 값 하나다) |
 | `use_experts` 5명·앱 3·입구 도구 12 | — | 포털 `pinned_agents`·에이전트 서버 `_persona_meta` 와 같은 제품 규칙. 넘긴 것은 `dropped_keys`·`*_omitted` |
 | 감사 `corr`·`note`·`error` | 120·120·200자 | 무기한 보존·한 호출 한 줄. 잘렸으면 `…(원문 N자)` 가 붙는다 |
 | 대화 저장의 이름·제목 | 120·200자 | 포털 입력 한도. 응답 `clipped` 와 감사 `note` 에 남는다 |
@@ -303,7 +305,8 @@ python3 tool_usage_report.py --days 60 --out unused.md
   `evidence` · `personas` · `human_note` · `search_sources` · `options` · `stop_after_round` · `advanced` 만 남기고(`tools` — 엔진이 시작 전에 읽기 판정
   없이 부르는 도구 · `apps` 같은 그 밖은 버린다), `save_report` · `wiki` 는 늘 `false` 다(보고서 · RA 초안은 루틴이 낸다). `advanced` 는 엔진이 통째로
   덮어 합치므로 그 안의 `tools` · `apps` · `save_report` · `wiki` 도 빼고(JSON 글이면 풀어서 보고, 사전이 아니면 버린다), `evidence` 가 비면 앞 단계 원
-  근거로 채운다. 원장에는 거른 인자가 남는다.
+  근거로 채운다. 원장에는 거른 인자가 남는다. `deliberate_result` 는 `view` 만 버린다(11-02, HWAXPortal docs/token-saving TS-4 — 루틴은 결정문을
+  전문으로 쪽마다 읽는다. `view="summary"` 는 개인 Claude 의 골라 쓰기다). 진행(`deliberate_status`)의 `wait_s` · `brief` 는 그대로다.
   심의 단계의 `deliberate_result` 는 단계 호출 예산 밖이다(시작이 예산을 다 써도 결정문을 읽는다). 실행 보기의 `run.limit_kind` 가 `time` 이면
   `deliberate_result` 는 시간 상한 뒤에도 부른다(실행 호출 상한은 그대로, 그 칸이 없는 옛 포털이면 종전대로 막는다). 심의 진행(`deliberate_status`)은
   `routine_call` 없이 직접 부른다(원장 · 예산을 쓰지 않는다). `deliberate_start` 가 됐는데 원장 쓰기(`POST /runs/{id}/calls`)가 거절되거나
@@ -331,6 +334,14 @@ python3 tool_usage_report.py --days 60 --out unused.md
   지시문(차례 · 울타리 · 인용 · 키 · 쓰기 금지)에 받은 입력을 `inputs` 로 박아 준다. 공개 루틴은 남이 쓰므로 제목 · 단계 제목은 한 줄 `«…»` 데이터로만
   싣고(줄바꿈 · `«»` 를 지운다) 작성자의 글이지 지시가 아니라고 한 줄 말한다 — 사람의 말(user)로 올라가 규칙을 덮지 못하게.
 - 서버 지침 12번이 루틴의 차례 · 울타리 · 키 규칙을 한 줄로 말한다(차례의 자세한 글은 `routine_list` 설명 — 지침 전체가 2048자 안이어야 한다).
+
+## 서버 지침 — initialize 의 instructions
+
+Claude Code · Desktop 이 세션마다 읽는 글이다(`_INSTRUCTIONS` + `_instructions()`). 세션마다 값을 치르므로 짧게 두고, 전체가 2048자 안이어야 한다 — Claude Code 가 거기서 자른다(시험이 가장 긴 조합을 잰다 — 11-02 에 2,031자).
+
+- 본문(1 ~ 10 · 12번)은 늘 실린다. 붙는 항목은 재집계(`_aggregate`)마다 지금 카탈로그로 다시 짓고 뒤에만 붙는다 — 13번(새 심의는 서버 엔진 `deliberate_start`)은 그 도구가 있을 때, 11번(리스크 심사는 `risk_next_step` 부터)은 그 도구가 있을 때. 이미 열린 세션은 그때 받은 글을 쓴다.
+- 서버 엔진을 기본 길로(사용자 결정 11-02, HWAXPortal docs/token-saving TS-5) — 13번 · 11번 끝 문장. Claude 가 좌석 · 판단 과제마다 직접 도는 워크플로(`hwax-*`)는 품질을 따로 잴 때만이다. 13번의 두 문장(`deliberate_status` 는 `wait_s` 로 한 번 기다린다 · 결과는 `deliberate_result(view="summary")` 부터)과 11번 끝 문장(`risk_start_job` 은 `llm=glm`)은 **그 인자가 지금 스키마에 있을 때만** 싣는다 — 에이전트 서버에 `wait_s` · `view` 가 아직 없는 판이면 13번에는 '고리로 되풀이해 묻지 마라' 만 남는다. 그래서 게이트웨이와 에이전트 서버의 배포 차례가 없다.
+- 본문의 토큰 습관 — `search_tools` 는 `detail` 을 필요할 때만, `list_agents` 는 `compact=true`.
 
 ## 실행
 ```bash

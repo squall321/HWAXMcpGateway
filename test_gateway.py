@@ -5347,10 +5347,10 @@ def test_응답_캐시는_큰_결과를_담지_않고_합도_바이트로_묶는
 
 
 # ── 순위 목록은 작은 창 소비자의 글자 절단을 견딘다(gw-adh GA-7) ─────────────────────────────────────────────────
-def _long_tools(monkeypatch, n, app="heax-hwax_risk"):
-    """설명·스키마가 리스크 앱 입구 도구만큼 긴 도구 n 개(실측: 8건 검색 결과 7,000~8,400자)."""
+def _long_tools(monkeypatch, n, app="heax-hwax_risk", arg_words=60):
+    """설명·스키마가 리스크 앱 입구 도구만큼 긴 도구 n 개(실측: 8건 검색 결과 7,000~8,400자). arg_words — 필수 인자 설명의 낱말 수."""
     tools = [types.Tool(name=f"risk_tool_{i:02d}", description=f"리스크 심사 도구 {i} — " + "설명 " * 300,
-                        inputSchema={"type": "object", "properties": {"project_id": {"type": "string", "description": "과제 " * 60}},
+                        inputSchema={"type": "object", "properties": {"project_id": {"type": "string", "description": "과제 " * arg_words}},
                                      "required": ["project_id"]}) for i in range(n)]
     monkeypatch.setattr(gw, "exposed_tools", tools)
     monkeypatch.setattr(gw, "route", {t.name: (app, t.name) for t in tools})
@@ -5365,8 +5365,9 @@ def _long_tools(monkeypatch, n, app="heax-hwax_risk"):
 
 def test_search_tools_는_찾은_도구_이름을_순위대로_먼저_싣는다(monkeypatch):
     """게이트웨이는 결과를 자르지 않는다 — 작은 창의 소비자(dev 웹 챗 TOOL_RESULT_MAX=6,000)가 앞에서부터 글자로 자른다. 설명·스키마
-    전문이 앞서면 그 절단에 6~8위 도구는 이름조차 사라져 '없다' 로 읽힌다. 이름 순위를 먼저 실으면 잘려도 순위는 남는다."""
-    _long_tools(monkeypatch, 12)
+    전문이 앞서면 그 절단에 6~8위 도구는 이름조차 사라져 '없다' 로 읽힌다. 이름 순위를 먼저 실으면 잘려도 순위는 남는다.
+    답이 촘촘한 JSON 이 된 뒤(11-02)에도 6,000자를 넘게 인자 설명을 늘려 둔다."""
+    _long_tools(monkeypatch, 12, arg_words=120)
     out = asyncio.run(gw._search_tools({"query": "리스크 심사"})).content[0].text
     body = json.loads(out)
     assert len(out) > 6000 and len(body["matches"]) == 8, "시험 입력이 dev 상한을 넘어야 뜻이 있다"
@@ -5375,6 +5376,142 @@ def test_search_tools_는_찾은_도구_이름을_순위대로_먼저_싣는다(
     head = out[:6000]
     assert all(f'"{n}"' in head for n in ranked), "6,000자에서 잘려도 8건 이름이 다 남아야 한다"
     assert head.index('"ranked"') < head.index('"matches"') and head.index('"note"') < head.index('"matches"')
+
+
+def test_search_tools_답은_촘촘한_JSON_이고_칸_차례는_그대로다(monkeypatch):
+    """들여쓰기(indent=2)는 같은 내용을 글자로 불려 Claude 길의 토큰만 먹었다(HWAXPortal docs/token-saving TS-5, 11-02). 받는 쪽은 JSON 으로
+    읽거나 글을 그대로 모델에 준다 — 빈칸 없는 구분자로 내고, 한글은 그대로(\\u 이스케이프 없이), 칸 차례(이름 순위 먼저 · 전문 맨 뒤)는 같다."""
+    _long_tools(monkeypatch, 12)
+    for args in ({"query": "리스크 심사"}, {"query": "리스크 심사", "detail": True}):
+        out = asyncio.run(gw._search_tools(args)).content[0].text
+        body = json.loads(out)
+        assert out == json.dumps(body, ensure_ascii=False, separators=(",", ":")), args
+        assert "\n" not in out and "리스크 심사" in out, args
+        assert list(body) == ["query", "match_count", "ranked", "truncated", "note", "matches"], list(body)
+        assert len(out) < len(json.dumps(body, ensure_ascii=False, indent=2)), "같은 내용이 들여쓴 꼴보다 짧다"
+
+
+# ── search_tools(detail=true) 상한 — Claude Code 의 MCP 결과 문턱 아래로, 조용히 줄이지 않고(HWAXPortal docs/token-saving TS-5) ─────────────
+def _detail_tools(monkeypatch, n=8, words=1200, extra=()):
+    """설명 · 인자 스키마가 긴 도구 n 개(전문 한 줄이 약 4,500자 — 8건이면 25,000자를 넘는다) + 덧붙일 도구(extra). 같은 점수라 이름 차례로 선다."""
+    tools = [types.Tool(name=f"mesh_tool_{i:02d}", description=f"메시 품질 점검 도구 {i} — " + "격자 " * words,
+                        inputSchema={"type": "object", "required": ["part"],
+                                     "properties": {"part": {"type": "string", "description": "파트 이름"},
+                                                    **{f"opt_{j}": {"type": "number", "description": "선택 " * 20} for j in range(10)}}})
+             for i in range(n)] + list(extra)
+    monkeypatch.setattr(gw, "exposed_tools", tools)
+    monkeypatch.setattr(gw, "route", {t.name: ("heax-step_forge", t.name) for t in tools})
+    monkeypatch.setattr(gw, "_local_tools", lambda: [])               # 게이트웨이 자체 도구가 '품질' 등에 맞아 줄을 보태지 않게
+    monkeypatch.setattr(gw, "backends", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    return {t.name: t for t in tools}
+
+
+def _st(**kw):
+    res = asyncio.run(gw._search_tools(kw))
+    return res.content[0].text, json.loads(res.content[0].text)
+
+
+def test_search_tools_detail_은_상한을_넘으면_상위부터_전문이고_나머지는_요약이며_그렇다고_말한다(monkeypatch):
+    """detail=true 는 설명 전문 · 스키마 전부를 상한 없이 실었다 — 10-16 스냅샷에서 limit 20 의 92/150 질의가 25,000자를 넘어, Claude Code 가 본문
+    대신 파일로 빼거나 잘랐다(MAX_MCP_OUTPUT_TOKENS). 상한을 넘으면 상위부터 전문을 싣고 넘칠 자리부터 기본 꼴(한 줄 요약)로 내며, 몇 건이 전문이고
+    어느 것이 요약인지 · 한 도구의 전문을 받는 호출을 detail_capped 로 말한다. 이름 순위는 그대로다."""
+    tools = _detail_tools(monkeypatch)
+    monkeypatch.setattr(gw, "SEARCH_DETAIL_MAX_CHARS", 0)
+    whole_text, whole = _st(query="메시 품질", detail=True)
+    assert len(whole_text) > 25_000 and "detail_capped" not in whole, "전제 — 상한을 끄면 전부 전문이고 25,000자를 넘는다"
+    monkeypatch.setattr(gw, "SEARCH_DETAIL_MAX_CHARS", 25_000)
+    text, body = _st(query="메시 품질", detail=True)
+    cap = body["detail_capped"]
+    k = cap["full_count"]
+    assert len(text) <= 25_000 and 1 <= k < 8, (len(text), k)
+    assert body["ranked"] == whole["ranked"] == [m["tool"] for m in body["matches"]], "이름 순위 · 차례는 그대로다"
+    assert cap["brief"] == body["ranked"][k:] and cap["max_chars"] == 25_000 and set(cap) == {"max_chars", "full_count", "brief", "how"}
+    assert list(body) == ["query", "match_count", "ranked", "detail_capped", "note", "matches"], "표지는 전문(matches) 앞에 선다"
+    for m in body["matches"][:k]:
+        t = tools[m["tool"]]
+        assert m["description"] == t.description.strip() and m["args"]["properties"] == t.inputSchema["properties"], m["tool"]
+    for m in body["matches"][k:]:
+        t = tools[m["tool"]]
+        assert m["description"] == gw._brief_desc(t.description) and list(m["args"]["properties"]) == ["part"], m["tool"]
+        assert m["args"]["optional"] == [f"opt_{j}" for j in range(10)], "요약 줄도 선택 인자 이름은 남는다"
+    assert f'search_tools(query="{cap["brief"][0]}", detail=true, limit=1)' in cap["how"], cap["how"]
+    assert "25,000자" in cap["how"] and "GATEWAY_SEARCH_DETAIL_MAX_CHARS" in cap["how"] and f"상위 {k}건만 전문" in cap["how"]
+    # 전문을 한 줄 더 실었으면 넘었다 — 앞에서부터 넣을 수 있는 만큼 넣었다
+    more = dict(body, matches=body["matches"][:k] + [whole["matches"][k]] + body["matches"][k + 1:])
+    assert len(json.dumps(more, ensure_ascii=False, separators=(",", ":"))) > 25_000
+    # 표지가 가리키는 호출은 요약으로 남은 어느 도구든 그 도구의 전문을 준다
+    for name in cap["brief"]:
+        _t, one = _st(query=name, detail=True, limit=1)
+        assert one["ranked"] == [name] and "detail_capped" not in one, name
+        assert one["matches"][0]["description"] == tools[name].description.strip(), name
+        assert one["matches"][0]["args"]["properties"] == tools[name].inputSchema["properties"], name
+
+
+def test_search_tools_detail_의_첫_줄은_상한보다_커도_전문이고_기본_꼴은_상한을_모른다(monkeypatch):
+    """한 도구의 전문은 언제나 받을 수 있어야 한다 — 첫 줄이 혼자 상한을 넘어도 전문이다. limit=1 은 표지 없이 전문이다. 상한은 detail=true 에만
+    걸린다 — 기본 꼴은 이미 요약이라 상한이 작아도 그대로다. 0 이하는 끔이다(종전처럼 전부 전문)."""
+    tools = _detail_tools(monkeypatch)
+    monkeypatch.setattr(gw, "SEARCH_DETAIL_MAX_CHARS", 1_000)
+    text, body = _st(query="메시 품질", detail=True)
+    first = body["ranked"][0]
+    assert body["detail_capped"]["full_count"] == 1 and body["detail_capped"]["brief"] == body["ranked"][1:]
+    assert body["matches"][0]["description"] == tools[first].description.strip() and len(text) > 1_000, "첫 줄은 상한보다 커도 전문"
+    _t, one = _st(query="메시 품질", detail=True, limit=1)
+    assert "detail_capped" not in one and one["matches"][0]["description"] == tools[first].description.strip()
+    plain_text, plain = _st(query="메시 품질")
+    assert "detail_capped" not in plain and len(plain_text) > 1_000, "기본 꼴에는 상한이 걸리지 않는다"
+    for off in (0, -5):
+        monkeypatch.setattr(gw, "SEARCH_DETAIL_MAX_CHARS", off)
+        _t, b = _st(query="메시 품질", detail=True)
+        assert "detail_capped" not in b and all(m["description"] == tools[m["tool"]].description.strip() for m in b["matches"]), off
+
+
+def test_search_tools_detail_은_이름_그대로_찾으면_순위와_상관없이_그_도구가_첫_줄_전문이다(monkeypatch):
+    """표지가 가리키는 호출(query=<이름>, detail=true, limit=1)이 늘 그 도구를 줘야 한다 — 순위로는 보장되지 않았다(10-16 스냅샷 446개 중 10개가 1위가
+    아니었다 — predict_sed 를 predict_sed_batch 가 앞섰다). 이름 가중을 0 으로 덧씌운 박스(점수 0 — 줄에 없다)에서도 그 도구다. detail 이 없으면 순위 그대로다."""
+    batch = types.Tool(name="predict_sed_batch", description="여러 건을 한 번에 — predict_sed 를 묶어 돈다. predict_sed 와 같은 인자. predict_sed 의 묶음.",
+                       inputSchema={"type": "object", "properties": {"items": {"type": "array"}}, "required": ["items"]})
+    single = types.Tool(name="predict_sed", description="SED 한 건을 예측한다.",
+                        inputSchema={"type": "object", "properties": {"x": {"type": "number", "description": "입력"}}, "required": ["x"]})
+    _detail_tools(monkeypatch, n=2, extra=(batch, single))
+    _t, plain = _st(query="predict_sed", limit=1)
+    assert plain["ranked"] == ["predict_sed_batch"], "전제 — 순위로는 이름이 더 긴 형제가 앞선다"
+    _t, one = _st(query="predict_sed", detail=True, limit=1)
+    assert one["ranked"] == ["predict_sed"] and one["matches"][0]["description"] == single.description
+    assert one["matches"][0]["args"]["properties"] == single.inputSchema["properties"]
+    line = _qlog_lines()[-1]
+    assert line["top"] == ["heax-step_forge:predict_sed"] and line["via"] == {"heax-step_forge:predict_sed": ["exact"]}
+    assert "boost_only" not in line, "이름 그대로 세운 줄은 보정 덕이 아니다 — 피드백 보고서가 '보정 덕에만' 으로 세지 않는다"
+    _t, upper = _st(query="  Predict_SED ", detail=True, limit=1)
+    assert upper["ranked"] == ["predict_sed"], "대소문자 · 앞뒤 빈칸은 이름 비교에 들지 않는다"
+    _t, wide = _st(query="predict_sed", detail=True)
+    assert wide["ranked"][0] == "predict_sed" and wide["ranked"].count("predict_sed") == 1 and "predict_sed_batch" in wide["ranked"]
+    tun = gw._tuning()
+    zero = {**tun, "weights": {**tun["weights"], "name": 0}}
+    res = asyncio.run(gw._search_tools({"query": "predict_sed", "detail": True, "limit": 1}, tuning=zero))
+    assert json.loads(res.content[0].text)["ranked"] == ["predict_sed"], "점수가 없어 줄에 없던 도구도 이름 그대로면 세운다"
+
+
+def test_search_tools_detail_이름_그대로는_접힌_사본도_꺼내고_대표의_same_in_에서_뺀다(monkeypatch):
+    """허브 가족의 형제 사본은 정본 한 줄로 접힌다(E2-2) — 그 사본의 이름으로 찾으면 정본이 대표로 서고 사본은 same_in 안에만 있었다. 이름 그대로
+    찾으면(detail=true) 그 사본이 첫 줄이고, 두 번 싣지 않게 대표의 same_in 에서 뺀다."""
+    search = _role_kit(monkeypatch)
+    name = "caegroupdatahub_objects_list"
+    plain = search(name)
+    head = plain["matches"][0]
+    assert head["tool"] == "rootdesigndatahub_objects_list" and name not in plain["ranked"], "전제 — 그 사본은 정본 아래 접힌다"
+    assert name in {x["tool"] for x in head["same_in"]}
+    _t, one = _st(query=name, detail=True, limit=1)
+    tool = next(t for t in gw.exposed_tools if t.name == name)
+    assert one["ranked"] == [name] and one["matches"][0]["description"] == tool.description.strip()
+    _t, wide = _st(query=name, detail=True)
+    assert wide["ranked"][0] == name and wide["ranked"].count(name) == 1
+    assert all(x["tool"] != name for m in wide["matches"] for x in m.get("same_in") or ()), "꺼낸 사본은 대표의 same_in 에 남지 않는다"
 
 
 def test_list_tool_apps_앱_상세는_도구_이름을_먼저_싣는다(monkeypatch):
@@ -6197,6 +6334,7 @@ def _tool_search_embed_off(monkeypatch):
 # 순위를 일부러 바꿀 때만 다시 뜬다 — RRF 를 고치다 끈 길이 바뀌면 이 시험이 잡는다.
 # 10-29 저녁(E-7)에 손잡이를 search_tuning.json 으로 옮긴 판에서 다시 떴다 — 옮기기 전 사본과 응답이 바이트까지 같은 것을 먼저 보였다
 # (옛 사본은 코드 상수를 읽고 새 함수는 손잡이 파일을 읽었다). 귀속 · 기록 줄도 RRF 처럼 뺐다.
+# 11-02(HWAXPortal docs/token-saving TS-5)에 응답 꼴을 촘촘한 JSON 으로 바꾸며 맨 끝 json.dumps 한 줄만 같이 바꿨다 — 순위 · 칸은 그대로다.
 _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tuning: dict | None = None,
                         embed: bool = True, log_query: bool = True) -> types.CallToolResult:
     """도구 검색 안내대 — 351개 평면 노출의 선택 비용을 줄이는 입구(실측: 상위 40개가
@@ -6386,7 +6524,7 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict, *, groups: l
                        + (" same_in 은 설명까지 같은 사본이다 — 위 도구를 먼저 쓴다." if any("same_in" in m for m in matches) else ""))
     payload["matches"] = matches
     return types.CallToolResult(
-        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
+        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))]
     )
 '''
 
@@ -6891,7 +7029,7 @@ def test_E2_2_설명이_같으면_가족_접기는_지금_코드와_바이트까
         o = json.loads(text)
         for m in o["matches"]:
             m.pop("role", None)
-        return json.dumps(o, ensure_ascii=False, indent=2)
+        return json.dumps(o, ensure_ascii=False, separators=(",", ":"))
     seen = {"same_in": 0, "role": 0}
     for q in ("고장모드 목록", "FailureTrace 고장모드 목록", "CAE 그룹 Datahub 객체 요약", "Which test items detect drop failure modes",
               "솔더 접합 불량 고장모드 원인 대책", "관리 기준 개수", "규격 실패모드", "이 모델의 전작", "가상검증", "심의 시작", "철판 낙하 기준"):
@@ -7465,7 +7603,7 @@ def test_search_tools_의미_순위를_끄면_답이_master_와_바이트까지_
             new, old = asyncio.run(gw._search_tools(args)), asyncio.run(legacy(args))
             assert (new.isError, new.content[0].text) == (old.isError, old.content[0].text), args
             seen["error"] += bool(old.isError)
-            seen["hit"] += '"match_count": 0' not in old.content[0].text
+            seen["hit"] += '"match_count":0,' not in old.content[0].text
             seen["truncated"] += '"truncated"' in old.content[0].text
     assert seen["error"] and seen["hit"] > 20 and seen["truncated"], seen          # 전제 — 오류·적중·자름이 모두 지나갔다
 
@@ -9907,6 +10045,26 @@ def test_심의_시작은_정한_칸만_넘기고_save_report_wiki_는_늘_false
     assert inner[-2][1] == {"job_id": "j", "tools": ["x"]} and inner[-1][1] == {"q": "x", "wiki": True}, "시작 말고는 손대지 않는다"
 
 
+def test_심의_결과는_routine_call_에서_view_를_버려_전문을_읽고_진행의_wait_s_brief_는_그대로다(monkeypatch):
+    """HWAXPortal docs/token-saving TS-4 — 루틴의 심의 단계는 결정문을 쪽마다 다 읽는다. deliberate_result(view="summary") 는 개인 Claude 의 골라
+    쓰기(에이전트 서버 wt1102/token-wait — 기본 full)라, 루틴 실행자(개인 Claude)가 routine_call 로 view 를 주면 단계가 말없이 요약만 받았다.
+    안쪽 호출 · 원장 쓰기 전에 view 만 뺀다 — 쪽(part)과 다른 칸은 그대로, 부른 쪽의 인자 사전도 그대로다. 진행(deliberate_status)의 wait_s · brief 는
+    루틴이 코드로 묻는 길이라 손대지 않는다."""
+    seen, inner = _rt_kit(monkeypatch)
+    sent = {"job_id": "j", "part": 2, "view": "summary"}
+    res, text = _rt_run("routine_call", {"run_id": "r1", "step": "delib", "name": "deliberate_result", "arguments": sent})
+    assert not res.isError, text
+    assert inner[-1][0] == "deliberate_result" and inner[-1][1] == {"job_id": "j", "part": 2}, inner[-1][1]
+    post = [b for m, p, b, _ in seen if (m, p) == ("POST", "/runs/r1/calls")][-1]
+    assert post["tool"] == "deliberate_result" and post["args"] == {"job_id": "j", "part": 2}, "원장에도 거른 인자가 남는다"
+    assert sent == {"job_id": "j", "part": 2, "view": "summary"}, "부른 쪽의 인자 사전은 그대로다"
+    _rt_run("routine_call", {"run_id": "r1", "step": "delib", "name": "hwax-deliberation:deliberate_result",
+                             "arguments": {"job_id": "j", "view": "full"}})
+    assert inner[-1][1] == {"job_id": "j"}, "'백엔드:원래 이름' 으로 불러도 · full 이어도 뺀다(엔진 기본이 full 이다)"
+    _rt_run("routine_call", {"run_id": "r1", "step": "delib", "name": "deliberate_status", "arguments": {"job_id": "j", "wait_s": 120, "brief": True}})
+    assert inner[-1][:2] == ("deliberate_status", {"job_id": "j", "wait_s": 120, "brief": True}), "진행의 wait_s · brief 는 그대로다"
+
+
 def test_시간_상한_뒤에도_심의_결과는_읽고_호출_상한_옛_포털은_그대로_막는다(monkeypatch):
     """심의는 분 ~ 시간이라 시간 상한(기본 60분)이 먼저 닿는다 — 결과 읽기까지 막으면 이미 쓴 GLM 시간이 루틴에서 사라진다(R3-D5).
     여는 것은 시간 상한 × deliberate_result 하나다. 호출 상한은 그대로이고 limit_kind 를 모르는 옛 포털이면 종전대로 막는다(단계 호출 예산은
@@ -10583,6 +10741,57 @@ def test_지침_12번은_분석_루틴의_차례_울타리_키를_말하고_2048
     assert item in full and "risk_next_step" in full and len(full) < 2048, len(full)
     monkeypatch.setattr(gw, "route", {})
     assert item in gw._instructions()
+
+
+def _schema_tool(name: str, *props: str) -> types.Tool:
+    return types.Tool(name=name, description="", inputSchema={"type": "object", "properties": {p: {"type": "string"} for p in props}})
+
+
+def test_지침_13번은_서버_엔진을_기본_길로_하고_지금_스키마에_있는_인자만_말한다(monkeypatch):
+    """사용자 결정 11-02(HWAXPortal docs/token-saving TS-5) — 새 심의는 서버 엔진(deliberate_start)이 기본 길이고 Claude 워크플로(hwax-*)는 품질을 따로
+    잴 때만, 상태는 고리로 묻지 않고 wait_s 로 한 번 기다리고, 결과는 view="summary" 부터, 리스크 판단 잡은 llm=glm. wait_s · view 는 에이전트 서버의
+    같은 날 변경이다 — 옛 판이 떠 있는 동안 없는 인자를 부르라고 하지 않게 지금 스키마에 있을 때만 그 문장을 싣는다(재집계가 판을 따라가므로 배포 차례가
+    없다). initialize 응답에 실리는 그 값으로 보고, 붙는 항목은 뒤에만 붙어 앞부분이 그대로다. search_tools · list_agents 습관은 본문에 늘 있다."""
+    monkeypatch.setattr(gw._low, "instructions", gw._low.instructions)
+    monkeypatch.setattr(gw, "POLICY", {})
+    base = gw._INSTRUCTIONS
+    assert "`detail` 은 필요할 때만" in base and "`list_agents` 는 `compact=true` 로" in base
+
+    def served(*, wait=True, view=True, llm=True, delib=True, risk=True):
+        spec = {}
+        if delib:
+            spec["hwax-deliberation"] = [_schema_tool("deliberate_start", "question"),
+                                         _schema_tool("deliberate_status", "job_id", *(["wait_s"] if wait else [])),
+                                         _schema_tool("deliberate_result", "job_id", *(["view"] if view else []))]
+        if risk:
+            spec["heax-hwax_risk"] = [_schema_tool("risk_next_step"), _schema_tool("risk_start_job", "target_key", *(["llm"] if llm else []))]
+        _aggregate_tools(monkeypatch, spec)
+        return gw._low.create_initialization_options().instructions
+
+    new = served()
+    item = next(ln for ln in new.splitlines() if ln.startswith("13. "))
+    for must in ("서버 엔진 `deliberate_start`", "`hwax-*` Claude 워크플로는 품질을 따로 잴 때만", "고리로 묻지 말고 `wait_s` 로 한 번 기다린다",
+                 '`deliberate_result(view="summary")` 부터'):
+        assert must in item, must
+    assert "`risk_start_job` 은 `llm=glm`(Claude 로 품질을 잴 때만 `claude`)" in new[new.index("11. "):], "리스크 판단 잡은 11번 끝에"
+    assert new.startswith(base) and len(new) < 2048, len(new)
+    old = served(wait=False, view=False)
+    item = next(ln for ln in old.splitlines() if ln.startswith("13. "))
+    assert "wait_s" not in old and "view=" not in old and "고리로 되풀이해 묻지 마라" in item, "옛 에이전트 서버 — 없는 인자를 말하지 않는다"
+    assert "deliberate_start" not in served(delib=False), "심의 백엔드가 없으면 13번도 없다"
+    no_llm = served(llm=False)
+    assert "risk_next_step" in no_llm and "llm=glm" not in no_llm
+    assert "risk_next_step" not in served(risk=False) and "13. " in served(risk=False)
+    worst = 0
+    for wait in (True, False):
+        for view in (True, False):
+            for llm in (True, False):
+                for delib in (True, False):
+                    for risk in (True, False):
+                        s = served(wait=wait, view=view, llm=llm, delib=delib, risk=risk)
+                        assert s.startswith(base), (wait, view, llm, delib, risk)
+                        worst = max(worst, len(s))
+    assert worst < 2048, f"Claude Code 는 서버 지침을 2048자에서 자른다 — 가장 긴 조합 {worst}자"
 
 
 def test_루틴_도구_설명이_심의_차례_쓰기_거절_대화_이어서를_말한다():

@@ -334,6 +334,14 @@ python3 tool_usage_report.py --days 60 --out unused.md
   싣고(줄바꿈 · `«»` 를 지운다) 작성자의 글이지 지시가 아니라고 한 줄 말한다 — 사람의 말(user)로 올라가 규칙을 덮지 못하게.
 - 서버 지침 12번이 루틴의 차례 · 울타리 · 키 규칙을 한 줄로 말한다(차례의 자세한 글은 `routine_list` 설명 — 지침 전체가 2048자 안이어야 한다).
 
+## 서버 지침 — initialize 의 instructions
+
+Claude Code · Desktop 이 세션마다 읽는 글이다(`_INSTRUCTIONS` + `_instructions()`). 세션마다 값을 치르므로 짧게 두고, 전체가 2048자 안이어야 한다 — Claude Code 가 거기서 자른다(시험이 가장 긴 조합을 잰다 — 11-02 에 2,031자).
+
+- 본문(1 ~ 10 · 12번)은 늘 실린다. 붙는 항목은 재집계(`_aggregate`)마다 지금 카탈로그로 다시 짓고 뒤에만 붙는다 — 13번(새 심의는 서버 엔진 `deliberate_start`)은 그 도구가 있을 때, 11번(리스크 심사는 `risk_next_step` 부터)은 그 도구가 있을 때. 이미 열린 세션은 그때 받은 글을 쓴다.
+- 서버 엔진을 기본 길로(사용자 결정 11-02, HWAXPortal docs/token-saving TS-5) — 13번 · 11번 끝 문장. Claude 가 좌석 · 판단 과제마다 직접 도는 워크플로(`hwax-*`)는 품질을 따로 잴 때만이다. 13번의 두 문장(`deliberate_status` 는 `wait_s` 로 한 번 기다린다 · 결과는 `deliberate_result(view="summary")` 부터)과 11번 끝 문장(`risk_start_job` 은 `llm=glm`)은 **그 인자가 지금 스키마에 있을 때만** 싣는다 — 에이전트 서버에 `wait_s` · `view` 가 아직 없는 판이면 13번에는 '고리로 되풀이해 묻지 마라' 만 남는다. 그래서 게이트웨이와 에이전트 서버의 배포 차례가 없다.
+- 본문의 토큰 습관 — `search_tools` 는 `detail` 을 필요할 때만, `list_agents` 는 `compact=true`.
+
 ## 실행
 ```bash
 ./start.sh          # 에이전트 venv 파이썬으로 gateway.py 기동 (streamable-http :9110/mcp)

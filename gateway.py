@@ -1856,37 +1856,35 @@ async def _backends_lifespan():
 # 서버 사용 지침 — MCP initialize 응답에 실려 **클라이언트(클로드)가 읽는다**. 비워 두면 도구
 # 350개를 주고 "알아서 하라" 는 셈이라, 이 허브에서 실제로 났던 실패가 그대로 재현된다.
 # 아래 문장은 전부 실측 사고에 근거한다(docs/gotchas.md · 무음 결함 점검 기록).
-_INSTRUCTIONS = """HWAX 엔지니어링 허브 — 사내 설계·해석·품질 데이터와 도구 게이트웨이.
+# ⚠ 전체(아래 붙는 11 · 13번까지)가 2048자 안이어야 한다 — Claude Code 가 서버 지침을 거기서 자른다. 11-02 에 13번 · 토큰 습관을 더하며 자리를
+#   냈다(HWAXPortal docs/token-saving TS-5) — 이어지는 줄의 들여쓰기 3칸, 따로 서던 머리 줄(제목 줄에 붙였다), 9번이 결과의 `how` 를 되풀이하던 사유별
+#   안내, 6번 · 1번의 덧말(기억으로 채운 값을 거기서 잡는다 · 그래야 클라이언트가 패널을 띄운다). 규칙은 하나도 빼지 않았다.
+_INSTRUCTIONS = """HWAX 엔지니어링 허브 — 사내 설계·해석·품질 데이터와 도구 게이트웨이. 아래는 실제로 났던 실패를 막는 순서다.
 
-신중하게 쓰는 법(이 허브에서 실제로 났던 실패를 막는 순서다):
-
-1. 도구가 수백 개다. 목록을 훑지 말고 `search_tools("하려는 일")` 로 찾아 `invoke_tool` 로
-   불러라. 목록에 안 보이는 도구도 invoke_tool 로 즉시 호출된다. 단 **패널 도구**(목록의 `_meta.ui` 가 달린 도구 —
-   SimFlow · ARP 의 open_* 등)는 invoke_tool 이 아니라 그 이름으로 직접 불러라 — 그래야 클라이언트가 패널을 띄운다.
+1. 도구가 수백 개다. 목록을 훑지 말고 `search_tools("하려는 일")` 로 찾아(`detail` 은 필요할 때만) `invoke_tool` 로
+불러라. 목록에 안 보이는 도구도 invoke_tool 로 즉시 호출된다. 단 **패널 도구**(목록의 `_meta.ui` 가 달린 도구 —
+SimFlow · ARP 의 open_* 등)는 invoke_tool 이 아니라 그 이름으로 직접 불러라.
 2. **수치·이름·ID 를 기억으로 채우지 마라.** 이 허브의 가장 위험한 실패는 도구를 부르지 않고
-   그럴듯한 값을 서술하는 것이다(표면이 완벽해 사용자가 진짜 데이터로 믿는다). 답에 쓰는 값은
-   도구 결과에 있던 값이어야 하고, 결과의 record_id·section_id 를 함께 인용하라.
+그럴듯한 값을 서술하는 것이다(표면이 완벽해 사용자가 진짜 데이터로 믿는다). 답에 쓰는 값은
+도구 결과에 있던 값이어야 하고, 결과의 record_id·section_id 를 함께 인용하라.
 3. `refused: true` 는 '자료가 없다' 가 아니라 '근거 점수가 임계 밑' 이다. 추측으로 메우지 말고
-   ① 질의를 현장 용어로 바꿔 다시 묻거나(예: "부풀어 올랐다" → "스웰링 가스발생")
-   ② `recommend_agents` 로 다른 전문가를 찾아라.
+① 질의를 현장 용어로 바꿔 다시 묻거나(예: "부풀어 올랐다" → "스웰링 가스발생")
+② `recommend_agents` 로 다른 전문가를 찾아라.
 4. 유사도 점수를 신뢰도로 읽지 마라. 점수의 바닥은 임베딩 모델마다 달라 **무관한 문장끼리도 높게 나올 수 있다**
-   (절대값으로 거르지 마라).
-   대신 응답의 `desc_match`(어휘 포함률)·`matched_sections`(소유 근거 수)·`low_confidence` 를 보라.
+(절대값으로 거르지 마라).
+대신 응답의 `desc_match`(어휘 포함률)·`matched_sections`(소유 근거 수)·`low_confidence` 를 보라.
 5. 사람에게 물을 일을 도구로 때우지 마라. 등록·발행·삭제·잡 제출처럼 되돌리기 어려운 도구는
-   무엇을 어디에 쓸지 사용자에게 확인한 뒤 부른다.
+무엇을 어디에 쓸지 사용자에게 확인한 뒤 부른다.
 6. 수치를 사용자에게 보내기 전에 `verify_answer(초안)` 로 대조하라 — 이번 세션에 실제로 조회한
-   도구 출력에 없는 값을 코드가 집어 준다(기억으로 채운 값을 거기서 잡는다).
+도구 출력에 없는 값을 코드가 집어 준다.
 7. 전문가가 필요하면 `browse_experts` 로 조직도를 보여 주고 사람이 고르게 한 뒤,
-   `use_experts(keys=[...])` 로 역할·도구를 받아 그 전문가로서 답하라(첫 명이 주 전문가).
+`use_experts(keys=[...])` 로 역할·도구를 받아 그 전문가로서 답하라(첫 명이 주 전문가). `list_agents` 는 `compact=true` 로.
 8. 도구가 실패하면 인자만 바꿔 반복하지 마라. 응답이 '인자 문제가 아니다' 라고 말하면
-   연결·시간초과이므로 다른 방법을 찾거나 사용자에게 알려라.
-9. 권한 없는 앱은 `list_tool_apps` 목록에 없고 `denied_apps` 에 라벨·사유(`reason`)·필요 권한·요청 경로만
-   있다. 그 앱의 도구 이름을 지어내거나 `invoke_tool` 로 우회하지 마라. 사유별로 안내가 다르다 —
-   `portal_access`: 포털 '내 권한'(`request` = `/access?need=<권한>`)에서 요청하라, 승인은 관리자가 한다 ·
-   `gateway_group`: 포털에서 청할 수 있는 것이 아니다, 포털 관리자에게 문의 · `policy_not_ready`(`retry:true`):
-   게이트웨이가 정책을 아직 못 받은 일시 상태다, 잠시 뒤 같은 호출을 다시 하라(요청하라고 하지 마라).
+연결·시간초과이므로 다른 방법을 찾거나 사용자에게 알려라.
+9. 권한 없는 앱은 `list_tool_apps` 의 `denied_apps` 에만 있다 — 도구 이름을 지어내거나 `invoke_tool` 로 우회하지 말고
+그 `how` 를 따르라(`portal_access` 만 `/access?need=<권한>` 에서 요청하고, `gateway_group` · `policy_not_ready` 는 요청하라고 하지 마라).
 10. `list_tool_apps` 의 `muted_apps` 는 사용자가 포털에서 **꺼 둔** 앱이다(권한 문제가 아니다 — 요청하라고 하지 마라).
-   사용자가 그 앱을 쓰라고 할 때만 `list_tool_apps(app='<키>')` 로 도구를 보고 `invoke_tool` 로 부른다.
+사용자가 그 앱을 쓰라고 할 때만 `list_tool_apps(app='<키>')` 로 도구를 보고 `invoke_tool` 로 부른다.
 12. 분석 루틴은 routine_list 설명의 차례로 돈다 — 단계 도구는 routine_call 로만(울타리 밖 금지), 키는 결과에 나온 값만 쓴다.
 """
 # 11번은 리스크 앱 길잡이(risk_next_step)가 **카탈로그에 있을 때만** 싣는다(`_instructions`). 위임을 모르는 옛 앱(HWAXRisk main)에는
@@ -1894,13 +1892,35 @@ _INSTRUCTIONS = """HWAX 엔지니어링 허브 — 사내 설계·해석·품질
 # 12번(분석 루틴 — 로컬 도구라 늘 있다)은 위 본문 끝에 있어 11번이 붙으면 12번 뒤에 온다(붙여도 앞부분이 그대로인 꼴을 지킨다). 전체가 2048자
 # 안이어야 한다 — Claude Code 가 서버 지침을 거기서 자른다(차례 · 울타리는 routine_* 도구 설명이 자세히 말한다).
 _INSTR_RISK_NEXT = """11. 설계 리스크 심사(과제 올리기·캡처·변경 비교·심사 시작·결과)는 `risk_next_step` 부터 — 단계·막힌 곳·다음 호출을 준다.
-   그 `next` 를 따라 쓰기 도구를 부를 때도 5번대로 사용자에게 먼저 확인한다(`consent` 는 사람이 동의한 뒤에만 true).
+그 `next` 를 따라 쓰기 도구를 부를 때도 5번대로 사용자에게 먼저 확인한다(`consent` 는 사람이 동의한 뒤에만 true).
 """
+# 13번 · 11번 끝 문장 — 서버 엔진(GLM)을 기본 길로(사용자 결정 11-02, HWAXPortal docs/token-saving TS-5). Claude 가 좌석 · 판단 과제마다 직접 도는
+# 워크플로(hwax-deliberate.js · hwax-risk-claude.js)가 가장 큰 토큰 지렛대다. 13번은 deliberate_start 가 카탈로그에 있을 때만(11번과 같은 까닭), 문장마다
+# 그 인자가 지금 스키마에 있을 때만 싣는다 — wait_s(deliberate_status) · view(deliberate_result)는 에이전트 서버의 같은 날 변경이라 옛 판이 떠 있는
+# 동안 없는 인자를 부르라고 하지 않는다. 재집계가 바뀐 판을 보면 다음 세션부터 따라가므로 두 리포의 배포 차례가 없다. 11번 끝 문장은 risk_start_job 이
+# llm 을 받을 때만이다(빼도 glm 이다 — claude 는 반출 동의가 든다).
+_INSTR_DELIB = "13. 새 심의는 서버 엔진 `deliberate_start` 로 연다(`hwax-*` Claude 워크플로는 품질을 따로 잴 때만)."
+_INSTR_DELIB_WAIT = " `deliberate_status` 는 고리로 묻지 말고 `wait_s` 로 한 번 기다린다."
+_INSTR_DELIB_NOWAIT = " `deliberate_status` 를 고리로 되풀이해 묻지 마라."
+_INSTR_DELIB_VIEW = ' 결과는 `deliberate_result(view="summary")` 부터.'
+_INSTR_RISK_LLM = " `risk_start_job` 은 `llm=glm`(Claude 로 품질을 잴 때만 `claude`)."
+
+
+def _tool_props(name: str) -> set[str]:
+    """노출된 도구의 인자 이름 — 지침이 그 인자를 말할지 가른다. 도구가 없으면 빈 집합."""
+    t = next((t for t in exposed_tools if t.name == name), None)
+    return set(((getattr(t, "inputSchema", None) or {}).get("properties") or {})) if t is not None else set()
 
 
 def _instructions() -> str:
-    """지금 카탈로그에 맞춘 서버 지침 — 없는 도구를 가리키는 항목은 싣지 않는다."""
-    return _INSTRUCTIONS + (_INSTR_RISK_NEXT if "risk_next_step" in route else "")
+    """지금 카탈로그에 맞춘 서버 지침 — 없는 도구 · 인자를 가리키는 문장은 싣지 않는다. 붙는 항목은 늘 뒤에 붙는다(앞부분은 그대로다)."""
+    out = _INSTRUCTIONS
+    if "deliberate_start" in route:
+        out += (_INSTR_DELIB + (_INSTR_DELIB_WAIT if "wait_s" in _tool_props("deliberate_status") else _INSTR_DELIB_NOWAIT)
+                + (_INSTR_DELIB_VIEW if "view" in _tool_props("deliberate_result") else "") + "\n")
+    if "risk_next_step" in route:
+        out += _INSTR_RISK_NEXT.rstrip("\n") + (_INSTR_RISK_LLM if "llm" in _tool_props("risk_start_job") else "") + "\n"
+    return out
 
 
 fm = FastMCP("hwax-mcp-gateway", instructions=_INSTRUCTIONS)

@@ -10723,6 +10723,57 @@ def test_지침_12번은_분석_루틴의_차례_울타리_키를_말하고_2048
     assert item in gw._instructions()
 
 
+def _schema_tool(name: str, *props: str) -> types.Tool:
+    return types.Tool(name=name, description="", inputSchema={"type": "object", "properties": {p: {"type": "string"} for p in props}})
+
+
+def test_지침_13번은_서버_엔진을_기본_길로_하고_지금_스키마에_있는_인자만_말한다(monkeypatch):
+    """사용자 결정 11-02(HWAXPortal docs/token-saving TS-5) — 새 심의는 서버 엔진(deliberate_start)이 기본 길이고 Claude 워크플로(hwax-*)는 품질을 따로
+    잴 때만, 상태는 고리로 묻지 않고 wait_s 로 한 번 기다리고, 결과는 view="summary" 부터, 리스크 판단 잡은 llm=glm. wait_s · view 는 에이전트 서버의
+    같은 날 변경이다 — 옛 판이 떠 있는 동안 없는 인자를 부르라고 하지 않게 지금 스키마에 있을 때만 그 문장을 싣는다(재집계가 판을 따라가므로 배포 차례가
+    없다). initialize 응답에 실리는 그 값으로 보고, 붙는 항목은 뒤에만 붙어 앞부분이 그대로다. search_tools · list_agents 습관은 본문에 늘 있다."""
+    monkeypatch.setattr(gw._low, "instructions", gw._low.instructions)
+    monkeypatch.setattr(gw, "POLICY", {})
+    base = gw._INSTRUCTIONS
+    assert "`detail` 은 필요할 때만" in base and "`list_agents` 는 `compact=true` 로" in base
+
+    def served(*, wait=True, view=True, llm=True, delib=True, risk=True):
+        spec = {}
+        if delib:
+            spec["hwax-deliberation"] = [_schema_tool("deliberate_start", "question"),
+                                         _schema_tool("deliberate_status", "job_id", *(["wait_s"] if wait else [])),
+                                         _schema_tool("deliberate_result", "job_id", *(["view"] if view else []))]
+        if risk:
+            spec["heax-hwax_risk"] = [_schema_tool("risk_next_step"), _schema_tool("risk_start_job", "target_key", *(["llm"] if llm else []))]
+        _aggregate_tools(monkeypatch, spec)
+        return gw._low.create_initialization_options().instructions
+
+    new = served()
+    item = next(ln for ln in new.splitlines() if ln.startswith("13. "))
+    for must in ("서버 엔진 `deliberate_start`", "`hwax-*` Claude 워크플로는 품질을 따로 잴 때만", "고리로 묻지 말고 `wait_s` 로 한 번 기다린다",
+                 '`deliberate_result(view="summary")` 부터'):
+        assert must in item, must
+    assert "`risk_start_job` 은 `llm=glm`(Claude 로 품질을 잴 때만 `claude`)" in new[new.index("11. "):], "리스크 판단 잡은 11번 끝에"
+    assert new.startswith(base) and len(new) < 2048, len(new)
+    old = served(wait=False, view=False)
+    item = next(ln for ln in old.splitlines() if ln.startswith("13. "))
+    assert "wait_s" not in old and "view=" not in old and "고리로 되풀이해 묻지 마라" in item, "옛 에이전트 서버 — 없는 인자를 말하지 않는다"
+    assert "deliberate_start" not in served(delib=False), "심의 백엔드가 없으면 13번도 없다"
+    no_llm = served(llm=False)
+    assert "risk_next_step" in no_llm and "llm=glm" not in no_llm
+    assert "risk_next_step" not in served(risk=False) and "13. " in served(risk=False)
+    worst = 0
+    for wait in (True, False):
+        for view in (True, False):
+            for llm in (True, False):
+                for delib in (True, False):
+                    for risk in (True, False):
+                        s = served(wait=wait, view=view, llm=llm, delib=delib, risk=risk)
+                        assert s.startswith(base), (wait, view, llm, delib, risk)
+                        worst = max(worst, len(s))
+    assert worst < 2048, f"Claude Code 는 서버 지침을 2048자에서 자른다 — 가장 긴 조합 {worst}자"
+
+
 def test_루틴_도구_설명이_심의_차례_쓰기_거절_대화_이어서를_말한다():
     """도구 설명이 실행자가 읽는 계약이다(R3-design 3.4 ⑤) — 심의는 시작(routine_call) → 진행(deliberate_status 직접) → 결과(routine_call,
     시간 상한 뒤에도), 단계 안 쓰기는 거절, 실행 시작은 대화(conversation_id) · 이어서(run_id)."""

@@ -5347,10 +5347,10 @@ def test_응답_캐시는_큰_결과를_담지_않고_합도_바이트로_묶는
 
 
 # ── 순위 목록은 작은 창 소비자의 글자 절단을 견딘다(gw-adh GA-7) ─────────────────────────────────────────────────
-def _long_tools(monkeypatch, n, app="heax-hwax_risk"):
-    """설명·스키마가 리스크 앱 입구 도구만큼 긴 도구 n 개(실측: 8건 검색 결과 7,000~8,400자)."""
+def _long_tools(monkeypatch, n, app="heax-hwax_risk", arg_words=60):
+    """설명·스키마가 리스크 앱 입구 도구만큼 긴 도구 n 개(실측: 8건 검색 결과 7,000~8,400자). arg_words — 필수 인자 설명의 낱말 수."""
     tools = [types.Tool(name=f"risk_tool_{i:02d}", description=f"리스크 심사 도구 {i} — " + "설명 " * 300,
-                        inputSchema={"type": "object", "properties": {"project_id": {"type": "string", "description": "과제 " * 60}},
+                        inputSchema={"type": "object", "properties": {"project_id": {"type": "string", "description": "과제 " * arg_words}},
                                      "required": ["project_id"]}) for i in range(n)]
     monkeypatch.setattr(gw, "exposed_tools", tools)
     monkeypatch.setattr(gw, "route", {t.name: (app, t.name) for t in tools})
@@ -5365,8 +5365,9 @@ def _long_tools(monkeypatch, n, app="heax-hwax_risk"):
 
 def test_search_tools_는_찾은_도구_이름을_순위대로_먼저_싣는다(monkeypatch):
     """게이트웨이는 결과를 자르지 않는다 — 작은 창의 소비자(dev 웹 챗 TOOL_RESULT_MAX=6,000)가 앞에서부터 글자로 자른다. 설명·스키마
-    전문이 앞서면 그 절단에 6~8위 도구는 이름조차 사라져 '없다' 로 읽힌다. 이름 순위를 먼저 실으면 잘려도 순위는 남는다."""
-    _long_tools(monkeypatch, 12)
+    전문이 앞서면 그 절단에 6~8위 도구는 이름조차 사라져 '없다' 로 읽힌다. 이름 순위를 먼저 실으면 잘려도 순위는 남는다.
+    답이 촘촘한 JSON 이 된 뒤(11-02)에도 6,000자를 넘게 인자 설명을 늘려 둔다."""
+    _long_tools(monkeypatch, 12, arg_words=120)
     out = asyncio.run(gw._search_tools({"query": "리스크 심사"})).content[0].text
     body = json.loads(out)
     assert len(out) > 6000 and len(body["matches"]) == 8, "시험 입력이 dev 상한을 넘어야 뜻이 있다"
@@ -5375,6 +5376,19 @@ def test_search_tools_는_찾은_도구_이름을_순위대로_먼저_싣는다(
     head = out[:6000]
     assert all(f'"{n}"' in head for n in ranked), "6,000자에서 잘려도 8건 이름이 다 남아야 한다"
     assert head.index('"ranked"') < head.index('"matches"') and head.index('"note"') < head.index('"matches"')
+
+
+def test_search_tools_답은_촘촘한_JSON_이고_칸_차례는_그대로다(monkeypatch):
+    """들여쓰기(indent=2)는 같은 내용을 글자로 불려 Claude 길의 토큰만 먹었다(HWAXPortal docs/token-saving TS-5, 11-02). 받는 쪽은 JSON 으로
+    읽거나 글을 그대로 모델에 준다 — 빈칸 없는 구분자로 내고, 한글은 그대로(\\u 이스케이프 없이), 칸 차례(이름 순위 먼저 · 전문 맨 뒤)는 같다."""
+    _long_tools(monkeypatch, 12)
+    for args in ({"query": "리스크 심사"}, {"query": "리스크 심사", "detail": True}):
+        out = asyncio.run(gw._search_tools(args)).content[0].text
+        body = json.loads(out)
+        assert out == json.dumps(body, ensure_ascii=False, separators=(",", ":")), args
+        assert "\n" not in out and "리스크 심사" in out, args
+        assert list(body) == ["query", "match_count", "ranked", "truncated", "note", "matches"], list(body)
+        assert len(out) < len(json.dumps(body, ensure_ascii=False, indent=2)), "같은 내용이 들여쓴 꼴보다 짧다"
 
 
 def test_list_tool_apps_앱_상세는_도구_이름을_먼저_싣는다(monkeypatch):
@@ -6197,6 +6211,7 @@ def _tool_search_embed_off(monkeypatch):
 # 순위를 일부러 바꿀 때만 다시 뜬다 — RRF 를 고치다 끈 길이 바뀌면 이 시험이 잡는다.
 # 10-29 저녁(E-7)에 손잡이를 search_tuning.json 으로 옮긴 판에서 다시 떴다 — 옮기기 전 사본과 응답이 바이트까지 같은 것을 먼저 보였다
 # (옛 사본은 코드 상수를 읽고 새 함수는 손잡이 파일을 읽었다). 귀속 · 기록 줄도 RRF 처럼 뺐다.
+# 11-02(HWAXPortal docs/token-saving TS-5)에 응답 꼴을 촘촘한 JSON 으로 바꾸며 맨 끝 json.dumps 한 줄만 같이 바꿨다 — 순위 · 칸은 그대로다.
 _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tuning: dict | None = None,
                         embed: bool = True, log_query: bool = True) -> types.CallToolResult:
     """도구 검색 안내대 — 351개 평면 노출의 선택 비용을 줄이는 입구(실측: 상위 40개가
@@ -6386,7 +6401,7 @@ _SEARCH_TOOLS_MASTER = r'''async def _search_tools(arguments: dict, *, groups: l
                        + (" same_in 은 설명까지 같은 사본이다 — 위 도구를 먼저 쓴다." if any("same_in" in m for m in matches) else ""))
     payload["matches"] = matches
     return types.CallToolResult(
-        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
+        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))]
     )
 '''
 
@@ -6891,7 +6906,7 @@ def test_E2_2_설명이_같으면_가족_접기는_지금_코드와_바이트까
         o = json.loads(text)
         for m in o["matches"]:
             m.pop("role", None)
-        return json.dumps(o, ensure_ascii=False, indent=2)
+        return json.dumps(o, ensure_ascii=False, separators=(",", ":"))
     seen = {"same_in": 0, "role": 0}
     for q in ("고장모드 목록", "FailureTrace 고장모드 목록", "CAE 그룹 Datahub 객체 요약", "Which test items detect drop failure modes",
               "솔더 접합 불량 고장모드 원인 대책", "관리 기준 개수", "규격 실패모드", "이 모델의 전작", "가상검증", "심의 시작", "철판 낙하 기준"):
@@ -7465,7 +7480,7 @@ def test_search_tools_의미_순위를_끄면_답이_master_와_바이트까지_
             new, old = asyncio.run(gw._search_tools(args)), asyncio.run(legacy(args))
             assert (new.isError, new.content[0].text) == (old.isError, old.content[0].text), args
             seen["error"] += bool(old.isError)
-            seen["hit"] += '"match_count": 0' not in old.content[0].text
+            seen["hit"] += '"match_count":0,' not in old.content[0].text
             seen["truncated"] += '"truncated"' in old.content[0].text
     assert seen["error"] and seen["hit"] > 20 and seen["truncated"], seen          # 전제 — 오류·적중·자름이 모두 지나갔다
 

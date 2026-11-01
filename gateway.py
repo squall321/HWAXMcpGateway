@@ -3767,8 +3767,13 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                        + (" tagline 은 그 형제 허브가 담은 데이터다 — 질문이 그 데이터에 대한 것이면 그 도구를 부른다."
                           if any("tagline" in x for m in matches for x in m.get("same_in") or ()) else ""))
     payload["matches"] = matches
+    # 촘촘한 JSON(빈칸 없는 구분자) — 들여쓰기는 같은 내용을 기본 1.55배 · detail 1.33배로 불려 Claude 길의 토큰만 먹었다(10-16 카탈로그 스냅샷 ·
+    # 평가셋 150 질의, HWAXPortal docs/token-saving TS-5, 11-02).
+    # 받는 쪽은 JSON 으로 읽거나(/search-eval · tool_search_eval/run.py) 글을 그대로 모델에 준다(Claude Code 와 그 워크플로 · 에이전트 서버 웹 챗의
+    # 안내대 — 루틴은 묶지 않고 심의 엔진은 부르지 않는다). 줄 · 빈칸 꼴에 기대는 곳이 없어(11-02 대조) 골라 쓰기가 아니라 기본이다.
+    # 칸 차례(이름 순위 먼저 · 전문 맨 뒤)는 그대로다.
     return types.CallToolResult(
-        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
+        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))]
     )
 
 

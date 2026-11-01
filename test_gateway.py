@@ -5391,6 +5391,129 @@ def test_search_tools_답은_촘촘한_JSON_이고_칸_차례는_그대로다(mo
         assert len(out) < len(json.dumps(body, ensure_ascii=False, indent=2)), "같은 내용이 들여쓴 꼴보다 짧다"
 
 
+# ── search_tools(detail=true) 상한 — Claude Code 의 MCP 결과 문턱 아래로, 조용히 줄이지 않고(HWAXPortal docs/token-saving TS-5) ─────────────
+def _detail_tools(monkeypatch, n=8, words=1200, extra=()):
+    """설명 · 인자 스키마가 긴 도구 n 개(전문 한 줄이 약 4,500자 — 8건이면 25,000자를 넘는다) + 덧붙일 도구(extra). 같은 점수라 이름 차례로 선다."""
+    tools = [types.Tool(name=f"mesh_tool_{i:02d}", description=f"메시 품질 점검 도구 {i} — " + "격자 " * words,
+                        inputSchema={"type": "object", "required": ["part"],
+                                     "properties": {"part": {"type": "string", "description": "파트 이름"},
+                                                    **{f"opt_{j}": {"type": "number", "description": "선택 " * 20} for j in range(10)}}})
+             for i in range(n)] + list(extra)
+    monkeypatch.setattr(gw, "exposed_tools", tools)
+    monkeypatch.setattr(gw, "route", {t.name: ("heax-step_forge", t.name) for t in tools})
+    monkeypatch.setattr(gw, "_local_tools", lambda: [])               # 게이트웨이 자체 도구가 '품질' 등에 맞아 줄을 보태지 않게
+    monkeypatch.setattr(gw, "backends", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    return {t.name: t for t in tools}
+
+
+def _st(**kw):
+    res = asyncio.run(gw._search_tools(kw))
+    return res.content[0].text, json.loads(res.content[0].text)
+
+
+def test_search_tools_detail_은_상한을_넘으면_상위부터_전문이고_나머지는_요약이며_그렇다고_말한다(monkeypatch):
+    """detail=true 는 설명 전문 · 스키마 전부를 상한 없이 실었다 — 10-16 스냅샷에서 limit 20 의 92/150 질의가 25,000자를 넘어, Claude Code 가 본문
+    대신 파일로 빼거나 잘랐다(MAX_MCP_OUTPUT_TOKENS). 상한을 넘으면 상위부터 전문을 싣고 넘칠 자리부터 기본 꼴(한 줄 요약)로 내며, 몇 건이 전문이고
+    어느 것이 요약인지 · 한 도구의 전문을 받는 호출을 detail_capped 로 말한다. 이름 순위는 그대로다."""
+    tools = _detail_tools(monkeypatch)
+    monkeypatch.setattr(gw, "SEARCH_DETAIL_MAX_CHARS", 0)
+    whole_text, whole = _st(query="메시 품질", detail=True)
+    assert len(whole_text) > 25_000 and "detail_capped" not in whole, "전제 — 상한을 끄면 전부 전문이고 25,000자를 넘는다"
+    monkeypatch.setattr(gw, "SEARCH_DETAIL_MAX_CHARS", 25_000)
+    text, body = _st(query="메시 품질", detail=True)
+    cap = body["detail_capped"]
+    k = cap["full_count"]
+    assert len(text) <= 25_000 and 1 <= k < 8, (len(text), k)
+    assert body["ranked"] == whole["ranked"] == [m["tool"] for m in body["matches"]], "이름 순위 · 차례는 그대로다"
+    assert cap["brief"] == body["ranked"][k:] and cap["max_chars"] == 25_000 and set(cap) == {"max_chars", "full_count", "brief", "how"}
+    assert list(body) == ["query", "match_count", "ranked", "detail_capped", "note", "matches"], "표지는 전문(matches) 앞에 선다"
+    for m in body["matches"][:k]:
+        t = tools[m["tool"]]
+        assert m["description"] == t.description.strip() and m["args"]["properties"] == t.inputSchema["properties"], m["tool"]
+    for m in body["matches"][k:]:
+        t = tools[m["tool"]]
+        assert m["description"] == gw._brief_desc(t.description) and list(m["args"]["properties"]) == ["part"], m["tool"]
+        assert m["args"]["optional"] == [f"opt_{j}" for j in range(10)], "요약 줄도 선택 인자 이름은 남는다"
+    assert f'search_tools(query="{cap["brief"][0]}", detail=true, limit=1)' in cap["how"], cap["how"]
+    assert "25,000자" in cap["how"] and "GATEWAY_SEARCH_DETAIL_MAX_CHARS" in cap["how"] and f"상위 {k}건만 전문" in cap["how"]
+    # 전문을 한 줄 더 실었으면 넘었다 — 앞에서부터 넣을 수 있는 만큼 넣었다
+    more = dict(body, matches=body["matches"][:k] + [whole["matches"][k]] + body["matches"][k + 1:])
+    assert len(json.dumps(more, ensure_ascii=False, separators=(",", ":"))) > 25_000
+    # 표지가 가리키는 호출은 요약으로 남은 어느 도구든 그 도구의 전문을 준다
+    for name in cap["brief"]:
+        _t, one = _st(query=name, detail=True, limit=1)
+        assert one["ranked"] == [name] and "detail_capped" not in one, name
+        assert one["matches"][0]["description"] == tools[name].description.strip(), name
+        assert one["matches"][0]["args"]["properties"] == tools[name].inputSchema["properties"], name
+
+
+def test_search_tools_detail_의_첫_줄은_상한보다_커도_전문이고_기본_꼴은_상한을_모른다(monkeypatch):
+    """한 도구의 전문은 언제나 받을 수 있어야 한다 — 첫 줄이 혼자 상한을 넘어도 전문이다. limit=1 은 표지 없이 전문이다. 상한은 detail=true 에만
+    걸린다 — 기본 꼴은 이미 요약이라 상한이 작아도 그대로다. 0 이하는 끔이다(종전처럼 전부 전문)."""
+    tools = _detail_tools(monkeypatch)
+    monkeypatch.setattr(gw, "SEARCH_DETAIL_MAX_CHARS", 1_000)
+    text, body = _st(query="메시 품질", detail=True)
+    first = body["ranked"][0]
+    assert body["detail_capped"]["full_count"] == 1 and body["detail_capped"]["brief"] == body["ranked"][1:]
+    assert body["matches"][0]["description"] == tools[first].description.strip() and len(text) > 1_000, "첫 줄은 상한보다 커도 전문"
+    _t, one = _st(query="메시 품질", detail=True, limit=1)
+    assert "detail_capped" not in one and one["matches"][0]["description"] == tools[first].description.strip()
+    plain_text, plain = _st(query="메시 품질")
+    assert "detail_capped" not in plain and len(plain_text) > 1_000, "기본 꼴에는 상한이 걸리지 않는다"
+    for off in (0, -5):
+        monkeypatch.setattr(gw, "SEARCH_DETAIL_MAX_CHARS", off)
+        _t, b = _st(query="메시 품질", detail=True)
+        assert "detail_capped" not in b and all(m["description"] == tools[m["tool"]].description.strip() for m in b["matches"]), off
+
+
+def test_search_tools_detail_은_이름_그대로_찾으면_순위와_상관없이_그_도구가_첫_줄_전문이다(monkeypatch):
+    """표지가 가리키는 호출(query=<이름>, detail=true, limit=1)이 늘 그 도구를 줘야 한다 — 순위로는 보장되지 않았다(10-16 스냅샷 446개 중 10개가 1위가
+    아니었다 — predict_sed 를 predict_sed_batch 가 앞섰다). 이름 가중을 0 으로 덧씌운 박스(점수 0 — 줄에 없다)에서도 그 도구다. detail 이 없으면 순위 그대로다."""
+    batch = types.Tool(name="predict_sed_batch", description="여러 건을 한 번에 — predict_sed 를 묶어 돈다. predict_sed 와 같은 인자. predict_sed 의 묶음.",
+                       inputSchema={"type": "object", "properties": {"items": {"type": "array"}}, "required": ["items"]})
+    single = types.Tool(name="predict_sed", description="SED 한 건을 예측한다.",
+                        inputSchema={"type": "object", "properties": {"x": {"type": "number", "description": "입력"}}, "required": ["x"]})
+    _detail_tools(monkeypatch, n=2, extra=(batch, single))
+    _t, plain = _st(query="predict_sed", limit=1)
+    assert plain["ranked"] == ["predict_sed_batch"], "전제 — 순위로는 이름이 더 긴 형제가 앞선다"
+    _t, one = _st(query="predict_sed", detail=True, limit=1)
+    assert one["ranked"] == ["predict_sed"] and one["matches"][0]["description"] == single.description
+    assert one["matches"][0]["args"]["properties"] == single.inputSchema["properties"]
+    line = _qlog_lines()[-1]
+    assert line["top"] == ["heax-step_forge:predict_sed"] and line["via"] == {"heax-step_forge:predict_sed": ["exact"]}
+    assert "boost_only" not in line, "이름 그대로 세운 줄은 보정 덕이 아니다 — 피드백 보고서가 '보정 덕에만' 으로 세지 않는다"
+    _t, upper = _st(query="  Predict_SED ", detail=True, limit=1)
+    assert upper["ranked"] == ["predict_sed"], "대소문자 · 앞뒤 빈칸은 이름 비교에 들지 않는다"
+    _t, wide = _st(query="predict_sed", detail=True)
+    assert wide["ranked"][0] == "predict_sed" and wide["ranked"].count("predict_sed") == 1 and "predict_sed_batch" in wide["ranked"]
+    tun = gw._tuning()
+    zero = {**tun, "weights": {**tun["weights"], "name": 0}}
+    res = asyncio.run(gw._search_tools({"query": "predict_sed", "detail": True, "limit": 1}, tuning=zero))
+    assert json.loads(res.content[0].text)["ranked"] == ["predict_sed"], "점수가 없어 줄에 없던 도구도 이름 그대로면 세운다"
+
+
+def test_search_tools_detail_이름_그대로는_접힌_사본도_꺼내고_대표의_same_in_에서_뺀다(monkeypatch):
+    """허브 가족의 형제 사본은 정본 한 줄로 접힌다(E2-2) — 그 사본의 이름으로 찾으면 정본이 대표로 서고 사본은 same_in 안에만 있었다. 이름 그대로
+    찾으면(detail=true) 그 사본이 첫 줄이고, 두 번 싣지 않게 대표의 same_in 에서 뺀다."""
+    search = _role_kit(monkeypatch)
+    name = "caegroupdatahub_objects_list"
+    plain = search(name)
+    head = plain["matches"][0]
+    assert head["tool"] == "rootdesigndatahub_objects_list" and name not in plain["ranked"], "전제 — 그 사본은 정본 아래 접힌다"
+    assert name in {x["tool"] for x in head["same_in"]}
+    _t, one = _st(query=name, detail=True, limit=1)
+    tool = next(t for t in gw.exposed_tools if t.name == name)
+    assert one["ranked"] == [name] and one["matches"][0]["description"] == tool.description.strip()
+    _t, wide = _st(query=name, detail=True)
+    assert wide["ranked"][0] == name and wide["ranked"].count(name) == 1
+    assert all(x["tool"] != name for m in wide["matches"] for x in m.get("same_in") or ()), "꺼낸 사본은 대표의 same_in 에 남지 않는다"
+
+
 def test_list_tool_apps_앱_상세는_도구_이름을_먼저_싣는다(monkeypatch):
     names = _long_tools(monkeypatch, 40)
     out = asyncio.run(gw._list_tool_apps({"app": "heax-hwax_risk"})).content[0].text

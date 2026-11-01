@@ -3144,6 +3144,13 @@ async def _read_json_body(receive, limit: int = 64 * 1024) -> dict:
     return d
 
 
+# search_tools(detail=true) 한 응답의 상한(글자). Claude Code 는 MCP 도구 결과가 MAX_MCP_OUTPUT_TOKENS(기본 25,000토큰)를 넘으면 본문 대신 파일로 빼거나
+# 앞 100,000자에서 자른다(2.0.74 판에서 읽은 동작 — 글자 수/4 가 상한의 절반 이하면 세지 않는다). 그 문턱을 1자≈1토큰으로 잡은 값이다(한글은 1자가
+# 1토큰 남짓 — 에이전트 서버 DELIB_MCP_PAGE_CHARS · 리스크 앱 CLAUDE_MCP_RESULT_CHARS 와 같은 보수 환산). 10-16 스냅샷 · 평가셋 150 질의에서 넘은 것은
+# limit 8 이 4건, limit 20 이 92건이었다. 넘어도 자르지 않는다 — 상위부터 전문을 싣고 나머지는 기본 꼴(한 줄 요약)로 내며 detail_capped 가 말한다
+# (_detail_capped). 0 이하면 끈다(종전처럼 전부 전문).
+SEARCH_DETAIL_MAX_CHARS = int(os.environ.get("GATEWAY_SEARCH_DETAIL_MAX_CHARS") or 25_000)
+
 SEARCH_TOOLS_TOOL = types.Tool(
     name="search_tools",
     description=(
@@ -3158,7 +3165,8 @@ SEARCH_TOOLS_TOOL = types.Tool(
             "query": {"type": "string", "description": "하고 싶은 일(한국어/영어, 예: '과거 보고서 요약', 'mesh quality check')"},
             "limit": {"type": "integer", "description": "최대 결과 수(기본 8, 최대 20). 더 맞은 것이 있으면 truncated 가 말한다"},
             "detail": {"type": "boolean", "description": "true 면 설명 전문과 인자 스키마 전부를 싣는다(기본 false — 한 줄 요약과 "
-                                                         "필수 인자의 스키마 · 선택 인자 이름만)"},
+                                                         "필수 인자의 스키마 · 선택 인자 이름만). 한 도구만 필요하면 query 에 그 도구 이름 · "
+                                                         "limit=1. 전문이 상한을 넘으면 상위부터 싣고 나머지는 요약이다(detail_capped 가 말한다)"},
         },
         "required": ["query"],
     },
@@ -3650,6 +3658,7 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     # 무리의 열쇠는 그 이름의 첫 가족 줄이 연 것이라, 설명이 같으면 지금과 글자 하나 다르지 않다. 설명이 다른 사본만 same_in 에 differs 가 붙는다.
     # 소개 줄이 붙은 형제(E2-4)도 differs 이고 그 줄(tagline)을 싣는다 — 같은 데이터의 사본이 아니라고 운영자가 적은 것이다(검토 10-31).
     folded: dict[int, list] = {}             # 대표 줄(id) → 접힌 것. 무리마다 따로다 — 원래 이름 · 설명이 같은 대표가 둘이어도 서로 덮지 않는다
+    scored = rows                            # 접기 전 줄 — 이름 그대로 찾기(아래)가 접힌 사본도 꺼낸다
     if sw["copy_fold"]:
         family = frozenset((vocab or {}).get("family") or ())
         canon_tools = {(route[t.name][1], _core_untagged(canon, (t.description or "").strip())): t
@@ -3690,6 +3699,19 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                                  **({"tagline": sib_lines[r[2]]} if r[2] in sib_lines else {})}
                                 for r in g if r is not head]
         rows = kept
+    # 이름 그대로(detail=true) — 질의가 보이는 도구의 노출 이름과 같으면 그 도구가 첫 줄이다. 접힌 사본이면 꺼내고, 점수가 없으면(이름 가중을 0 으로
+    # 덧씌운 박스) 줄을 만든다. 첫 줄은 상한(SEARCH_DETAIL_MAX_CHARS)에 걸리지 않으므로 search_tools(query=<이름>, detail=true, limit=1) 은 늘 그 도구의
+    # 전문을 준다 — detail_capped 가 가리키는 호출이다. 순위로는 보장되지 않았다(10-16 스냅샷 446개 중 10개가 1위가 아니었다 — 이름이 더 긴 형제
+    # 도구 · 동의어 갈래가 앞서거나 사본으로 접혔다). detail 이 없으면 순위 그대로다.
+    exact = next((t for t in visible if t.name.lower() == q), None) if detail else None
+    if exact is not None:
+        row = next((r for r in rows if r[4] is exact), None) or next((r for r in scored if r[4] is exact), None)
+        if row is None:
+            e_app, e_orig = route.get(exact.name, ("_gateway", exact.name))[:2]
+            row = (0, exact.name, e_app, (exact.description or "").strip(), exact, _tool_is_write(exact, e_orig), e_orig, 0, 0, ())
+        rows = [row] + [r for r in rows if r[4] is not exact]
+        for lst in folded.values():
+            lst[:] = [x for x in lst if x["tool"] != exact.name]
 
     def _args_summary(t) -> dict:
         """invoke_tool 로 바로 부를 수 있게 인자 계약을 붙인다 — 이게 없으면 모델이
@@ -3725,22 +3747,27 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                 out[k] = sch[k]
         return out
 
-    matches = []
-    for r in rows[:limit]:
+    def _entry(r, full: bool) -> dict:
+        """결과 한 줄 — full 이면 설명 전문 · 인자 스키마 전부(detail=true), 아니면 한 줄 요약 · 필수 인자 스키마(기본, 상한에 걸린 줄)."""
         _, n, a, d, t, w, _orig, _c, *_attr = r
         m = {"tool": n, "app": a}
         role = _app_role(a)
         if role and role[0] != "canonical":
             m["role"] = role[0]                  # 형제 · 비코어만(E2-1 · C-B) — 정본은 설명 앞 소개 줄이 말한다
-        m.update(description=d if detail else _brief_desc(d), args=_args_summary(t) if detail else _args_brief(t))
+        m.update(description=d if full else _brief_desc(d), args=_args_summary(t) if full else _args_brief(t))
         if w:
             m["write"] = True                    # 쓰기 · 잡 시작 — 사람에게 확인한 뒤 부른다(지침 5)
         if folded.get(id(r)):
             m["same_in"] = folded[id(r)]
-        matches.append(m)
+        return m
+
+    matches = [_entry(r, detail) for r in rows[:limit]]
     # 귀속 — 보정 뺀 점수로 줄을 세워, 보여 준 결과 가운데 보정 덕에만 든 것(boost_only — 보정을 빼면 0점이거나 limit 밖)을 가린다(E-9 ①)
     base_order = {r[1]: i for i, r in enumerate(sorted(rows, key=lambda r: (-r[8], r[7], r[1])), 1)}
     attrib = {r[1]: (r[9], r[8] <= 0 or base_order[r[1]] > limit) for r in rows[:limit]}
+    if exact is not None:
+        # 이름 그대로 세운 줄은 보정 덕이 아니다 — 질의 기록의 boost_only 를 플랫폼 피드백 보고서가 '보정 덕에만 찾아진 질의' 로 센다
+        attrib[exact.name] = (("exact",), False)
     if log_query:
         _log_tool_query(raw_q, (mode or {}).get("mode") or "substring", [m["tool"] for m in matches], attrib, tun["fingerprint"])
     # ⚠ 순서가 뜻이다 — 이름 순위·안내를 먼저, 설명·스키마 전문(matches)을 맨 뒤에 둔다. 작은 창의 소비자(dev 웹 챗
@@ -3772,9 +3799,32 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     # 받는 쪽은 JSON 으로 읽거나(/search-eval · tool_search_eval/run.py) 글을 그대로 모델에 준다(Claude Code 와 그 워크플로 · 에이전트 서버 웹 챗의
     # 안내대 — 루틴은 묶지 않고 심의 엔진은 부르지 않는다). 줄 · 빈칸 꼴에 기대는 곳이 없어(11-02 대조) 골라 쓰기가 아니라 기본이다.
     # 칸 차례(이름 순위 먼저 · 전문 맨 뒤)는 그대로다.
-    return types.CallToolResult(
-        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))]
-    )
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if detail and 0 < SEARCH_DETAIL_MAX_CHARS < len(text) and len(matches) > 1:
+        text = _detail_capped(payload, [_entry(r, False) for r in rows[:limit]])
+    return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
+
+
+def _detail_capped(payload: dict, brief: list[dict]) -> str:
+    """detail=true 답이 SEARCH_DETAIL_MAX_CHARS 를 넘을 때의 답 — 상위부터 전문을 싣다가 넘칠 자리부터 기본 꼴(한 줄 요약 · 필수 인자)로 낸다.
+    첫 줄은 늘 전문이다(그 한 줄이 상한을 넘어도 — 한 도구의 전문은 언제나 받을 수 있어야 한다). 조용히 줄이지 않는다 — detail_capped 가 상한 ·
+    전문으로 실은 건수 · 요약으로 남긴 도구 · 한 도구의 전문을 받는 호출을 말하고, 이름 순위 · 안내처럼 전문(matches) 앞에 선다."""
+    full = payload["matches"]
+    head = {k: v for k, v in payload.items() if k not in ("note", "matches")}
+    text = ""
+    for k in range(len(full) - 1, 0, -1):
+        ms = full[:k] + brief[k:]
+        short = [m["tool"] for m in ms[k:]]
+        out = {**head, "detail_capped": {                # 전문은 ranked 의 앞 full_count 건이다(이름은 ranked 가 이미 싣는다)
+            "max_chars": SEARCH_DETAIL_MAX_CHARS, "full_count": k, "brief": short,
+            "how": (f"응답이 상한 {SEARCH_DETAIL_MAX_CHARS:,}자(GATEWAY_SEARCH_DETAIL_MAX_CHARS)를 넘어 상위 {k}건만 전문이고 {len(short)}건은 "
+                    f"한 줄 요약이다(brief). 한 도구의 전문은 search_tools(query=\"{short[0]}\", detail=true, limit=1) 처럼 그 이름으로 받는다 — "
+                    "질의가 도구 이름과 같으면 그 도구가 첫 줄에 전문으로 온다(첫 줄은 상한에 걸리지 않는다). limit 를 줄여도 된다.")},
+            "note": payload["note"], "matches": ms}
+        text = json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+        if len(text) <= SEARCH_DETAIL_MAX_CHARS:
+            break
+    return text
 
 
 def _denied_entry(key: str, meta: dict, reason: str) -> dict:

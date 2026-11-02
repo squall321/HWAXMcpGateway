@@ -2588,10 +2588,24 @@ def test_다시_받아도_거절되면_두_번에서_멈추고_그대로_알린�
     assert "HTTP 401" in seen["result"].content[0].text, "무엇이 실패했는지 그대로 전한다"
 
 
+_MXWP_401 = ("Error executing tool upload_image_bytes: 인증 실패 (401): Invalid or expired token. "
+             "MXWP_API_TOKEN 이 올바른지 확인하세요.")
+
+
+def test_mx_백서가_토큰을_거절해도_한_번_다시_받아_부른다(monkeypatch):
+    """MX 백서 도구집은 API 의 401 을 `인증 실패 (401): …` 로 낸다 — 이 꼴을 못 알아보면 철회된 위임 토큰을 12시간 계속 썼다(figure_to_doc 검토)."""
+    seen = _remint_kit(monkeypatch, [_MXWP_401, None])
+    assert seen["calls"] == 2 and seen["stale"] == [None, "old-tok"], "거절된 토큰을 짚어 다시 받는다"
+    assert seen["tokens"] == ["Bearer old-tok", "Bearer new-tok"]
+    assert not seen["result"].isError
+
+
 @pytest.mark.parametrize("err", [
     "Error executing tool cluster_info: GET /api/cluster → HTTP 503: 클러스터 조회 실패",   # 토큰 문제가 아니다(slurm)
     "Error executing tool fetch_url: 원격 서버가 HTTP 401 을 냈다",                        # 도구가 바깥에서 받은 401
     "GET /api/cluster → HTTP 401: x",                                                    # FastMCP 가 감싼 모양이 아니다
+    "인증 실패 (401): x",                                                                 # MX 백서 꼴이라도 FastMCP 머리가 없다
+    "Error executing tool upload_image_bytes: 업로드 실패 — 원격이 인증 실패 (401) 를 냈다",  # 머리 바로 뒤가 아니다
 ])
 def test_토큰_거절이_아니면_다시_부르지_않는다(monkeypatch, err):
     """쓰기 도구를 두 번 부를 수 있으니 모양을 좁게 본다."""

@@ -7368,7 +7368,9 @@ def _forget_user_pat(app_id: str, email: str, tok: str) -> None:
 # 폐기된 캐시 토큰을 캐시 수명(12시간) 동안 계속 썼다(HWAXPortal docs/ste-cae00 D-30). 401 은 인증에서 끊긴 것이라 도구가
 # 아무것도 안 했다 — 다시 불러도 두 번 실행되지 않는다. 모양은 좁게 본다: 도구가 **바깥에서** 받은 401 을 옮기는 결과와 섞이면
 # 쓰기 도구를 두 번 부를 수 있다.
-_TOKEN_REJECTED = re.compile(r"^Error executing tool \S+: (?:GET|POST|PUT|PATCH|DELETE) \S+ → HTTP 401\b")
+# MX 백서 도구집은 API 의 401 을 `인증 실패 (401): …` 로 낸다(MXWhitePaper dist/llm-docx-toolkit/mcp/api_client.py) — 그 꼴도 거절로 본다.
+# 모양은 좁게 둔다 — FastMCP 가 감싼 머리 바로 뒤의 두 꼴만(쓰기 도구를 두 번 부르지 않게).
+_TOKEN_REJECTED = re.compile(r"^Error executing tool \S+: (?:(?:GET|POST|PUT|PATCH|DELETE) \S+ → HTTP 401\b|인증 실패 \(401\):)")
 
 
 def _token_rejected(res) -> bool:

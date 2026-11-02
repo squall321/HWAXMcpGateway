@@ -371,6 +371,14 @@ svg 만). 감사 줄에는 그 결과의 `images` · `image_bytes` 가 붙는다
   호출자 Authorization 그대로(공유 비밀 · 신원 없는 호출은 넘기지 않는다). `caption` 은 500자까지(Report Archive 그림 설명 상한 — 포털은 넘으면
   말없이 줄인다). svg 는 포털이 받지 않는다(415). 답은 포털의 JSON(`ok` · `report_id` · `file_id` · `page` · `block_index?` · `url?`), 실패(2xx 의
   `ok:false` 포함)는 `FIGURE_ERROR:` 한 줄.
+- **`figure_to_doc(ref, slug, section_id, caption="", alt="", after_block_id=None)`**(쓰기 — 읽기 전용 · 패널 PAT 는 거절) — 주인을 본 뒤 MX 백서
+  (`mx-white-paper`)의 `upload_image_bytes`(`<도구>-<ref>.<확장자>` · base64 · mime · sha256) → `insert_image_block`(받은 `image_id`, `after_block_id`
+  가 없으면 섹션 끝)을 정상 호출 길로 부른다 — 그 사람의 위임 토큰(사람별 위임 `PER_USER_SSO_APPS mx-white-paper:MXWP`, 꺼져 있으면 부르지 않는다 —
+  서비스 계정 이름으로 문서를 고치지 않게)과 소속 · plat 증명이 실리고, 감사는 두 도구 한 줄씩과 `figure_to_doc` 한 줄이다. 바이트는 서버끼리 간다.
+  svg 는 넣지 않는다(MXWP 가 WebP 로 다시 굽는다 — png 로 다시 부른다). `caption` 500자 · `alt` 200자(MXWP 그림 블록 상한 — 넘으면 말한다, `alt` 를
+  비우면 caption 을 200자에서 잘라 물려받고 그것도 비면 도구 이름). 넣기는 '문서가 그 사이 변경되었습니다'(412 · 409 — 넣지 않았다)에만 한 번 더
+  부른다. 답은 `{ok, slug, section_id, block_id, image_id, deduped}`, 실패는 `FIGURE_ERROR:` 한 줄(낡은 MXWP 는 `upload_image_bytes 가 없다` · 403 은
+  MXWP 문구 · 404 는 문서 · 섹션 · 블록, 넣기에서 멈추면 올려 둔 `image_id`).
 
 | 손잡이 | 기본 | 뜻 |
 |---|---|---|

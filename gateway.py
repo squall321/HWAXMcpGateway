@@ -5689,14 +5689,17 @@ FIG_LIST_TOOL = types.Tool(
     inputSchema={"type": "object", "properties": {
         "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "최대 행 수(1 ~ 100, 기본 20)"}}, "required": []},
     annotations=types.ToolAnnotations(readOnlyHint=True))
+# 보고서 그림 설명 상한 — Report Archive image 위젯 caption 과 같다(포털 report_figures 는 넘으면 말없이 줄인다 — 여기서 먼저 말한다).
+FIG_CAPTION_MAX = 500
 FIG_REPORT_TOOL = types.Tool(
     name="figure_to_report",
     description=("저장된 그림(fig_…)을 Report Archive 보고서에 넣는다 — 포털이 그 사람 이름으로 넣는다(내 그림 · 내가 고칠 수 있는 보고서만). "
-                 "보고서에 그림을 붙일 때 쓴다. 답은 포털의 것(ok · report_id · file_id · page …)이다."),
+                 "보고서에 그림을 붙일 때 쓴다. png · jpeg · gif · webp 만 들어간다(svg 는 포털이 받지 않는다 — 도구를 png 로 다시 부른다). "
+                 "답은 포털의 것(ok · report_id · file_id · page …)이다."),
     inputSchema={"type": "object", "properties": {
         "ref": _FIG_REF_ARG,
-        "report_id": {"type": "string", "maxLength": 200, "description": "넣을 Report Archive 보고서 id"},
-        "caption": {"type": "string", "maxLength": 2000, "description": "그림 설명(2,000자까지, 비우면 없음)"},
+        "report_id": {"type": "string", "maxLength": 200, "description": "넣을 Report Archive 보고서 id(숫자)"},
+        "caption": {"type": "string", "maxLength": FIG_CAPTION_MAX, "description": f"그림 설명({FIG_CAPTION_MAX}자까지, 비우면 없음)"},
         "page": {"type": "integer", "minimum": 1, "description": "넣을 쪽(1부터, 비우면 포털이 정한 자리)"}},
         "required": ["ref", "report_id"]},
     annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False))
@@ -5762,8 +5765,8 @@ async def _fig_report(meta: dict, ref: str, a: dict) -> dict:
         raise _FigError("report_id 를 준다(200자까지) — 넣을 Report Archive 보고서 id")
     caption = a.get("caption")
     caption = "" if caption is None else str(caption)
-    if len(caption) > 2000:
-        raise _FigError("caption 은 2,000자까지다")
+    if len(caption) > FIG_CAPTION_MAX:
+        raise _FigError(f"caption 은 {FIG_CAPTION_MAX}자까지다(Report Archive 그림 설명 상한 — 포털은 넘으면 말없이 줄인다)")
     page = a.get("page")
     if page is not None and (isinstance(page, bool) or not isinstance(page, int) or page < 1):
         raise _FigError("page 는 1 이상의 정수다(비우면 포털이 정한 자리)")
@@ -5796,8 +5799,9 @@ async def _fig_report(meta: dict, ref: str, a: dict) -> dict:
         raise _FigError("포털에 그림 넣기 창구(/agent/figures/to-report)가 없다 — 포털이 이 게이트웨이보다 낡았다(포털을 새 판으로)")
     if r.status_code == 401:
         raise _FigError("포털이 이 토큰을 받지 않았다(만료 · 폐기 — 포털 /tokens 에서 다시 발급)")
-    if not 200 <= r.status_code < 300:
-        raise _FigError(_clip(str(detail or f"portal {r.status_code}"), 500))
+    if not 200 <= r.status_code < 300 or data.get("ok") is False:
+        # 포털의 실패 꼴은 {ok:false, error, detail} — 2xx 로 와도 실패로 말한다
+        raise _FigError(_clip(str(detail or (data or {}).get("error") or f"portal {r.status_code}"), 500))
     return data
 
 

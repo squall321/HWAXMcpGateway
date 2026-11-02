@@ -11882,6 +11882,19 @@ def test_실패_봉투는_structuredContent_에_있어도_두지_않고_손대�
     assert not gw.FIG_DIR.exists()
 
 
+def test_figure_to_report_는_포털_한도에_맞추고_2xx_의_ok_false_도_실패로_말한다(monkeypatch):
+    """포털(report_figures) 계약 — caption 은 Report Archive 상한 500자(포털은 넘으면 말없이 줄인다), 실패 꼴 {ok:false, error, detail},
+    Content-Length 없는 본문은 411."""
+    sent = _fig_portal(monkeypatch, lambda req: httpx.Response(200, json={"ok": False, "error": "bad_page", "detail": "그 보고서에는 2쪽까지"}))
+    ref = _fig_stored()
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", "authorization": "Bearer pat-a"})
+    res = asyncio.run(gw._call_tool("figure_to_report", {"ref": ref, "report_id": "7", "caption": "가" * 501}))
+    assert res.isError and "500자" in res.content[0].text and sent == []
+    res = asyncio.run(gw._call_tool("figure_to_report", {"ref": ref, "report_id": "7", "caption": "가" * 500, "page": 3}))
+    assert res.isError and res.content[0].text == "FIGURE_ERROR: 그 보고서에는 2쪽까지"
+    assert sent[0].headers["content-length"] == str(len(sent[0].content)), "포털은 Content-Length 없는 본문을 받지 않는다"
+
+
 def test_받기는_링크를_따라가지_않는다(monkeypatch):
     ref = _fig_stored()
     other = gw.FIG_DIR.parent / "secret.png"

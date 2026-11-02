@@ -11936,14 +11936,16 @@ def _mx_ok(name, args):
             else {"block_id": _MX_BLOCK_ID})
 
 
-def _mx_kit(monkeypatch, decide=_mx_ok, *, tools=("upload_image_bytes", "insert_image_block"), served=None, sso=True):
+def _mx_kit(monkeypatch, decide=_mx_ok, *, tools=("upload_image_bytes", "insert_image_block"), served=None, sso=True, list_status=None):
     """MXWP 백엔드 하나로 figure_to_doc 을 태운다. tools — 게이트웨이 목록(재집계)에 오른 MXWP 도구, served — MXWP 가 실제로 아는 도구(비우면
-    tools — 모르는 도구는 FastMCP 처럼 'Unknown tool: X'). decide(이름, 인자)가 dict 면 성공 답, 글이면 그 도구가 던진 오류다. 요청자는 a@corp.com
-    (사람 PAT · plat:mxwhitepaper). 반환은 (부르기, 센 것 — mints: 발급이 받은 위임 이메일, calls: tools/call 마다 (이름, 인자, 머리), backend)."""
+    tools — 모르는 도구는 FastMCP 처럼 'Unknown tool: X'). decide(이름, 인자)가 dict 면 성공 답, 글이면 그 도구가 던진 오류다(코루틴이면 기다린다 —
+    느린 MXWP). list_status(센 것)가 정수를 주면 그 tools/list 를 그 HTTP 상태로 답한다(클라이언트가 성공한 tools/call 뒤 출력 검증으로 부른다).
+    요청자는 a@corp.com(사람 PAT · plat:mxwhitepaper). 반환은 (부르기, 센 것 — mints: 발급이 받은 위임 이메일, calls: tools/call 마다 (이름, 인자,
+    머리), backend)."""
     served = tuple(tools if served is None else served)
     seen = {"mints": [], "calls": []}
 
-    def handler(req):
+    async def handler(req):
         u = str(req.url)
         if u == _MX_SSO:
             who = req.headers.get("x-heax-user-email")
@@ -11960,12 +11962,17 @@ def _mx_kit(monkeypatch, decide=_mx_ok, *, tools=("upload_image_bytes", "insert_
         if "id" not in msg:
             return httpx.Response(202)
         if msg.get("method") == "tools/list":      # 진짜 클라이언트는 tools/call 뒤에 출력 스키마를 보러 목록을 부른다(mcp 1.28)
+            st = list_status(seen) if list_status else None
+            if isinstance(st, int):
+                return httpx.Response(st, json={"error": "x"})
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [
                 {"name": n, "inputSchema": {"type": "object"}, "outputSchema": {"type": "object"}} for n in served]}})
         assert msg.get("method") == "tools/call", msg
         name, args = msg["params"]["name"], msg["params"].get("arguments") or {}
         seen["calls"].append((name, args, {k.lower(): v for k, v in req.headers.items()}))
         out = decide(name, args) if name in served else None
+        if asyncio.iscoroutine(out):
+            out = await out
         if isinstance(out, dict):
             result = {"content": [{"type": "text", "text": json.dumps(out)}], "structuredContent": out, "isError": False}
         else:
@@ -12114,16 +12121,117 @@ def test_figure_to_doc_는_문서가_그_사이_바뀌면_넣기만_한_번_다�
      "MX 백서에 그림을 올리지 못했다 — 권한/scope 부족 (403): Token lacks write scope", ["upload_image_bytes"]),
     ("insert_image_block", "HTTP 404 not_found: section not found",
      "MX 백서에 그 문서 · 섹션 · 블록이 없다(404", ["upload_image_bytes", "insert_image_block"]),
-    ("insert_image_block", "HTTP 500 internal: boom",            # 넣었는지 모르는 실패는 다시 부르지 않는다(블록이 둘 된다)
-     "MX 백서 문서에 그림 블록을 넣지 못했다 — HTTP 500 internal: boom", ["upload_image_bytes", "insert_image_block"])])
+    ("insert_image_block", "권한/scope 부족 (403): 이 문서를 고칠 수 없다. write scope 토큰이 필요합니다.",
+     "MX 백서 문서에 그림 블록을 넣지 못했다 — 권한/scope 부족 (403)", ["upload_image_bytes", "insert_image_block"]),
+    ("insert_image_block", "block schema 검증 실패 (API 호출 안 함) — /alt: too long. block JSON 작성법은 query_rules 참조.",
+     "MX 백서 문서에 그림 블록을 넣지 못했다 — block schema 검증 실패 (API 호출 안 함)", ["upload_image_bytes", "insert_image_block"])])
 def test_figure_to_doc_는_MXWP_의_거절을_그대로_말한다(monkeypatch, tool, err, want, calls):
+    """아무것도 넣지 않은 것이 확실한 거절(4xx · 보내기 전 검증)만 '넣지 못했다' 다 — 다시 부르지 않는다."""
     call, seen = _mx_kit(monkeypatch, lambda name, args: err if name == tool else _mx_ok(name, args))
     text = call({"ref": _fig_stored(), **_MX_AT}).content[0].text
-    assert text.startswith(f"FIGURE_ERROR: {want}") and err in text, text
+    assert text.startswith(f"FIGURE_ERROR: {want}") and err.split(" — ")[0].split(". write")[0] in text, text
     assert [c[0] for c in seen["calls"]] == calls
     assert (_MX_IMAGE_ID in text) == (tool == "insert_image_block"), "넣기에서 멈추면 올려 둔 그림의 image_id 를 말한다"
+    assert ("쓰기 역할(editor)" in text) == (tool == "upload_image_bytes"), "올리기의 403 은 MX 백서 역할을 말한다"
     row = _audit_rows()[-1]
     assert (row["tool"], row["backend"], row["ok"]) == ("figure_to_doc", "mx-white-paper", False)
+
+
+@pytest.mark.parametrize("case", ["api-timeout", "api-5xx", "envelope", "gateway-timeout", "after-call-list"])
+def test_figure_to_doc_는_넣었는지_모르는_실패를_넣지_못했다로_말하지_않고_다시_부르지_않는다(monkeypatch, case):
+    """넣기 요청이 MXWP 에 닿은 뒤의 실패 — 그쪽 API 시간 초과 · 5xx · 봉투 오류 · 게이트웨이 호출 한도 · 넣은 뒤 클라이언트가 출력 검증으로 부르는
+    tools/list 의 실패(MXWP 는 이미 넣었다) — 는 넣었을 수 있다. '넣지 못했다' 로 말하던 판은 다시 부르게 해 같은 그림 블록이 둘 됐다(반대 검토 1)."""
+    decide, list_status = _mx_ok, None
+    if case == "api-timeout":
+        decide = lambda n, a: ("timeout (15.0s) on POST /api/v1/documents/hinge-durability/blocks"     # noqa: E731
+                               if n == "insert_image_block" else _mx_ok(n, a))
+    elif case == "api-5xx":
+        decide = lambda n, a: "HTTP 500 internal: boom" if n == "insert_image_block" else _mx_ok(n, a)        # noqa: E731
+    elif case == "envelope":
+        decide = lambda n, a: {"error": "저장 중 끊겼다"} if n == "insert_image_block" else _mx_ok(n, a)        # noqa: E731
+    elif case == "gateway-timeout":
+        async def decide(n, a):
+            if n == "insert_image_block":
+                await asyncio.sleep(3)                  # MXWP 는 받아서 넣는 중이다
+            return _mx_ok(n, a)
+    else:
+        list_status = lambda seen: 500 if any(c[0] == "insert_image_block" for c in seen["calls"]) else None     # noqa: E731
+    call, seen = _mx_kit(monkeypatch, decide, list_status=list_status)
+    if case == "gateway-timeout":
+        monkeypatch.setattr(gw, "CALL_TIMEOUT_S", 0.5)
+    text = call({"ref": _fig_stored(), **_MX_AT}).content[0].text
+    assert text.startswith("FIGURE_ERROR: MX 백서 문서에 그림 블록을 넣었는지 모른다 — "), text
+    assert "넣지 못했다" not in text and f"이 그림(image_id {_MX_IMAGE_ID})" in text and "get_document_outline" in text, text
+    assert [c[0] for c in seen["calls"]] == ["upload_image_bytes", "insert_image_block"], "다시 부르지 않는다"
+
+
+def test_figure_to_doc_는_넣었다는_답에_block_id_가_없으면_다시_부르지_말라고_말한다(monkeypatch):
+    call, seen = _mx_kit(monkeypatch, lambda name, args: {"inserted": True} if name == "insert_image_block" else _mx_ok(name, args))
+    res = call({"ref": _fig_stored(), **_MX_AT})
+    text = res.content[0].text
+    assert res.isError and text.startswith("FIGURE_ERROR: MX 백서가 넣었다고 답했지만 block_id 를 주지 않았다 — 다시 부르지 말고"), text
+    assert _MX_IMAGE_ID in text and [c[0] for c in seen["calls"]] == ["upload_image_bytes", "insert_image_block"]
+
+
+def test_figure_to_doc_는_MXWP_401_을_위임_토큰으로_말하고_PC_설정_안내를_싣지_않는다(monkeypatch):
+    revoked = ("인증 실패 (401): Delegated token revoked. MXWP_API_TOKEN 환경변수가 없습니다. 위키 UI 의 'API 토큰' 메뉴에서 write scope 토큰을 "
+               "발급받아 (POST /api/v1/me/api-tokens, scopes ['read','write']) MCP 설정 env 에 MXWP_API_TOKEN 으로 넣어주세요.")
+    call, seen = _mx_kit(monkeypatch, lambda name, args: revoked)
+    text = call({"ref": _fig_stored(), **_MX_AT}).content[0].text
+    assert text.startswith("FIGURE_ERROR: MX 백서에 그림을 올리지 못했다 — 인증 실패 (401): Delegated token revoked."), text
+    assert "MXWP_API_TOKEN" not in text and "위임 토큰을 받지 않았다" in text, text
+    assert [c[0] for c in seen["calls"]] == ["upload_image_bytes"]
+
+
+def test_figure_to_doc_는_글이_아닌_인자를_문서에_넣지_않는다(monkeypatch):
+    """입력 검증을 끈 호출 길이다 — 숫자 · 객체 · 목록 · 참거짓을 str() 로 바꿔 '123' · "{'id': 'S'}" · "['단면']" · 'False' 로 넣던 것(반대 검토 5)."""
+    call, seen = _mx_kit(monkeypatch)
+    at = {"ref": _fig_stored(), **_MX_AT}
+    for key, bad in (("slug", 123), ("section_id", {"id": "S"}), ("caption", ["단면", "A-A"]), ("alt", False), ("after_block_id", 7)):
+        text = call({**at, key: bad}).content[0].text
+        assert text == f"FIGURE_ERROR: {key} 는 글(문자열)이다", (key, text)
+    assert seen["calls"] == [] and seen["mints"] == []
+    assert not call({**at, "caption": None, "alt": None, "after_block_id": None}).isError, "비운 칸(null)은 그대로 된다"
+
+
+def test_figure_to_doc_는_위임_토큰을_다른_머리로_싣는_설정이면_부르지_않는다(monkeypatch):
+    """token_header 가 있으면 그 사람의 토큰은 다른 머리로 가고 바탕 Authorization(서비스 토큰)이 그대로 간다 — MXWP 는 Authorization 만 읽어
+    서비스 계정(admin@mx.local) 이름으로 쓴다(반대 검토 4)."""
+    call, seen = _mx_kit(monkeypatch)
+    monkeypatch.setattr(gw, "PER_USER_SSO", {"mx-white-paper": {**gw.PER_USER_SSO["mx-white-paper"], "token_header": "X-Mxwp-User-Token"}})
+    text = call({"ref": _fig_stored(), **_MX_AT}).content[0].text
+    assert text.startswith("FIGURE_ERROR: MX 백서 위임 설정에 token_header 가 있다"), text
+    assert seen["calls"] == [] and seen["mints"] == [] and seen["backend"].session.calls == []
+
+
+def test_그림_넣기는_주인을_본_뒤_지워진_파일을_없는_그림으로_말하고_경로를_내보내지_않는다(monkeypatch):
+    """주인을 본 뒤 바이트를 읽기 전에 청소 · 상한이 지운 파일 — 날것의 FileNotFoundError 가 서버 경로를 담아 나갔고 감사 줄도 없었다(반대 검토 7).
+    보고서 넣기도 같은 자리를 지난다."""
+    call, seen = _mx_kit(monkeypatch)
+    ref = _fig_stored()
+    path = gw._fig_load(ref)["path"]
+
+    def gone(p):
+        raise FileNotFoundError(2, "No such file or directory", str(p))
+    monkeypatch.setattr(gw, "_fig_read_image", gone)
+    res = call({"ref": ref, **_MX_AT})
+    assert res.isError and res.content[0].text == f"FIGURE_ERROR: {gw._FIG_MISSING}" and str(path) not in res.content[0].text
+    assert seen["calls"] == [] and (_audit_rows()[-1]["tool"], _audit_rows()[-1]["ok"]) == ("figure_to_doc", False)
+    _fig_portal(monkeypatch, lambda req: httpx.Response(200, json={"ok": True}))
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", "authorization": "Bearer pat-a"})
+    res = asyncio.run(gw._call_tool("figure_to_report", {"ref": ref, "report_id": "r-1"}))
+    assert res.isError and res.content[0].text == f"FIGURE_ERROR: {gw._FIG_MISSING}"
+    assert (_audit_rows()[-1]["tool"], _audit_rows()[-1]["ok"]) == ("figure_to_report", False)
+
+
+def test_figure_to_doc_는_넣기에_없는_MXWP_와_겹친_그림을_말한다(monkeypatch):
+    call, seen = _mx_kit(monkeypatch, served=("upload_image_bytes",))      # 넣기를 모르는 MXWP(목록은 새것)
+    text = call({"ref": _fig_stored(), **_MX_AT}).content[0].text
+    assert text.startswith("FIGURE_ERROR: MX 백서 판이 낡았다 — insert_image_block 이 없다") and _MX_IMAGE_ID in text, text
+    # 같은 그림을 다시 올리면 MXWP 가 겹침으로 거른다 — 그 표지를 그대로 준다
+    call, seen = _mx_kit(monkeypatch, lambda name, args: {**_mx_ok(name, args), "deduped": True} if name == "upload_image_bytes"
+                         else _mx_ok(name, args))
+    assert json.loads(call({"ref": _fig_stored(), **_MX_AT}).content[0].text)["deduped"] is True
 
 
 def test_figure_to_doc_는_MXWP_그림_블록_상한을_부르기_전에_지키고_물려받은_alt_는_자른다(monkeypatch):

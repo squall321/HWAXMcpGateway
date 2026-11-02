@@ -4993,19 +4993,28 @@ def _caller_bearer() -> str:
 async def _routine_portal(method: str, path: str, *, body: dict | None = None, params: dict | None = None,
                           timeout: float | None = None) -> dict:
     """포털 /routines-api 를 호출자 PAT 로 — 답이 JSON 이 아니면(SPA 폴백 · 옛 포털) '포털이 낡았다' 다('루틴 없음' 이 아니다)."""
+    return await _portal_api("/routines-api", method, path, body=body, params=params, timeout=timeout or ROUTINE_TIMEOUT_S,
+                             err=_RoutineError, what="루틴",
+                             no_pat="루틴은 사람 PAT 로만 돈다 — 원장 · 보고서가 그 사람 이름이어야 한다(게이트웨이 공유 비밀로는 부를 수 없다)")
+
+
+async def _portal_api(prefix: str, method: str, path: str, *, body: dict | None, params: dict | None, timeout: float,
+                      err: type, what: str, no_pat: str) -> dict:
+    """포털의 창구(prefix — /routines-api · /insights-api)를 호출자 사람 PAT 로 부른다. 루틴 도구와 과제 인사이트 도구가 같은 판정을 쓴다 —
+    공유 비밀 · 신원 없는 호출은 거절(no_pat), 비 JSON · 글 404 는 '포털이 낡았다', 5xx 는 포털 오류, 401 은 토큰 거절."""
     base = _portal_api_base()
     if not base:
-        raise _RoutineError("포털 주소가 없다(gateway_config.json portal.api_base)")
+        raise err("포털 주소가 없다(gateway_config.json portal.api_base)")
     auth = _caller_bearer()
     if not auth:
-        raise _RoutineError("루틴은 사람 PAT 로만 돈다 — 원장 · 보고서가 그 사람 이름이어야 한다(게이트웨이 공유 비밀로는 부를 수 없다)")
+        raise err(no_pat)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout or ROUTINE_TIMEOUT_S, connect=8.0)) as cli:
-            r = await cli.request(method, f"{base}/routines-api{path}", json=body, params=params,
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=8.0)) as cli:
+            r = await cli.request(method, f"{base}{prefix}{path}", json=body, params=params,
                                   headers={"Authorization": auth})
     except httpx.HTTPError as exc:
-        raise _RoutineError(f"포털에 닿지 못했다({type(exc).__name__})") from None
-    stale = "포털에 루틴 창구가 없다 — 포털이 이 게이트웨이보다 낡았다(포털을 새 판으로)"
+        raise err(f"포털에 닿지 못했다({type(exc).__name__})") from None
+    stale = f"포털에 {what} 창구가 없다 — 포털이 이 게이트웨이보다 낡았다(포털을 새 판으로)"
     is_json = "json" in r.headers.get("content-type", "")
     if r.status_code >= 500:
         # 5xx 는 포털 오류다 — 낡은 포털로 읽지 않는다. Starlette 의 500 은 text/plain 이라 예전엔 '낡았다' 로 오독했다(R3-design 3.4).
@@ -5016,26 +5025,26 @@ async def _routine_portal(method: str, path: str, *, body: dict | None = None, p
                 detail = (r.json() or {}).get("detail")
             except (ValueError, AttributeError):
                 detail = None
-        raise _RoutineError(f"포털 오류(HTTP {r.status_code}) — 잠시 뒤 다시"
-                            + (f"({_clip(detail, 300)})" if isinstance(detail, str) and detail.strip() else ""))
+        raise err(f"포털 오류(HTTP {r.status_code}) — 잠시 뒤 다시"
+                  + (f"({_clip(detail, 300)})" if isinstance(detail, str) and detail.strip() else ""))
     if not is_json:
         # '낡았다' 는 창구가 없다는 답일 때만 — 글 404(nginx · Starlette), 그리고 2xx 의 SPA 폴백(/routines-api 를 모르는 옛 포털은
         # index.html 을 200 으로 낸다 — 새 포털은 API 자리의 없는 경로를 JSON 404 로 답한다). 그 밖의 비 JSON 은 읽지 못한 답이다
         if r.status_code == 404 or 200 <= r.status_code < 300:
-            raise _RoutineError(stale)
-        raise _RoutineError(f"포털 답을 읽지 못했다({r.status_code})")
+            raise err(stale)
+        raise err(f"포털 답을 읽지 못했다({r.status_code})")
     try:
         data = r.json()
     except ValueError:
-        raise _RoutineError(f"포털 답을 읽지 못했다({r.status_code})") from None
+        raise err(f"포털 답을 읽지 못했다({r.status_code})") from None
     if r.status_code in (200, 201, 202):
         return data if isinstance(data, dict) else {"items": data}
     detail = data.get("detail") if isinstance(data, dict) else None
     if r.status_code == 404 and detail == "Not Found":
-        raise _RoutineError(stale)
+        raise err(stale)
     if r.status_code == 401:
-        raise _RoutineError("포털이 이 토큰을 받지 않았다(만료 · 폐기 — 포털 /tokens 에서 다시 발급)")
-    raise _RoutineError(_clip(str(detail or f"portal {r.status_code}"), 500), status=r.status_code)
+        raise err("포털이 이 토큰을 받지 않았다(만료 · 폐기 — 포털 /tokens 에서 다시 발급)")
+    raise err(_clip(str(detail or f"portal {r.status_code}"), 500), status=r.status_code)
 
 
 def _rt_json(obj) -> types.CallToolResult:
@@ -5052,6 +5061,63 @@ def _rt_exposed(backend: str, original: str) -> str | None:
         if r == (backend, original):
             return exposed
     return None
+
+
+# ── 과제 인사이트(HWAXPortal docs/project-insight-graph M2 · contracts §7) ──────────────────────────────────────────────────────
+# 원장 · 시야(읽을 때 거름)는 포털(/insights-api)이 쥐고, 게이트웨이는 호출자 사람 PAT 를 그대로 넘기는 얇은 읽기 도구 둘만 둔다(루틴 도구와 같은
+# 꼴 — _portal_api). 게이트웨이 공유 비밀 · 신원 없는 호출은 아무것도 못 본다. 쓰기 도구는 없다 — 확인 · 고침 · 거둠은 사람이 포털 화면에서 한다.
+# 이름은 insight_ 로 시작한다 — 엔진의 좌석 자유 조회 접두에 걸리지 않고 리스크 심사 좌석에서는 이름으로 거절된다(D-18, 에이전트 _INSIGHT_TOOL_HEAD).
+# 리스크 심사 결과는 이 도구가 아니라 리스크 앱(risk_find_projects_by_subject)이 그 사람 시야로 낸다.
+INSIGHT_TIMEOUT_S = float(os.environ.get("GATEWAY_INSIGHT_TIMEOUT_S", "30") or 30)
+INSIGHT_FIND_TOOL = _routine_tool(
+    "insight_find",
+    "과제 인사이트 — 내가 볼 수 있는 앞선 일반 심의의 결정 카드를 과제(SP 허브 key) · 차수로 찾는다(웹 심의 · MCP 심의 · Claude 워크플로가 모두 "
+    "같은 (과제, 차수) 칸에 모인다). 카드는 단마다 하나 — 주장(핵심 요약) · 표결 · RA 보고서 · 근거 표지 · 상태(초안 · 확인 · 반박)다. 결과는 "
+    "앞선 인사이트일 뿐 검증 대상이고 독립 근거가 아니다 — 새 심의에 넘기려면 deliberate_start 의 evidence 로 출처째 싣는다. 과제 key 는 "
+    "find_plm_task 결과 행의 key 다(과제코드가 아니다). 리스크 심사 결과는 risk_find_projects_by_subject 로 본다.",
+    {"sp_task": {"type": "string", "maxLength": 200, "description": "허브 과제 key(글자 그대로) — 비우면 모든 과제"},
+     "round": {"type": "string", "maxLength": 40, "description": "차수 — pre · dv1 ~ dv3 · dvr · pv1 ~ pv3 · pvr · pra · mp, 차수 모름 칸만은 unknown, "
+                                                                 "비우면 모든 차수"},
+     "q": {"type": "string", "maxLength": 200, "description": "주장 · 과제 글에 든 말(대소문자 없이) — 비우면 거르지 않는다"},
+     "artifact_kind": {"type": "string", "enum": ["mcad", "ecad", "cae"], "description": "설계 자료 종류 — artifact_id 와 함께"},
+     "artifact_id": {"type": "string", "maxLength": 64, "description": "설계 자료 열쇠 — StepForge project_id · ODB job_id · DynaForge 리포트 id"},
+     "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "최대 행 수(기본 20)"}}, [])
+INSIGHT_GET_TOOL = _routine_tool(
+    "insight_get",
+    "과제 인사이트 카드 하나의 전부 — 주제(과제 · 차수 · 설계 자료) · 주장 · 표결 · RA 보고서 · 근거 표지(도구 · 인자 · 결과 지문) · 상태 · 범위 · "
+    "반박 잇기. 볼 수 없는 카드는 없는 것과 같다. 검증 대상이고 독립 근거가 아니다.",
+    {"id": {"type": "string", "maxLength": 300, "description": "카드 id — insight_find 결과의 id(ins:web:… · ins:delib:… · ins:wf:…)"}}, ["id"])
+INSIGHT_TOOLS = (INSIGHT_FIND_TOOL, INSIGHT_GET_TOOL)
+_INSIGHT_NAMES = frozenset(t.name for t in INSIGHT_TOOLS)
+_INSIGHT_FIND_KEYS = ("sp_task", "round", "q", "artifact_kind", "artifact_id", "limit")
+
+
+class _InsightError(_RoutineError):
+    """과제 인사이트 도구가 호출자에게 그대로 말할 까닭(루틴 도구의 포털 판정을 같이 쓴다)."""
+
+
+async def _insight_dispatch(name: str, arguments: dict) -> types.CallToolResult:
+    """과제 인사이트 로컬 도구 둘 — 포털 창구를 호출자 사람 PAT 로. 실패는 INSIGHT_ERROR 한 줄(까닭 그대로), 감사는 portal 로 한 줄."""
+    t0 = time.monotonic()
+    a = arguments or {}
+    try:
+        if name == INSIGHT_FIND_TOOL.name:
+            params = {k: str(a[k]).strip() for k in _INSIGHT_FIND_KEYS if a.get(k) not in (None, "")}
+            data = await _portal_api("/insights-api", "GET", "/find", body=None, params=params, timeout=INSIGHT_TIMEOUT_S,
+                                     err=_InsightError, what="과제 인사이트",
+                                     no_pat="과제 인사이트는 사람 PAT 로만 읽는다 — 그 사람이 볼 수 있는 카드만 보인다(게이트웨이 공유 비밀로는 부를 수 없다)")
+        else:
+            cid = str(a.get("id") or "").strip()
+            if not cid:
+                raise _InsightError("id 가 비었다 — insight_find 결과의 id 를 준다")
+            data = await _portal_api("/insights-api", "GET", f"/cards/{quote(cid, safe='')}", body=None, params=None,
+                                     timeout=INSIGHT_TIMEOUT_S, err=_InsightError, what="과제 인사이트",
+                                     no_pat="과제 인사이트는 사람 PAT 로만 읽는다 — 그 사람이 볼 수 있는 카드만 보인다(게이트웨이 공유 비밀로는 부를 수 없다)")
+        _audit(name, "portal", True, None, round((time.monotonic() - t0) * 1000))
+        return _rt_json(data)
+    except _InsightError as exc:
+        _audit(name, "portal", False, str(exc), round((time.monotonic() - t0) * 1000))
+        return types.CallToolResult(content=[types.TextContent(type="text", text=f"INSIGHT_ERROR: {exc}")], isError=True)
 
 
 async def _routine_dispatch(name: str, arguments: dict) -> types.CallToolResult:
@@ -5563,7 +5629,7 @@ def _local_tools() -> list[types.Tool]:
     목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
-             BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS]
+             BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS]
     # REST 다리는 **등록된 사이트가 있을 때만** 낸다 — 쓸 수 없는 도구를 목록에 두면
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
@@ -6672,7 +6738,8 @@ async def _list_tools(req: types.ListToolsRequest):
 # invoke_tool 은 안쪽 도구로 바꾼 뒤 _readonly_denial 이 다시 본다.
 _LOCAL_READ = frozenset({SEARCH_CONV_TOOL.name, LIST_APPS_TOOL.name, SEARCH_TOOLS_TOOL.name, BROWSE_EXPERTS_TOOL.name,
                          USE_EXPERTS_TOOL.name, VERIFY_TOOL.name, REST_CATALOG_TOOL.name,
-                         ROUTINE_LIST_TOOL.name, ROUTINE_GET_TOOL.name})   # 루틴 실행 · 원장 쓰기는 읽기 전용 PAT 밖
+                         ROUTINE_LIST_TOOL.name, ROUTINE_GET_TOOL.name,   # 루틴 실행 · 원장 쓰기는 읽기 전용 PAT 밖
+                         *_INSIGHT_NAMES})                                 # 과제 인사이트는 읽기 둘뿐이다
 _ROUTINE_NAMES = frozenset(t.name for t in ROUTINE_TOOLS)
 
 
@@ -6768,6 +6835,8 @@ async def _call_tool_body(name: str, arguments: dict):
         return await _verify_answer(arguments or {})
     if name in _ROUTINE_NAMES:
         return await _routine_dispatch(name, arguments or {})
+    if name in _INSIGHT_NAMES:
+        return await _insight_dispatch(name, arguments or {})
 
     if name == REST_CATALOG_TOOL.name:
         return await _rest_catalog(arguments or {})
@@ -7126,7 +7195,7 @@ def _bearer_gate(app, pat_verifier=None):
             # search_tools·invoke_tool 도 게이트웨이 로컬이다 — 빠뜨리면 /tools-map 의 _gateway
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
-                        VERIFY_TOOL, *ROUTINE_TOOLS):
+                        VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서

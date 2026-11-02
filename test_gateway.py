@@ -102,7 +102,7 @@ def test_visible_tools(monkeypatch):
     local = {t.name for t in (gw.SAVE_CONV_TOOL, gw.SEARCH_CONV_TOOL, gw.LIST_APPS_TOOL,
                               gw.SEARCH_TOOLS_TOOL, gw.INVOKE_TOOL,
                               gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL,
-                              gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL, *gw.ROUTINE_TOOLS)}
+                              gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL, *gw.ROUTINE_TOOLS, *gw.INSIGHT_TOOLS)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -6228,7 +6228,7 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
         "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4) · 패널 확인용 읽기 목록(HA-20 B-2)은 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
-    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 14, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6
+    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 16, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
     assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
@@ -6295,7 +6295,7 @@ def test_기준_미만으로_처음_붙는_앱만_한_번_경고하고_막지_�
 def test_게이트웨이_로컬_도구는_제_앱으로_센다(monkeypatch, _fresh_scores):
     """로컬 도구는 route 에 없다 — `_gateway` 앱으로 세고, tools/list 가 붙이는 것과 같은 목록이다(REST 다리는 사이트가 있을
     때만). 목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
-    for rest, n_local in (({}, 14), ({"s": {"base": "http://x"}}, 16)):      # 로컬 8 + 분석 루틴 6(+ REST 다리 둘)
+    for rest, n_local in (({}, 16), ({"s": {"base": "http://x"}}, 18)):      # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2(+ REST 다리 둘)
         monkeypatch.setattr(gw, "REST", rest)
         _aggregate_tools(monkeypatch, {"sf": [_stool("sf_q", {"q": None})]})
         row = {r["app"]: r for r in gw._ARG_SCORE["apps"]}["_gateway"]
@@ -11066,7 +11066,73 @@ def test_HA20_두_리포_계약_포털이_찍는_패널_PAT_를_게이트웨이�
                                               now=int(_ptime.time()))["jti"], "jti 는 매번 새것이다(하나씩 폐기할 수 있다)"
 
 
-# ── save_conversation 의 심의 주제(과제 인사이트 — HWAXPortal docs/project-insight-graph contracts §7) ──────────────────────────────
+# ── 과제 인사이트(HWAXPortal docs/project-insight-graph M2 · contracts §7) — 사람 PAT 로만 포털 원장을 읽는 얇은 도구 둘 ──────────────
+def test_인사이트_도구_둘은_로컬_목록_읽기_전용_도구_지도에_있다(monkeypatch):
+    names = [t.name for t in gw._local_tools()]
+    assert {"insight_find", "insight_get"} <= set(names) and len(gw.INSIGHT_TOOLS) == 2
+    for t in gw.INSIGHT_TOOLS:
+        assert t.name.startswith("insight_"), "엔진의 리스크 심사 거절은 이 머리를 본다(D-18)"
+        props = t.inputSchema.get("properties") or {}
+        assert props and all((p.get("description") or "").strip() for p in props.values()), f"{t.name} 인자 설명(점수판)"
+        assert gw._readonly_denial(t.name, {}) == "", "읽기 전용 PAT 도 부른다"
+    st, body = _gate_call(monkeypatch, "/tools-map")
+    assert st == 200 and all(body["map"].get(t.name) == "_gateway" for t in gw.INSIGHT_TOOLS)
+
+
+def _insight_portal(monkeypatch, responder, auth="Bearer pat-person"):
+    sent = []
+
+    def handler(req):
+        sent.append(req)
+        return responder(req)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(gw.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(gw, "PORTAL", {"api_base": "http://portal.test"})
+    _set_request_headers(monkeypatch, {"authorization": auth} if auth else {})
+    return sent
+
+
+def test_insight_find_는_호출자_PAT_로_포털_find_를_부르고_답을_그대로_준다(monkeypatch):
+    sent = _insight_portal(monkeypatch, lambda req: httpx.Response(200, json={"note": "검증 대상", "items": [{"id": "ins:wf:c1"}]}))
+    res = asyncio.run(gw._call_tool("insight_find", {"sp_task": "알파 개발_C2", "round": "dv1", "limit": 5, "q": ""}))
+    assert not res.isError and json.loads(res.content[0].text)["items"] == [{"id": "ins:wf:c1"}]
+    req = sent[0]
+    assert req.headers["authorization"] == "Bearer pat-person" and req.url.path == "/insights-api/find"
+    assert dict(req.url.params) == {"sp_task": "알파 개발_C2", "round": "dv1", "limit": "5"}, "빈 인자는 싣지 않는다"
+    res = asyncio.run(gw._call_tool("insight_get", {"id": "ins:web:c 1:r/2:default"}))
+    assert not res.isError and sent[1].url.raw_path.decode().endswith("/insights-api/cards/ins%3Aweb%3Ac%201%3Ar%2F2%3Adefault")
+
+
+def test_insight_도구는_사람_PAT_가_아니면_부르지_않고_까닭을_말한다(monkeypatch):
+    sent = _insight_portal(monkeypatch, lambda req: httpx.Response(200, json={}), auth="Bearer gw-secret")
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    res = asyncio.run(gw._call_tool("insight_find", {}))
+    assert res.isError and res.content[0].text.startswith("INSIGHT_ERROR: 과제 인사이트는 사람 PAT 로만") and sent == []
+    _set_request_headers(monkeypatch, {})
+    assert asyncio.run(gw._call_tool("insight_get", {"id": "x"})).isError and sent == []
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
+    res = asyncio.run(gw._call_tool("insight_get", {"id": " "}))
+    assert res.isError and "id 가 비었다" in res.content[0].text and sent == []
+
+
+@pytest.mark.parametrize("resp,why", [
+    (httpx.Response(200, text="<html>SPA</html>", headers={"content-type": "text/html"}), "포털에 과제 인사이트 창구가 없다"),
+    (httpx.Response(404, json={"detail": "Not Found"}), "포털이 이 게이트웨이보다 낡았다"),
+    (httpx.Response(404, json={"detail": "카드를 찾을 수 없습니다"}), "카드를 찾을 수 없습니다"),
+    (httpx.Response(403, json={"detail": "권한이 없습니다(feat:insights)"}), "feat:insights"),
+    (httpx.Response(502, json={"detail": "x"}), "포털 오류(HTTP 502)")])
+def test_insight_도구는_포털의_거절과_낡음을_그대로_말한다(monkeypatch, resp, why):
+    _insight_portal(monkeypatch, lambda req: resp)
+    res = asyncio.run(gw._call_tool("insight_get", {"id": "ins:wf:c1"}))
+    assert res.isError and why in res.content[0].text, res.content[0].text
+
+
+def test_루틴_창구는_공통_판정으로_옮겨도_같은_말을_한다(monkeypatch):
+    _insight_portal(monkeypatch, lambda req: httpx.Response(200, text="<html>SPA</html>", headers={"content-type": "text/html"}))
+    with pytest.raises(gw._RoutineError, match="포털에 루틴 창구가 없다"):
+        asyncio.run(gw._routine_portal("GET", "/routines"))
+
+
 def test_save_conversation_은_꼴이_맞는_주제와_의장_틀을_포털에_넘긴다(monkeypatch):
     subj = {"sp_task": "알파 개발_C2", "round": "dv1", "text": "알파 1차", "artifacts": [{"kind": "mcad", "id": "019a2b3c4d5e6f7a8b9c0d1"}]}
     res, posts, _audits = _drive_save_all(monkeypatch, {"title": "심의", "messages": [{"role": "user", "content": "q"}],

@@ -335,6 +335,17 @@ python3 tool_usage_report.py --days 60 --out unused.md
   싣고(줄바꿈 · `«»` 를 지운다) 작성자의 글이지 지시가 아니라고 한 줄 말한다 — 사람의 말(user)로 올라가 규칙을 덮지 못하게.
 - 서버 지침 12번이 루틴의 차례 · 울타리 · 키 규칙을 한 줄로 말한다(차례의 자세한 글은 `routine_list` 설명 — 지침 전체가 2048자 안이어야 한다).
 
+## 과제 인사이트 — 읽기 도구 둘 · 대화 저장의 주제(HWAXPortal docs/project-insight-graph M2)
+
+원장 · 시야는 포털 `/insights-api` 가 쥐고(읽을 때 그 사람 기준으로 거른다), 게이트웨이는 호출자 PAT 를 그대로 넘기는 읽기 도구 둘(`insight_find` ·
+`insight_get`)만 둔다 — 루틴 도구와 같은 포털 판정(`_portal_api` — 공유 비밀 · 익명 거절, 낡은 포털 · 5xx · 401 의 말)을 쓴다. 쓰기 도구는 없다(확인 ·
+고침 · 거둠은 사람이 포털 화면에서). 읽기 전용 PAT 도 부른다. 이름이 `insight_` 로 시작하는 까닭 — 에이전트 서버의 좌석 자유 조회 접두에 걸리지 않고
+리스크 심사 좌석에서는 이 머리로 거절된다(D-18). 정본 계약은 포털 `docs/project-insight-graph/contracts.md` §7 이다.
+
+- `save_conversation` 은 `subject`(받는 칸 넷 — `sp_task` · `round` · `text` · `artifacts`, JSON 20,000자까지)와 `chair_template`(`[a-z0-9-]` 40자)을
+  꼴만 보고 포털 `ConvCreate` 에 넘긴다. 틀리면 그 칸만 버리고 대화는 저장한 뒤 답의 `subject_dropped` 로 말한다. 포털이 들인 결과(`insight` — id ·
+  상태 또는 건너뛴 까닭)를 답에 옮긴다. 확인(SP key 다시 풀기)은 포털이 저장한 뒤 에이전트 서버로 한다.
+
 ## 서버 지침 — initialize 의 instructions
 
 Claude Code · Desktop 이 세션마다 읽는 글이다(`_INSTRUCTIONS` + `_instructions()`). 세션마다 값을 치르므로 짧게 두고, 전체가 2048자 안이어야 한다 — Claude Code 가 거기서 자른다(시험이 가장 긴 조합을 잰다 — 11-02 에 2,031자).

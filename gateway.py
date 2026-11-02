@@ -2277,6 +2277,28 @@ CONV_CONTENT_MAX = 20000
 CONV_PERSONA_MAX = 120
 CONV_TITLE_MAX = 200
 CONV_BATCH_MAX = 200
+# 심의 주제(과제 인사이트 그래프 — HWAXPortal docs/project-insight-graph contracts §5 · §7) — Claude 워크플로(hwax-deliberate.js)가 사람이 고른
+# 주제와 의장 틀을 대화 저장에 싣는다. 포털이 저장한 **뒤** 그 사람 PAT 로 다시 풀어 카드로 들인다(저장은 막지 않는다). 여기서는 꼴만 본다 —
+# 받는 칸은 넷이고(확인 상태 · 지문 · 차수 출처는 서버가 적는다) 객체 JSON 이 상한 안이어야 한다. 아니면 버리고 답의 subject_dropped 로 말한다.
+CONV_SUBJECT_FIELDS = ("sp_task", "round", "text", "artifacts")
+CONV_SUBJECT_MAX_CHARS = 20000          # 포털 ConvCreate 가 받는 subject JSON 상한과 같다(넘으면 포털이 버린다 — 여기서 먼저 말한다)
+_CONV_CHAIR_RE = re.compile(r"[a-z0-9-]{1,40}")
+
+
+def _conv_subject(raw) -> tuple[dict | None, str]:
+    """save_conversation 의 subject → (넘길 값, 버린 까닭). 열쇠 · 차수의 꼴은 포털 들이기에서 에이전트 서버가 본다(PG-19 — 확인하는 쪽은 하나)."""
+    if raw is None:
+        return None, ""
+    if not isinstance(raw, dict):
+        return None, f"subject 는 {{{', '.join(CONV_SUBJECT_FIELDS)}}} 객체다"
+    extra = sorted(set(raw) - set(CONV_SUBJECT_FIELDS))
+    if extra:
+        return None, f"subject 에 모르는 칸 {extra[:5]} — 받는 칸은 {' · '.join(CONV_SUBJECT_FIELDS)} 다(확인 상태는 서버가 적는다)"
+    if len(json.dumps(raw, ensure_ascii=False, default=str)) > CONV_SUBJECT_MAX_CHARS:
+        return None, f"subject 가 {CONV_SUBJECT_MAX_CHARS:,}자(JSON)를 넘는다"
+    return dict(raw), ""
+
+
 SAVE_CONV_TOOL = types.Tool(
     name="save_conversation",
     description=(
@@ -2285,7 +2307,9 @@ SAVE_CONV_TOOL = types.Tool(
         "meta 는 심의 발언의 {rebut:[{target,quote,counter,basis}], non_negotiable} — 웹 관계도·이어하기가 쓴다. "
         "성공 시 conversation_id 반환, 포털 미가용/인증 불가면 CONV_UNAVAILABLE. "
         "발언은 자르지 않는다 — 포털 한 칸(20,000자)을 넘으면 이어지는 메시지로 나눠 싣고(split), 200건을 넘으면 나머지를 "
-        "덧붙인다. 덧붙이다 멈추면 CONV_PARTIAL(어디까지 들어갔는지) — 그때는 다시 보내지 마라(같은 대화가 두 벌 생긴다)."
+        "덧붙인다. 덧붙이다 멈추면 CONV_PARTIAL(어디까지 들어갔는지) — 그때는 다시 보내지 마라(같은 대화가 두 벌 생긴다). "
+        "과제 심의면 subject(사람이 고른 과제 key · 차수 · 글 · 설계 자료)와 chair_template 을 함께 싣는다 — 포털이 저장한 뒤 그 사람 "
+        "권한으로 다시 풀어 과제 인사이트 카드로 들인다(답의 insight). 과제 대상이 아닌 질문 · 리스크 심사는 subject 를 싣지 않는다."
     ),
     inputSchema={
         "type": "object",
@@ -2308,6 +2332,22 @@ SAVE_CONV_TOOL = types.Tool(
                     "required": ["role", "content"],
                 },
             },
+            "subject": {
+                "type": "object",
+                "description": ("심의 주제(선택) — {sp_task: 허브 과제 key(find_plm_task 결과 행의 key), round: 차수(pre · dv1 ~ dv3 · dvr · "
+                                "pv1 ~ pv3 · pvr · pra · mp), text: 사람이 적은 과제 글, artifacts: [{kind: mcad|ecad|cae, app, id, rev}]}. "
+                                "넷 밖의 칸은 받지 않는다. 과제 대상이 아니면 뺀다"),
+                "properties": {
+                    "sp_task": {"type": "string", "description": "허브 과제 key — find_plm_task 결과 행의 key 그대로(과제코드가 아니다)"},
+                    "round": {"type": "string", "description": "차수 — 개발 단계 코드(dv1 꼴), 모르면 뺀다"},
+                    "text": {"type": "string", "description": "사람이 적은 과제 이름 · 코드 · 차수 글(500자까지)"},
+                    "artifacts": {"type": "array", "description": "설계 자료 — [{kind: mcad|ecad|cae, app?, id, rev?}] 8개까지",
+                                  "items": {"type": "object"}},
+                },
+            },
+            "chair_template": {"type": "string",
+                               "description": "그 심의의 의장 틀(default · mechanism · sim-plan · build-plan · test-plan 등, 소문자 · 숫자 · - 40자) — "
+                                              "리스크 심사 계열이면 포털이 인사이트로 들이지 않는다"},
         },
         "required": ["title", "messages"],
     },
@@ -2410,6 +2450,15 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
         # 한 번에 CONV_BATCH_MAX 건으로 만들고 나머지는 순서대로 덧붙인다(POST /agent/conversations/{id}/messages).
         "messages": msgs[:CONV_BATCH_MAX],
     }
+    # 심의 주제 · 의장 틀(과제 인사이트) — 꼴이 맞을 때만 넘긴다. 포털은 둘 다 없어도 지금처럼 저장한다.
+    _subj, subject_dropped = _conv_subject(arguments.get("subject"))
+    if _subj is not None:
+        body["subject"] = _subj
+    _chair = str(arguments.get("chair_template") or "").strip()
+    if _chair and _CONV_CHAIR_RE.fullmatch(_chair):
+        body["chair_template"] = _chair
+    elif _chair:
+        subject_dropped = (subject_dropped + " · " if subject_dropped else "") + "chair_template 은 소문자 · 숫자 · - 40자다"
     rest = msgs[CONV_BATCH_MAX:]
     note = " ".join(x for x in (f"split:{len(split)}" if split else "", f"clipped:{len(clipped)}" if clipped else "",
                                 f"appended:{len(rest)}" if rest else "") if x) or None
@@ -2429,7 +2478,8 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
             r = await cli.post(f"{base}/agent/conversations", json=body, headers=hdrs)
             if r.status_code != 200:
                 return _fail(f"portal {r.status_code}")
-            cid = r.json().get("id")
+            created = r.json()
+            cid = created.get("id")
             saved = len(body["messages"])
             for m in rest:
                 try:
@@ -2442,6 +2492,10 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
         _audit("save_conversation", "portal", True, None,
                round((time.monotonic() - t0) * 1000), note=note)
         out = {"ok": True, "conversation_id": cid}
+        if isinstance(created.get("insight"), dict):
+            out["insight"] = created["insight"]      # 포털이 과제 인사이트로 들였나(id · 상태) 또는 건너뛴 까닭
+        if subject_dropped:
+            out["subject_dropped"] = subject_dropped
         if split or clipped or rest:
             out["messages_saved"] = saved
         if split:

@@ -11064,3 +11064,54 @@ def test_HA20_두_리포_계약_포털이_찍는_패널_PAT_를_게이트웨이�
         {"app": _P_APP, "uri": _P_URI}]
     assert claims["jti"] != mod.panel_claims(iss="x", sub="S-1", email="u@corp.com", name="U", groups=[], app=_P_APP, uri=_P_URI,
                                               now=int(_ptime.time()))["jti"], "jti 는 매번 새것이다(하나씩 폐기할 수 있다)"
+
+
+# ── save_conversation 의 심의 주제(과제 인사이트 — HWAXPortal docs/project-insight-graph contracts §7) ──────────────────────────────
+def test_save_conversation_은_꼴이_맞는_주제와_의장_틀을_포털에_넘긴다(monkeypatch):
+    subj = {"sp_task": "알파 개발_C2", "round": "dv1", "text": "알파 1차", "artifacts": [{"kind": "mcad", "id": "019a2b3c4d5e6f7a8b9c0d1"}]}
+    res, posts, _audits = _drive_save_all(monkeypatch, {"title": "심의", "messages": [{"role": "user", "content": "q"}],
+                                                        "subject": subj, "chair_template": "sim-plan"})
+    body = posts[0][1]
+    assert body["subject"] == subj and body["chair_template"] == "sim-plan" and not res.isError
+    assert "subject_dropped" not in json.loads(res.content[0].text)
+
+
+@pytest.mark.parametrize("subject,chair,word", [
+    ({"sp_task": "x", "sp_state": "confirmed"}, "default", "모르는 칸"),
+    ("알파", "default", "객체다"),
+    ({"text": "가" * 30000}, "default", "넘는다"),
+    ({"sp_task": "x"}, "Risk Review!", "chair_template"),
+])
+def test_save_conversation_은_꼴이_틀린_주제를_버리고_저장은_그대로_한다(monkeypatch, subject, chair, word):
+    res, posts, _audits = _drive_save_all(monkeypatch, {"title": "심의", "messages": [{"role": "user", "content": "q"}],
+                                                        "subject": subject, "chair_template": chair})
+    out = json.loads(res.content[0].text)
+    assert not res.isError and out["ok"] is True and word in out["subject_dropped"], out
+    body = posts[0][1]
+    assert body["messages"] == [{"role": "user", "content": "q"}], "주제가 틀려도 대화는 저장한다"
+    if word == "chair_template":
+        assert body["subject"] == subject and "chair_template" not in body, "틀린 칸만 버린다"
+    else:
+        assert "subject" not in body and body["chair_template"] == chair, "틀린 칸만 버린다"
+
+
+def test_save_conversation_은_주제가_없으면_종전_본문이고_포털의_insight_를_옮긴다(monkeypatch):
+    from types import SimpleNamespace as NS
+    res, posts, _audits = _drive_save_all(monkeypatch, {"title": "심의", "messages": [{"role": "user", "content": "q"}]})
+    assert set(posts[0][1]) == {"title", "kind", "source", "messages"}
+
+    class _Resp:
+        status_code = 200
+        def json(self): return {"id": "c-9", "insight": {"id": "ins:wf:c-9", "status": "draft"}}
+
+    class _Cli:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None): return _Resp()
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    monkeypatch.setattr(gw, "_low", NS(request_context=NS(request=NS(headers={"authorization": "Bearer t"}))))
+    out = json.loads(asyncio.run(gw._save_conversation({"title": "심의", "messages": [{"role": "user", "content": "q"}],
+                                                         "subject": {"sp_task": "x"}})).content[0].text)
+    assert out["insight"] == {"id": "ins:wf:c-9", "status": "draft"}
+

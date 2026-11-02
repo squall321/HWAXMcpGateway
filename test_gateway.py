@@ -11658,3 +11658,16 @@ def test_그림_도구는_로컬_목록에_있고_읽기_표지와_읽기_전용
     monkeypatch.setattr(gw, "FIG_STORE_ON", False)
     assert gw._readonly_denial("figure_to_report", {}) == "", "끄면 그런 도구가 없다(지금처럼 unknown tool 로 끝난다)"
 
+
+def test_받기_표는_게이트웨이_로그에_남지_않는다():
+    """uvicorn 접근 로그는 제 처리기로 찍어 가림 형식기를 타지 않는다 — 표(?t=, 1시간 자격)가 gateway.log 에 그대로 남던 길을 막는다."""
+    import uvicorn
+    uvicorn.Config(lambda scope, receive, send: None, log_level="info")      # main() 이 하는 로그 설정(dictConfig) — 거른이가 남는다
+    acc = logging.getLogger("uvicorn.access")
+    assert any(isinstance(f, gw._MaskAccessQuery) for f in acc.filters)
+    rec = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                            ("198.51.100.7:5000", "GET", "/fig/fig_" + "a" * 22 + "?t=v1.1700000000." + "f" * 64 + "&x=1", "1.1", 200), None)
+    assert all(f.filter(rec) for f in acc.filters)
+    assert rec.getMessage() == f'198.51.100.7:5000 - "GET /fig/fig_{"a" * 22}?t=***&x=1 HTTP/1.1" 200'
+    line = gw._MaskSecretsFormatter("%(message)s").format(logging.LogRecord("x", logging.INFO, __file__, 1, "GET /fig/r?t=v1.9.abc", None, None))
+    assert line == "GET /fig/r?t=***"

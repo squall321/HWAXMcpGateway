@@ -38,7 +38,8 @@ from rest_proxy import (EXPIRED_BODY, JWKS_TIMEOUT_S, REST_PROXY_UPSTREAM_TIMEOU
 # HWAXPortal docs/request-1027 HG-02. 재프로비저닝 전 config 는 아직 쿼리 꼴이다), httpx 는 INFO 로 요청마다 주소를 통째로 찍었다 —
 # cae00 gateway.log 26,275줄(10-17 리뷰 G1), dev 는 이메일 쿼리도 실렸다.
 # 요청 줄은 WARNING 아래로 내리고, 다른 길(예외 문구 · 트레이스백)로 찍히는 주소도 형식기에서 가린다.
-_SECRET_QUERY = re.compile(r"(?i)([?&](?:token|access_token|api_key|apikey|key|secret|password|pat)=)[^&\s'\"<>]+")
+# `t` 는 그림 받기 표(GET /fig/<ref>?t=… — 1시간 자격)다.
+_SECRET_QUERY = re.compile(r"(?i)([?&](?:token|access_token|api_key|apikey|key|secret|password|pat|t)=)[^&\s'\"<>]+")
 
 
 # 외부 연결 선언의 토큰 접두(HWAXPortal docs/ext-connect GW16) — 그 접두 뒤에 8자 이상이 붙고 숫자가 하나라도 든 문자열도 가린다. 선언을 받을
@@ -57,9 +58,19 @@ class _MaskSecretsFormatter(logging.Formatter):
         return _CONN_TOKEN_MASK.sub(_mask_conn_token, out) if _CONN_TOKEN_MASK is not None else out
 
 
+class _MaskAccessQuery(logging.Filter):
+    """uvicorn 접근 로그는 제 처리기로 찍어 위 형식기를 타지 않는다 — 요청 주소(인자)의 비밀 쿼리를 여기서 가린다. 그림 받기 표(?t=)가
+    gateway.log 에 그대로 남던 길이다(nginx 접근 로그는 쿼리 없는 $uri 라 남지 않는다)."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(_SECRET_QUERY.sub(r"\1***", a) if isinstance(a, str) else a for a in record.args)
+        return True
+
+
 _log_handler = logging.StreamHandler()
 _log_handler.setFormatter(_MaskSecretsFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
 logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
+logging.getLogger("uvicorn.access").addFilter(_MaskAccessQuery())     # uvicorn 의 로그 설정(dictConfig)은 거른이를 지우지 않는다
 for _noisy in ("httpx", "httpcore"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("hwax-mcp-gateway")

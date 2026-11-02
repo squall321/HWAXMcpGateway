@@ -8191,7 +8191,9 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     # noncore(0.5) · noncore_demote(끔)는 10-31 E2-5 가 더한 새 손잡이다 — 끈 채로 들어와 순위는 그대로다(옮긴 값이 아니다)
     assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2, "noncore": 0.5}
     assert all(v for k, v in d["switches"].items() if k != "noncore_demote") and d["switches"]["noncore_demote"] is False
-    assert len(d["synonyms"]) == 73 and d["synonyms"]["요약"] == ("digest", "summary")
+    # 11-02 그림 저장에서 '그림' 에 figure 를 더하고 '이미지' 를 새로 넣었다(그림 도구를 찾게 — 일부러 바꾼 기본값)
+    assert len(d["synonyms"]) == 74 and d["synonyms"]["요약"] == ("digest", "summary")
+    assert d["synonyms"]["그림"] == ("plot", "render", "figure") and d["synonyms"]["이미지"] == ("figure", "image")
     assert d["fingerprint"] == d["base_fingerprint"] and gw._tuning_health()["overlay"] == {"present": False}
 
 
@@ -11657,6 +11659,17 @@ def test_그림_도구는_로컬_목록에_있고_읽기_표지와_읽기_전용
     assert gw._readonly_denial("figure_to_report", {}).startswith("read_only: figure_to_report")
     monkeypatch.setattr(gw, "FIG_STORE_ON", False)
     assert gw._readonly_denial("figure_to_report", {}) == "", "끄면 그런 도구가 없다(지금처럼 unknown tool 로 끝난다)"
+
+
+@pytest.mark.parametrize("q,want", [("그림", "figure_get"), ("이미지", "figure_get"), ("보고서에 그림", "figure_to_report"),
+                                    ("그림 파일로 받기", "figure_get"), ("이미지 목록", "figure_list"),
+                                    ("응력 곡선 그림", "plot_curve")])          # 그리는 질의는 그리는 도구가 그대로 앞이다
+def test_search_tools_는_그림_이미지_보고서에_그림으로_그림_도구를_찾는다(monkeypatch, q, want):
+    _search_catalog(monkeypatch)
+    _no_embed(monkeypatch)
+    ranked = json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]
+    assert ranked[0] == want, (q, ranked)
+    assert {"figure_get", "figure_list", "figure_to_report"} <= set(ranked), (q, ranked)
 
 
 def test_받기_표는_게이트웨이_로그에_남지_않는다():

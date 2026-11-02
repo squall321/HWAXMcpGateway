@@ -199,7 +199,16 @@
   "그림": {
    "to": [
     "plot",
-    "render"
+    "render",
+    "figure"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "이미지": {
+   "to": [
+    "figure",
+    "image"
    ],
    "owner": null,
    "source_fix": null

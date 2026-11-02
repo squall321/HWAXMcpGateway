@@ -7363,6 +7363,88 @@ def test_E2_5_검색_평가는_꺼진_손잡이를_하나씩_켠_판도_잰다(m
     assert v["+quality"]["switches"]["quality"] is True, "박스에서 끈 묶음은 켠 판을 잰다"
 
 
+# ── 온톨로지 먼저 — 검색 손잡이 onto_first(HWAXPortal docs/ontology-first OF-7 · M3, 사용자 결정 OF-14 ①) ─────────────────────────────────
+# 어휘표 ontology.apps.<키>.entry(그 앱에서 이름 · 코드를 키로 푸는 원래 이름)를 게이트웨이도 앱 줄마다 거르며 읽는다(_onto_entries). 손잡이는 기본 끔 —
+# 켜면 질의가 그 앱 이름을 부른 줄에서 입구 도구에 weights.onto 를 더하고, 코어 질문에는 걸지 않는다. 추적 기본 표에는 입구가 없다.
+_ONTO_OTHER = {**_CORE_OTHER,
+               "heax-step_forge": ("StepForge", [("onto_search", "온톨로지 개념을 이름 · 코드로 찾는다 — resolve=true 면 exact · candidates · none."),
+                                                 ("list_parts", "파트 목록 — 이름 · 부피 · 재질을 찾는다."),
+                                                 ("find_plm_task", "허브 거울에서 PLM 과제를 과제명 · 과제코드로 찾는다.")]),
+               "heax-kooremapper_mcp": ("DynaForge", [("list_tasks", "해석 과제 목록 — 과제명 · 과제코드 · 별칭으로 찾는다."),
+                                                      ("report_summary", "해석 리포트 요약 — 과제 이름으로 찾는다.")])}
+_ONTO_PATCH = {"ontology": {"apps": {"heax-step_forge": {"tools": ["find_plm_task", "onto_search"], "entry": "onto_search"},
+                                     "heax-kooremapper_mcp": {"tools": ["list_tasks", "task_revisions", "compare_task_revisions"],
+                                                              "entry": "list_tasks"}}}}
+
+
+def test_onto_first_입구는_앱_줄마다_거르고_예외를_내지_않는다():
+    fam = ("rootdesigndatahub", "failuretrace")
+    good = {"heax-step_forge": {"tools": ["find_plm_task", "onto_search"], "reserve": True, "entry": "onto_search"},
+            "heax-kooremapper_mcp": {"tools": ["list_tasks"], "entry": "list_tasks", "_doc": "설명"}}
+    bad = {"rootdesigndatahub": {"tools": ["object_resolve"], "entry": "object_resolve"},   # 허브 가족 — 정본의 입구는 규칙 ①
+           "Bad Key": {"tools": ["x"], "entry": "x"}, "signalforge": {"tools": "resolve_product_keyword", "entry": "resolve_product_keyword"},
+           "mx-white-paper": {"tools": ["wiki_entity"], "entry": "wiki_search"}, "matnexus": {"tools": ["a"], "entry": "a", "reserve": "yes"},
+           "fmea": {"tools": ["a"], "entry": "a", "weight": 3}, "arp": None, "odb-hub": {"tools": [], "entry": None},
+           "componentcore": {"tools": ["a b"], "entry": "a b"}}
+    assert gw._onto_entries({"ontology": {"apps": {**good, **bad}}}, fam) == {("heax-step_forge", "onto_search"), ("heax-kooremapper_mcp", "list_tasks")}
+    for junk in (None, [], "x", {"apps": []}, {"apps": None}, {"apps": {"k": "v"}}, {"facts": {}}):
+        assert gw._onto_entries({"ontology": junk}, fam) == frozenset(), junk
+    assert gw._onto_entries({}, fam) == frozenset()
+
+
+def test_onto_first_틀린_ontology_줄이_덧씌우기_전체를_버리지_않는다(monkeypatch, tmp_path):
+    """게이트웨이의 해석이 예외를 내면 덧씌우기 전체를 버려 에이전트 서버와 지문이 갈리고 다른 덧씌우기 손잡이(소개 줄 · 역할)까지 잃는다(OF-5)."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    _vocab_overlay(monkeypatch, tmp_path, {"apps": {"newhub": {"role": "sibling", "label": "새 허브"}},
+                                           "ontology": {"apps": {"heax-step_forge": {"tools": "onto_search", "entry": 3},
+                                                                 "heax-kooremapper_mcp": {"tools": ["list_tasks"], "entry": "list_tasks"}}}})
+    d = gw._core_vocab()
+    h = gw._core_vocab_health()
+    assert "error" not in h["overlay"] and h["fingerprint"] != h["base"], h["overlay"]
+    assert "newhub" in d["family"] and d["onto_entries"] == {("heax-kooremapper_mcp", "list_tasks")}
+
+
+def test_onto_first_는_기본_끔이고_꺼져_있으면_입구가_있어도_순위가_그대로다(monkeypatch, tmp_path):
+    search = _role_kit(monkeypatch, other=_ONTO_OTHER)
+    t = gw._tuning()
+    assert t["switches"]["onto_first"] is False and t["weights"]["onto"] == 4 and "switches_on" not in gw._tuning_health()
+    qs = ("StepForge 파트 이름 찾기", "DynaForge 해석 리포트 과제 이름", "파트 이름 찾기", "고장모드 목록")
+    before = {q: search(q, 10, raw=True) for q in qs}
+    _vocab_overlay(monkeypatch, tmp_path, _ONTO_PATCH)
+    assert gw._core_vocab()["onto_entries"] == {("heax-step_forge", "onto_search"), ("heax-kooremapper_mcp", "list_tasks")}
+    assert {q: search(q, 10, raw=True) for q in qs} == before, "끄면 순위 · 답이 바이트까지 같다(E-7)"
+
+
+def test_onto_first_를_켜면_질의가_부른_앱의_입구만_오르고_코어_질문에는_걸지_않는다(monkeypatch, tmp_path):
+    search = _role_kit(monkeypatch, other=_ONTO_OTHER)
+    _vocab_overlay(monkeypatch, tmp_path, _ONTO_PATCH)
+    named = {"StepForge 파트 이름 찾기": "onto_search", "DynaForge 이름 요약": "list_tasks"}
+    plain = ("파트 이름 찾기", "해석 리포트 과제 이름")                  # 앱 이름을 부르지 않았다 — 이미 쓰는 플랫폼이 아니다
+    core = ("StepForge 고장모드 이름", "DynaForge 관리 기준 과제")       # 코어 질문 — 정본이 먼저다(앱을 불렀어도)
+    off = {q: search(q, 10)["ranked"] for q in (*named, *plain, *core)}
+    for q, entry in named.items():
+        assert off[q][0] != entry, ("전제 — 끈 채로는 입구가 1위가 아니다", q, off[q])
+    _tune(monkeypatch, tmp_path, {"switches": {"onto_first": True}})
+    assert gw._tuning_health()["switches_on"] == ["onto_first"]
+    for q, entry in named.items():
+        on = search(q, 10)["ranked"]
+        assert on.index(entry) < off[q].index(entry), ("입구가 오른다", q, off[q], on)
+        assert [n for n in on if n != entry] == [n for n in off[q] if n != entry], "입구 하나만 움직인다"
+    assert search("StepForge 파트 이름 찾기", 10)["ranked"][0] == "onto_search", "이름 적중과 같은 가중(4) — 맞힌 낱말이 같으면 입구가 앞선다"
+    for q in named:
+        search(q, 10)
+        rec = [r for r in gw._qlog_read() if "q" in r][-1]
+        assert any("onto_first" in v for v in (rec.get("via") or {}).values()), rec
+    for q in (*plain, *core):
+        assert search(q, 10)["ranked"] == off[q], q
+
+
+def test_onto_first_검색_평가가_켠_판을_잰다(monkeypatch, tmp_path):
+    v = gw._eval_variants()
+    assert v["+onto_first"]["switches"]["onto_first"] is True and "-onto_first" not in v
+    assert v["+noncore_demote"]["switches"]["onto_first"] is False, "다른 판에서는 그대로 끔"
+
+
 # ── 개인 Claude 보기(HWAXPortal docs/request-1029 E-4 · design-e2-e4.md 2.4 — 사용자 결정 10-31, 권장안 그대로) ───────────────────────────────
 # 보기 셋(전체 · 묶음 · 가벼운)은 tools/list 에만 건다 — 검색 · 부르기 · 이름 · 권한은 그대로다. 포털 사람 설정(권한 응답 view)으로 고르고 연결 머리
 # X-HWAX-View 가 덮는다(리포 .mcp.json 은 늘 full). 포털 설정은 머리 portal 로 청한 연결에만 얹는다(포털 등록 배치 · 명령 — 검토 10-31). 머리가 없는
@@ -8192,9 +8274,12 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     assert d["delib_ask"] == ('심의', '토의', '회의')
     assert d["quality_words"] == ('불량', '시장', '원인', '대책', '사례') and d["quality_areas"] == ("quality", "voc")
     assert d["write_intent"] == ('등록', '생성', '만들', '추가', '수정', '고치', '고쳐', '바꾸', '바꿔', '변경', '삭제', '지우', '지워', '저장', '올리', '올려', '업로드', '반입', '가져오', '실행', '돌리', '돌려', '제출', '시작', '걸어', '적용', '반영', '보내', '발행', '게시', '취소', '중지', '멈추', '멈춰', '학습', '이어서', '다시 돌', '채워', '채우', '넣어', '넣고', '남기', '남겨', '붙여', '붙이', '기각', '승인', '심의', '토의', '심사', '회의', 'create', 'add ', 'update', 'edit', 'modify', 'delete', 'remove', 'save', 'register', 'upload', 'import', 'run ', 'execute', 'submit', 'start', 'launch', 'apply', 'publish', 'send', 'cancel', 'stop', 'train', 'rename')
-    # noncore(0.5) · noncore_demote(끔)는 10-31 E2-5 가 더한 새 손잡이다 — 끈 채로 들어와 순위는 그대로다(옮긴 값이 아니다)
-    assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2, "noncore": 0.5}
-    assert all(v for k, v in d["switches"].items() if k != "noncore_demote") and d["switches"]["noncore_demote"] is False
+    # noncore(0.5) · noncore_demote(끔)는 10-31 E2-5 가, onto(4) · onto_first(끔)는 11-02 온톨로지 먼저(HWAXPortal docs/ontology-first)가 더한 새
+    # 손잡이다 — 끈 채로 들어와 순위는 그대로다(옮긴 값이 아니다)
+    assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2, "noncore": 0.5,
+                            "onto": 4}
+    assert all(v for k, v in d["switches"].items() if k not in gw._TUNING_OPT_IN) and gw._TUNING_OPT_IN == ("noncore_demote", "onto_first")
+    assert d["switches"]["noncore_demote"] is False and d["switches"]["onto_first"] is False
     # 11-02 그림 저장에서 '그림' 에 figure 를 더하고 '이미지' 를 새로 넣었다(그림 도구를 찾게 — 일부러 바꾼 기본값)
     assert len(d["synonyms"]) == 74 and d["synonyms"]["요약"] == ("digest", "summary")
     assert d["synonyms"]["그림"] == ("plot", "render", "figure") and d["synonyms"]["이미지"] == ("figure", "image")
@@ -9564,9 +9649,9 @@ def test_E9_평가는_떠_있는_카탈로그로_판마다_재고_기록을_남�
     assert st == 200, body
     assert body["pairs"]["total"] == 3 and body["pairs"]["measured"] == 2 and body["pairs"]["missing_gold"] == 1
     assert body["pairs"]["box"] == 1 and body["pairs"]["doc"] == 1
-    # 켜진 묶음은 하나씩 끈 판(-), 꺼진 손잡이(기본 끔인 noncore_demote — E2-5)는 하나씩 켠 판(+)
-    assert set(body["variants"]) == {"effective", "base", "off", *[f"-{k}" for k in gw._TUNING_SWITCHES if k != "noncore_demote"],
-                                     "+noncore_demote"}
+    # 켜진 묶음은 하나씩 끈 판(-), 꺼진 손잡이(기본 끔인 noncore_demote — E2-5 · onto_first — 온톨로지 먼저)는 하나씩 켠 판(+)
+    assert set(body["variants"]) == {"effective", "base", "off", *[f"-{k}" for k in gw._TUNING_SWITCHES if k not in gw._TUNING_OPT_IN],
+                                     "+noncore_demote", "+onto_first"}
     assert body["variants"]["effective"]["전체"]["n"] == 2 and body["variants"]["effective"]["box"]["hit@5"] == 1.0
     assert body["fingerprint"] == gw._tuning()["fingerprint"]
     assert not [r for r in gw._qlog_read() if "q" in r], "평가 질의는 실사용 질의 기록에 섞이지 않는다"

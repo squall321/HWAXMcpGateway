@@ -3312,13 +3312,15 @@ _COPY_LABEL = re.compile(r"[(\[](?:시험|사본|테스트|test|copy|staging|dev
 # 그것도 없으면 손 동의어 없는 _TUNING_FALLBACK 으로 돈다. 고리는 cae00 에서 닫힌다 — 거기서 고치고 그 자리에서 잰다(C-31).
 SEARCH_TUNING_PATH = Path(__file__).with_name("search_tuning.json")
 SEARCH_TUNING_LOCAL_PATH = Path(__file__).with_name("search_tuning.local.json")
-_TUNING_SWITCHES = ("synonyms", "core_vocab", "delib_narrow", "quality", "write_penalty", "copy_fold", "noncore_demote")
+_TUNING_SWITCHES = ("synonyms", "core_vocab", "delib_narrow", "quality", "write_penalty", "copy_fold", "noncore_demote", "onto_first")
 # 기본이 끔인 손잡이 — 칸이 없으면(덧씌우기가 null 로 지웠거나 기본값 파일을 못 읽었다) 끔으로 읽는다. 나머지는 칸이 없으면 켬이다.
 # noncore_demote(E2-5) 는 cae00 검색 평가(+noncore_demote 판)를 본 뒤 박스 덧씌우기로 켠다(결정 Q-1).
-_TUNING_OPT_IN = ("noncore_demote",)
-_TUNING_WEIGHTS = ("name", "desc_cap", "app", "coverage", "write_penalty", "quality_per_word", "noncore")
+# onto_first(HWAXPortal docs/ontology-first OF-7 · M3) — 질의가 앱 이름을 부른 줄에서 그 앱의 온톨로지 입구(코어 어휘표 ontology 의 entry)에 가중치 onto 를
+# 더한다. 코어 질문(어휘표 검색 낱말이 든 질의)에는 걸지 않는다 — 코어는 정본이 먼저다. cae00 검색 평가(+onto_first 판)를 본 뒤 박스 덧씌우기로 켠다.
+_TUNING_OPT_IN = ("noncore_demote", "onto_first")
+_TUNING_WEIGHTS = ("name", "desc_cap", "app", "coverage", "write_penalty", "quality_per_word", "noncore", "onto")
 _TUNING_FALLBACK = {"weights": {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2,
-                                "noncore": 0.5}}
+                                "noncore": 0.5, "onto": 4}}
 _TUNING: dict = {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None}
 
 
@@ -3462,12 +3464,36 @@ def _core_vocab_parse(d: dict) -> dict:
     return {"version": d.get("version"), "canonical": app, "tag": (app, tagline) if tagline else None, "syn": syn,
             "staging": frozenset(k for k, r in role.items() if r == "staging"),
             "family": (app, *siblings), "siblings": frozenset(siblings),
+            # 온톨로지 입구 {(백엔드 키, 원래 이름)} — 검색 손잡이 onto_first 가 읽는다. 앱 줄마다 거르고 예외를 내지 않는다(_onto_entries)
+            "onto_entries": _onto_entries(d, (app, *siblings)),
             "noncore": {k: str(apps[k].get("note") or "").strip() for k, r in role.items() if r == "noncore"},
             # 비코어 앱을 부르는 이름 — 어휘표 라벨의 이름과 백엔드 키(비코어 낮추기가 비켜 갈 때 게이트웨이 라벨과 함께 본다, E2-5)
             "noncore_names": {k: frozenset(_label_names(str(apps[k].get("label") or "")) | {k.lower()})
                               for k, r in role.items() if r == "noncore"},
             "sib_tags": {k: s for k in siblings if (s := str(apps[k].get("tagline") or "").strip())},
             "core_reads": frozenset(t for _f, _p, tools in syn for t in tools)}
+
+
+def _onto_entries(d: dict, family) -> frozenset:
+    """어휘표 ontology.apps 의 온톨로지 입구 {(백엔드 키, 원래 이름)}(HWAXPortal docs/ontology-first PLAN §4.1 · OF-5). 에이전트 서버 onto_links 와 같은
+    규칙으로 앱 줄마다 거른다 — 키 꼴 · 받는 칸(tools · reserve · entry) · tools 는 원래 이름의 비지 않은 목록 · reserve 는 참 거짓 · entry 는 tools 안 ·
+    허브 가족(정본 · 형제)의 entry 는 버린다. 틀린 줄만 빠지고 **예외를 내지 않는다** — 여기서 예외가 나면 _core_vocab 이 덧씌우기 전체를 버려 에이전트
+    서버와 지문이 갈리고 다른 덧씌우기 손잡이(소개 줄 · 역할)까지 잃는다. 포털 시험(test_core_vocab)이 두 쪽에 같은 줄을 넣어 견준다."""
+    onto = d.get("ontology")
+    apps = onto.get("apps") if isinstance(onto, dict) else None
+    out: set = set()
+    for key, row in (apps.items() if isinstance(apps, dict) else ()):
+        if not (isinstance(key, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,79}", key) and isinstance(row, dict)):
+            continue
+        tools, entry = row.get("tools"), row.get("entry")
+        if any(k not in ("tools", "reserve", "entry", "_doc") for k in row) or ("reserve" in row and not isinstance(row["reserve"], bool)):
+            continue
+        if not (isinstance(tools, list) and tools
+                and all(isinstance(t, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,120}", t) for t in tools)):
+            continue
+        if isinstance(entry, str) and entry in tools and key not in family:
+            out.add((key, entry))
+    return frozenset(out)
 
 
 def _core_family() -> tuple:
@@ -3696,6 +3722,12 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     # 이름을 부르면 낮추지 않는다 — 값은 {앱 키: 어휘표가 아는 그 앱의 이름(라벨 · 키)}이다(아래 줄마다 게이트웨이 라벨의 이름과 함께 본다).
     demote = (vocab.get("noncore_names") or {}) if (sw.get("noncore_demote") and vocab
                                                    and any(f in q_flat for f, _p, _t in vocab["syn"])) else {}
+    # 온톨로지 먼저(HWAXPortal docs/ontology-first OF-7 — 손잡이 onto_first, 기본 끔 · 켜기는 박스 덧씌우기). 켜면 질의가 앱 이름을 부른 줄(row_named)에서
+    # 그 앱의 입구(어휘표 ontology 의 entry — (백엔드, 원래 이름))에 weights.onto 를 더한다 — 이미 쓰는 플랫폼 안에서 입구를 먼저(사용자 결정 OF-14 ①).
+    # 코어 질문(noncore_demote 와 같은 판정)에는 걸지 않는다 — 코어는 정본이 먼저다(그러면 '온톨로지 플랫폼으로 보낸다' 가 된다). 보정 뺀 점수(base)에는
+    # 넣지 않는다(귀속 · boost_only 판정은 그대로). 끄면 순위가 바이트까지 같다(E-7).
+    onto = (vocab.get("onto_entries") or frozenset()) if (sw.get("onto_first") and vocab
+                                                        and not any(f in q_flat for f, _p, _t in vocab["syn"])) else frozenset()
     w_name, w_app, cap, w_cov = wt["name"], wt["app"], wt["desc_cap"], wt["coverage"]
     groups = _request_groups() if groups is None else groups
     visible = _visible_tools(groups)
@@ -3743,6 +3775,9 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
             if quality_n and _area_of(t.name, app) in tun["quality_areas"]:
                 score += wt["quality_per_word"] * quality_n          # 품질 질의 — 품질 · VOC 도구를 위로(HG-01)
                 via.add("quality")
+            if row_named and (app, original) in onto:
+                score += wt["onto"]                                  # 질의가 부른 앱의 온톨로지 입구(onto_first — 위 onto 주석)
+                via.add("onto_first")
             # 커버리지 승수 — 질의어를 더 많이 맞힌 도구가 개별 단어 빈도보다 앞선다.
             final = score * (1 + w_cov * covered / max(1, len(terms)))
             base_final = base * (1 + w_cov * base_cov / max(1, len(terms))) if base > 0 else 0

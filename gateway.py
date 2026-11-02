@@ -3638,6 +3638,23 @@ def _brief_desc(desc: str, n: int = 200) -> str:
     return (line[:cut + 1] if cut > n // 3 else line[:n]).rstrip() + " …"
 
 
+def _flat_at_word(flat: str, q: str) -> bool:
+    """빈칸을 뺀 질의에서 flat 이 어느 낱말의 머리에서 시작하나 — '목표 칸' 은 '표 칸' 이 아니다(띄어 쓴 열쇠의 빈칸 뺀 맞추기, HWAXPortal
+    docs/report-figures RF-24 S4)."""
+    words = q.split()
+    starts, pos = set(), 0
+    for w in words:
+        starts.add(pos)
+        pos += len(w)
+    joined = "".join(words)
+    i = joined.find(flat)
+    while i >= 0:
+        if i in starts:
+            return True
+        i = joined.find(flat, i + 1)
+    return False
+
+
 async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tuning: dict | None = None,
                         embed: bool = True, log_query: bool = True) -> types.CallToolResult:
     """도구 검색 안내대 — 351개 평면 노출의 선택 비용을 줄이는 입구(실측: 상위 40개가
@@ -3683,7 +3700,7 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     # 같다 — 박스 덧씌우기의 띄어 쓴 열쇠(server-setup 7.3 의 예 '메인 PBA')도 이제 먹는다(HWAXPortal docs/report-figures RF-23).
     for k, ss in syn.items():
         flat = re.sub(r"\s+", "", k)
-        if flat == k or len(flat) < 2 or flat not in q_flat:
+        if flat == k or len(flat) < 2 or not _flat_at_word(flat, q):
             continue
         if flat not in expand:
             terms.append(flat)
@@ -5959,7 +5976,8 @@ KIT_NAMES = frozenset({"hwax-md2docx.py"})
 KIT_TICKET_TTL_S = 3600
 KIT_MAX_BYTES = 2 * 1024 * 1024        # 키트 한 파일의 상한 — 스크립트 한 장이다(잘못 둔 큰 파일을 통째로 읽어 내지 않게)
 _KIT_USAGE = {"hwax-md2docx.py": [
-    "받기 — 위 curl 한 줄을 보고서 폴더에서 돌린다(주소는 1시간). 필요한 것은 Python 3.9+ 와 pip install python-docx 다.",
+    "받기 — 위 curl 한 줄을 보고서 폴더에서 돌린다(주소는 1시간 · Windows PowerShell 에서는 curl 대신 curl.exe). 필요한 것은 Python 3.9+ 와 "
+    "pip install python-docx 다.",
     "그림 — 도구 결과의 fig_… 는 figure_get 이 준 curl 로 md 폴더나 --fig-dir 폴더에 받는다(HWAX_GATEWAY_PAT · HWAX_PORTAL_BASE 를 두면 변환기가 받는다).",
     "쓰기 — md 어디에나 ![캡션](fig_… 또는 경로) 를 쓴다. 표 칸 안에 써도 그 칸의 그림이 된다.",
     "돌리기 — python hwax-md2docx.py 보고서.md -o 보고서.docx --fig-dir 그림폴더 를 돌리고 끝 줄 '그림 표기 N · docx 그림 N · 표 칸 안 M' 을 본다"

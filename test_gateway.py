@@ -11955,6 +11955,7 @@ def test_kit_get_은_전달된_머리로_표_붙은_바깥_주소와_curl_한_�
     assert 3 <= len(out["usage"]) <= 5 and all(isinstance(u, str) and u for u in out["usage"])
     joined = " ".join(out["usage"])
     assert "figure_get" in joined and "--fig-dir" in joined and "python hwax-md2docx.py" in joined and "표 칸" in joined
+    assert "curl.exe" in joined, "Windows PowerShell 5.1 의 curl 은 Invoke-WebRequest 다(반대 검토 S1)"
     t = out["url"].split("?t=", 1)[1]
     exp = int(t.split(".")[1])
     assert gw._kit_ticket_owner(t, _KIT_NAME) == "a@corp.com" and exp <= gw.time.time() + gw.KIT_TICKET_TTL_S + 1
@@ -12125,3 +12126,6 @@ def test_띄어_쓴_손_동의어_열쇠는_빈칸을_뺀_질의로_맞추고_�
                                                       ensure_ascii=False), encoding="utf-8")
     assert {q: ranked(q) for q in before} == before
     assert ranked("메인 기판 부품")[0] == "list_parts" and ranked("메인기판")[0] == "list_parts"
+    # 낱말 머리에서만 — '목표 칸' 의 '표 칸' 은 아니다(반대 검토 S4)
+    assert "kit_get" not in ranked("목표 칸 채우기") and ranked("표 칸 채우기")[0] == "kit_get"
+    assert gw._flat_at_word("표칸", "목표 칸") is False and gw._flat_at_word("표칸", "엑셀 표칸에") is True

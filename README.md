@@ -205,12 +205,12 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 
 ## 검색 손잡이 — `search_tuning.json` + 박스 덧씌우기(HWAXPortal docs/request-1029 E-7)
 
-`search_tools` 의 손 동의어(73) · 쓰기 의도 낱말 · 품질 낱말 · 심의 낱말 · 가중치는 코드 상수가 아니라 `search_tuning.json`(추적 — 기본값)에 있다. 10-29 에 상수를 옮기며 응답 · 평가가 옮기기 전과 바이트까지 같은 것을 먼저 보였다(`test_gateway.py` 의 `_SEARCH_TOOLS_MASTER`).
+`search_tools` 의 손 동의어(77) · 쓰기 의도 낱말 · 품질 낱말 · 심의 낱말 · 가중치는 코드 상수가 아니라 `search_tuning.json`(추적 — 기본값)에 있다. 10-29 에 상수를 옮기며 응답 · 평가가 옮기기 전과 바이트까지 같은 것을 먼저 보였다(`test_gateway.py` 의 `_SEARCH_TOOLS_MASTER`).
 
 - 박스 튜닝 — 같은 자리의 `search_tuning.local.json`(gitignore)에 바꿀 칸만 적는다. **JSON merge patch(RFC 7386)** — 객체는 재귀로 합치고 그 밖은 바꾸며 `null` 은 지운다(목록은 통째로 바뀐다). 두 파일의 바뀐 시각을 보고 **재기동 없이** 다음 검색부터 탄다. 덧씌우기가 깨지면(JSON 아님 · 객체 아님 · 가중치가 수가 아님 · `to` 가 목록이 아님) 버리고 기본값으로 돌며 까닭을 `/health` 에 싣는다.
 - 묶음별 끄기 `switches` — `synonyms`(손 동의어) · `core_vocab`(코어 어휘표 낱말) · `delib_narrow`(코어 질문의 심의 가중 끔) · `quality`(품질 낱말 가중) · `write_penalty`(쓰기 도구 감점) · `copy_fold`(같은 도구 사본 접기).
 - 기본이 끔인 손잡이 `noncore_demote`(E-2 E2-5 — 칸이 없어도 끔으로 읽는다) — 켜면 코어 질문(어휘표 검색 낱말이 든 질의)에서 비코어 앱 도구의 점수에 `weights.noncore`(0.5)를 곱한다. 질의가 그 앱 이름을 부르면 낮추지 않고(게이트웨이 라벨의 이름에 더해 어휘표의 앱 라벨 · 백엔드 키도 이름이다 — 외부 연결 앱의 라벨은 포털 플랫폼 라벨 'FMEA Agent' 다), 질의 기록 `via` 에 `demote:noncore` 가 남는다. 켜기는 cae00 `/search-eval` 의 `+noncore_demote` 판을 본 뒤 박스 덧씌우기로 한다.
-- 손 동의어 한 줄은 `{to: [이을 낱말 · 도구 이름 조각], owner, source_fix}` 다. `owner` 는 그 낱말이 도구 설명에 없어 우리가 보정하는 플랫폼(백엔드 키, 일반 낱말은 null), `source_fix` 는 그쪽이 고칠 것이다 — 아래 피드백 보고서가 읽는다. 보정은 비계다 — 그쪽이 설명을 고치면 걷는다.
+- 손 동의어 한 줄은 `{to: [이을 낱말 · 도구 이름 조각], owner, source_fix}` 다. 열쇠에 빈칸이 있으면(`표 칸`) 빈칸을 뺀 꼴이 빈칸을 뺀 질의에서 어느 낱말의 머리부터 들 때 맞춘다(`목표 칸` 은 아니다) — 질의의 한 글자 낱말은 버려져 낱말로는 못 맞힌다(11-02 PC 키트 — 그 전에는 띄어 쓴 열쇠가 말없이 안 먹었다). `owner` 는 그 낱말이 도구 설명에 없어 우리가 보정하는 플랫폼(백엔드 키, 일반 낱말은 null), `source_fix` 는 그쪽이 고칠 것이다 — 아래 피드백 보고서가 읽는다. 보정은 비계다 — 그쪽이 설명을 고치면 걷는다.
 - 지문 — `/health` 의 `search_tuning` 이 `{fingerprint(덧씌운 값), base(기본값), switches_off, synonyms, overlay{present, fingerprint, changed, error}}` 를 싣는다(기본이 끔인 손잡이를 켰으면 `switches_on` 이 더 붙는다). 지문은 `_doc` 을 뺀 키 차례 JSON 의 sha256 앞 12자이고 질의 기록 줄(`fp`) · 평가 결과에도 실린다 — dev 와 cae00 이 다르게 도는 것을 숫자 곁에서 보인다.
 
 ## 개인 Claude 보기 — 전체 · 묶음 · 가벼운(HWAXPortal docs/request-1029 E-4)
@@ -382,6 +382,25 @@ svg 만). 감사 줄에는 그 결과의 `images` · `image_bytes` 가 붙는다
 | `GATEWAY_FIG_OWNER_MAX_COUNT` | 5000 | 사람당 장 수 — 넘으면 그 사람의 오래된 것부터 |
 | `GATEWAY_FIG_TICKET_TTL_S` | 3600 | 받기 표의 수명 |
 | `GATEWAY_FIG_SWEEP_S` | 3600 | 청소 주기(기동 때 한 번 디스크에서 표를 짓는다). 상한은 쓸 때마다 지킨다 |
+
+## PC 키트 — 개인 Claude 가 PC 로 받는 도구 파일(HWAXPortal infra/pc-kit · docs/report-figures RF-22, 사용자 보고 11-02)
+
+보고서 md → docx 변환기 `hwax-md2docx.py`(표 칸 안 그림 · 문단 그림 · `fig_…` ref, 빠진 그림이 있으면 docx 를 쓰지 않는다)를 내려준다. 파일은
+형제 리포 `HWAXPortal/infra/pc-kit` 에서 읽고(이 파일 자리에서 유도 — 박스 절대 경로 없음) 허용 목록(`KIT_NAMES`)의 이름만 낸다.
+
+- **`kit_get(name="hwax-md2docx.py")`**(읽기) — `{name, bytes, sha256, url, curl, usage}`. `url` 은 `figure_get` 과 같은 길로 지은 사람 PC 주소
+  (`…/mcp-gw/kit/<이름>?t=…`, 1시간), `curl` 은 `curl -fsS -o hwax-md2docx.py "<url>"`, `usage` 는 쓰는 법 넷(받기 — Windows PowerShell 은 `curl.exe` · 그림 —
+  `figure_get` · `--fig-dir` · 쓰기 · 돌리기). 박스 안 서비스 · 신원 없음 · 공유 비밀 없음이면 `url` · `curl` 이 null 이고 `note` 가 까닭을 말한다. 파일이 없으면
+  `KIT_ERROR:` 한 줄. 같은 이름의 백엔드 도구는 접두를 단다. 검색 낱말 `docx` · `변환기` · `표 칸`(위 검색 손잡이).
+- **받기** `GET /kit/<이름>` — 밖에서는 `/mcp-gw/kit/<이름>`(nginx 고침 없음). 그 이름의 서명한 표 `?t=v1.<끝 시각>.<주인 base64url>.<HMAC-SHA256 hex>`
+  (서명 대상 `v1|kit:<이름>|<주인>|<끝 시각>` — 파일에 주인이 없어 표에 싣는다, 열쇠는 그림 표와 다른 용도 이름 `hwax-mcp-gateway/kit-ticket/v1`) 또는
+  MCP 청중 PAT 누구나(패널 PAT · 공유 비밀 아님). 자격이 없거나 PAT 를 검증하지 못하면 401, 모르는 이름 · 경로 넘기 · 틀린 표 · 파일 없음(링크 ·
+  폴더 · 2 MiB 넘음 포함)은 같은 404. 답은 `text/x-python; charset=utf-8` · `attachment` · `nosniff` · CSP `sandbox`, 감사 한 줄(`GET /kit` ·
+  `via` ticket|pat · `bytes`). 표는 gateway.log 접근 줄에서 가린다.
+
+| 손잡이 | 기본 | 뜻 |
+|---|---|---|
+| `GATEWAY_KIT_DIR` | `<이 리포>/../HWAXPortal/infra/pc-kit` | 키트 파일 폴더 — 상대 경로는 이 리포 루트 기준 |
 
 ## 서버 지침 — initialize 의 instructions
 

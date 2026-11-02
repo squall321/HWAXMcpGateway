@@ -41,6 +41,8 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "_FIG_TOTAL", {"bytes": 0})
     monkeypatch.setattr(gw, "_FIG_SWEEP", {"on": False, "added": set(), "dropped": set()})
     monkeypatch.setattr(gw, "_FIG_LIMITER", {"lim": None})
+    # PC 키트 폴더도 같다 — 안 걸면 시험이 형제 리포(HWAXPortal infra/pc-kit)의 실제 변환기를 읽는다. 기본은 없는 폴더, 키트 시험이 제 파일을 둔다
+    monkeypatch.setattr(gw, "KIT_DIR", tmp_path / "pc-kit")
 
 
 @pytest.fixture(autouse=True)
@@ -112,7 +114,7 @@ def test_visible_tools(monkeypatch):
                               gw.SEARCH_TOOLS_TOOL, gw.INVOKE_TOOL,
                               gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL,
                               gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL, *gw.ROUTINE_TOOLS, *gw.INSIGHT_TOOLS,
-                              *gw.FIGURE_TOOLS)}
+                              *gw.FIGURE_TOOLS, gw.KIT_GET_TOOL)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -6238,7 +6240,7 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
         "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4) · 패널 확인용 읽기 목록(HA-20 B-2)은 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
-    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 19, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 3
+    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 20, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 3 + PC 키트 1
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
     assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
@@ -6305,7 +6307,7 @@ def test_기준_미만으로_처음_붙는_앱만_한_번_경고하고_막지_�
 def test_게이트웨이_로컬_도구는_제_앱으로_센다(monkeypatch, _fresh_scores):
     """로컬 도구는 route 에 없다 — `_gateway` 앱으로 세고, tools/list 가 붙이는 것과 같은 목록이다(REST 다리는 사이트가 있을
     때만). 목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
-    for rest, n_local in (({}, 19), ({"s": {"base": "http://x"}}, 21)):      # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 3(+ REST 다리 둘)
+    for rest, n_local in (({}, 20), ({"s": {"base": "http://x"}}, 22)):      # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 3 + PC 키트 1(+ REST 다리 둘)
         monkeypatch.setattr(gw, "REST", rest)
         _aggregate_tools(monkeypatch, {"sf": [_stool("sf_q", {"q": None})]})
         row = {r["app"]: r for r in gw._ARG_SCORE["apps"]}["_gateway"]
@@ -8195,7 +8197,9 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2, "noncore": 0.5}
     assert all(v for k, v in d["switches"].items() if k != "noncore_demote") and d["switches"]["noncore_demote"] is False
     # 11-02 그림 저장에서 '그림' 에 figure 를 더하고 '이미지' 를 새로 넣었다(그림 도구를 찾게 — 일부러 바꾼 기본값)
-    assert len(d["synonyms"]) == 74 and d["synonyms"]["요약"] == ("digest", "summary")
+    # 11-02 PC 키트에서 'docx' · '변환기' · '표 칸'(띄어 쓴 열쇠) → kit_get 을 넣었다(변환기를 찾게 — 일부러 바꾼 기본값, HWAXPortal docs/report-figures RF-23)
+    assert len(d["synonyms"]) == 77 and d["synonyms"]["요약"] == ("digest", "summary")
+    assert d["synonyms"]["docx"] == d["synonyms"]["변환기"] == d["synonyms"]["표 칸"] == ("kit_get",)
     assert d["synonyms"]["그림"] == ("plot", "render", "figure") and d["synonyms"]["이미지"] == ("figure", "image")
     assert d["fingerprint"] == d["base_fingerprint"] and gw._tuning_health()["overlay"] == {"present": False}
 
@@ -11915,3 +11919,213 @@ def test_받기는_링크를_따라가지_않는다(monkeypatch):
 def test_퍼센트로_적은_표_이름도_로그에서_가린다():
     line = gw._MaskSecretsFormatter("%(message)s").format(logging.LogRecord("x", logging.INFO, __file__, 1, "GET /fig/r?%74=v1.9.abc", None, None))
     assert line == "GET /fig/r?%74=***"
+
+
+# ── PC 키트 — kit_get · GET /kit/<이름>(HWAXPortal infra/pc-kit · docs/report-figures RF-22, 사용자 보고 11-02 '표칸그림 필요해') ──────
+# 개인 Claude 가 PC 로 받아 쓰는 보고서 md → docx 변환기를 내려준다. 받기는 그 이름의 서명한 표 또는 MCP 청중 PAT — 그 밖은 같은 404 다.
+_KIT = "#!/usr/bin/env python3\n# 시험용 키트 — 보고서 md 를 docx 로\nprint('키트')\n".encode("utf-8")
+_KIT_NAME = "hwax-md2docx.py"
+_KIT_FWD = {gw.USER_HEADER: "a@corp.com", gw.VIA_HEADER: "pat", "host": "127.0.0.1:9110",
+            "x-forwarded-host": "portal.corp.example:8443", "x-forwarded-proto": "https"}
+
+
+def _kit_file(monkeypatch, tmp_path, blob=_KIT):
+    d = tmp_path / "kit-src"
+    d.mkdir(exist_ok=True)
+    (d / _KIT_NAME).write_bytes(blob)
+    monkeypatch.setattr(gw, "KIT_DIR", d)
+    return d
+
+
+def _kit_call(monkeypatch, headers, args=None):
+    _set_request_headers(monkeypatch, headers)
+    return asyncio.run(gw._call_tool("kit_get", args or {}))
+
+
+def test_kit_get_은_전달된_머리로_표_붙은_바깥_주소와_curl_한_줄과_쓰는_법을_준다(monkeypatch, tmp_path):
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    _kit_file(monkeypatch, tmp_path)
+    res = _kit_call(monkeypatch, _KIT_FWD)
+    assert not res.isError, res.content[0].text
+    out = json.loads(res.content[0].text)
+    assert set(out) == {"name", "bytes", "sha256", "url", "curl", "usage"}
+    assert (out["name"], out["bytes"], out["sha256"]) == (_KIT_NAME, len(_KIT), hashlib.sha256(_KIT).hexdigest())
+    assert out["url"].startswith(f"https://portal.corp.example:8443/mcp-gw/kit/{_KIT_NAME}?t=v1."), "안쪽 주소(127.0.0.1:9110)가 아니다"
+    assert out["curl"] == f'curl -fsS -o {_KIT_NAME} "{out["url"]}"'
+    assert 3 <= len(out["usage"]) <= 5 and all(isinstance(u, str) and u for u in out["usage"])
+    joined = " ".join(out["usage"])
+    assert "figure_get" in joined and "--fig-dir" in joined and "python hwax-md2docx.py" in joined and "표 칸" in joined
+    assert "curl.exe" in joined, "Windows PowerShell 5.1 의 curl 은 Invoke-WebRequest 다(반대 검토 S1)"
+    t = out["url"].split("?t=", 1)[1]
+    exp = int(t.split(".")[1])
+    assert gw._kit_ticket_owner(t, _KIT_NAME) == "a@corp.com" and exp <= gw.time.time() + gw.KIT_TICKET_TTL_S + 1
+    assert _audit_rows()[-1]["tool"] == "kit_get" and _audit_rows()[-1]["note"] == _KIT_NAME
+    # 그 주소로 실제로 받는다(nginx 는 /mcp-gw 를 떼고 넘긴다) — PAT 없는 PC 셸
+    st, head, body = _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", qs=f"t={t}".encode())
+    assert (st, body) == (200, _KIT)
+    assert head["content-type"] == "text/x-python; charset=utf-8" and head["content-length"] == str(len(_KIT))
+    assert head["content-disposition"] == f'attachment; filename="{_KIT_NAME}"' and head["x-content-type-options"] == "nosniff"
+    assert "sandbox" in head["content-security-policy"] and "no-store" in head["cache-control"]
+    row = _audit_rows()[-1]
+    assert (row["tool"], row["ok"], row["via"], row["bytes"], row["caller"], row["ip"], row["note"]) == (
+        "GET /kit", True, "ticket", len(_KIT), "a@corp.com", "198.51.100.7", _KIT_NAME)
+
+
+def test_kit_받기는_그_이름의_표나_MCP_PAT_로만_되고_나머지는_같은_404다(monkeypatch, tmp_path):
+    d = _kit_file(monkeypatch, tmp_path)
+    (tmp_path / "secret.txt").write_text("남의 파일")
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    exp = int(gw.time.time()) + 600
+    good = gw._kit_ticket(_KIT_NAME, "a@corp.com", exp)
+    nf = (404, b'{"error":"not found"}')
+    assert _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", qs=f"t={good}".encode())[::2] == (200, _KIT)
+    # 위조 · 바꿔치기 — 서명 한 글자 · 주인 · 끝 시각 · 다른 이름의 표 · 그림 표 열쇠로 지은 표 · 끝난 표 · 꼴이 틀린 표
+    v, e, o, sig = good.split(".")
+    flipped = good[:-1] + ("0" if good[-1] != "0" else "1")
+    other_owner = f"v1.{e}.{gw._kit_owner_b64('b@corp.com')}.{sig}"
+    longer = f"v1.{exp + 3600}.{o}.{sig}"
+    other_name = gw._kit_ticket("other.py", "a@corp.com", exp)
+    fig_key_sig = gw.hmac.new(gw._fig_ticket_key(), f"v1|kit:{_KIT_NAME}|a@corp.com|{exp}".encode(), gw.hashlib.sha256).hexdigest()
+    fig_keyed = f"v1.{exp}.{o}.{fig_key_sig}"
+    expired = gw._kit_ticket(_KIT_NAME, "a@corp.com", int(gw.time.time()) - 5)
+    odd = gw._kit_owner_b64("a@corp.com")
+    odd = odd[:-1] + chr(ord(odd[-1]) + 1)                                    # 남는 비트만 다른 꼴 — 같은 주인으로 풀리지만 받지 않는다
+    assert gw.base64.urlsafe_b64decode(odd + "=" * (-len(odd) % 4)) == b"a@corp.com"
+    padded = f"v1.{e}.{odd}.{sig}"
+    for t in (flipped, other_owner, longer, other_name, fig_keyed, expired, padded, gw._fig_ticket("x", "a@corp.com", exp),
+              "v1.x.y.z", f"v1.{exp}.{o}.{sig.upper()}", "v1.١٢٣." + o + "." + sig):
+        assert _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", qs=f"t={t}".encode())[::2] == nf, t
+    # 표는 그 이름에만 — 맞는 표를 다른 이름에 써도 404
+    assert _fig_get(monkeypatch, "/kit/other.py", qs=f"t={good}".encode())[::2] == nf
+    # PAT — MCP 청중이면 누구나(주인과 무관), 패널 PAT 는 아니다
+    anyone = _FigV({"email": "B@Corp.com", "groups": []})
+    st, _h, body = _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", auth=b"Bearer pat-b", verifier=anyone)
+    assert (st, body) == (200, _KIT) and anyone.auds == [[gw.MCP_AUDIENCE]] and _audit_rows()[-1]["via"] == "pat"
+    assert _audit_rows()[-1]["caller"] == "b@corp.com"
+    pv = _FigV({"email": "a@corp.com", "purpose": "mcp-app", "jti": "mcpapp-1", "aud": [gw.PANEL_AUDIENCE], "panel": {}})
+    assert _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", auth=b"Bearer panel", verifier=pv)[::2] == nf
+    # 경로 넘기 · 꼴 바꾸기 — 맞는 PAT 로도 같은 404(허용 목록의 이름과 글자까지 같아야 연다)
+    for bad in ("../secret.txt", "../../gateway.py", f"{_KIT_NAME}/../../secret.txt", f"./{_KIT_NAME}", f"/{_KIT_NAME}",
+                _KIT_NAME.upper(), f"{_KIT_NAME}\x00", f"{_KIT_NAME}/", "", "..%2Fsecret.txt", f"{d}/{_KIT_NAME}"):
+        assert _fig_get(monkeypatch, f"/kit/{bad}", auth=b"Bearer pat-b", verifier=anyone)[::2] == nf, bad
+    # 자격이 없거나 PAT 를 검증하지 못하면 401 — 이름과 무관한 답이다
+    assert _fig_get(monkeypatch, f"/kit/{_KIT_NAME}")[0] == 401 and _fig_get(monkeypatch, "/kit/nope.py")[0] == 401
+    assert _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", auth=b"Bearer forged", verifier=_FigV(None))[0] == 401
+    st, _h, body = _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", auth=b"Bearer old", verifier=_FigV(expired=True))
+    assert st == 401 and json.loads(body) == gw.EXPIRED_BODY
+    assert _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", auth=b"Bearer gw-secret", verifier=anyone)[0] == 401, "공유 비밀은 받기 자격이 아니다"
+    assert _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", method="POST", auth=b"Bearer pat-b", verifier=anyone)[0] == 405
+    assert all(r["tool"] == "GET /kit" for r in _audit_rows()[-3:]), "받기마다 감사 한 줄"
+    # 공유 비밀이 비면 표를 받지 않는다(누구나 서명할 수 있게 된다)
+    monkeypatch.setattr(gw, "GW_TOKEN", "")
+    assert gw._kit_ticket_owner(gw._kit_ticket(_KIT_NAME, "a@corp.com", exp), _KIT_NAME) is None
+
+
+def test_kit_파일이_없거나_링크_폴더면_같은_404_이고_kit_get_은_까닭을_말한다(monkeypatch, tmp_path):
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    good = gw._kit_ticket(_KIT_NAME, "a@corp.com", int(gw.time.time()) + 600)
+    anyone = _FigV({"email": "b@corp.com", "groups": []})
+    nf = (404, b'{"error":"not found"}')
+    assert not gw.KIT_DIR.exists(), "전제 — autouse 가 없는 폴더를 건다"
+    assert _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", qs=f"t={good}".encode())[::2] == nf
+    assert _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", auth=b"Bearer pat-b", verifier=anyone)[::2] == nf
+    assert _audit_rows()[-1]["error"] == "not-found: file"
+    res = _kit_call(monkeypatch, _KIT_FWD)
+    assert res.isError and res.content[0].text.startswith("KIT_ERROR: 이 박스에 hwax-md2docx.py 이 없다") and "GATEWAY_KIT_DIR" in res.content[0].text
+    # 링크(남의 파일을 가리켜도) · 폴더 · 상한 넘음 — 내지 않는다
+    d = tmp_path / "kit-src"
+    d.mkdir()
+    (tmp_path / "secret.txt").write_text("남의 파일")
+    (d / _KIT_NAME).symlink_to(tmp_path / "secret.txt")
+    monkeypatch.setattr(gw, "KIT_DIR", d)
+    assert _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", auth=b"Bearer pat-b", verifier=anyone)[::2] == nf
+    (d / _KIT_NAME).unlink()
+    (d / _KIT_NAME).mkdir()
+    assert _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", auth=b"Bearer pat-b", verifier=anyone)[::2] == nf
+    (d / _KIT_NAME).rmdir()
+    (d / _KIT_NAME).write_bytes(b"x" * (gw.KIT_MAX_BYTES + 1))
+    assert _fig_get(monkeypatch, f"/kit/{_KIT_NAME}", auth=b"Bearer pat-b", verifier=anyone)[::2] == nf
+    assert _kit_call(monkeypatch, _KIT_FWD).isError
+    # 기본 자리 — 이 리포 옆 형제 리포 HWAXPortal 의 infra/pc-kit(박스 절대 경로가 아니다), GATEWAY_KIT_DIR 상대 경로는 이 리포 기준
+    monkeypatch.delenv("GATEWAY_KIT_DIR", raising=False)
+    repo = gw.Path(gw.__file__).resolve().parent
+    assert gw._kit_dir_setting() == repo.parent / "HWAXPortal" / "infra" / "pc-kit"
+    monkeypatch.setenv("GATEWAY_KIT_DIR", "kit")
+    assert gw._kit_dir_setting() == repo / "kit"
+    monkeypatch.setenv("GATEWAY_KIT_DIR", str(tmp_path))
+    assert gw._kit_dir_setting() == tmp_path
+
+
+def test_kit_get_은_박스_안_호출자에게_주소를_내지_않고_모르는_이름은_거절한다(monkeypatch, tmp_path):
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    _kit_file(monkeypatch, tmp_path)
+
+    def out(headers, args=None):
+        return json.loads(_kit_call(monkeypatch, headers, args).content[0].text)
+    inner = out({gw.USER_HEADER: "a@corp.com", gw.VIA_HEADER: "chat", "host": "127.0.0.1:9110"})
+    assert inner["url"] is None and inner["curl"] is None and "개인 Claude" in inner["note"]
+    assert inner["bytes"] == len(_KIT) and len(inner["usage"]) >= 3, "주소 말고는 다 준다"
+    assert out({gw.VIA_HEADER: "pat", "host": "127.0.0.1:9110"})["url"] is None, "사람 신원이 없으면 표를 짓지 않는다"
+    assert out({**_KIT_FWD, "x-forwarded-host": 'evil.example"; rm -rf ~; "'})["url"] is None, "셸에 실릴 글자가 섞인 머리는 쓰지 않는다"
+    direct = out({gw.USER_HEADER: "a@corp.com", gw.VIA_HEADER: "pat", "host": "127.0.0.1:9110"})
+    assert direct["url"].startswith(f"http://127.0.0.1:9110/kit/{_KIT_NAME}?t=v1."), "사람 PAT 로 바로 붙었으면 그 Host"
+    assert out(_KIT_FWD, {"name": _KIT_NAME})["url"], "이름을 줘도 같다"
+    bad = _kit_call(monkeypatch, _KIT_FWD, {"name": "../gateway_config.json"})
+    assert bad.isError and bad.content[0].text.startswith("KIT_ERROR: 그런 키트가 없다")
+    monkeypatch.setattr(gw, "GW_TOKEN", "")
+    assert out(_KIT_FWD)["url"] is None
+
+
+def test_kit_get_은_로컬_목록_읽기_도구_도구_지도에_있고_같은_이름의_백엔드_도구는_접두를_단다(monkeypatch):
+    names = [t.name for t in gw._local_tools()]
+    assert names.count("kit_get") == 1 and gw.KIT_GET_TOOL.annotations.readOnlyHint is True
+    props = gw.KIT_GET_TOOL.inputSchema["properties"]
+    assert all((p.get("description") or "").strip() for p in props.values()) and props["name"]["enum"] == [_KIT_NAME]
+    assert gw._readonly_denial("kit_get", {}) == "", "읽기 전용 PAT 도 받는다(파일을 내줄 뿐이다)"
+    assert gw._panel_denial("kit_get", {"app": "heax-step_forge", "uri": "ui://x"}) == "gateway-tool"
+    st, body = _gate_call(monkeypatch, "/tools-map")
+    assert st == 200 and body["map"].get("kit_get") == "_gateway"
+    b = _CallB([])
+    b.session = _CallSess([_tool("kit_get")])
+    monkeypatch.setattr(gw, "backends", {"heax-x": b})
+    for k, v in (("exposed_tools", []), ("route", {}), ("alias_route", {}), ("POLICY", {}), ("_ACCESS_POLICY", {})):
+        monkeypatch.setattr(gw, k, v)
+    asyncio.run(gw._aggregate())
+    assert "kit_get" not in gw.route and gw.route.get("heaxx_kit_get") == ("heax-x", "kit_get"), "맨 이름이면 늘 로컬로 가 백엔드에 닿지 못한다"
+
+
+_KIT_SEARCH_SPECS = _SEARCH_SPECS + [
+    (a, n, "그림을 그린다(plot · render).") for a, n in (
+        ("heax-step_forge", "render_3d"), ("heax-step_forge", "render_interface"), ("heax-step_forge", "render_status"),
+        ("heax-step_forge", "mesh_section_figure"), ("heax-step_forge", "mesh_surface_figure"), ("heax-materialtwin_web", "plot_curves"),
+        ("heax-materialtwin_web", "plot_ashby"), ("heax-materialtwin_web", "stress_strain_plot"), ("heax-kooremapper_mcp", "report_image"),
+        ("heax-kooremapper_mcp", "attach_render"), ("heax-doc_forge", "docx_outline"))]
+
+
+@pytest.mark.parametrize("q", ["docx", "변환기", "표 칸 그림", "md2docx", "표칸그림", "표 칸에 그림 넣기", "docx 변환기", "보고서 docx 표 칸 그림"])
+def test_search_tools_는_docx_변환기_표_칸_그림_md2docx_로_kit_get_을_찾는다(monkeypatch, q):
+    """dev 의 그리는 도구(plot · render · figure 이름 열한 개)가 있는 카탈로그에서 첫 줄이 kit_get 이다 — '표 칸 그림' 은 한 글자 낱말이 버려져
+    '그림' 하나만 남는다(띄어 쓴 열쇠 '표 칸' 이 빈칸을 뺀 질의로 맞춘다)."""
+    _search_catalog(monkeypatch, _KIT_SEARCH_SPECS)
+    _no_embed(monkeypatch)
+    ranked = json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]
+    assert ranked[0] == "kit_get", (q, ranked)
+
+
+def test_띄어_쓴_손_동의어_열쇠는_빈칸을_뺀_질의로_맞추고_맞지_않으면_순위가_그대로다(monkeypatch, tmp_path):
+    _search_catalog(monkeypatch, _KIT_SEARCH_SPECS)
+    _no_embed(monkeypatch)
+
+    def search(q):
+        return json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)
+    ranked = lambda q: search(q)["ranked"]  # noqa: E731
+    assert ranked("그림")[0] == "figure_get" and ranked("그림")[:8].count("kit_get") == 0, "'그림' 만으로는 그리는 도구가 앞이다(kit_get 은 설명으로만)"
+    before = {q: ranked(q) for q in ("그림", "표로 받기", "응력 곡선 그림")}
+    # 박스 덧씌우기로 띄어 쓴 열쇠를 더해도 그 꼴이 없는 질의의 순위는 그대로다
+    gw.SEARCH_TUNING_LOCAL_PATH.write_text(json.dumps({"synonyms": {"메인 기판": {"to": ["list_parts"], "owner": None, "source_fix": None}}},
+                                                      ensure_ascii=False), encoding="utf-8")
+    assert {q: ranked(q) for q in before} == before
+    assert ranked("메인 기판 부품")[0] == "list_parts" and ranked("메인기판")[0] == "list_parts"
+    # 낱말 머리에서만 — '목표 칸' 의 '표 칸' 은 아니다(반대 검토 S4)
+    assert "kit_get" not in ranked("목표 칸 채우기") and ranked("표 칸 채우기")[0] == "kit_get"
+    assert gw._flat_at_word("표칸", "목표 칸") is False and gw._flat_at_word("표칸", "엑셀 표칸에") is True

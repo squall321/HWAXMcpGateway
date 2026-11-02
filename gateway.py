@@ -38,8 +38,8 @@ from rest_proxy import (EXPIRED_BODY, JWKS_TIMEOUT_S, REST_PROXY_UPSTREAM_TIMEOU
 # HWAXPortal docs/request-1027 HG-02. 재프로비저닝 전 config 는 아직 쿼리 꼴이다), httpx 는 INFO 로 요청마다 주소를 통째로 찍었다 —
 # cae00 gateway.log 26,275줄(10-17 리뷰 G1), dev 는 이메일 쿼리도 실렸다.
 # 요청 줄은 WARNING 아래로 내리고, 다른 길(예외 문구 · 트레이스백)로 찍히는 주소도 형식기에서 가린다.
-# `t` 는 그림 받기 표(GET /fig/<ref>?t=… — 1시간 자격)다.
-_SECRET_QUERY = re.compile(r"(?i)([?&](?:token|access_token|api_key|apikey|key|secret|password|pat|t)=)[^&\s'\"<>]+")
+# `t` 는 그림 받기 표(GET /fig/<ref>?t=… — 1시간 자격)다. 퍼센트로 적은 이름(%74 — 서버는 t 로 읽는다)도 가린다.
+_SECRET_QUERY = re.compile(r"(?i)([?&](?:token|access_token|api_key|apikey|key|secret|password|pat|t|%74)=)[^&\s'\"<>]+")
 
 
 # 외부 연결 선언의 토큰 접두(HWAXPortal docs/ext-connect GW16) — 그 접두 뒤에 8자 이상이 붙고 숫자가 하나라도 든 문자열도 가린다. 선언을 받을
@@ -1057,7 +1057,7 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
             rec["error"] = _clip(err, 200)
         if res is not None:
             rec["chars"] = _res_chars(res)
-            _imgs, _img_bytes = _res_images(res)
+            _imgs, _img_bytes = _res_images(res) if FIG_STORE_ON else (0, 0)      # 끄면 감사 줄도 지금과 같다
             if _imgs:
                 rec["images"], rec["image_bytes"] = _imgs, _img_bytes
         if size is not None:
@@ -1403,6 +1403,9 @@ async def _aggregate():
             log.warning("alias collision %s: %s ← %s", _alias, alias_route[_alias], (key, t.name))
         alias_route[_alias] = (key, t.name)
         clash = name_counts[t.name] > 1 if key in _CONN_ACTIVE else base_counts[t.name] > 1
+        # 그림 도구(로컬)와 같은 이름의 백엔드 도구는 접두를 단다 — 맨 이름이면 tools/list 에 같은 이름이 둘이고 그 이름의 호출은 늘 로컬로 가서
+        # 백엔드 도구에 닿지 못했다(반대 검토 7). 그림 저장이 새로 맡은 이름만이다 — 다른 로컬 이름은 지금 그대로다.
+        clash = clash or (FIG_STORE_ON and t.name in _FIG_NAMES)
         if clash or key in family:
             prefix = key.replace("-", "")  # mx-white-paper -> mxwhitepaper
             exposed_name = f"{prefix}_{t.name}"
@@ -1878,6 +1881,7 @@ async def _backends_lifespan():
         await _refresh_access_policy()
         tg.start_soon(_access_policy_loop)
         if FIG_STORE_ON:
+            _FIG_LIMITER["lim"] = anyio.CapacityLimiter(4)      # 그림 파일 일은 일꾼 넷까지 — 기본 풀(PAT 검증 등)을 다 잡지 않게
             tg.start_soon(_fig_sweep_loop)        # 기동 때 한 번 디스크에서 그림 표를 짓고, 뒤로는 주기마다 끝난 것을 치운다
         try:
             yield
@@ -3653,6 +3657,8 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     tun = tuning or _tuning()
     sw, wt = tun["switches"], tun["weights"]
     syn = tun["synonyms"] if sw["synonyms"] else {}
+    if not FIG_STORE_ON:
+        syn = _fig_unsyn(syn)              # 그림 저장을 끄면 그것이 더한 갈래도 없다(검색 순위가 지금과 같다)
     q_flat = re.sub(r"\s+", "", q)
     vocab = _core_vocab()
     # 코어 질문에서는 일반 업무 낱말 → deliberate_start 를 심의를 청할 때만 잇는다(R-5 — 조회 질문이 심의 시작으로 끌렸다).
@@ -5189,7 +5195,9 @@ def _fig_env_int(name: str, default: int, minimum: int) -> int:
 
 FIG_TTL_S = _fig_env_int("GATEWAY_FIG_TTL_S", 7 * 86400, 60)                     # 그림 하나의 보존(초)
 FIG_MAX_BYTES = _fig_env_int("GATEWAY_FIG_MAX_BYTES", 8 * 1024 * 1024, 1024)       # 한 장 상한 — 넘으면 두지 않는다
+# 사람당 · 전체 합은 디스크 몫으로 센다(_fig_disk — 파일마다 4 KiB 블록). 그림 바이트만 세던 때는 작은 그림 2만 장이 160 KB 로 셌다(반대 검토 9).
 FIG_OWNER_QUOTA = _fig_env_int("GATEWAY_FIG_OWNER_QUOTA", 1024 ** 3, 1024)         # 사람당 합 — 넘으면 그 사람의 오래된 것부터
+FIG_OWNER_MAX_COUNT = _fig_env_int("GATEWAY_FIG_OWNER_MAX_COUNT", 5000, 1)          # 사람당 장 수 — 넘으면 그 사람의 오래된 것부터
 FIG_TOTAL_CAP = _fig_env_int("GATEWAY_FIG_TOTAL_CAP", 20 * 1024 ** 3, 1024)        # 전체 합 — 넘으면 모두의 오래된 것부터
 FIG_TICKET_TTL_S = _fig_env_int("GATEWAY_FIG_TICKET_TTL_S", 3600, 60)              # 받기 표의 수명(그림이 먼저 끝나면 그때까지)
 FIG_SWEEP_S = _fig_env_int("GATEWAY_FIG_SWEEP_S", 3600, 30)                        # 청소 주기 — 상한은 쓸 때마다 지키고 청소는 끝난 것을 치운다
@@ -5220,13 +5228,19 @@ _FIG_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/
 # 청소가 지워도 되는 이름 — 이 꼴만 지운다(GATEWAY_FIG_DIR 를 남과 같이 쓰는 폴더로 잡아도 남의 파일은 건드리지 않는다).
 _FIG_FILE_RE = re.compile(r"(fig_[A-Za-z0-9_-]{22})\.(?:png|jpg|gif|webp|svg|json)(?:\.part)?")
 _FIG_HOST_RE = re.compile(r"(?:[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?")
-# 쓰기 · 청소 · 상한은 한 잠금 안에서 — 파일 일은 일꾼 스레드에서 돈다(이벤트 루프를 막지 않는다).
+# 쓰기 · 표 바꿔 끼우기 · 상한은 한 잠금 안에서 — 파일 일은 일꾼 스레드에서 돈다(이벤트 루프에서는 이 잠금을 잡지 않는다).
 _FIG_LOCK = threading.Lock()
 # ref → 곁 JSON + created_ts · expires_ts — 청소가 디스크에서 다시 짓는다. 상한 셈 · figure_list · 같은 그림 찾기가 쓴다.
 _FIG_META: dict[str, dict] = {}
 _FIG_KEY: dict[tuple, str] = {}        # (주인, 백엔드, 도구, sha256) → ref — 캐시 적중 · 같은 결과가 같은 ref 를 쓴다
-_FIG_USAGE: dict[str, int] = {}        # 주인 → 바이트 합
-_FIG_TOTAL = {"bytes": 0}
+_FIG_USAGE: dict[str, int] = {}        # 주인 → 디스크 몫 합(_fig_disk)
+_FIG_COUNT: dict[str, int] = {}        # 주인 → 장 수
+_FIG_TOTAL = {"bytes": 0}              # 디스크 몫 합
+# 청소가 잠금 밖에서 디스크를 읽는 동안 들고 난 ref — 잠금 안에서 표를 바꿔 끼울 때 이것으로 맞춘다. 잠금을 쥔 채 곁 JSON 을 다 읽던 때는 그림 10만
+# 장에서 1.6초 동안 그림 든 결과가 모두 멈췄다(반대 검토 1).
+_FIG_SWEEP: dict = {"on": False, "added": set(), "dropped": set()}
+# 그림 파일 일의 일꾼 수 — 기본 일꾼 풀(PAT 검증 등이 같이 쓴다)을 그림 결과가 다 잡지 않게 따로 둔다. 기동(lifespan)이 만든다 — 없으면(시험) 기본 풀.
+_FIG_LIMITER: dict = {"lim": None}
 _FIG_SKIP_TEXT = {"big": "한 장 상한({cap})을 넘음", "kind": "형식을 모름(png · jpeg · gif · webp · svg 만)", "bad": "base64 를 못 읽음",
                   "quota": "사람당 · 전체 상한보다 큼", "disk": "디스크에 쓰지 못함"}
 
@@ -5239,6 +5253,16 @@ def _fig_size(n: int) -> str:
     if n < 1024 ** 3:
         return f"{round(n / 1024 ** 2, 1):g} MB"
     return f"{round(n / 1024 ** 3, 1):g} GB"
+
+
+def _fig_disk(n: int) -> int:
+    """그림 하나의 디스크 몫 — 그림 파일을 4 KiB 블록으로 올려 세고 곁 JSON 한 블록을 더한다."""
+    return -(-n // 4096) * 4096 + 4096
+
+
+def _fig_thread(fn, *args):
+    """그림 파일 일을 일꾼 스레드로 — 그림 전용 일꾼 수(_FIG_LIMITER) 안에서."""
+    return anyio.to_thread.run_sync(fn, *args, limiter=_FIG_LIMITER["lim"])
 
 
 def _fig_sniff(raw: bytes) -> str | None:
@@ -5279,52 +5303,146 @@ def _fig_write(path: Path, blob: bytes) -> None:
     os.replace(tmp, path)
 
 
+def _fig_open(path: Path):
+    """그림 파일을 읽기로 연다 — 심볼릭 링크는 따라가지 않는다(폴더에 누가 링크를 심어도 다른 파일을 내지 않는다). 폴더면 fdopen 이 던지면서
+    fd 를 닫지 않는다(실측) — 여기서 닫는다(청소가 곁 JSON 이름의 폴더를 만날 때마다 fd 가 새지 않게)."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _fig_read_image(path: Path) -> bytes:
+    with _fig_open(path) as f:
+        return f.read()
+
+
 def _fig_add(ref: str, meta: dict) -> None:
+    """표에 넣는다(잠금 안에서)."""
+    owner, disk = meta["owner"], _fig_disk(meta["bytes"])
     _FIG_META[ref] = meta
-    _FIG_KEY[(meta["owner"], meta["backend"], meta["tool"], meta["sha256"])] = ref
-    _FIG_USAGE[meta["owner"]] = _FIG_USAGE.get(meta["owner"], 0) + meta["bytes"]
-    _FIG_TOTAL["bytes"] += meta["bytes"]
+    _FIG_KEY[(owner, meta["backend"], meta["tool"], meta["sha256"])] = ref
+    _FIG_USAGE[owner] = _FIG_USAGE.get(owner, 0) + disk
+    _FIG_COUNT[owner] = _FIG_COUNT.get(owner, 0) + 1
+    _FIG_TOTAL["bytes"] += disk
+    if _FIG_SWEEP["on"]:
+        _FIG_SWEEP["added"].add(ref)
 
 
-def _fig_drop(ref: str) -> None:
-    """표에서 빼고 파일을 지운다(없는 파일은 넘어간다)."""
+def _fig_forget(ref: str) -> None:
+    """표에서만 뺀다(잠금 안에서) — 파일은 그대로다."""
     meta = _FIG_META.pop(ref, None)
-    if meta is not None:
-        k = (meta["owner"], meta["backend"], meta["tool"], meta["sha256"])
-        if _FIG_KEY.get(k) == ref:
-            del _FIG_KEY[k]
-        left = _FIG_USAGE.get(meta["owner"], 0) - meta["bytes"]
+    if meta is None:
+        return
+    owner, disk = meta["owner"], _fig_disk(meta["bytes"])
+    k = (owner, meta["backend"], meta["tool"], meta["sha256"])
+    if _FIG_KEY.get(k) == ref:
+        del _FIG_KEY[k]
+    for table, by in ((_FIG_USAGE, disk), (_FIG_COUNT, 1)):
+        left = table.get(owner, 0) - by
         if left > 0:
-            _FIG_USAGE[meta["owner"]] = left
+            table[owner] = left
         else:
-            _FIG_USAGE.pop(meta["owner"], None)
-        _FIG_TOTAL["bytes"] = max(0, _FIG_TOTAL["bytes"] - meta["bytes"])
+            table.pop(owner, None)
+    _FIG_TOTAL["bytes"] = max(0, _FIG_TOTAL["bytes"] - disk)
+    if _FIG_SWEEP["on"]:
+        _FIG_SWEEP["dropped"].add(ref)
+
+
+def _fig_unlink(ref: str) -> None:
+    """ref 의 파일을 지운다 — 없으면 넘어가고, 못 지우면(폴더 · 권한) 한 줄 남기고 넘어간다(파일 하나가 청소 전체를 멈추지 않게, 반대 검토 5)."""
     for p in _fig_files(ref):
         try:
             p.unlink()
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            log.warning("그림 파일을 지우지 못했다(%s): %r", p.name, exc)
 
 
-def _fig_enforce(keep: str | None = None) -> int:
-    """사람당 · 전체 상한 — 넘친 만큼 오래된 것부터 지운다(방금 둔 keep 은 빼고). 잠금 안에서 부른다."""
-    if (all(v <= FIG_OWNER_QUOTA for v in _FIG_USAGE.values())) and _FIG_TOTAL["bytes"] <= FIG_TOTAL_CAP:
+def _fig_drop(ref: str) -> None:
+    """표에서 빼고 파일을 지운다(잠금 안에서)."""
+    _fig_forget(ref)
+    _fig_unlink(ref)
+
+
+def _fig_over(owner: str) -> bool:
+    return _FIG_USAGE.get(owner, 0) > FIG_OWNER_QUOTA or _FIG_COUNT.get(owner, 0) > FIG_OWNER_MAX_COUNT
+
+
+def _fig_enforce(keep=frozenset()) -> int:
+    """사람당 상한(디스크 몫 · 장 수)을 먼저, 그다음 전체 상한 — 넘친 만큼 오래된 것부터 지운다(keep — 이번 결과에 둔 그림 — 은 빼고). 잠금 안에서
+    부른다. '그 사람이 넘었거나 전체가 넘었으면' 한 번에 지우던 때는 상한 안의 남의 그림까지 지웠다(반대 검토 2)."""
+    over = {o for o in _FIG_USAGE if _fig_over(o)}
+    if not over and _FIG_TOTAL["bytes"] <= FIG_TOTAL_CAP:
         return 0
+    order = sorted(_FIG_META, key=lambda r: (_FIG_META[r]["created_ts"], r))
     n = 0
-    for ref in sorted(_FIG_META, key=lambda r: (_FIG_META[r]["created_ts"], r)):
-        if ref == keep:
-            continue
-        m = _FIG_META[ref]
-        if _FIG_USAGE.get(m["owner"], 0) > FIG_OWNER_QUOTA or _FIG_TOTAL["bytes"] > FIG_TOTAL_CAP:
+    for ref in order:
+        m = _FIG_META.get(ref)
+        if m is not None and ref not in keep and m["owner"] in over and _fig_over(m["owner"]):
+            _fig_drop(ref)
+            n += 1
+    for ref in order:
+        if _FIG_TOTAL["bytes"] <= FIG_TOTAL_CAP:
+            break
+        if ref in _FIG_META and ref not in keep:
             _fig_drop(ref)
             n += 1
     return n
 
 
+def _fig_reuse(owner: str, backend: str, tool: str, sha: str, now: float) -> str | None:
+    """같은 사람 · 백엔드 · 도구 · 바이트로 둔 그림이 살아 있으면 그 ref(잠금 안에서). 한 시간 넘게 지난 것은 만든 때 · 끝나는 때를 새로 적는다 —
+    다시 받은 결과의 ref 가 옛 기한으로 곧 끝나지 않게(반대 검토 3). 새로 적지 못하면 None(새로 둔다)."""
+    ref = _FIG_KEY.get((owner, backend, tool, sha))
+    m = _FIG_META.get(ref) if ref else None
+    if m is None or m["expires_ts"] <= now or not (FIG_DIR / f"{ref}.json").is_file():
+        return None
+    if m["expires_ts"] - now < FIG_TTL_S - 3600:
+        side = {k: m[k] for k in ("owner", "tool", "backend", "mime", "bytes", "sha256")}
+        side.update(created=_fig_iso(now), expires=_fig_iso(now + FIG_TTL_S))
+        try:
+            _fig_write(FIG_DIR / f"{ref}.json", json.dumps(side, ensure_ascii=False).encode("utf-8"))
+        except OSError as exc:
+            log.warning("그림 기한을 새로 적지 못했다(%s) — 새로 둔다: %r", ref, exc)
+            return None
+        _fig_forget(ref)
+        _fig_add(ref, {**side, "created_ts": now, "expires_ts": now + FIG_TTL_S})
+    return ref
+
+
+def _fig_put(owner: str, backend: str, tool: str, mime: str, raw: bytes, sha: str, now: float) -> str | None:
+    """새 ref 로 그림 파일과 곁 JSON 을 쓰고 표에 넣는다(잠금 안에서). 쓰지 못하면 남은 조각을 지우고 None."""
+    ref = "fig_" + secrets.token_urlsafe(16)
+    side = {"owner": owner, "tool": tool, "backend": backend, "mime": mime, "bytes": len(raw), "sha256": sha,
+            "created": _fig_iso(now), "expires": _fig_iso(now + FIG_TTL_S)}
+    try:
+        FIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _fig_write(FIG_DIR / f"{ref}.{_FIG_EXT[mime]}", raw)
+        _fig_write(FIG_DIR / f"{ref}.json", json.dumps(side, ensure_ascii=False).encode("utf-8"))
+    except OSError as exc:
+        log.warning("그림을 디스크에 쓰지 못했다(%s) — 결과는 그대로 준다: %r", FIG_DIR, exc)
+        for p in _fig_files(ref):
+            for q in (p, p.with_name(p.name + ".part")):
+                try:
+                    q.unlink()
+                except OSError:
+                    pass
+        return None
+    _fig_add(ref, {**side, "created_ts": now, "expires_ts": now + FIG_TTL_S})
+    return ref
+
+
 def _fig_store_sync(owner: str, backend: str, tool: str, datas: list[str], now: float | None = None) -> list[tuple]:
-    """그림 블록(base64)마다 (ref, 형식, 바이트) 또는 (None, 못 둔 까닭, 바이트). 일꾼 스레드에서 돈다."""
+    """그림 블록(base64)마다 (ref, 형식, 바이트) 또는 (None, 못 둔 까닭, 바이트). 일꾼 스레드에서 돈다. 이번 결과에 둔 그림(batch)은 상한이 지우지
+    않는다 — 지우면 글 블록이 지운 ref 를 '저장' 으로 말한다(반대 검토 2). 그래서 결과 하나가 사람당 · 전체 상한을 넘기는 그림은 두지 않는다."""
     now = time.time() if now is None else now
     out: list[tuple] = []
+    batch: set[str] = set()
+    batch_disk = 0
     for data in datas:
         if len(data) * 3 // 4 > FIG_MAX_BYTES + 2:          # 풀기 전에 — 큰 것을 메모리에 한 벌 더 만들지 않는다
             out.append((None, "big", len(data) * 3 // 4))
@@ -5335,54 +5453,48 @@ def _fig_store_sync(owner: str, backend: str, tool: str, datas: list[str], now: 
             out.append((None, "bad", 0))
             continue
         mime = _fig_sniff(raw)
+        disk = _fig_disk(len(raw))
         why = ("big" if len(raw) > FIG_MAX_BYTES else "kind" if mime is None
-               else "quota" if len(raw) > min(FIG_OWNER_QUOTA, FIG_TOTAL_CAP) else "")
+               else "quota" if (batch_disk + disk > min(FIG_OWNER_QUOTA, FIG_TOTAL_CAP) or len(batch) + 1 > FIG_OWNER_MAX_COUNT) else "")
         if why:
             out.append((None, why, len(raw)))
             continue
         sha = hashlib.sha256(raw).hexdigest()
         with _FIG_LOCK:
-            ref = _FIG_KEY.get((owner, backend, tool, sha))
-            if ref and (_FIG_META.get(ref) or {}).get("expires_ts", 0) > now and (FIG_DIR / f"{ref}.json").exists():
-                out.append((ref, mime, len(raw)))          # 캐시 적중 · 같은 결과 — 두 벌 두지 않고 같은 ref
-                continue
-            ref = "fig_" + secrets.token_urlsafe(16)
-            meta = {"owner": owner, "tool": tool, "backend": backend, "mime": mime, "bytes": len(raw), "sha256": sha,
-                    "created": _fig_iso(now), "expires": _fig_iso(now + FIG_TTL_S)}
-            try:
-                FIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-                _fig_write(FIG_DIR / f"{ref}.{_FIG_EXT[mime]}", raw)
-                _fig_write(FIG_DIR / f"{ref}.json", json.dumps(meta, ensure_ascii=False).encode("utf-8"))
-            except OSError as exc:
-                log.warning("그림을 디스크에 쓰지 못했다(%s) — 결과는 그대로 준다: %r", FIG_DIR, exc)
-                for p in _fig_files(ref):
-                    for q in (p, p.with_name(p.name + ".part")):
-                        try:
-                            q.unlink()
-                        except OSError:
-                            pass
-                out.append((None, "disk", len(raw)))
-                continue
-            _fig_add(ref, {**meta, "created_ts": now, "expires_ts": now + FIG_TTL_S})
-            _fig_enforce(keep=ref)
-        out.append((ref, mime, len(raw)))
+            # 캐시 적중 · 같은 결과 — 두 벌 두지 않고 같은 ref
+            ref = _fig_reuse(owner, backend, tool, sha, now) or _fig_put(owner, backend, tool, mime, raw, sha, now)
+            if ref is not None:
+                batch.add(ref)
+                batch_disk += disk
+                _fig_enforce(keep=batch)
+        out.append((ref, mime, len(raw)) if ref is not None else (None, "disk", len(raw)))
     return out
 
 
-def _fig_read_meta(ref: str) -> dict | None:
-    """디스크의 곁 JSON — ref 꼴이 틀리거나 · 없거나 · 칸이 어긋나면 None. 표가 아니라 디스크가 정본이다(받기 · figure_get 의 주인 판정)."""
-    if not isinstance(ref, str) or not _FIG_REF_RE.fullmatch(ref):
-        return None
+def _fig_meta_from(blob) -> dict | None:
+    """곁 JSON(글 · 바이트) → 정보(+created_ts · expires_ts). JSON · 칸이 어긋나면 None."""
     try:
-        m = json.loads((FIG_DIR / f"{ref}.json").read_text(encoding="utf-8"))
+        m = json.loads(blob)
         meta = {"owner": str(m["owner"]), "tool": str(m["tool"]), "backend": str(m["backend"]), "mime": str(m["mime"]),
                 "bytes": int(m["bytes"]), "sha256": str(m["sha256"]), "created": str(m["created"]), "expires": str(m["expires"])}
         meta["created_ts"], meta["expires_ts"] = _fig_ts(meta["created"]), _fig_ts(meta["expires"])
-    except (OSError, ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError):
         return None
-    if meta["mime"] not in _FIG_EXT or not meta["owner"]:
+    if meta["mime"] not in _FIG_EXT or not meta["owner"] or meta["bytes"] < 0:
         return None
     return meta
+
+
+def _fig_read_meta(ref: str) -> dict | None:
+    """디스크의 곁 JSON — ref 꼴이 틀리거나 · 없거나 · 못 읽거나 · 칸이 어긋나면 None. 표가 아니라 디스크가 정본이다(받기 · figure_get 의 주인 판정)."""
+    if not isinstance(ref, str) or not _FIG_REF_RE.fullmatch(ref):
+        return None
+    try:
+        with _fig_open(FIG_DIR / f"{ref}.json") as f:
+            blob = f.read()
+    except OSError:
+        return None
+    return _fig_meta_from(blob)
 
 
 def _fig_load(ref: str, now: float | None = None) -> dict | None:
@@ -5397,41 +5509,65 @@ def _fig_load(ref: str, now: float | None = None) -> dict | None:
 
 
 def _fig_sweep_sync(now: float | None = None) -> dict:
-    """청소 — 디스크에서 표를 다시 짓는다. 끝난 것 · 곁 JSON 이 깨진 것 · 곁 JSON 없는 그림(한 시간 넘은 것) · 남은 .part 를 지우고 상한을 다시
-    지킨다. 기동 때 한 번(표를 채운다), 뒤로는 FIG_SWEEP_S 마다."""
+    """청소 — 디스크에서 표를 다시 짓는다. 곁 JSON 은 잠금 밖에서 읽고(그동안 든 것 · 난 것은 _FIG_SWEEP 이 적는다) 잠금 안에서는 표만 바꿔 끼운다.
+    끝난 것 · 곁 JSON 이 깨진 것(JSON · 칸이 틀림) · 곁 JSON 없는 그림과 남은 .part(한 시간 넘은 것)를 지우고 상한을 다시 지킨다. 곁 JSON 을 못 읽은
+    것(권한 · I/O)은 지우지도 세지도 않는다 — 일시 오류가 그림을 지우지 않게(반대 검토 5). 기동 때 한 번(표를 채운다), 뒤로는 FIG_SWEEP_S 마다."""
     now = time.time() if now is None else now
-    gone = {"expired": 0, "broken": 0, "orphans": 0}
+    gone = {"expired": 0, "broken": 0, "orphans": 0, "unreadable": 0}
     with _FIG_LOCK:
-        _FIG_META.clear()
-        _FIG_KEY.clear()
-        _FIG_USAGE.clear()
-        _FIG_TOTAL["bytes"] = 0
+        _FIG_SWEEP.update(on=True, added=set(), dropped=set())
+    try:
         try:
             entries = list(os.scandir(FIG_DIR))
         except FileNotFoundError:
             entries = []
-        live: set[str] = set()
+        live: dict[str, dict] = {}
+        dead: list[str] = []
+        held: set[str] = set()
         for e in entries:
             if not e.name.endswith(".json") or not _FIG_REF_RE.fullmatch(e.name[:-5]):
                 continue
             ref = e.name[:-5]
-            meta = _fig_read_meta(ref)
-            if meta is None:
+            try:
+                with _fig_open(Path(e.path)) as f:
+                    blob = f.read()
+            except FileNotFoundError:
+                continue                                     # 읽는 사이 지워졌다
+            except OSError:
+                held.add(ref)
+                gone["unreadable"] += 1
+                continue
+            meta = _fig_meta_from(blob)
+            if meta is None or not (FIG_DIR / f"{ref}.{_FIG_EXT[meta['mime']]}").is_file():
+                dead.append(ref)
                 gone["broken"] += 1
-                _fig_drop(ref)
             elif meta["expires_ts"] <= now:
+                dead.append(ref)
                 gone["expired"] += 1
-                _fig_drop(ref)
-            elif not (FIG_DIR / f"{ref}.{_FIG_EXT[meta['mime']]}").is_file():
-                gone["broken"] += 1
-                _fig_drop(ref)
             else:
-                _fig_add(ref, meta)
-                live.add(ref)
+                live[ref] = meta
+        with _FIG_LOCK:
+            added, dropped = _FIG_SWEEP["added"], _FIG_SWEEP["dropped"]
+            _FIG_SWEEP.update(on=False, added=set(), dropped=set())
+            carry = {r: _FIG_META[r] for r in added if r in _FIG_META}       # 읽는 동안 새로 둔(또는 기한을 새로 적은) 것
+            _FIG_META.clear()
+            _FIG_KEY.clear()
+            _FIG_USAGE.clear()
+            _FIG_COUNT.clear()
+            _FIG_TOTAL["bytes"] = 0
+            for r, m in live.items():
+                if r not in dropped and r not in carry:                          # 읽는 동안 상한이 지운 것은 다시 넣지 않는다
+                    _fig_add(r, m)
+            for r, m in carry.items():
+                _fig_add(r, m)
+            evicted = _fig_enforce()
+            known = set(_FIG_META)
+        for ref in dead:
+            if ref not in known:
+                _fig_unlink(ref)
         for e in entries:
-            # 곁 JSON 없는 그림 · 남은 .part — 한 시간 넘은 것만(쓰는 중인 것은 잠금 안이라 여기 없지만, 손으로 옮긴 파일에 여유를 둔다)
             m = _FIG_FILE_RE.fullmatch(e.name)
-            if not m or m.group(1) in live or e.name.endswith(".json"):
+            if not m or e.name.endswith(".json") or m.group(1) in known or m.group(1) in held or m.group(1) in live:
                 continue
             try:
                 if now - e.stat(follow_symlinks=False).st_mtime > 3600 and (e.is_symlink() or e.is_file()):
@@ -5439,18 +5575,21 @@ def _fig_sweep_sync(now: float | None = None) -> dict:
                     gone["orphans"] += 1
             except OSError:
                 pass
-        evicted = _fig_enforce()
-    return {**gone, "evicted": evicted, "kept": len(_FIG_META), "bytes": _FIG_TOTAL["bytes"]}
+    finally:
+        with _FIG_LOCK:
+            if _FIG_SWEEP["on"]:
+                _FIG_SWEEP.update(on=False, added=set(), dropped=set())
+    return {**gone, "evicted": evicted, "kept": len(known), "bytes": _FIG_TOTAL["bytes"]}
 
 
 async def _fig_sweep_loop() -> None:
     """기동 때 한 번(표를 채운다), 뒤로는 FIG_SWEEP_S 마다 — 한 번의 실패가 루프를 죽이지 않는다."""
     while True:
         try:
-            got = await anyio.to_thread.run_sync(_fig_sweep_sync)
-            if got["expired"] or got["evicted"] or got["broken"] or got["orphans"]:
-                log.info("그림 청소 — 끝남 %d · 상한 %d · 깨짐 %d · 떠돌이 %d 지움, 남은 %d개 %s", got["expired"], got["evicted"],
-                         got["broken"], got["orphans"], got["kept"], _fig_size(got["bytes"]))
+            got = await _fig_thread(_fig_sweep_sync)
+            if got["expired"] or got["evicted"] or got["broken"] or got["orphans"] or got["unreadable"]:
+                log.info("그림 청소 — 끝남 %d · 상한 %d · 깨짐 %d · 떠돌이 %d 지움, 못 읽음 %d(그대로 둔다), 남은 %d개 %s", got["expired"],
+                         got["evicted"], got["broken"], got["orphans"], got["unreadable"], got["kept"], _fig_size(got["bytes"]))
         except Exception as exc:  # noqa: BLE001
             log.warning("그림 청소 실패: %r", exc)
         await anyio.sleep(FIG_SWEEP_S)
@@ -5476,12 +5615,14 @@ async def _fig_keep(backend: str, original: str, res):
     try:
         datas = [c.data for c in (getattr(res, "content", None) or [])
                  if getattr(c, "type", None) == "image" and isinstance(getattr(c, "data", None), str)]
-        if not datas or getattr(res, "isError", False) or _looks_failed(res):
+        # 실패 결과는 두지 않고 손대지 않는다 — 봉투 판정(_envelope_reason)은 structuredContent 의 오류도 본다. 그림만 든 결과에 글 블록을 덧붙이면
+        # 그 글이 '첫 글 블록' 이 되어 루틴 원장이 그 실패를 ok 로 적었다(반대 검토 8).
+        if not datas or getattr(res, "isError", False) or _looks_failed(res) or _envelope_reason(res):
             return res
         owner = _request_user()
         if not owner or _request_panel() is not None:
             return res
-        outcomes = await anyio.to_thread.run_sync(_fig_store_sync, owner, backend, original, datas)
+        outcomes = await _fig_thread(_fig_store_sync, owner, backend, original, datas)
         return res.model_copy(update={"content": [*res.content, types.TextContent(type="text", text=_fig_note(outcomes))]})
     except Exception as exc:  # noqa: BLE001 — 그림 저장이 도구 결과를 막으면 안 된다
         log.warning("그림 저장 실패(%s · %s) — 결과는 그대로 준다: %r", backend, original, exc)
@@ -5500,7 +5641,8 @@ def _fig_ticket(ref: str, owner: str, exp: int) -> str:
 
 
 def _fig_ticket_ok(ticket: str, ref: str, owner: str, now: float | None = None) -> bool:
-    m = re.fullmatch(r"v1\.(\d{1,12})\.([0-9a-f]{64})", ticket or "")
+    # ASCII 숫자만 — `\d` 는 유니코드 숫자(٩)도 받아 compare_digest 가 TypeError 를 던졌다(있는 ref 만 500 — 무인증 존재 신호, 반대 검토 4)
+    m = re.fullmatch(r"v1\.([0-9]{1,12})\.([0-9a-f]{64})", ticket or "")
     if not m or not GW_TOKEN or int(m.group(1)) <= (time.time() if now is None else now):
         return False
     return hmac.compare_digest(_fig_ticket(ref, owner, int(m.group(1))), ticket)
@@ -5568,6 +5710,24 @@ def _fig_tools() -> tuple:
     return FIGURE_TOOLS if FIG_STORE_ON else ()
 
 
+# search_tools 손 동의어 가운데 그림 저장이 더한 갈래(search_tuning.json 의 '그림' · '이미지' 와 맞춘다) — 끄면 뺀다. 두면 끈 박스에서 '그림' ·
+# '이미지' 질의가 이름에 figure · image 가 든 백엔드 도구를 새로 올려 순위가 지금과 달랐다(반대 검토 6).
+_FIG_SYN = {"그림": ("figure",), "이미지": ("figure", "image")}
+
+
+def _fig_unsyn(syn: dict) -> dict:
+    """그림 저장을 끈 박스의 손 동의어 — 위 갈래를 뺀다(갈래가 다 빠지면 낱말째)."""
+    out = dict(syn)
+    for k, gone in _FIG_SYN.items():
+        if k in out:
+            left = tuple(v for v in out[k] if v not in gone)
+            if left:
+                out[k] = left
+            else:
+                out.pop(k)
+    return out
+
+
 def _fig_line() -> str:
     """기동 로그 한 줄 — 켰는지 · 어디에 · 상한. 끈 것도 남긴다(안 켠 기능도 로그에). 폴더가 체크아웃 안이면 함께 경고한다."""
     if not FIG_STORE_ON:
@@ -5575,7 +5735,7 @@ def _fig_line() -> str:
     repo = Path(__file__).resolve().parent
     inside = FIG_DIR.resolve() == repo or repo in FIG_DIR.resolve().parents
     return (f"그림 저장 켬 — {FIG_DIR} · 보존 {FIG_TTL_S / 86400:g}일 · 한 장 {_fig_size(FIG_MAX_BYTES)} · 사람당 {_fig_size(FIG_OWNER_QUOTA)} · "
-            f"전체 {_fig_size(FIG_TOTAL_CAP)} · 받기 표 {FIG_TICKET_TTL_S}초 · 청소 {FIG_SWEEP_S}초"
+            f"{FIG_OWNER_MAX_COUNT}장 · 전체 {_fig_size(FIG_TOTAL_CAP)}(디스크 몫) · 받기 표 {FIG_TICKET_TTL_S}초 · 청소 {FIG_SWEEP_S}초"
             + (" · ⚠ 체크아웃 안이다 — git stash -u 가 쓸어 갈 수 있다(GATEWAY_FIG_DIR 를 리포 밖으로)" if inside else "")
             + ("" if GW_TOKEN else " · ⚠ 게이트웨이 공유 비밀이 비어 받기 표를 내지 않는다(PAT 로만 받는다)"))
 
@@ -5613,7 +5773,7 @@ async def _fig_report(meta: dict, ref: str, a: dict) -> dict:
     auth = _caller_bearer()
     if not auth:
         raise _FigError("보고서에 넣기는 사람 PAT 로만 된다 — 포털이 그 사람 이름으로 넣는다(게이트웨이 공유 비밀로는 부를 수 없다)")
-    raw = await anyio.to_thread.run_sync(meta["path"].read_bytes)
+    raw = await _fig_thread(_fig_read_image, meta["path"])
     filename = _fig_filename(meta, ref)
     body = {"report_id": report_id, "caption": caption, "page": page, "tool": meta["tool"], "mime": meta["mime"],
             "sha256": meta["sha256"], "filename": filename, "ref": ref}
@@ -5656,13 +5816,13 @@ async def _fig_dispatch(name: str, arguments: dict) -> types.CallToolResult:
                 limit = max(1, min(100, int(a.get("limit") or 20)))
             except (TypeError, ValueError):
                 raise _FigError("limit 은 1 ~ 100 의 정수다") from None
-            mine = await anyio.to_thread.run_sync(_fig_mine, owner)
+            mine = await _fig_thread(_fig_mine, owner)
             mine.sort(key=lambda x: (-x[1]["created_ts"], x[0]))
             out = {"figures": [{"ref": r, "tool": m["tool"], "mime": m["mime"], "bytes": m["bytes"], "created": m["created"],
                                 "expires": m["expires"]} for r, m in mine[:limit]], "count": len(mine)}
             _audit(name, backend, True, None, round((time.monotonic() - t0) * 1000))
             return _rt_json(out)
-        meta = await anyio.to_thread.run_sync(_fig_load, ref)
+        meta = await _fig_thread(_fig_load, ref)
         if meta is None or meta["owner"] != owner:
             raise _FigError(_FIG_MISSING)
         if name == FIG_GET_TOOL.name:
@@ -5688,7 +5848,8 @@ async def _fig_dispatch(name: str, arguments: dict) -> types.CallToolResult:
 
 async def _fig_download(scope, send, pat_verifier, gw_auth: str) -> None:
     """GET /fig/<ref> — 주인의 PAT(MCP 청중 · 패널 아님) 또는 서명한 표(?t=). 자격이 하나도 없거나 PAT 가 검증되지 않으면 401(ref 와 무관한 답),
-    그 밖의 실패(없는 것 · 끝난 것 · 남의 것 · 틀린 표)는 모두 같은 404 다. 감사는 한 줄(via · 보낸 바이트)."""
+    그 밖의 실패(없는 것 · 끝난 것 · 남의 것 · 틀린 표)는 모두 같은 404 다 — 판정 중의 뜻밖의 예외도 같은 404 다(있는 ref 만 500 이면 무인증 존재
+    신호가 된다, 반대 검토 4). 감사는 한 줄(via · 보낸 바이트)."""
     t0 = time.monotonic()
     ref = scope.get("path", "")[len("/fig/"):]
     ip = (scope.get("client") or (None,))[0]
@@ -5714,20 +5875,28 @@ async def _fig_download(scope, send, pat_verifier, gw_auth: str) -> None:
         _aud(False, "unauthorized: no-credential")
         await _reply(401, b'{"error":"unauthorized"}')
         return
-    meta = await anyio.to_thread.run_sync(_fig_load, ref)
-    who = via = None
-    if meta is not None and ticket and _fig_ticket_ok(ticket, ref, meta["owner"]):
-        who, via = meta["owner"], "ticket"
+    who = via = f = None
     claims, expired = None, False
-    if who is None and token and pat_verifier is not None:
-        try:
-            claims = await pat_verifier.verify(token, [MCP_AUDIENCE])
-        except PatExpired:
-            expired = True
-        if claims is not None and not _panel_scope(claims)[0]:
-            email = str(claims.get("email") or "").strip().lower()
-            if meta is not None and email and email == meta["owner"]:
-                who, via = email, "pat"
+    try:
+        meta = await _fig_thread(_fig_load, ref)
+        if meta is not None and ticket and _fig_ticket_ok(ticket, ref, meta["owner"]):
+            who, via = meta["owner"], "ticket"
+        if who is None and token and pat_verifier is not None:
+            try:
+                claims = await pat_verifier.verify(token, [MCP_AUDIENCE])
+            except PatExpired:
+                expired = True
+            if claims is not None and not _panel_scope(claims)[0]:
+                email = str(claims.get("email") or "").strip().lower()
+                if meta is not None and email and email == meta["owner"]:
+                    who, via = email, "pat"
+        if who is not None:
+            f = anyio.wrap_file(await _fig_thread(_fig_open, meta["path"]))     # 링크는 따라가지 않는다
+    except Exception as exc:  # noqa: BLE001 — 뜻밖의 예외도 같은 404(ref 마다 다른 답을 내지 않는다)
+        log.warning("그림 받기 판정 실패(%s) — 404 로 답한다: %r", ref[:40], exc)
+        _aud(False, f"not-found: {type(exc).__name__}", caller=who, via=via)
+        await _reply(404, b'{"error":"not found"}')
+        return
     if who is None:
         if not ticket and claims is None:
             # PAT 를 검증하지 못했다 — ref 와 무관한 답이다(있는지 없는지를 말하지 않는다)
@@ -5735,12 +5904,6 @@ async def _fig_download(scope, send, pat_verifier, gw_auth: str) -> None:
             await _reply(401, json.dumps(EXPIRED_BODY, ensure_ascii=False).encode() if expired else b'{"error":"unauthorized"}')
             return
         _aud(False, "not-found", caller=str((claims or {}).get("email") or "").strip().lower() or None, via="pat" if claims else "ticket")
-        await _reply(404, b'{"error":"not found"}')
-        return
-    try:
-        f = await anyio.open_file(meta["path"], "rb")
-    except OSError:
-        _aud(False, "not-found: file", caller=who, via=via)
         await _reply(404, b'{"error":"not found"}')
         return
     sent, size = 0, -1
@@ -6573,8 +6736,11 @@ def _readonly_denial(name: str, arguments: dict) -> str:
     if name in _ROUTINE_NAMES:
         # 루틴 도구는 경로(route)에 없는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸린다 — 실행 · 원장 쓰기는 여기서 막는다(목록 · 계획은 _LOCAL_READ)
         return f"read_only: {name} — 읽기 전용 토큰(scopes 에 read 만)은 루틴을 돌리지 못한다(원장에 쓴다). routine_list · routine_get 만 된다."
-    if FIG_STORE_ON and name == FIG_REPORT_TOOL.name:
-        # 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸린다 — 보고서 쓰기는 여기서 막는다(figure_get · figure_list 는 _LOCAL_READ)
+    if FIG_STORE_ON and name in _FIG_NAMES:
+        # 그림 도구 — 받기 · 목록은 읽기다. 보고서 쓰기는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸리므로 여기서 막는다. 끄면 이 이름들은 그림
+        # 도구가 아니다 — _LOCAL_READ 에 두면 끈 박스에서 같은 이름의 백엔드 쓰기 도구가 읽기 전용 PAT 로 열렸다(반대 검토 6)
+        if name in _FIG_READ_NAMES:
+            return ""
         return "read_only: figure_to_report — 읽기 전용 토큰(scopes 에 read 만)은 보고서에 그림을 넣지 못한다. figure_get · figure_list 만 된다."
     resolved = route.get(name) or alias_route.get(name)
     if resolved is None:
@@ -7385,8 +7551,7 @@ async def _list_tools(req: types.ListToolsRequest):
 _LOCAL_READ = frozenset({SEARCH_CONV_TOOL.name, LIST_APPS_TOOL.name, SEARCH_TOOLS_TOOL.name, BROWSE_EXPERTS_TOOL.name,
                          USE_EXPERTS_TOOL.name, VERIFY_TOOL.name, REST_CATALOG_TOOL.name,
                          ROUTINE_LIST_TOOL.name, ROUTINE_GET_TOOL.name,   # 루틴 실행 · 원장 쓰기는 읽기 전용 PAT 밖
-                         *_INSIGHT_NAMES,                                  # 과제 인사이트는 읽기 둘뿐이다
-                         *_FIG_READ_NAMES})                                # 그림 받기 · 목록(보고서에 넣기는 _readonly_denial 이 막는다)
+                         *_INSIGHT_NAMES})                                 # 과제 인사이트는 읽기 둘뿐이다
 _ROUTINE_NAMES = frozenset(t.name for t in ROUTINE_TOOLS)
 
 

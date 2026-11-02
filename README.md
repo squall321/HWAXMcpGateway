@@ -201,6 +201,7 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 - 형제 소개 줄(E2-4) — 형제의 `apps.<키>.tagline` 이 차면 정본과 같은 길로 그 형제 도구 설명 앞에 붙는다(비코어 · 시험 앱의 칸은 쓰지 않는다). 문안은 운영자가 박스 덧씌우기에 쓴다. 가족 · 형제 소개 줄이 바뀌면 다음 재활 회차에 다시 집계한다. 순위는 그대로다 — 점수(부분문자열 · 의미 순위 둘 다)는 그 줄을 뗀 설명으로 내고, 형제가 정본 아래로 접히면 `same_in` 의 그 형제 칸이 `differs: true` 와 `tagline`(그 줄)을 싣는다(검토 10-31).
 - 시험 사본 숨김 — 앱 역할이 `staging` 인 앱(`apps.<키>.role`)은 tools/list · `search_tools` 에서 빠진다(R-6). 웹 챗 묶음 · 개인 Claude 기본 목록 · 검색 결과가 한 번에 빠진다. `invoke_tool` · 노출 이름 호출은 경로가 그대로다(숨김만 — 허브 앱 켜고 끄기와 같은 자리).
 - 박스 덧씌우기 — 같은 자리의 `core_vocab.local.json`(포털 리포 gitignore)을 JSON merge patch 로 얹는다(아래 '검색 손잡이' 와 같은 규칙). 코어 낱말 · 정본 · 앱 역할을 cae00 에서 커밋 없이 고친다. 깨지면 버리고 기본 표로 돈다. 에이전트 서버도 같은 파일을 같은 규칙으로 읽는다 — 두 쪽의 `/health` `core_vocab.fingerprint` 가 같아야 한다(포털 update-all §6 이 견준다).
+- 온톨로지 입구(HWAXPortal docs/ontology-first OF-7) — 어휘표 `ontology.apps.<백엔드 키>.entry`(그 앱에서 이름 · 코드를 키로 푸는 원래 이름)를 앱 줄마다 거르며 읽는다(`_onto_entries` — 에이전트 서버 `onto_links` 와 같은 규칙, 허브 가족의 entry 는 버린다, **예외를 내지 않는다** — 틀린 줄 하나가 덧씌우기 전체를 버리면 두 서비스의 지문이 갈린다). 검색 손잡이 `onto_first`(기본 끔 — 칸이 없어도 끔, 가중치 `weights.onto` 4)를 켜면 질의가 그 앱 이름을 부른 줄에서 입구 도구에 가중치를 더하고(보정 뺀 점수에는 넣지 않는다 · 질의 기록 `via` 에 `onto_first`), 코어 질문(어휘표 검색 낱말이 든 질의)에는 걸지 않는다. 추적 기본 표에는 입구가 없다. 켜기는 cae00 `/search-eval` 의 `+onto_first` 판을 본 뒤 박스 덧씌우기로 한다. 서버 지침 · 도구 설명은 그대로다.
 - 표가 없거나 꼴이 틀리면 지금 동작(손 낱말 · 소개 줄 없음 · 숨기지 않음)으로 돈다. `/health` 의 `core_vocab` 이 `{loaded, version, words, canonical, canonical_backend, staging_hidden, tagline_applied}` 또는 `{loaded: false, error}` 를 싣고, 실린 표에는 지문 `fingerprint`(덧씌운 표) · `base`(기본 표) · 덧씌우기 `overlay`(`present` · 건드린 칸 · 버린 까닭)가 붙는다(경로는 싣지 않는다). `canonical_backend` 가 false 면 정본 키가 이 박스의 백엔드 키와 달라 소개 줄 · 정본 대표 접기가 꺼져 있다. `staging_hidden` 은 이 박스에서 숨긴 백엔드다. `roles` 는 `{family: {키: 이 박스에 있나}, noncore: {키: 있나}, sibling_taglines, family_prefixed: {count, names}}` 다 — 덧씌우기에 키를 틀리게 적으면 여기서 false 로 보인다.
 
 ## 검색 손잡이 — `search_tuning.json` + 박스 덧씌우기(HWAXPortal docs/request-1029 E-7)
@@ -328,6 +329,10 @@ python3 tool_usage_report.py --days 60 --out unused.md
 - `/tools-map` 의 `panel_read` — 포털 MCP Apps 패널(HWAXPortal docs/request-1027 HA-20)의 첫 쓰기 확인이 읽기로 보는 도구의 노출 이름(`_panel_read` —
   위 `_routine_read` 의 차례에서 마지막 갈래인 이름 낱말만 뺀 것: 닫기 목록 → 앱 표지 → 읽기 목록). 이 밖이면 포털은 그 패널 세션의 첫 호출에 확인을
   묻는다 — 이름 규칙은 울타리가 아니다.
+- `/tools-map` 의 `orig` · 앱 줄의 `declared`(HWAXPortal docs/ontology-first F0) — `orig` 는 노출 이름 → 원래 이름(둘이 다른 것만 — 겹침 접두 · 허브 가족
+  접두, 백엔드 도구만)이고, `declared` 는 선언 백엔드(박스 권한표 `connect:` — 부를 때 그 사람의 등록 토큰이 없으면 거절된다)의 앱 줄에만 `true` 로
+  붙는다. 에이전트 서버의 좌석 자유 조회가 겹침 때문에 접두가 붙은 읽기를 원래 이름으로 판정하고(리스크 심사 · 선언 백엔드 · 허브 가족은 빼고), 웹 챗
+  고정 몫이 (백엔드, 원래 이름)으로 노출 이름을 찾는다. `orig` 가 없으면 옛 게이트웨이로 보고 지금처럼 노출 이름으로 판정한다.
 - MCP prompts — `prompts/list` 는 부른 사람(사람 PAT)이 볼 수 있는 루틴마다 `routine-<루틴 id>`(제목 · 단계 사슬 · 변수 인자 — 필수 표시는 포털 목록의
   `required`)를 낸다. 공유 비밀 · 익명 · 포털 실패는 빈 목록이다(실패는 경고 한 줄, 다만 권한(`feat:routines`)이 없다는 포털 403 은 정상 거절이라 정보 한 줄).
   `prompts/get` 은 계획의 변수로 빠진 필수 · 없는 입력을 먼저 거절하고, 루틴을 `routine_*` 도구로 돌리는

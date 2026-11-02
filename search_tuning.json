@@ -14,7 +14,8 @@
   "quality": true,
   "write_penalty": true,
   "copy_fold": true,
-  "noncore_demote": false
+  "noncore_demote": false,
+  "onto_first": false
  },
  "weights": {
   "name": 4,
@@ -23,7 +24,8 @@
   "coverage": 1,
   "write_penalty": 0.5,
   "quality_per_word": 2,
-  "noncore": 0.5
+  "noncore": 0.5,
+  "onto": 4
  },
  "synonyms": {
   "보고서": {

@@ -11077,6 +11077,8 @@ def test_인사이트_도구_둘은_로컬_목록_읽기_전용_도구_지도에
         assert gw._readonly_denial(t.name, {}) == "", "읽기 전용 PAT 도 부른다"
     st, body = _gate_call(monkeypatch, "/tools-map")
     assert st == 200 and all(body["map"].get(t.name) == "_gateway" for t in gw.INSIGHT_TOOLS)
+    # 결과를 새 심의 근거로 넘기는 길은 막지 않되, 그 카드가 주인만 본다는 것을 설명이 말한다(포털 반대 검토 11-02 의 3 — 범위 이어받기는 M3)
+    assert "주인만 본다" in gw.INSIGHT_FIND_TOOL.description and "tool 칸" in gw.INSIGHT_FIND_TOOL.description
 
 
 def _insight_portal(monkeypatch, responder, auth="Bearer pat-person"):

@@ -5073,7 +5073,8 @@ INSIGHT_FIND_TOOL = _routine_tool(
     "insight_find",
     "과제 인사이트 — 내가 볼 수 있는 앞선 일반 심의의 결정 카드를 과제(SP 허브 key) · 차수로 찾는다(웹 심의 · MCP 심의 · Claude 워크플로가 모두 "
     "같은 (과제, 차수) 칸에 모인다). 카드는 단마다 하나 — 주장(핵심 요약) · 표결 · RA 보고서 · 근거 표지 · 상태(초안 · 확인 · 반박)다. 결과는 "
-    "앞선 인사이트일 뿐 검증 대상이고 독립 근거가 아니다 — 새 심의에 넘기려면 deliberate_start 의 evidence 로 출처째 싣는다. 과제 key 는 "
+    "앞선 인사이트일 뿐 검증 대상이고 독립 근거가 아니다 — 새 심의의 근거로 넘기면(deliberate_start 의 evidence 에 tool 칸으로 이 도구 이름을 "
+    "남긴다) 그 심의의 인사이트 카드는 원래 카드들의 보이는 범위를 이어받는 규칙이 서기 전까지 주인만 본다. 과제 key 는 "
     "find_plm_task 결과 행의 key 다(과제코드가 아니다). 리스크 심사 결과는 risk_find_projects_by_subject 로 본다.",
     {"sp_task": {"type": "string", "maxLength": 200, "description": "허브 과제 key(글자 그대로) — 비우면 모든 과제"},
      "round": {"type": "string", "maxLength": 40, "description": "차수 — pre · dv1 ~ dv3 · dvr · pv1 ~ pv3 · pvr · pra · mp, 차수 모름 칸만은 unknown, "

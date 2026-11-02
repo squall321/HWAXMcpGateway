@@ -11739,10 +11739,16 @@ def test_청소는_곁_JSON_을_잠금_밖에서_읽고_그동안_둔_것과_지
     try:
         assert reading.wait(5)
         assert gw._FIG_LOCK.acquire(timeout=1), "청소가 디스크를 읽는 동안 잠금을 쥐었다"
-        gw._FIG_LOCK.release()
-        new = _fig_stored()                              # 읽는 동안 새로 둔 그림
-        with gw._FIG_LOCK:
-            gw._fig_drop(old)                            # 읽는 동안 지운 그림
+        try:
+            release.set()
+            gw.time.sleep(0.3)                           # 청소는 old 를 다 읽고(그림 파일도 있다) 표를 바꿔 끼우려 잠금을 기다린다
+            assert th.is_alive(), "청소가 잠금 없이 표를 바꿔 끼웠다"
+            # 잠금을 쥔 채(쓰기 · 상한과 같은 자리) — 읽는 동안 새로 둔 그림 하나, 청소가 읽은 뒤 상한이 지운 그림 하나
+            new = gw._fig_put("a@corp.com", "heax-step_forge", "render_3d", "image/png", _PNG, hashlib.sha256(_PNG).hexdigest(),
+                              gw.time.time())
+            gw._fig_drop(old)
+        finally:
+            gw._FIG_LOCK.release()
     finally:
         release.set()
         th.join(5)

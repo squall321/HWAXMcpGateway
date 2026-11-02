@@ -12285,3 +12285,37 @@ def test_그림_저장을_끄면_문서에_백서_동의어_갈래도_없다(mon
     assert "get_document" in ranked("위키 문서에") and {"get_document", "list_mxwp_pages", "figure_to_doc"} <= set(ranked("백서"))
     monkeypatch.setattr(gw, "FIG_STORE_ON", False)
     assert not {"get_document", "list_mxwp_pages", "figure_to_doc"} & set(ranked("위키 문서에") + ranked("백서"))
+
+
+# MX 백서 자기 도구(10-16 카탈로그 스냅샷의 설명 그대로) — 그림 낱말 없는 '백서' 질의에서 figure_to_doc 이 앞서지 않는지 본다(반대 검토 8)
+_MX_SPECS = [
+    ("mx-white-paper", "list_documents", "위키 문서 목록 조회. q 로 title/summary 부분 검색. → [{slug, title, part, updated_at}]"),
+    ("mx-white-paper", "get_document_outline", "문서 구조 지도 (토큰 절약용) — 섹션 트리를 평탄화해 각 block 의 id/type/한 줄 hint 만 반환. 본문 편집 "
+                                               "전 항상 먼저 호출. → {title, etag, sections:[{id, number, title, blocks:[{id,type,hint}]}]}"),
+    ("mx-white-paper", "get_section", "**문서 편집 앱**의 섹션 1개 블록 전체 JSON. 첫 인자는 문서 `slug` 다. AIDataHub 레코드(record_id)의 섹션이 "
+                                      "아니다 — 그건 `get_record_sections` 를 쓴다. section_id 는 get_document_outline 에서 얻는다."),
+    ("mx-white-paper", "create_document", "새 위키 문서 생성 (빈 '개요' 섹션 1개 포함). slug 생략 시 title 로 생성 (소문자/한글/하이픈). "
+                                          "MXWP_API_TOKEN (write scope) 필수. → {slug, url}"),
+    ("mx-white-paper", "insert_image_block", "upload_image 로 얻은 image_id 로 ImageBlock 을 섹션에 삽입. after_block_id 생략 시 맨 뒤. 전송 전 "
+                                             "로컬 schema 검증. MXWP_API_TOKEN 필수. → {block_id}"),
+    ("mx-white-paper", "search_documents", "위키 문서를 전문(full-text) 검색한다. 주제어로 관련 문서를 찾는 1차 진입점 — 결과 slug 를 "
+                                           "get_document_outline / get_relationships 로 이어 읽는다."),
+    ("mx-white-paper", "export_document", "위키 문서를 파일로 렌더해 로컬 경로에 저장한다. format: docx(Word) | pptx | pdf | markdown. AI 가 위키를 "
+                                          "읽고 작성한 보고서를 Word 파일로 받을 때 사용 (먼저 create_document 로 저장해 slug 확보 후 호출)."),
+    ("heax-step_forge", "render_3d", "어셈블리를 3D 로 렌더해 그림(PNG)으로 준다."),
+]
+
+
+@pytest.mark.parametrize("q,mine", [("백서 문서 만들기", "create_document"), ("백서 내보내기", "export_document"),
+                                    ("백서 섹션 읽기", "get_section"), ("백서 검색", "search_documents"),
+                                    ("백서에 그림 넣기", None), ("문서에 그림", None)])
+def test_search_tools_는_그림_낱말_없는_백서_질의에_figure_to_doc_을_앞세우지_않는다(monkeypatch, q, mine):
+    """그림 낱말이 없으면 MX 백서 자기 도구가 figure_to_doc 보다 앞이다(설명에 '백서' 를 세 번 쓴 판은 '백서 내보내기' · '백서 문서 만들기' 의
+    첫 줄이 figure_to_doc 이었다 — 반대 검토 8). 그림을 넣는 질의는 figure_to_doc 이 첫 줄이다."""
+    _search_catalog(monkeypatch, _MX_SPECS)
+    _no_embed(monkeypatch)
+    ranked = json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]
+    if mine is None:
+        assert ranked[0] == "figure_to_doc", (q, ranked)
+    else:
+        assert mine in ranked and ranked.index(mine) < (ranked.index("figure_to_doc") if "figure_to_doc" in ranked else 99), (q, ranked)

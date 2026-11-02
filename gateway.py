@@ -5709,9 +5709,10 @@ FIG_DOC_CAPTION_MAX = 500
 FIG_DOC_ALT_MAX = 200
 FIG_DOC_TOOL = types.Tool(
     name="figure_to_doc",
+    # '백서' 는 한 번만 — 세 번 쓴 판은 그림 낱말 없는 '백서 내보내기 · 백서 문서 만들기' 질의에서도 이 도구를 첫 줄로 올렸다(반대 검토 8)
     description=("저장된 그림(fig_…)을 MX 백서(MXWP) 문서의 섹션에 그림 블록으로 넣는다 — 게이트웨이가 그 사람 이름으로 올리고 넣는다(바이트는 "
-                 "서버끼리 간다). 백서 문서에 그림을 붙일 때 쓴다. png · jpeg · gif · webp 만(svg 는 도구를 png 로 다시 부른다). slug · section_id 는 "
-                 "MX 백서 get_document_outline 으로 본다. 답은 ok · slug · section_id · block_id · image_id · deduped."),
+                 "서버끼리 간다). 문서에 그림을 붙일 때 쓴다. png · jpeg · gif · webp 만(svg 는 도구를 png 로 다시 부른다). slug · section_id 는 "
+                 "get_document_outline 으로 본다. 답은 ok · slug · section_id · block_id · image_id · deduped."),
     inputSchema={"type": "object", "properties": {
         "ref": _FIG_REF_ARG,
         "slug": {"type": "string", "maxLength": 200, "description": "넣을 MX 백서 문서의 slug"},

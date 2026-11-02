@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import secrets
+import stat
 import threading
 import time
 from array import array
@@ -1404,8 +1405,8 @@ async def _aggregate():
         alias_route[_alias] = (key, t.name)
         clash = name_counts[t.name] > 1 if key in _CONN_ACTIVE else base_counts[t.name] > 1
         # 그림 도구(로컬)와 같은 이름의 백엔드 도구는 접두를 단다 — 맨 이름이면 tools/list 에 같은 이름이 둘이고 그 이름의 호출은 늘 로컬로 가서
-        # 백엔드 도구에 닿지 못했다(반대 검토 7). 그림 저장이 새로 맡은 이름만이다 — 다른 로컬 이름은 지금 그대로다.
-        clash = clash or (FIG_STORE_ON and t.name in _FIG_NAMES)
+        # 백엔드 도구에 닿지 못했다(반대 검토 7). 그림 저장 · PC 키트가 새로 맡은 이름만이다 — 다른 로컬 이름은 지금 그대로다.
+        clash = clash or (FIG_STORE_ON and t.name in _FIG_NAMES) or t.name == KIT_GET_TOOL.name
         if clash or key in family:
             prefix = key.replace("-", "")  # mx-white-paper -> mxwhitepaper
             exposed_name = f"{prefix}_{t.name}"
@@ -5930,6 +5931,210 @@ async def _fig_download(scope, send, pat_verifier, gw_auth: str) -> None:
         _aud(sent == size, None if sent == size else f"short: {sent}/{size}", caller=who, via=via, size=sent)
 
 
+# ── PC 키트 — 개인 Claude 가 PC 로 받아 쓰는 도구 파일(HWAXPortal infra/pc-kit · docs/report-figures RF-19 ~, 사용자 보고 11-02 '표칸그림 필요해') ──
+# 현장 변환기(md2docx_z.py)는 표 칸 · 문단 안 그림을 글자로 남기고 없는 그림을 말없이 넘겼다. 그것을 대신하는 보고서 md → docx 변환기를
+# 게이트웨이가 내려준다 — 개인 Claude 가 kit_get 으로 받는 주소와 curl 한 줄을 받는다.
+#  · 파일은 형제 리포 HWAXPortal 의 infra/pc-kit 에서 읽는다(박스마다 리포 루트가 달라 이 파일 자리에서 유도한다 — 박스 절대 경로 없음). GATEWAY_KIT_DIR
+#    이 덮는다(상대 경로는 이 리포 루트 기준). 허용 목록(KIT_NAMES)의 이름만 낸다 — 경로를 넘는 이름은 목록에 없으니 열지도 않는다.
+#  · 받기 GET /kit/<이름>(nginx 는 /mcp-gw/kit/<이름> — 막는 넷 밖이라 nginx 고침이 없다) — MCP 청중 PAT 누구나(패널 PAT 는 아니다) 또는 서명한 표
+#    (?t=v1.<끝 시각>.<주인 base64url>.<HMAC(v1|kit:이름|주인|끝 시각)>, 1시간). 그림과 달리 파일에 주인이 없어 표에 주인을 싣는다(감사에 누가 받았나 —
+#    로그는 t 값째 가린다). 열쇠는 그림 표와 다른 용도 이름으로 뽑는다. 모르는 이름 · 틀린 표 · 파일 없음은 같은 404, 자격이 없으면 401 이다.
+KIT_NAMES = frozenset({"hwax-md2docx.py"})
+KIT_TICKET_TTL_S = 3600
+KIT_MAX_BYTES = 2 * 1024 * 1024        # 키트 한 파일의 상한 — 스크립트 한 장이다(잘못 둔 큰 파일을 통째로 읽어 내지 않게)
+_KIT_USAGE = {"hwax-md2docx.py": [
+    "받기 — 위 curl 한 줄을 보고서 폴더에서 돌린다(주소는 1시간). 필요한 것은 Python 3.9+ 와 pip install python-docx 다.",
+    "그림 — 도구 결과의 fig_… 는 figure_get 이 준 curl 로 md 폴더나 --fig-dir 폴더에 받는다(HWAX_GATEWAY_PAT · HWAX_PORTAL_BASE 를 두면 변환기가 받는다).",
+    "쓰기 — md 어디에나 ![캡션](fig_… 또는 경로) 를 쓴다. 표 칸 안에 써도 그 칸의 그림이 된다.",
+    "돌리기 — python hwax-md2docx.py 보고서.md -o 보고서.docx --fig-dir 그림폴더 를 돌리고 끝 줄 '그림 표기 N · docx 그림 N · 표 칸 안 M' 을 본다"
+    "(빠진 그림이 있으면 docx 를 쓰지 않고 종료 2, 수가 어긋나면 3).",
+]}
+
+
+def _kit_dir_setting() -> Path:
+    raw = (os.environ.get("GATEWAY_KIT_DIR") or "").strip()
+    repo = Path(__file__).resolve().parent
+    if not raw:
+        return repo.parent / "HWAXPortal" / "infra" / "pc-kit"
+    p = Path(raw).expanduser()
+    return p if p.is_absolute() else repo / p
+
+
+KIT_DIR = _kit_dir_setting()
+_KIT_TICKET_RE = re.compile(r"v1\.([0-9]{1,12})\.([A-Za-z0-9_-]{2,400})\.([0-9a-f]{64})")
+
+
+def _kit_ticket_key() -> bytes:
+    """키트 받기 표의 열쇠 — 그림 표(figure-ticket)와 다른 용도 이름으로 공유 비밀에서 뽑는다(그림 표를 키트 표로 쓰지 못한다)."""
+    return hmac.new(str(GW_TOKEN).encode("utf-8"), b"hwax-mcp-gateway/kit-ticket/v1", hashlib.sha256).digest()
+
+
+def _kit_owner_b64(owner: str) -> str:
+    return base64.urlsafe_b64encode(owner.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _kit_ticket(name: str, owner: str, exp: int) -> str:
+    """`v1.<끝 시각>.<주인 base64url>.<HMAC-SHA256 hex>` — 서명 대상은 `v1|kit:<이름>|<주인>|<끝 시각>`."""
+    sig = hmac.new(_kit_ticket_key(), f"v1|kit:{name}|{owner}|{exp}".encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"v1.{exp}.{_kit_owner_b64(owner)}.{sig}"
+
+
+def _kit_ticket_owner(ticket: str, name: str, now: float | None = None) -> str | None:
+    """맞는 표면 그 주인, 아니면 None — 꼴(ASCII 숫자 · base64url · 16진) · 끝 시각 · 서명. 표 글 전체를 다시 지어 견주므로 같은 주인을 다른 꼴로
+    적은 표(남는 비트 · 덧붙인 =)도 받지 않는다."""
+    m = _KIT_TICKET_RE.fullmatch(ticket or "")
+    if not m or not GW_TOKEN or int(m.group(1)) <= (time.time() if now is None else now):
+        return None
+    try:
+        b = m.group(2)
+        owner = base64.urlsafe_b64decode(b + "=" * (-len(b) % 4)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return owner if owner and hmac.compare_digest(_kit_ticket(name, owner, int(m.group(1))), ticket) else None
+
+
+def _kit_read(name: str) -> bytes | None:
+    """허용 목록의 키트 파일 바이트 — 목록 밖 이름 · 없음 · 보통 파일이 아님(링크 · 폴더 · 관 포함) · 상한 넘음은 None."""
+    if name not in KIT_NAMES:
+        return None
+    try:
+        fd = os.open(KIT_DIR / name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > KIT_MAX_BYTES:
+            return None
+        chunks, left = [], KIT_MAX_BYTES + 1
+        while left > 0:
+            chunk = os.read(fd, min(left, 256 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+        blob = b"".join(chunks)
+        return blob if len(blob) <= KIT_MAX_BYTES else None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+KIT_GET_TOOL = types.Tool(
+    name="kit_get",
+    description=("PC 에서 쓰는 HWAX 도구 파일 받기 — 보고서 md → Word(docx) 변환기 hwax-md2docx.py(표 칸 안 그림 · 문단 그림 · 그림 ref fig_… 를 "
+                 "넣고, 빠진 그림이 있으면 docx 를 쓰지 않는다). 바이트 · sha256 · 내 PC 로 받는 주소(url — 1시간) · curl 한 줄 · 쓰는 법을 준다."),
+    inputSchema={"type": "object", "properties": {
+        "name": {"type": "string", "enum": sorted(KIT_NAMES), "description": "받을 파일 이름(비우면 hwax-md2docx.py)"}}, "required": []},
+    annotations=types.ToolAnnotations(readOnlyHint=True))
+
+
+class _KitError(Exception):
+    """kit_get 이 호출자에게 그대로 말할 까닭."""
+
+
+async def _kit_dispatch(arguments: dict) -> types.CallToolResult:
+    """kit_get — 이름 · 바이트 · sha256 · 받는 주소(표 — 바깥 주소는 figure_get 과 같은 길) · curl 한 줄 · 쓰는 법. 실패는 KIT_ERROR 한 줄, 감사는 한 줄."""
+    t0 = time.monotonic()
+    name = str((arguments or {}).get("name") or "hwax-md2docx.py").strip()
+    try:
+        if name not in KIT_NAMES:
+            raise _KitError(f"그런 키트가 없다 — 있는 것: {', '.join(sorted(KIT_NAMES))}")
+        blob = await anyio.to_thread.run_sync(_kit_read, name)
+        if blob is None:
+            raise _KitError(f"이 박스에 {name} 이 없다 — 운영자가 게이트웨이 옆 HWAXPortal 리포의 infra/pc-kit(GATEWAY_KIT_DIR)를 본다")
+        out = {"name": name, "bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest(), "url": None, "curl": None,
+               "usage": list(_KIT_USAGE[name])}
+        owner = _request_user()
+        pub = _fig_public_base() if (GW_TOKEN and owner) else None
+        if pub:
+            out["url"] = f"{pub}/kit/{name}?t={_kit_ticket(name, owner, int(time.time() + KIT_TICKET_TTL_S))}"
+            out["curl"] = f'curl -fsS -o {name} "{out["url"]}"'
+        elif not GW_TOKEN:
+            out["note"] = "게이트웨이 공유 비밀이 비어 받기 표를 내지 않는다 — 운영자가 gateway_config.json 의 _gateway.token 을 본다"
+        elif not owner:
+            out["note"] = "사람 신원이 없는 호출이라 받는 주소를 내지 않는다 — 개인 Claude(포털 /mcp-gw)에서 부른다"
+        else:
+            out["note"] = ("이 호출은 사람 PC 가 아니라 박스 안 서비스(웹 챗 · 심의 등)를 거쳐 와서 PC 가 쓸 주소를 모른다 — 개인 Claude(포털 "
+                           "/mcp-gw)에서 kit_get 을 부르면 받는 주소가 나온다")
+        _audit(KIT_GET_TOOL.name, "_gateway", True, None, round((time.monotonic() - t0) * 1000), note=name)
+        return _rt_json(out)
+    except _KitError as exc:
+        _audit(KIT_GET_TOOL.name, "_gateway", False, str(exc), round((time.monotonic() - t0) * 1000), note=name[:40] or None)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=f"KIT_ERROR: {exc}")], isError=True)
+
+
+async def _kit_download(scope, send, pat_verifier, gw_auth: str) -> None:
+    """GET /kit/<이름> — 그 이름의 서명한 표(?t=) 또는 MCP 청중 PAT(누구나 · 패널 아님). 자격이 하나도 없거나 PAT 가 검증되지 않으면 401(이름과 무관한
+    답), 그 밖의 실패(모르는 이름 · 경로 넘기 · 틀린 · 끝난 · 다른 이름의 표 · 패널 PAT · 파일 없음)는 모두 같은 404 다. 감사는 한 줄(via · 바이트)."""
+    t0 = time.monotonic()
+    name = scope.get("path", "")[len("/kit/"):]
+    ip = (scope.get("client") or (None,))[0]
+
+    def _aud(ok: bool, err: str | None, caller=None, via=None, size=None):
+        _audit("GET /kit", "_gateway", ok, err, round((time.monotonic() - t0) * 1000), caller=caller, via=via, ip=ip,
+               note=name[:40] or None, size=size)
+
+    async def _reply(status: int, body: bytes, extra=()):
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"application/json"), (b"cache-control", b"no-store"), *extra]})
+        await send({"type": "http.response.body", "body": body})
+
+    if scope.get("method") != "GET":
+        _aud(False, "method not allowed")
+        await _reply(405, b'{"error":"method not allowed"}', [(b"allow", b"GET")])
+        return
+    ticket = (parse_qs((scope.get("query_string") or b"").decode("latin-1")).get("t") or [""])[0]
+    auths = [v.decode("latin-1") for k, v in (scope.get("headers") or []) if k.lower() == b"authorization"]
+    auth = auths[0] if len(auths) == 1 else ""            # 두 번 실리면 없는 것으로 본다(/mcp 와 같은 자세)
+    token = auth[7:].strip() if auth[:7].lower() == "bearer " and not _secret_eq(auth, gw_auth) else ""
+    if not ticket and not token:
+        _aud(False, "unauthorized: no-credential")
+        await _reply(401, b'{"error":"unauthorized"}')
+        return
+    ok = False
+    who = via = blob = None
+    claims, expired = None, False
+    try:
+        owner = _kit_ticket_owner(ticket, name) if ticket and name in KIT_NAMES else None
+        if owner:
+            ok, who, via = True, owner, "ticket"
+        if not ok and token and pat_verifier is not None:
+            try:
+                claims = await pat_verifier.verify(token, [MCP_AUDIENCE])
+            except PatExpired:
+                expired = True
+            if claims is not None and not _panel_scope(claims)[0]:
+                ok, who, via = True, str(claims.get("email") or "").strip().lower() or None, "pat"
+        if ok:
+            blob = await anyio.to_thread.run_sync(_kit_read, name)
+    except Exception as exc:  # noqa: BLE001 — 뜻밖의 예외도 같은 404(이름마다 다른 답을 내지 않는다)
+        log.warning("키트 받기 판정 실패(%s) — 404 로 답한다: %r", name[:40], exc)
+        _aud(False, f"not-found: {type(exc).__name__}", caller=who, via=via)
+        await _reply(404, b'{"error":"not found"}')
+        return
+    if not ok:
+        if not ticket and claims is None:
+            # PAT 를 검증하지 못했다 — 이름과 무관한 답이다
+            _aud(False, "unauthorized: " + ("expired" if expired else "unverified-token"))
+            await _reply(401, json.dumps(EXPIRED_BODY, ensure_ascii=False).encode() if expired else b'{"error":"unauthorized"}')
+            return
+        _aud(False, "not-found", caller=str((claims or {}).get("email") or "").strip().lower() or None, via="pat" if claims else "ticket")
+        await _reply(404, b'{"error":"not found"}')
+        return
+    if blob is None:
+        _aud(False, "not-found: file", caller=who, via=via)
+        await _reply(404, b'{"error":"not found"}')
+        return
+    await send({"type": "http.response.start", "status": 200, "headers": [
+        (b"content-type", b"text/x-python; charset=utf-8"), (b"content-length", str(len(blob)).encode()),
+        (b"content-disposition", f'attachment; filename="{name}"'.encode("latin-1")),
+        (b"x-content-type-options", b"nosniff"), (b"cache-control", b"private, no-store"),
+        (b"content-security-policy", b"default-src 'none'; sandbox")]})
+    await send({"type": "http.response.body", "body": blob})
+    _aud(True, None, caller=who, via=via, size=len(blob))
+
+
 async def _routine_dispatch(name: str, arguments: dict) -> types.CallToolResult:
     """루틴 로컬 도구 여섯 — 실패는 ROUTINE_ERROR 한 줄로 낸다(까닭 그대로). 감사는 portal 로 한 줄."""
     t0 = time.monotonic()
@@ -6439,7 +6644,7 @@ def _local_tools() -> list[types.Tool]:
     목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
-             BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools()]
+             BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL]
     # REST 다리는 **등록된 사이트가 있을 때만** 낸다 — 쓸 수 없는 도구를 목록에 두면
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
@@ -7555,7 +7760,8 @@ async def _list_tools(req: types.ListToolsRequest):
 _LOCAL_READ = frozenset({SEARCH_CONV_TOOL.name, LIST_APPS_TOOL.name, SEARCH_TOOLS_TOOL.name, BROWSE_EXPERTS_TOOL.name,
                          USE_EXPERTS_TOOL.name, VERIFY_TOOL.name, REST_CATALOG_TOOL.name,
                          ROUTINE_LIST_TOOL.name, ROUTINE_GET_TOOL.name,   # 루틴 실행 · 원장 쓰기는 읽기 전용 PAT 밖
-                         *_INSIGHT_NAMES})                                 # 과제 인사이트는 읽기 둘뿐이다
+                         *_INSIGHT_NAMES,                                  # 과제 인사이트는 읽기 둘뿐이다
+                         KIT_GET_TOOL.name})                               # PC 키트 받기 — 파일을 내줄 뿐이다
 _ROUTINE_NAMES = frozenset(t.name for t in ROUTINE_TOOLS)
 
 
@@ -7655,6 +7861,8 @@ async def _call_tool_body(name: str, arguments: dict):
         return await _insight_dispatch(name, arguments or {})
     if FIG_STORE_ON and name in _FIG_NAMES:
         return await _fig_dispatch(name, arguments or {})
+    if name == KIT_GET_TOOL.name:
+        return await _kit_dispatch(arguments or {})
 
     if name == REST_CATALOG_TOOL.name:
         return await _rest_catalog(arguments or {})
@@ -8014,7 +8222,7 @@ def _bearer_gate(app, pat_verifier=None):
             # search_tools·invoke_tool 도 게이트웨이 로컬이다 — 빠뜨리면 /tools-map 의 _gateway
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
-                        VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools()):
+                        VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서
@@ -8196,6 +8404,10 @@ def _bearer_gate(app, pat_verifier=None):
         if FIG_STORE_ON and scope.get("path", "").startswith("/fig/"):
             # 그림 받기 — 주인의 PAT 또는 서명한 표로 스스로 인증한다(_fig_download). 끄면 이 길이 없다(지금처럼 아래 인증으로 간다).
             await _fig_download(scope, send, pat_verifier, expected)
+            return
+        if scope.get("path", "").startswith("/kit/"):
+            # PC 키트 받기 — 그 이름의 서명한 표 또는 MCP 청중 PAT 로 스스로 인증한다(_kit_download). 허용 목록 밖은 같은 404 다.
+            await _kit_download(scope, send, pat_verifier, expected)
             return
         if scope.get("path", "").startswith("/api/"):
             # REST 프록시: GW_TOKEN이 아니라 라우트 핸들러가 포털 PAT(JWKS)로 자체 인증.

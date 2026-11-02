@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import threading
 import time
 from array import array
 from collections import Counter, OrderedDict
@@ -36,7 +38,8 @@ from rest_proxy import (EXPIRED_BODY, JWKS_TIMEOUT_S, REST_PROXY_UPSTREAM_TIMEOU
 # HWAXPortal docs/request-1027 HG-02. 재프로비저닝 전 config 는 아직 쿼리 꼴이다), httpx 는 INFO 로 요청마다 주소를 통째로 찍었다 —
 # cae00 gateway.log 26,275줄(10-17 리뷰 G1), dev 는 이메일 쿼리도 실렸다.
 # 요청 줄은 WARNING 아래로 내리고, 다른 길(예외 문구 · 트레이스백)로 찍히는 주소도 형식기에서 가린다.
-_SECRET_QUERY = re.compile(r"(?i)([?&](?:token|access_token|api_key|apikey|key|secret|password|pat)=)[^&\s'\"<>]+")
+# `t` 는 그림 받기 표(GET /fig/<ref>?t=… — 1시간 자격)다. 퍼센트로 적은 이름(%74 — 서버는 t 로 읽는다)도 가린다.
+_SECRET_QUERY = re.compile(r"(?i)([?&](?:token|access_token|api_key|apikey|key|secret|password|pat|t|%74)=)[^&\s'\"<>]+")
 
 
 # 외부 연결 선언의 토큰 접두(HWAXPortal docs/ext-connect GW16) — 그 접두 뒤에 8자 이상이 붙고 숫자가 하나라도 든 문자열도 가린다. 선언을 받을
@@ -55,9 +58,19 @@ class _MaskSecretsFormatter(logging.Formatter):
         return _CONN_TOKEN_MASK.sub(_mask_conn_token, out) if _CONN_TOKEN_MASK is not None else out
 
 
+class _MaskAccessQuery(logging.Filter):
+    """uvicorn 접근 로그는 제 처리기로 찍어 위 형식기를 타지 않는다 — 요청 주소(인자)의 비밀 쿼리를 여기서 가린다. 그림 받기 표(?t=)가
+    gateway.log 에 그대로 남던 길이다(nginx 접근 로그는 쿼리 없는 $uri 라 남지 않는다)."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(_SECRET_QUERY.sub(r"\1***", a) if isinstance(a, str) else a for a in record.args)
+        return True
+
+
 _log_handler = logging.StreamHandler()
 _log_handler.setFormatter(_MaskSecretsFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
 logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
+logging.getLogger("uvicorn.access").addFilter(_MaskAccessQuery())     # uvicorn 의 로그 설정(dictConfig)은 거른이를 지우지 않는다
 for _noisy in ("httpx", "httpcore"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("hwax-mcp-gateway")
@@ -983,7 +996,19 @@ def _res_chars(res) -> int:
     return sum(len(getattr(c, "text", "") or "") for c in (getattr(res, "content", None) or []))
 
 
-def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=None, ip=None, via=None, res=None):
+def _res_images(res) -> tuple[int, int]:
+    """도구 결과의 그림 블록 수와 바이트(base64 를 풀지 않고 길이로 센다) — 감사 원장의 `images` · `image_bytes`. `chars` 는 글만 세서 그림만 든
+    결과가 `chars:0` 으로 남았다(그림 저장 — 사용자 보고 11-02)."""
+    n = size = 0
+    for c in getattr(res, "content", None) or []:
+        data = getattr(c, "data", None)
+        if getattr(c, "type", None) == "image" and isinstance(data, str):
+            n += 1
+            size += max(0, len(data) * 3 // 4 - data[-2:].count("="))
+    return n, size
+
+
+def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=None, ip=None, via=None, res=None, size=None):
     """호출 1건을 JSONL 감사 로그에 append (감사 실패가 호출을 막지 않게).
 
     ⚠ **`error` 는 실패에만 쓴다.** 종전에는 위임 신원(`as:someone@…`)과 메모(`cache-hit`·
@@ -1004,6 +1029,8 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
       uri    : 패널 PAT(via=mcp-app) 호출이면 그 패널의 ui:// 주소 — 요청에서 읽는다(_request_panel).
       chars  : 호출자에게 돌려준 도구 결과의 글자 수(`res` 를 준 자리만). 게이트웨이는 결과를 자르지 않는다 —
                이 칸이 '그때 얼마나 컸나' 를 남긴다.
+      images · image_bytes : 그 결과의 그림 블록 수와 바이트(`res` 를 준 자리에서 그림이 있을 때만 — 없으면 줄이 지금과 같다).
+      bytes  : 그림 받기(GET /fig/<ref>)가 보낸 바이트(`size` 를 준 자리만).
     `res` 를 준 자리에서 `isError` 는 아닌데 본문이 오류 봉투면 `ok` 를 false 로 고쳐 적고 사유를 `error` 에 싣는다
     (`_envelope_reason`, HG-06). 호출부의 `ok=not isError` 만으로는 점검기 · 사용 통계가 이 실패를 세지 못했다.
     corr·note·error 는 길이를 둔다(무기한 보존·한 호출 한 줄). 잘렸으면 원문 길이를 붙인다(`_clip`) — 실측으로 오류 1,423줄 중
@@ -1030,6 +1057,11 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
             rec["error"] = _clip(err, 200)
         if res is not None:
             rec["chars"] = _res_chars(res)
+            _imgs, _img_bytes = _res_images(res) if FIG_STORE_ON else (0, 0)      # 끄면 감사 줄도 지금과 같다
+            if _imgs:
+                rec["images"], rec["image_bytes"] = _imgs, _img_bytes
+        if size is not None:
+            rec["bytes"] = size
         purpose = _request_purpose()
         if purpose:
             rec["purpose"] = purpose
@@ -1371,6 +1403,9 @@ async def _aggregate():
             log.warning("alias collision %s: %s ← %s", _alias, alias_route[_alias], (key, t.name))
         alias_route[_alias] = (key, t.name)
         clash = name_counts[t.name] > 1 if key in _CONN_ACTIVE else base_counts[t.name] > 1
+        # 그림 도구(로컬)와 같은 이름의 백엔드 도구는 접두를 단다 — 맨 이름이면 tools/list 에 같은 이름이 둘이고 그 이름의 호출은 늘 로컬로 가서
+        # 백엔드 도구에 닿지 못했다(반대 검토 7). 그림 저장이 새로 맡은 이름만이다 — 다른 로컬 이름은 지금 그대로다.
+        clash = clash or (FIG_STORE_ON and t.name in _FIG_NAMES)
         if clash or key in family:
             prefix = key.replace("-", "")  # mx-white-paper -> mxwhitepaper
             exposed_name = f"{prefix}_{t.name}"
@@ -1845,6 +1880,9 @@ async def _backends_lifespan():
         _load_access_cache()
         await _refresh_access_policy()
         tg.start_soon(_access_policy_loop)
+        if FIG_STORE_ON:
+            _FIG_LIMITER["lim"] = anyio.CapacityLimiter(4)      # 그림 파일 일은 일꾼 넷까지 — 기본 풀(PAT 검증 등)을 다 잡지 않게
+            tg.start_soon(_fig_sweep_loop)        # 기동 때 한 번 디스크에서 그림 표를 짓고, 뒤로는 주기마다 끝난 것을 치운다
         try:
             yield
         finally:
@@ -3619,6 +3657,8 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     tun = tuning or _tuning()
     sw, wt = tun["switches"], tun["weights"]
     syn = tun["synonyms"] if sw["synonyms"] else {}
+    if not FIG_STORE_ON:
+        syn = _fig_unsyn(syn)              # 그림 저장을 끄면 그것이 더한 갈래도 없다(검색 순위가 지금과 같다)
     q_flat = re.sub(r"\s+", "", q)
     vocab = _core_vocab()
     # 코어 질문에서는 일반 업무 낱말 → deliberate_start 를 심의를 청할 때만 잇는다(R-5 — 조회 질문이 심의 시작으로 끌렸다).
@@ -5121,6 +5161,775 @@ async def _insight_dispatch(name: str, arguments: dict) -> types.CallToolResult:
         return types.CallToolResult(content=[types.TextContent(type="text", text=f"INSIGHT_ERROR: {exc}")], isError=True)
 
 
+# ── 그림 저장 — 도구 결과의 그림을 파일로 두고, 받고, 보고서에 넣는다(사용자 보고 11-02) ─────────────────────────────────────────────
+# StepForge · DynaForge 의 그림(ImageContent — base64)은 결과 안에만 있었다. 게이트웨이는 그 블록을 그대로 흘리고 아무것도 두지 않아 개인 Claude 가
+# 받은 그림을 파일로 꺼낼 길도, 인사이트로 쓰는 Report Archive 보고서에 넣을 길도 없었다(받는 경로 없음 · 루틴 원장은 글만 · 감사는 글자만 세 chars:0).
+#  · 성공한 백엔드 결과의 그림 블록마다 파일 하나와 곁 JSON(주인 · 도구 · 백엔드 · 형식 · 바이트 · sha256 · 만든 때 · 끝나는 때)을 둔다. 결과의 그림
+#    블록은 그대로 두고 짧은 글 블록 하나를 끝에 덧붙인다. 캐시 적중은 같은 ref 를 다시 쓴다 — (주인, 백엔드, 도구, sha256) 으로 찾는다(주인 안에서만).
+#  · ref 는 fig_ + 무작위 16바이트다. 내용 해시로 지으면 같은 바이트를 쥔 사람이 남의 파일을 찾는다. 주인(검증된 신원)이 없거나 패널 PAT 면 두지 않는다.
+#  · 받기 GET /fig/<ref>(nginx 는 /mcp-gw/fig/<ref> — 막는 넷 밖이라 nginx 고침이 없다) — 주인의 PAT(MCP 청중 · 패널 아님) 또는 서명한 표
+#    (?t=v1.<끝 시각>.<HMAC(ref · 주인 · 끝 시각)>, 1시간). 없는 것 · 끝난 것 · 남의 것은 같은 404 다. figure_get 이 표 붙은 바깥 주소와 curl 한 줄을 준다.
+#  · 보관 — 7일 · 사람당 1 GiB · 전체 20 GiB(넘으면 오래된 것부터) · 한 장 8 MiB(넘으면 두지 않고 글 블록이 말한다). 청소는 주기마다 디스크에서 다시 짓는다.
+#  · FIG_DIR 은 체크아웃 밖이다 — update-all · deploy-all 의 git stash -u 가 리포 안의 추적 안 된 파일을 쓸어 간다. 감사 원장이 사는 데이터 루트
+#    (GATEWAY_AUDIT, 또는 리포의 audit.jsonl 다리가 가리키는 /data/svc/mcp-gateway) 아래 figures 이고, 데이터 루트가 없는 박스(원장이 리포 안)면
+#    리포 옆 <리포>-figures 다. GATEWAY_FIG_DIR 이 덮는다(상대 경로는 리포 루트 기준).
+#  · 끄기 — GATEWAY_FIG_STORE=0. 끄면 결과 · 도구 목록 · 경로가 지금과 같다(그림 블록은 종전대로 그대로 흐른다).
+FIG_STORE_ON = os.environ.get("GATEWAY_FIG_STORE", "1").strip() != "0"
+
+
+def _fig_env_int(name: str, default: int, minimum: int) -> int:
+    """정수 손잡이 — 못 읽거나 하한 밑이면 따르지 않고 기본값으로 돈다(경고 한 줄). 0 을 '끔' 으로 읽어 청소가 쉬지 않고 돌거나 모든 그림이
+    곧바로 끝나는 꼴을 막는다."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        v = minimum - 1
+    if v < minimum:
+        log.warning("%s=%r 는 따르지 않는다(%d 이상의 정수) — 기본값 %d 로 돈다", name, raw, minimum, default)
+        return default
+    return v
+
+
+FIG_TTL_S = _fig_env_int("GATEWAY_FIG_TTL_S", 7 * 86400, 60)                     # 그림 하나의 보존(초)
+FIG_MAX_BYTES = _fig_env_int("GATEWAY_FIG_MAX_BYTES", 8 * 1024 * 1024, 1024)       # 한 장 상한 — 넘으면 두지 않는다
+# 사람당 · 전체 합은 디스크 몫으로 센다(_fig_disk — 파일마다 4 KiB 블록). 그림 바이트만 세던 때는 작은 그림 2만 장이 160 KB 로 셌다(반대 검토 9).
+FIG_OWNER_QUOTA = _fig_env_int("GATEWAY_FIG_OWNER_QUOTA", 1024 ** 3, 1024)         # 사람당 합 — 넘으면 그 사람의 오래된 것부터
+FIG_OWNER_MAX_COUNT = _fig_env_int("GATEWAY_FIG_OWNER_MAX_COUNT", 5000, 1)          # 사람당 장 수 — 넘으면 그 사람의 오래된 것부터
+FIG_TOTAL_CAP = _fig_env_int("GATEWAY_FIG_TOTAL_CAP", 20 * 1024 ** 3, 1024)        # 전체 합 — 넘으면 모두의 오래된 것부터
+FIG_TICKET_TTL_S = _fig_env_int("GATEWAY_FIG_TICKET_TTL_S", 3600, 60)              # 받기 표의 수명(그림이 먼저 끝나면 그때까지)
+FIG_SWEEP_S = _fig_env_int("GATEWAY_FIG_SWEEP_S", 3600, 30)                        # 청소 주기 — 상한은 쓸 때마다 지키고 청소는 끝난 것을 치운다
+FIG_PUBLIC_PREFIX = "/mcp-gw"          # nginx 가 게이트웨이를 내는 자리(HWAXPortal infra/nginx — /mcp-gw/ 를 떼고 넘긴다)
+
+
+def _fig_dir_default() -> Path:
+    """감사 원장이 사는 데이터 루트의 figures — 원장이 리포 안이면(데이터 루트 없는 박스) 리포 옆 <리포>-figures."""
+    repo = Path(__file__).resolve().parent
+    root = Path(AUDIT_PATH).expanduser().resolve().parent
+    if root == repo or repo in root.parents:
+        return repo.with_name(repo.name + "-figures")
+    return root / "figures"
+
+
+def _fig_dir_setting() -> Path:
+    raw = (os.environ.get("GATEWAY_FIG_DIR") or "").strip()
+    if not raw:
+        return _fig_dir_default()
+    p = Path(raw).expanduser()
+    return p if p.is_absolute() else Path(__file__).resolve().parent / p
+
+
+FIG_DIR = _fig_dir_setting()
+_FIG_REF_RE = re.compile(r"fig_[A-Za-z0-9_-]{22}")
+# 형식 → 확장자. 형식은 바이트로 가린다(_fig_sniff) — 백엔드가 단 mimeType 은 믿지 않는다. 이 밖의 형식은 두지 않는다.
+_FIG_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp", "image/svg+xml": "svg"}
+# 청소가 지워도 되는 이름 — 이 꼴만 지운다(GATEWAY_FIG_DIR 를 남과 같이 쓰는 폴더로 잡아도 남의 파일은 건드리지 않는다).
+_FIG_FILE_RE = re.compile(r"(fig_[A-Za-z0-9_-]{22})\.(?:png|jpg|gif|webp|svg|json)(?:\.part)?")
+_FIG_HOST_RE = re.compile(r"(?:[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?")
+# 쓰기 · 표 바꿔 끼우기 · 상한은 한 잠금 안에서 — 파일 일은 일꾼 스레드에서 돈다(이벤트 루프에서는 이 잠금을 잡지 않는다).
+_FIG_LOCK = threading.Lock()
+# ref → 곁 JSON + created_ts · expires_ts — 청소가 디스크에서 다시 짓는다. 상한 셈 · figure_list · 같은 그림 찾기가 쓴다.
+_FIG_META: dict[str, dict] = {}
+_FIG_KEY: dict[tuple, str] = {}        # (주인, 백엔드, 도구, sha256) → ref — 캐시 적중 · 같은 결과가 같은 ref 를 쓴다
+_FIG_USAGE: dict[str, int] = {}        # 주인 → 디스크 몫 합(_fig_disk)
+_FIG_COUNT: dict[str, int] = {}        # 주인 → 장 수
+_FIG_TOTAL = {"bytes": 0}              # 디스크 몫 합
+# 청소가 잠금 밖에서 디스크를 읽는 동안 들고 난 ref — 잠금 안에서 표를 바꿔 끼울 때 이것으로 맞춘다. 잠금을 쥔 채 곁 JSON 을 다 읽던 때는 그림 10만
+# 장에서 1.6초 동안 그림 든 결과가 모두 멈췄다(반대 검토 1).
+_FIG_SWEEP: dict = {"on": False, "added": set(), "dropped": set()}
+# 그림 파일 일의 일꾼 수 — 기본 일꾼 풀(PAT 검증 등이 같이 쓴다)을 그림 결과가 다 잡지 않게 따로 둔다. 기동(lifespan)이 만든다 — 없으면(시험) 기본 풀.
+_FIG_LIMITER: dict = {"lim": None}
+_FIG_SKIP_TEXT = {"big": "한 장 상한({cap})을 넘음", "kind": "형식을 모름(png · jpeg · gif · webp · svg 만)", "bad": "base64 를 못 읽음",
+                  "quota": "사람당 · 전체 상한보다 큼", "disk": "디스크에 쓰지 못함"}
+
+
+def _fig_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 ** 2:
+        return f"{round(n / 1024)} KB"
+    if n < 1024 ** 3:
+        return f"{round(n / 1024 ** 2, 1):g} MB"
+    return f"{round(n / 1024 ** 3, 1):g} GB"
+
+
+def _fig_disk(n: int) -> int:
+    """그림 하나의 디스크 몫 — 그림 파일을 4 KiB 블록으로 올려 세고 곁 JSON 한 블록을 더한다."""
+    return -(-n // 4096) * 4096 + 4096
+
+
+def _fig_thread(fn, *args):
+    """그림 파일 일을 일꾼 스레드로 — 그림 전용 일꾼 수(_FIG_LIMITER) 안에서."""
+    return anyio.to_thread.run_sync(fn, *args, limiter=_FIG_LIMITER["lim"])
+
+
+def _fig_sniff(raw: bytes) -> str | None:
+    """바이트로 형식을 가린다 — 모르면 None(두지 않는다)."""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    head = raw[:4096].lstrip(b"\xef\xbb\xbf \t\r\n")
+    if head.startswith(b"<svg") or (head.startswith((b"<?xml", b"<!--", b"<!DOCTYPE")) and b"<svg" in head):
+        return "image/svg+xml"
+    return None
+
+
+def _fig_ts(iso: str) -> float:
+    return datetime.fromisoformat(str(iso)).timestamp()
+
+
+def _fig_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds")
+
+
+def _fig_files(ref: str) -> list[Path]:
+    """ref 의 파일 — 그림(확장자 표의 것)과 곁 JSON."""
+    return [FIG_DIR / f"{ref}.{e}" for e in sorted(set(_FIG_EXT.values()))] + [FIG_DIR / f"{ref}.json"]
+
+
+def _fig_write(path: Path, blob: bytes) -> None:
+    """임시 이름에 0600 으로 쓰고 바꿔 끼운다 — 곁 JSON 이 있으면 그림은 다 쓴 것이다."""
+    tmp = path.with_name(path.name + ".part")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(blob)
+    os.replace(tmp, path)
+
+
+def _fig_open(path: Path):
+    """그림 파일을 읽기로 연다 — 심볼릭 링크는 따라가지 않는다(폴더에 누가 링크를 심어도 다른 파일을 내지 않는다). 폴더면 fdopen 이 던지면서
+    fd 를 닫지 않는다(실측) — 여기서 닫는다(청소가 곁 JSON 이름의 폴더를 만날 때마다 fd 가 새지 않게)."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _fig_read_image(path: Path) -> bytes:
+    with _fig_open(path) as f:
+        return f.read()
+
+
+def _fig_add(ref: str, meta: dict) -> None:
+    """표에 넣는다(잠금 안에서)."""
+    owner, disk = meta["owner"], _fig_disk(meta["bytes"])
+    _FIG_META[ref] = meta
+    _FIG_KEY[(owner, meta["backend"], meta["tool"], meta["sha256"])] = ref
+    _FIG_USAGE[owner] = _FIG_USAGE.get(owner, 0) + disk
+    _FIG_COUNT[owner] = _FIG_COUNT.get(owner, 0) + 1
+    _FIG_TOTAL["bytes"] += disk
+    if _FIG_SWEEP["on"]:
+        _FIG_SWEEP["added"].add(ref)
+
+
+def _fig_forget(ref: str) -> None:
+    """표에서만 뺀다(잠금 안에서) — 파일은 그대로다."""
+    meta = _FIG_META.pop(ref, None)
+    if meta is None:
+        return
+    owner, disk = meta["owner"], _fig_disk(meta["bytes"])
+    k = (owner, meta["backend"], meta["tool"], meta["sha256"])
+    if _FIG_KEY.get(k) == ref:
+        del _FIG_KEY[k]
+    for table, by in ((_FIG_USAGE, disk), (_FIG_COUNT, 1)):
+        left = table.get(owner, 0) - by
+        if left > 0:
+            table[owner] = left
+        else:
+            table.pop(owner, None)
+    _FIG_TOTAL["bytes"] = max(0, _FIG_TOTAL["bytes"] - disk)
+    if _FIG_SWEEP["on"]:
+        _FIG_SWEEP["dropped"].add(ref)
+
+
+def _fig_unlink(ref: str) -> None:
+    """ref 의 파일을 지운다 — 없으면 넘어가고, 못 지우면(폴더 · 권한) 한 줄 남기고 넘어간다(파일 하나가 청소 전체를 멈추지 않게, 반대 검토 5)."""
+    for p in _fig_files(ref):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("그림 파일을 지우지 못했다(%s): %r", p.name, exc)
+
+
+def _fig_drop(ref: str) -> None:
+    """표에서 빼고 파일을 지운다(잠금 안에서)."""
+    _fig_forget(ref)
+    _fig_unlink(ref)
+
+
+def _fig_over(owner: str) -> bool:
+    return _FIG_USAGE.get(owner, 0) > FIG_OWNER_QUOTA or _FIG_COUNT.get(owner, 0) > FIG_OWNER_MAX_COUNT
+
+
+def _fig_enforce(keep=frozenset()) -> int:
+    """사람당 상한(디스크 몫 · 장 수)을 먼저, 그다음 전체 상한 — 넘친 만큼 오래된 것부터 지운다(keep — 이번 결과에 둔 그림 — 은 빼고). 잠금 안에서
+    부른다. '그 사람이 넘었거나 전체가 넘었으면' 한 번에 지우던 때는 상한 안의 남의 그림까지 지웠다(반대 검토 2)."""
+    over = {o for o in _FIG_USAGE if _fig_over(o)}
+    if not over and _FIG_TOTAL["bytes"] <= FIG_TOTAL_CAP:
+        return 0
+    order = sorted(_FIG_META, key=lambda r: (_FIG_META[r]["created_ts"], r))
+    n = 0
+    for ref in order:
+        m = _FIG_META.get(ref)
+        if m is not None and ref not in keep and m["owner"] in over and _fig_over(m["owner"]):
+            _fig_drop(ref)
+            n += 1
+    for ref in order:
+        if _FIG_TOTAL["bytes"] <= FIG_TOTAL_CAP:
+            break
+        if ref in _FIG_META and ref not in keep:
+            _fig_drop(ref)
+            n += 1
+    return n
+
+
+def _fig_reuse(owner: str, backend: str, tool: str, sha: str, now: float) -> str | None:
+    """같은 사람 · 백엔드 · 도구 · 바이트로 둔 그림이 살아 있으면 그 ref(잠금 안에서). 한 시간 넘게 지난 것은 만든 때 · 끝나는 때를 새로 적는다 —
+    다시 받은 결과의 ref 가 옛 기한으로 곧 끝나지 않게(반대 검토 3). 새로 적지 못하면 None(새로 둔다)."""
+    ref = _FIG_KEY.get((owner, backend, tool, sha))
+    m = _FIG_META.get(ref) if ref else None
+    if m is None or m["expires_ts"] <= now or not (FIG_DIR / f"{ref}.json").is_file():
+        return None
+    if m["expires_ts"] - now < FIG_TTL_S - 3600:
+        side = {k: m[k] for k in ("owner", "tool", "backend", "mime", "bytes", "sha256")}
+        side.update(created=_fig_iso(now), expires=_fig_iso(now + FIG_TTL_S))
+        try:
+            _fig_write(FIG_DIR / f"{ref}.json", json.dumps(side, ensure_ascii=False).encode("utf-8"))
+        except OSError as exc:
+            log.warning("그림 기한을 새로 적지 못했다(%s) — 새로 둔다: %r", ref, exc)
+            return None
+        _fig_forget(ref)
+        _fig_add(ref, {**side, "created_ts": now, "expires_ts": now + FIG_TTL_S})
+    return ref
+
+
+def _fig_put(owner: str, backend: str, tool: str, mime: str, raw: bytes, sha: str, now: float) -> str | None:
+    """새 ref 로 그림 파일과 곁 JSON 을 쓰고 표에 넣는다(잠금 안에서). 쓰지 못하면 남은 조각을 지우고 None."""
+    ref = "fig_" + secrets.token_urlsafe(16)
+    side = {"owner": owner, "tool": tool, "backend": backend, "mime": mime, "bytes": len(raw), "sha256": sha,
+            "created": _fig_iso(now), "expires": _fig_iso(now + FIG_TTL_S)}
+    try:
+        FIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _fig_write(FIG_DIR / f"{ref}.{_FIG_EXT[mime]}", raw)
+        _fig_write(FIG_DIR / f"{ref}.json", json.dumps(side, ensure_ascii=False).encode("utf-8"))
+    except OSError as exc:
+        log.warning("그림을 디스크에 쓰지 못했다(%s) — 결과는 그대로 준다: %r", FIG_DIR, exc)
+        for p in _fig_files(ref):
+            for q in (p, p.with_name(p.name + ".part")):
+                try:
+                    q.unlink()
+                except OSError:
+                    pass
+        return None
+    _fig_add(ref, {**side, "created_ts": now, "expires_ts": now + FIG_TTL_S})
+    return ref
+
+
+def _fig_store_sync(owner: str, backend: str, tool: str, datas: list[str], now: float | None = None) -> list[tuple]:
+    """그림 블록(base64)마다 (ref, 형식, 바이트) 또는 (None, 못 둔 까닭, 바이트). 일꾼 스레드에서 돈다. 이번 결과에 둔 그림(batch)은 상한이 지우지
+    않는다 — 지우면 글 블록이 지운 ref 를 '저장' 으로 말한다(반대 검토 2). 그래서 결과 하나가 사람당 · 전체 상한을 넘기는 그림은 두지 않는다."""
+    now = time.time() if now is None else now
+    out: list[tuple] = []
+    batch: set[str] = set()
+    batch_disk = 0
+    for data in datas:
+        if len(data) * 3 // 4 > FIG_MAX_BYTES + 2:          # 풀기 전에 — 큰 것을 메모리에 한 벌 더 만들지 않는다
+            out.append((None, "big", len(data) * 3 // 4))
+            continue
+        try:
+            raw = base64.b64decode(data)
+        except ValueError:
+            out.append((None, "bad", 0))
+            continue
+        mime = _fig_sniff(raw)
+        disk = _fig_disk(len(raw))
+        why = ("big" if len(raw) > FIG_MAX_BYTES else "kind" if mime is None
+               else "quota" if (batch_disk + disk > min(FIG_OWNER_QUOTA, FIG_TOTAL_CAP) or len(batch) + 1 > FIG_OWNER_MAX_COUNT) else "")
+        if why:
+            out.append((None, why, len(raw)))
+            continue
+        sha = hashlib.sha256(raw).hexdigest()
+        with _FIG_LOCK:
+            # 캐시 적중 · 같은 결과 — 두 벌 두지 않고 같은 ref
+            ref = _fig_reuse(owner, backend, tool, sha, now) or _fig_put(owner, backend, tool, mime, raw, sha, now)
+            if ref is not None:
+                batch.add(ref)
+                batch_disk += disk
+                _fig_enforce(keep=batch)
+        out.append((ref, mime, len(raw)) if ref is not None else (None, "disk", len(raw)))
+    return out
+
+
+def _fig_meta_from(blob) -> dict | None:
+    """곁 JSON(글 · 바이트) → 정보(+created_ts · expires_ts). JSON · 칸이 어긋나면 None."""
+    try:
+        m = json.loads(blob)
+        meta = {"owner": str(m["owner"]), "tool": str(m["tool"]), "backend": str(m["backend"]), "mime": str(m["mime"]),
+                "bytes": int(m["bytes"]), "sha256": str(m["sha256"]), "created": str(m["created"]), "expires": str(m["expires"])}
+        meta["created_ts"], meta["expires_ts"] = _fig_ts(meta["created"]), _fig_ts(meta["expires"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    if meta["mime"] not in _FIG_EXT or not meta["owner"] or meta["bytes"] < 0:
+        return None
+    return meta
+
+
+def _fig_read_meta(ref: str) -> dict | None:
+    """디스크의 곁 JSON — ref 꼴이 틀리거나 · 없거나 · 못 읽거나 · 칸이 어긋나면 None. 표가 아니라 디스크가 정본이다(받기 · figure_get 의 주인 판정)."""
+    if not isinstance(ref, str) or not _FIG_REF_RE.fullmatch(ref):
+        return None
+    try:
+        with _fig_open(FIG_DIR / f"{ref}.json") as f:
+            blob = f.read()
+    except OSError:
+        return None
+    return _fig_meta_from(blob)
+
+
+def _fig_load(ref: str, now: float | None = None) -> dict | None:
+    """받을 수 있는 그림 — 곁 JSON 이 맞고 끝나지 않았고 그림 파일이 있으면 그 정보(+path), 아니면 None."""
+    meta = _fig_read_meta(ref)
+    if meta is None or meta["expires_ts"] <= (time.time() if now is None else now):
+        return None
+    path = FIG_DIR / f"{ref}.{_FIG_EXT[meta['mime']]}"
+    if not path.is_file():
+        return None
+    return {**meta, "ref": ref, "path": path}
+
+
+def _fig_sweep_sync(now: float | None = None) -> dict:
+    """청소 — 디스크에서 표를 다시 짓는다. 곁 JSON 은 잠금 밖에서 읽고(그동안 든 것 · 난 것은 _FIG_SWEEP 이 적는다) 잠금 안에서는 표만 바꿔 끼운다.
+    끝난 것 · 곁 JSON 이 깨진 것(JSON · 칸이 틀림) · 곁 JSON 없는 그림과 남은 .part(한 시간 넘은 것)를 지우고 상한을 다시 지킨다. 곁 JSON 을 못 읽은
+    것(권한 · I/O)은 지우지도 세지도 않는다 — 일시 오류가 그림을 지우지 않게(반대 검토 5). 기동 때 한 번(표를 채운다), 뒤로는 FIG_SWEEP_S 마다."""
+    now = time.time() if now is None else now
+    gone = {"expired": 0, "broken": 0, "orphans": 0, "unreadable": 0}
+    with _FIG_LOCK:
+        _FIG_SWEEP.update(on=True, added=set(), dropped=set())
+    try:
+        try:
+            entries = list(os.scandir(FIG_DIR))
+        except FileNotFoundError:
+            entries = []
+        live: dict[str, dict] = {}
+        dead: list[str] = []
+        held: set[str] = set()
+        for e in entries:
+            if not e.name.endswith(".json") or not _FIG_REF_RE.fullmatch(e.name[:-5]):
+                continue
+            ref = e.name[:-5]
+            try:
+                with _fig_open(Path(e.path)) as f:
+                    blob = f.read()
+            except FileNotFoundError:
+                continue                                     # 읽는 사이 지워졌다
+            except OSError:
+                held.add(ref)
+                gone["unreadable"] += 1
+                continue
+            meta = _fig_meta_from(blob)
+            if meta is None or not (FIG_DIR / f"{ref}.{_FIG_EXT[meta['mime']]}").is_file():
+                dead.append(ref)
+                gone["broken"] += 1
+            elif meta["expires_ts"] <= now:
+                dead.append(ref)
+                gone["expired"] += 1
+            else:
+                live[ref] = meta
+        with _FIG_LOCK:
+            added, dropped = _FIG_SWEEP["added"], _FIG_SWEEP["dropped"]
+            _FIG_SWEEP.update(on=False, added=set(), dropped=set())
+            carry = {r: _FIG_META[r] for r in added if r in _FIG_META}       # 읽는 동안 새로 둔(또는 기한을 새로 적은) 것
+            _FIG_META.clear()
+            _FIG_KEY.clear()
+            _FIG_USAGE.clear()
+            _FIG_COUNT.clear()
+            _FIG_TOTAL["bytes"] = 0
+            for r, m in live.items():
+                if r not in dropped and r not in carry:                          # 읽는 동안 상한이 지운 것은 다시 넣지 않는다
+                    _fig_add(r, m)
+            for r, m in carry.items():
+                _fig_add(r, m)
+            evicted = _fig_enforce()
+            known = set(_FIG_META)
+        for ref in dead:
+            if ref not in known:
+                _fig_unlink(ref)
+        for e in entries:
+            m = _FIG_FILE_RE.fullmatch(e.name)
+            if not m or e.name.endswith(".json") or m.group(1) in known or m.group(1) in held or m.group(1) in live:
+                continue
+            try:
+                if now - e.stat(follow_symlinks=False).st_mtime > 3600 and (e.is_symlink() or e.is_file()):
+                    os.unlink(e.path)
+                    gone["orphans"] += 1
+            except OSError:
+                pass
+    finally:
+        with _FIG_LOCK:
+            if _FIG_SWEEP["on"]:
+                _FIG_SWEEP.update(on=False, added=set(), dropped=set())
+    return {**gone, "evicted": evicted, "kept": len(known), "bytes": _FIG_TOTAL["bytes"]}
+
+
+async def _fig_sweep_loop() -> None:
+    """기동 때 한 번(표를 채운다), 뒤로는 FIG_SWEEP_S 마다 — 한 번의 실패가 루프를 죽이지 않는다."""
+    while True:
+        try:
+            got = await _fig_thread(_fig_sweep_sync)
+            if got["expired"] or got["evicted"] or got["broken"] or got["orphans"] or got["unreadable"]:
+                log.info("그림 청소 — 끝남 %d · 상한 %d · 깨짐 %d · 떠돌이 %d 지움, 못 읽음 %d(그대로 둔다), 남은 %d개 %s", got["expired"],
+                         got["evicted"], got["broken"], got["orphans"], got["unreadable"], got["kept"], _fig_size(got["bytes"]))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("그림 청소 실패: %r", exc)
+        await anyio.sleep(FIG_SWEEP_S)
+
+
+def _fig_note(outcomes: list[tuple]) -> str:
+    """결과 끝에 덧붙이는 글 블록 하나 — 둔 ref · 받는 도구 · 넣는 도구, 못 둔 것은 까닭과 장 수."""
+    kept = [f"{ref} ({mime.split('/')[1].split('+')[0]} · {_fig_size(n)})" for ref, mime, n in outcomes if ref]
+    why = Counter(w for ref, w, _n in outcomes if not ref)
+    skip = " · ".join(f"{_FIG_SKIP_TEXT[w].format(cap=_fig_size(FIG_MAX_BYTES))} {k}장" for w, k in why.items())
+    if not kept:
+        return f"그림 저장 못 함 — {skip}"
+    return ("그림 저장 — " + ", ".join(kept) + " · 파일로 받기 figure_get · 보고서에 넣기 figure_to_report"
+            + (f" · 못 둔 그림 — {skip}" if skip else ""))
+
+
+async def _fig_keep(backend: str, original: str, res):
+    """성공한 백엔드 결과의 그림을 두고 글 블록 하나를 덧붙인 **사본**을 돌려준다 — 끔 · 그림 없음 · 실패 · 주인 없음 · 패널 PAT 면 그 결과 그대로다.
+    캐시에는 덧붙이기 전 결과가 담긴다(호출부가 _cache_put 바깥에서 부른다) — 적중은 (주인, 백엔드, 도구, sha256) 으로 같은 ref 를 찾는다.
+    ⚠ 던지지 않는다 — 호출부가 백엔드 호출과 같은 try 안이라, 여기서 던지면 재연결 분기가 도구를 한 번 더 부른다."""
+    if not FIG_STORE_ON or res is None:
+        return res
+    try:
+        datas = [c.data for c in (getattr(res, "content", None) or [])
+                 if getattr(c, "type", None) == "image" and isinstance(getattr(c, "data", None), str)]
+        # 실패 결과는 두지 않고 손대지 않는다 — 봉투 판정(_envelope_reason)은 structuredContent 의 오류도 본다. 그림만 든 결과에 글 블록을 덧붙이면
+        # 그 글이 '첫 글 블록' 이 되어 루틴 원장이 그 실패를 ok 로 적었다(반대 검토 8).
+        if not datas or getattr(res, "isError", False) or _looks_failed(res) or _envelope_reason(res):
+            return res
+        owner = _request_user()
+        if not owner or _request_panel() is not None:
+            return res
+        outcomes = await _fig_thread(_fig_store_sync, owner, backend, original, datas)
+        return res.model_copy(update={"content": [*res.content, types.TextContent(type="text", text=_fig_note(outcomes))]})
+    except Exception as exc:  # noqa: BLE001 — 그림 저장이 도구 결과를 막으면 안 된다
+        log.warning("그림 저장 실패(%s · %s) — 결과는 그대로 준다: %r", backend, original, exc)
+        return res
+
+
+def _fig_ticket_key() -> bytes:
+    """받기 표의 열쇠 — 게이트웨이 공유 비밀에서 용도를 붙여 뽑는다(같은 비밀을 다른 서명에 그대로 쓰지 않는다). 비밀이 비면 표를 쓰지 않는다."""
+    return hmac.new(str(GW_TOKEN).encode("utf-8"), b"hwax-mcp-gateway/figure-ticket/v1", hashlib.sha256).digest()
+
+
+def _fig_ticket(ref: str, owner: str, exp: int) -> str:
+    """`v1.<끝 시각>.<HMAC-SHA256 hex>` — 서명 대상은 `v1|ref|주인|끝 시각`. 주인은 주소에 싣지 않고 받을 때 곁 JSON 의 주인으로 다시 잰다."""
+    sig = hmac.new(_fig_ticket_key(), f"v1|{ref}|{owner}|{exp}".encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"v1.{exp}.{sig}"
+
+
+def _fig_ticket_ok(ticket: str, ref: str, owner: str, now: float | None = None) -> bool:
+    # ASCII 숫자만 — `\d` 는 유니코드 숫자(٩)도 받아 compare_digest 가 TypeError 를 던졌다(있는 ref 만 500 — 무인증 존재 신호, 반대 검토 4)
+    m = re.fullmatch(r"v1\.([0-9]{1,12})\.([0-9a-f]{64})", ticket or "")
+    if not m or not GW_TOKEN or int(m.group(1)) <= (time.time() if now is None else now):
+        return False
+    return hmac.compare_digest(_fig_ticket(ref, owner, int(m.group(1))), ticket)
+
+
+def _fig_public_base() -> str | None:
+    """이 호출자의 PC 가 게이트웨이에 닿는 주소의 앞부분 — nginx 를 거쳤으면 그 머리(X-Forwarded-Host · Proto) + /mcp-gw, 사람 PAT 로 게이트웨이에
+    바로 붙었으면 그 Host. 박스 안 서비스(웹 챗 · 심의 · 절차 — 사람 PC 가 아니다)가 부른 것이면 None — 안쪽 주소를 사람에게 내주지 않는다."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return None
+    if req is None:
+        return None
+    h = req.headers
+    fwd = (h.get("x-forwarded-host") or "").split(",")[0].strip()
+    if fwd:
+        if not _FIG_HOST_RE.fullmatch(fwd):
+            return None
+        proto = (h.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+        return f"{proto if proto in ('http', 'https') else 'https'}://{fwd}{FIG_PUBLIC_PREFIX}"
+    host = (h.get("host") or "").strip()
+    if _request_via() != "pat" or not _FIG_HOST_RE.fullmatch(host):
+        return None
+    scheme = str(getattr(getattr(req, "url", None), "scheme", "") or "http")
+    return f"{scheme if scheme in ('http', 'https') else 'http'}://{host}"
+
+
+def _fig_filename(meta: dict, ref: str) -> str:
+    tool = re.sub(r"[^A-Za-z0-9._-]+", "_", meta.get("tool") or "").strip("._-")[:60] or "figure"
+    return f"{tool}-{ref}.{_FIG_EXT[meta['mime']]}"
+
+
+_FIG_REF_ARG = {"type": "string", "maxLength": 26, "description": "그림 ref — 도구 결과 끝 '그림 저장 —' 줄 또는 figure_list 의 fig_…(26자)"}
+FIG_GET_TOOL = types.Tool(
+    name="figure_get",
+    description=("저장된 그림(이미지) 하나를 파일로 받기 — 도구 결과의 그림을 게이트웨이가 fig_… 로 7일 둔다. 형식 · 바이트 · sha256 · 끝나는 때와 "
+                 "내 PC 로 받는 주소(url — 1시간) · curl 한 줄을 준다. 내 그림만 보인다."),
+    inputSchema={"type": "object", "properties": {"ref": _FIG_REF_ARG}, "required": ["ref"]},
+    annotations=types.ToolAnnotations(readOnlyHint=True))
+FIG_LIST_TOOL = types.Tool(
+    name="figure_list",
+    description="내 최근 그림(이미지) 목록 — 새것부터 ref · 도구 · 형식 · 바이트 · 만든 때. 받는 주소는 figure_get 이 준다.",
+    inputSchema={"type": "object", "properties": {
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "최대 행 수(1 ~ 100, 기본 20)"}}, "required": []},
+    annotations=types.ToolAnnotations(readOnlyHint=True))
+# 보고서 그림 설명 상한 — Report Archive image 위젯 caption 과 같다(포털 report_figures 는 넘으면 말없이 줄인다 — 여기서 먼저 말한다).
+FIG_CAPTION_MAX = 500
+FIG_REPORT_TOOL = types.Tool(
+    name="figure_to_report",
+    description=("저장된 그림(fig_…)을 Report Archive 보고서에 넣는다 — 포털이 그 사람 이름으로 넣는다(내 그림 · 내가 고칠 수 있는 보고서만). "
+                 "보고서에 그림을 붙일 때 쓴다. png · jpeg · gif · webp 만 들어간다(svg 는 포털이 받지 않는다 — 도구를 png 로 다시 부른다). "
+                 "답은 포털의 것(ok · report_id · file_id · page …)이다."),
+    inputSchema={"type": "object", "properties": {
+        "ref": _FIG_REF_ARG,
+        "report_id": {"type": "string", "maxLength": 200, "description": "넣을 Report Archive 보고서 id(숫자)"},
+        "caption": {"type": "string", "maxLength": FIG_CAPTION_MAX, "description": f"그림 설명({FIG_CAPTION_MAX}자까지, 비우면 없음)"},
+        "page": {"type": "integer", "minimum": 1, "description": "넣을 쪽(1부터, 비우면 포털이 정한 자리)"}},
+        "required": ["ref", "report_id"]},
+    annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False))
+FIGURE_TOOLS = (FIG_GET_TOOL, FIG_LIST_TOOL, FIG_REPORT_TOOL)
+_FIG_NAMES = frozenset(t.name for t in FIGURE_TOOLS)
+_FIG_READ_NAMES = frozenset((FIG_GET_TOOL.name, FIG_LIST_TOOL.name))
+
+
+def _fig_tools() -> tuple:
+    """도구 목록에 싣는 그림 도구 — 끄면 없다(지금과 같은 목록)."""
+    return FIGURE_TOOLS if FIG_STORE_ON else ()
+
+
+# search_tools 손 동의어 가운데 그림 저장이 더한 갈래(search_tuning.json 의 '그림' · '이미지' 와 맞춘다) — 끄면 뺀다. 두면 끈 박스에서 '그림' ·
+# '이미지' 질의가 이름에 figure · image 가 든 백엔드 도구를 새로 올려 순위가 지금과 달랐다(반대 검토 6).
+_FIG_SYN = {"그림": ("figure",), "이미지": ("figure", "image")}
+
+
+def _fig_unsyn(syn: dict) -> dict:
+    """그림 저장을 끈 박스의 손 동의어 — 위 갈래를 뺀다(갈래가 다 빠지면 낱말째)."""
+    out = dict(syn)
+    for k, gone in _FIG_SYN.items():
+        if k in out:
+            left = tuple(v for v in out[k] if v not in gone)
+            if left:
+                out[k] = left
+            else:
+                out.pop(k)
+    return out
+
+
+def _fig_line() -> str:
+    """기동 로그 한 줄 — 켰는지 · 어디에 · 상한. 끈 것도 남긴다(안 켠 기능도 로그에). 폴더가 체크아웃 안이면 함께 경고한다."""
+    if not FIG_STORE_ON:
+        return "그림 저장 끔(GATEWAY_FIG_STORE=0) — 도구 결과의 그림은 종전대로 결과 안으로만 흐른다. 켜려면 그 값을 빼고 재기동"
+    repo = Path(__file__).resolve().parent
+    inside = FIG_DIR.resolve() == repo or repo in FIG_DIR.resolve().parents
+    return (f"그림 저장 켬 — {FIG_DIR} · 보존 {FIG_TTL_S / 86400:g}일 · 한 장 {_fig_size(FIG_MAX_BYTES)} · 사람당 {_fig_size(FIG_OWNER_QUOTA)} · "
+            f"{FIG_OWNER_MAX_COUNT}장 · 전체 {_fig_size(FIG_TOTAL_CAP)}(디스크 몫) · 받기 표 {FIG_TICKET_TTL_S}초 · 청소 {FIG_SWEEP_S}초"
+            + (" · ⚠ 체크아웃 안이다 — git stash -u 가 쓸어 갈 수 있다(GATEWAY_FIG_DIR 를 리포 밖으로)" if inside else "")
+            + ("" if GW_TOKEN else " · ⚠ 게이트웨이 공유 비밀이 비어 받기 표를 내지 않는다(PAT 로만 받는다)"))
+
+
+class _FigError(Exception):
+    """그림 도구가 호출자에게 그대로 말할 까닭."""
+
+
+def _fig_mine(owner: str) -> list[tuple[str, dict]]:
+    """그 사람의 살아 있는 그림(ref, 정보) — 일꾼 스레드에서 잠금을 잡는다(이벤트 루프에서 잡으면 긴 청소가 게이트웨이를 멈춘다)."""
+    now = time.time()
+    with _FIG_LOCK:
+        return [(r, dict(m)) for r, m in _FIG_META.items() if m["owner"] == owner and m["expires_ts"] > now]
+
+
+_FIG_MISSING = "그런 그림이 없다 — 없거나 · 보존 기간이 지났거나 · 내 것이 아니다(figure_list 로 내 그림을 본다)"
+
+
+async def _fig_report(meta: dict, ref: str, a: dict) -> dict:
+    """포털 POST /agent/figures/to-report 에 multipart(meta JSON · file)로 — 호출자 PAT 를 그대로 넘긴다(대화 저장과 같은 자세 — 포털이 다시
+    검증하고 그 사람이 고칠 수 있는 보고서인지 본다). 게이트웨이 공유 비밀 · 신원 없는 호출은 넘기지 않는다(포털이 사람으로 받지 못한다)."""
+    report_id = str(a.get("report_id") or "").strip()
+    if not report_id or len(report_id) > 200:
+        raise _FigError("report_id 를 준다(200자까지) — 넣을 Report Archive 보고서 id")
+    caption = a.get("caption")
+    caption = "" if caption is None else str(caption)
+    if len(caption) > FIG_CAPTION_MAX:
+        raise _FigError(f"caption 은 {FIG_CAPTION_MAX}자까지다(Report Archive 그림 설명 상한 — 포털은 넘으면 말없이 줄인다)")
+    page = a.get("page")
+    if page is not None and (isinstance(page, bool) or not isinstance(page, int) or page < 1):
+        raise _FigError("page 는 1 이상의 정수다(비우면 포털이 정한 자리)")
+    base = _portal_api_base()
+    if not base:
+        raise _FigError("포털 주소가 없다(gateway_config.json portal.api_base)")
+    auth = _caller_bearer()
+    if not auth:
+        raise _FigError("보고서에 넣기는 사람 PAT 로만 된다 — 포털이 그 사람 이름으로 넣는다(게이트웨이 공유 비밀로는 부를 수 없다)")
+    raw = await _fig_thread(_fig_read_image, meta["path"])
+    filename = _fig_filename(meta, ref)
+    body = {"report_id": report_id, "caption": caption, "page": page, "tool": meta["tool"], "mime": meta["mime"],
+            "sha256": meta["sha256"], "filename": filename, "ref": ref}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(PORTAL_SAVE_TIMEOUT_S, connect=8.0)) as cli:
+            r = await cli.post(f"{base}/agent/figures/to-report", headers={"Authorization": auth},
+                               files={"meta": (None, json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json"),
+                                      "file": (filename, raw, meta["mime"])})
+    except httpx.HTTPError as exc:
+        raise _FigError(f"포털에 닿지 못했다({type(exc).__name__})") from None
+    is_json = "json" in r.headers.get("content-type", "")
+    try:
+        data = r.json() if is_json else None
+    except ValueError:
+        data = None
+    detail = data.get("detail") if isinstance(data, dict) else None
+    if r.status_code >= 500:
+        raise _FigError(f"포털 오류(HTTP {r.status_code}) — 잠시 뒤 다시" + (f"({_clip(detail, 300)})" if isinstance(detail, str) and detail else ""))
+    if (r.status_code == 404 and (not is_json or detail == "Not Found")) or (200 <= r.status_code < 300 and not isinstance(data, dict)):
+        raise _FigError("포털에 그림 넣기 창구(/agent/figures/to-report)가 없다 — 포털이 이 게이트웨이보다 낡았다(포털을 새 판으로)")
+    if r.status_code == 401:
+        raise _FigError("포털이 이 토큰을 받지 않았다(만료 · 폐기 — 포털 /tokens 에서 다시 발급)")
+    if not 200 <= r.status_code < 300 or data.get("ok") is False:
+        # 포털의 실패 꼴은 {ok:false, error, detail} — 2xx 로 와도 실패로 말한다
+        raise _FigError(_clip(str(detail or (data or {}).get("error") or f"portal {r.status_code}"), 500))
+    return data
+
+
+async def _fig_dispatch(name: str, arguments: dict) -> types.CallToolResult:
+    """그림 도구 셋 — 주인(검증된 신원)만. 없는 것 · 끝난 것 · 남의 것은 같은 말이다. 실패는 FIGURE_ERROR 한 줄, 감사는 한 줄."""
+    t0 = time.monotonic()
+    a = arguments or {}
+    ref = str(a.get("ref") or "").strip()
+    backend = "portal" if name == FIG_REPORT_TOOL.name else "_gateway"
+    try:
+        owner = _request_user()
+        if not owner:
+            raise _FigError("사람 신원이 없는 호출이다 — 그림은 그것을 받은 사람(PAT 주인)만 본다")
+        if name == FIG_LIST_TOOL.name:
+            try:
+                limit = max(1, min(100, int(a.get("limit") or 20)))
+            except (TypeError, ValueError):
+                raise _FigError("limit 은 1 ~ 100 의 정수다") from None
+            mine = await _fig_thread(_fig_mine, owner)
+            mine.sort(key=lambda x: (-x[1]["created_ts"], x[0]))
+            out = {"figures": [{"ref": r, "tool": m["tool"], "mime": m["mime"], "bytes": m["bytes"], "created": m["created"],
+                                "expires": m["expires"]} for r, m in mine[:limit]], "count": len(mine)}
+            _audit(name, backend, True, None, round((time.monotonic() - t0) * 1000))
+            return _rt_json(out)
+        meta = await _fig_thread(_fig_load, ref)
+        if meta is None or meta["owner"] != owner:
+            raise _FigError(_FIG_MISSING)
+        if name == FIG_GET_TOOL.name:
+            out = {k: meta[k] for k in ("tool", "mime", "bytes", "sha256", "created", "expires")}
+            out = {"ref": ref, **out, "url": None, "curl": None}
+            pub = _fig_public_base() if GW_TOKEN else None
+            if pub:
+                exp = int(min(time.time() + FIG_TICKET_TTL_S, meta["expires_ts"]))
+                out["url"] = f"{pub}/fig/{ref}?t={_fig_ticket(ref, owner, exp)}"
+                out["curl"] = f'curl -fsS -o "{_fig_filename(meta, ref)}" "{out["url"]}"'
+            else:
+                out["note"] = ("이 호출은 사람 PC 가 아니라 박스 안 서비스(웹 챗 · 심의 등)를 거쳐 와서 PC 가 쓸 주소를 모른다 — 개인 Claude(포털 "
+                               "/mcp-gw)에서 figure_get 을 부르면 받는 주소가 나온다")
+            _audit(name, backend, True, None, round((time.monotonic() - t0) * 1000), note=ref)
+            return _rt_json(out)
+        data = await _fig_report(meta, ref, a)
+        _audit(name, backend, True, None, round((time.monotonic() - t0) * 1000), note=ref)
+        return _rt_json(data)
+    except _FigError as exc:
+        _audit(name, backend, False, str(exc), round((time.monotonic() - t0) * 1000), note=ref[:40] or None)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=f"FIGURE_ERROR: {exc}")], isError=True)
+
+
+async def _fig_download(scope, send, pat_verifier, gw_auth: str) -> None:
+    """GET /fig/<ref> — 주인의 PAT(MCP 청중 · 패널 아님) 또는 서명한 표(?t=). 자격이 하나도 없거나 PAT 가 검증되지 않으면 401(ref 와 무관한 답),
+    그 밖의 실패(없는 것 · 끝난 것 · 남의 것 · 틀린 표)는 모두 같은 404 다 — 판정 중의 뜻밖의 예외도 같은 404 다(있는 ref 만 500 이면 무인증 존재
+    신호가 된다, 반대 검토 4). 감사는 한 줄(via · 보낸 바이트)."""
+    t0 = time.monotonic()
+    ref = scope.get("path", "")[len("/fig/"):]
+    ip = (scope.get("client") or (None,))[0]
+
+    def _aud(ok: bool, err: str | None, caller=None, via=None, size=None):
+        _audit("GET /fig", "_gateway", ok, err, round((time.monotonic() - t0) * 1000), caller=caller, via=via, ip=ip,
+               note=ref[:40] or None, size=size)
+
+    async def _reply(status: int, body: bytes, extra=()):
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"application/json"), (b"cache-control", b"no-store"), *extra]})
+        await send({"type": "http.response.body", "body": body})
+
+    if scope.get("method") != "GET":
+        _aud(False, "method not allowed")
+        await _reply(405, b'{"error":"method not allowed"}', [(b"allow", b"GET")])
+        return
+    ticket = (parse_qs((scope.get("query_string") or b"").decode("latin-1")).get("t") or [""])[0]
+    auths = [v.decode("latin-1") for k, v in (scope.get("headers") or []) if k.lower() == b"authorization"]
+    auth = auths[0] if len(auths) == 1 else ""            # 두 번 실리면 없는 것으로 본다(/mcp 와 같은 자세)
+    token = auth[7:].strip() if auth[:7].lower() == "bearer " and not _secret_eq(auth, gw_auth) else ""
+    if not ticket and not token:
+        _aud(False, "unauthorized: no-credential")
+        await _reply(401, b'{"error":"unauthorized"}')
+        return
+    who = via = f = None
+    claims, expired = None, False
+    try:
+        meta = await _fig_thread(_fig_load, ref)
+        if meta is not None and ticket and _fig_ticket_ok(ticket, ref, meta["owner"]):
+            who, via = meta["owner"], "ticket"
+        if who is None and token and pat_verifier is not None:
+            try:
+                claims = await pat_verifier.verify(token, [MCP_AUDIENCE])
+            except PatExpired:
+                expired = True
+            if claims is not None and not _panel_scope(claims)[0]:
+                email = str(claims.get("email") or "").strip().lower()
+                if meta is not None and email and email == meta["owner"]:
+                    who, via = email, "pat"
+        if who is not None:
+            f = anyio.wrap_file(await _fig_thread(_fig_open, meta["path"]))     # 링크는 따라가지 않는다
+    except Exception as exc:  # noqa: BLE001 — 뜻밖의 예외도 같은 404(ref 마다 다른 답을 내지 않는다)
+        log.warning("그림 받기 판정 실패(%s) — 404 로 답한다: %r", ref[:40], exc)
+        _aud(False, f"not-found: {type(exc).__name__}", caller=who, via=via)
+        await _reply(404, b'{"error":"not found"}')
+        return
+    if who is None:
+        if not ticket and claims is None:
+            # PAT 를 검증하지 못했다 — ref 와 무관한 답이다(있는지 없는지를 말하지 않는다)
+            _aud(False, "unauthorized: " + ("expired" if expired else "unverified-token"))
+            await _reply(401, json.dumps(EXPIRED_BODY, ensure_ascii=False).encode() if expired else b'{"error":"unauthorized"}')
+            return
+        _aud(False, "not-found", caller=str((claims or {}).get("email") or "").strip().lower() or None, via="pat" if claims else "ticket")
+        await _reply(404, b'{"error":"not found"}')
+        return
+    sent, size = 0, -1
+    try:
+        size = os.fstat(f.wrapped.fileno()).st_size
+        await send({"type": "http.response.start", "status": 200, "headers": [
+            (b"content-type", meta["mime"].encode("latin-1")), (b"content-length", str(size).encode()),
+            (b"content-disposition", f'attachment; filename="{_fig_filename(meta, ref)}"'.encode("latin-1")),
+            (b"x-content-type-options", b"nosniff"), (b"cache-control", b"private, no-store"),
+            (b"content-security-policy", b"default-src 'none'; sandbox")]})
+        while True:
+            chunk = await f.read(256 * 1024)
+            if not chunk:
+                break
+            sent += len(chunk)
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        await send({"type": "http.response.body", "body": b""})
+    finally:
+        await f.aclose()
+        _aud(sent == size, None if sent == size else f"short: {sent}/{size}", caller=who, via=via, size=sent)
+
+
 async def _routine_dispatch(name: str, arguments: dict) -> types.CallToolResult:
     """루틴 로컬 도구 여섯 — 실패는 ROUTINE_ERROR 한 줄로 낸다(까닭 그대로). 감사는 portal 로 한 줄."""
     t0 = time.monotonic()
@@ -5630,7 +6439,7 @@ def _local_tools() -> list[types.Tool]:
     목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
-             BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS]
+             BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools()]
     # REST 다리는 **등록된 사이트가 있을 때만** 낸다 — 쓸 수 없는 도구를 목록에 두면
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
@@ -5931,6 +6740,12 @@ def _readonly_denial(name: str, arguments: dict) -> str:
     if name in _ROUTINE_NAMES:
         # 루틴 도구는 경로(route)에 없는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸린다 — 실행 · 원장 쓰기는 여기서 막는다(목록 · 계획은 _LOCAL_READ)
         return f"read_only: {name} — 읽기 전용 토큰(scopes 에 read 만)은 루틴을 돌리지 못한다(원장에 쓴다). routine_list · routine_get 만 된다."
+    if FIG_STORE_ON and name in _FIG_NAMES:
+        # 그림 도구 — 받기 · 목록은 읽기다. 보고서 쓰기는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸리므로 여기서 막는다. 끄면 이 이름들은 그림
+        # 도구가 아니다 — _LOCAL_READ 에 두면 끈 박스에서 같은 이름의 백엔드 쓰기 도구가 읽기 전용 PAT 로 열렸다(반대 검토 6)
+        if name in _FIG_READ_NAMES:
+            return ""
+        return "read_only: figure_to_report — 읽기 전용 토큰(scopes 에 read 만)은 보고서에 그림을 넣지 못한다. figure_get · figure_list 만 된다."
     resolved = route.get(name) or alias_route.get(name)
     if resolved is None:
         return ""      # 아래 'unknown tool' 로 끝난다 — 없는 도구를 읽기 전용 까닭으로 가리지 않는다
@@ -6838,6 +7653,8 @@ async def _call_tool_body(name: str, arguments: dict):
         return await _routine_dispatch(name, arguments or {})
     if name in _INSIGHT_NAMES:
         return await _insight_dispatch(name, arguments or {})
+    if FIG_STORE_ON and name in _FIG_NAMES:
+        return await _fig_dispatch(name, arguments or {})
 
     if name == REST_CATALOG_TOOL.name:
         return await _rest_catalog(arguments or {})
@@ -6888,7 +7705,8 @@ async def _call_tool_body(name: str, arguments: dict):
             # 경로 다섯은 전부 감쌌다). 그래서 캐시가 데워진 뒤에는 `verify_answer` 가
             # **방금 제대로 조회한 수치**를 지어낸 값이라고 고발했다 — 간헐적이라
             # 모양이 가장 나쁘다(사람이 도구를 못 믿게 된다).
-            return _evid_keep(name, _hit)
+            # 그림 저장도 같다 — 캐시에는 덧붙이기 전 결과가 있고, 같은 그림은 같은 ref 를 다시 쓴다(_fig_keep).
+            return await _fig_keep(backend_key, original, _evid_keep(name, _hit))
     else:
         # 캐시 대상이 아니다 = 쓰기이거나 알 수 없는 도구. 그 백엔드의 캐시를 버린다 —
         # 방금 만든 것이 TTL 동안 목록에 안 보이는 read-after-write 를 막는다.
@@ -6977,7 +7795,7 @@ async def _call_tool_body(name: str, arguments: dict):
                        caller=email, mode="as-user-pat", corr=_request_corr(),
                        note="+".join(n for n in ("re-minted" if attempt else None, _sso_fold_note(tok, email), *pp_notes) if n)
                        or None, res=res)
-                return _cache_put(ckey, _evid_keep(name, _pii_mask(res)))
+                return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res))))
     elif backend_key in PORTAL_CONN_BACKENDS:
         # 포털 등록 연결 토큰 위임(RA 등). 신원이 있는 호출은 **본인 토큰으로만** 간다. 서비스 계정(cae00 에선
         # 실제 사람의 RA 토큰)으로 대신 보내면 그 사람 개인 공간에 글이 쌓이고 그 사람의 '내 글' 이 남에게
@@ -7051,7 +7869,7 @@ async def _call_tool_body(name: str, arguments: dict):
                    round((time.monotonic() - t0) * 1000),
                    caller=email, mode="as-conn", corr=_request_corr(), res=res,
                    note=(f"tok:{hashlib.sha256(conn['token'].encode('utf-8')).hexdigest()[:10]}" if _declared else None))
-            return _cache_put(ckey, _evid_keep(name, _pii_mask(res)))
+            return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res))))
 
     # 이 호출이 쓰는 세션의 세대. 실패했을 때 "내가 죽었다고 본 그 세션" 을 가리키므로,
     # 그 사이 다른 호출이 이미 갈아 끼웠다면 새 세션을 또 부수지 않는다. try 밖에서 잡는다 —
@@ -7070,12 +7888,12 @@ async def _call_tool_body(name: str, arguments: dict):
             _audit(name, backend_key, not getattr(res, "isError", False), None,
                    round((time.monotonic() - t0) * 1000),
                    caller=_u or None, mode="identity-fwd", corr=_request_corr(), res=res)
-            return _cache_put(ckey, _evid_keep(name, _pii_mask(res)))
+            return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res))))
         res = await _call_shared(b, backend_key, original, arguments)
         _audit(name, backend_key, not getattr(res, "isError", False), None,
                round((time.monotonic() - t0) * 1000),
                caller=_u or None, mode="service", note=note, corr=_request_corr(), res=res)
-        return _cache_put(ckey, _evid_keep(name, _pii_mask(res)))
+        return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res))))
     except _Late as late:
         return _late(late)
     except Exception as e:  # noqa: BLE001
@@ -7106,7 +7924,7 @@ async def _call_tool_body(name: str, arguments: dict):
                            caller=_u or None, mode="identity-fwd" if _fwd else "service",
                            note="reconnected" + (f"+{note}" if note else ""),
                            corr=_request_corr(), res=res)
-                    return _cache_put(ckey, _evid_keep(name, _pii_mask(res)))
+                    return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res))))
         except _Late as late:
             return _late(late)
         except Exception as e2:  # noqa: BLE001 — 재시도 실패도 정돈된 isError 로 (프로토콜 에러 방지)
@@ -7196,7 +8014,7 @@ def _bearer_gate(app, pat_verifier=None):
             # search_tools·invoke_tool 도 게이트웨이 로컬이다 — 빠뜨리면 /tools-map 의 _gateway
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
-                        VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS):
+                        VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools()):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서
@@ -7374,6 +8192,10 @@ def _bearer_gate(app, pat_verifier=None):
             await send({"type": "http.response.start", "status": _status,
                         "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": _body})
+            return
+        if FIG_STORE_ON and scope.get("path", "").startswith("/fig/"):
+            # 그림 받기 — 주인의 PAT 또는 서명한 표로 스스로 인증한다(_fig_download). 끄면 이 길이 없다(지금처럼 아래 인증으로 간다).
+            await _fig_download(scope, send, pat_verifier, expected)
             return
         if scope.get("path", "").startswith("/api/"):
             # REST 프록시: GW_TOKEN이 아니라 라우트 핸들러가 포털 PAT(JWKS)로 자체 인증.
@@ -7670,6 +8492,7 @@ def main():
     app = _bearer_gate(star, pat_verifier)
     log.info("starting hwax-mcp-gateway on %s:%d (path /mcp), %d backends", HOST, PORT, len(BACKENDS))
     log.info("%s", _limits_line())
+    log.info("%s", _fig_line())
     _GracefulServer(uvicorn.Config(app, host=HOST, port=PORT, log_level="info",
                                    timeout_graceful_shutdown=SHUTDOWN_TAIL_S)).run()
 

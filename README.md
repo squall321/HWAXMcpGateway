@@ -346,6 +346,43 @@ python3 tool_usage_report.py --days 60 --out unused.md
   꼴만 보고 포털 `ConvCreate` 에 넘긴다. 틀리면 그 칸만 버리고 대화는 저장한 뒤 답의 `subject_dropped` 로 말한다. 포털이 들인 결과(`insight` — id ·
   상태 또는 건너뛴 까닭)를 답에 옮긴다. 확인(SP key 다시 풀기)은 포털이 저장한 뒤 에이전트 서버로 한다.
 
+## 그림 저장 — 도구 결과의 그림을 받고 보고서에 넣는다(사용자 보고 11-02)
+
+StepForge · DynaForge 의 그림(`ImageContent`)은 결과 안에만 있었다. 게이트웨이는 성공한 백엔드 결과(캐시 적중 포함)의 그림 블록마다 파일 하나와
+곁 JSON(`owner` · `tool` · `backend` · `mime` · `bytes` · `sha256` · `created` · `expires`)을 두고, 결과에는 그림 블록을 그대로 둔 채 글 블록
+하나를 덧붙인다 — `그림 저장 — fig_… (png · 214 KB) · 파일로 받기 figure_get · 보고서에 넣기 figure_to_report`. 주인(검증된 신원)이 없거나 패널
+PAT 면, 실패 결과(봉투 — structuredContent 포함)면 두지 않는다. ref 는 `fig_` + 무작위 16바이트(내용 해시가 아니다)이고, 같은 사람 · 도구 ·
+바이트는 같은 ref 를 다시 쓴다(캐시 적중 — 한 시간 넘게 지났으면 만든 때 · 끝나는 때를 새로 적는다). 형식은 바이트로 가린다(png · jpeg · gif · webp ·
+svg 만). 감사 줄에는 그 결과의 `images` · `image_bytes` 가 붙는다(그림이 있을 때만). 그림 도구 이름과 겹치는 백엔드 도구는 접두를 단다.
+파일 일은 그림 전용 일꾼 넷 안에서 돌고, 청소는 곁 JSON 을 잠금 밖에서 읽는다(못 읽은 곁 JSON 은 지우지 않는다).
+
+- **받기** `GET /fig/<ref>` — 밖에서는 `/mcp-gw/fig/<ref>`(nginx 고침 없음). 주인의 PAT(MCP 청중 · 패널 PAT 아님) 또는 서명한 표
+  `?t=v1.<끝 시각>.<HMAC-SHA256 hex>`(서명 대상 `v1|ref|주인|끝 시각`, 열쇠는 게이트웨이 공유 비밀에서 용도를 붙여 뽑는다 · 1시간 · 그림이 먼저
+  끝나면 그때까지). 자격이 없거나 PAT 를 검증하지 못하면 401, 없는 것 · 끝난 것 · 남의 것 · 틀린 표는 모두 같은 404 다. 답은 `attachment` ·
+  `nosniff` · CSP `sandbox` 다(SVG 가 포털 오리진에서 그려지지 않게). 감사 한 줄(`GET /fig` · `via` ticket|pat · `bytes`). 표는 gateway.log 의
+  uvicorn 접근 줄에서도 가린다.
+- **`figure_get(ref)`**(읽기) — `{ref, tool, mime, bytes, sha256, created, expires, url, curl}`. `url` 은 호출 요청의 `X-Forwarded-Host` ·
+  `X-Forwarded-Proto` 로 지은 사람 PC 주소(`…/mcp-gw/fig/<ref>?t=…`)이고, 사람 PAT 로 바로 붙은 박스 안 클라이언트는 그 Host 다. 박스 안
+  서비스(웹 챗 · 심의 · 절차)가 부른 것은 PC 주소를 몰라 `url` · `curl` 이 null 이고 `note` 가 까닭을 말한다. `curl` 은
+  `curl -fsS -o "<도구>-<ref>.<확장자>" "<url>"`.
+- **`figure_list(limit=20)`**(읽기) — 내 살아 있는 그림 새것부터 `{figures: [{ref, tool, mime, bytes, created, expires}], count}`.
+- **`figure_to_report(ref, report_id, caption="", page=None)`**(쓰기 — 읽기 전용 PAT 는 거절) — 주인을 본 뒤 포털
+  `POST /agent/figures/to-report` 에 multipart(`meta` JSON `{report_id, caption, page, tool, mime, sha256, filename, ref}` · `file` 바이트)로,
+  호출자 Authorization 그대로(공유 비밀 · 신원 없는 호출은 넘기지 않는다). `caption` 은 500자까지(Report Archive 그림 설명 상한 — 포털은 넘으면
+  말없이 줄인다). svg 는 포털이 받지 않는다(415). 답은 포털의 JSON(`ok` · `report_id` · `file_id` · `page` · `block_index?` · `url?`), 실패(2xx 의
+  `ok:false` 포함)는 `FIGURE_ERROR:` 한 줄.
+
+| 손잡이 | 기본 | 뜻 |
+|---|---|---|
+| `GATEWAY_FIG_STORE` | 켬 | `0` 이면 끈다 — 결과 · 도구 목록 · 경로 · 읽기 전용 판정 · 감사 줄 · 검색 순위가 지금과 같다(로그의 표 가림만 그대로 둔다) |
+| `GATEWAY_FIG_DIR` | 데이터 루트의 `figures` | 감사 원장이 사는 곳(`GATEWAY_AUDIT` · 리포의 `audit.jsonl` 다리가 가리키는 `/data/svc/mcp-gateway`)의 `figures`, 원장이 리포 안이면 리포 옆 `<리포>-figures` — 체크아웃 밖이어야 한다(git stash -u). 상대 경로는 리포 루트 기준 |
+| `GATEWAY_FIG_TTL_S` | 604800(7일) | 그림 하나의 보존 |
+| `GATEWAY_FIG_MAX_BYTES` | 8 MiB | 한 장 상한 — 넘으면 두지 않고 글 블록이 말한다 |
+| `GATEWAY_FIG_OWNER_QUOTA` · `GATEWAY_FIG_TOTAL_CAP` | 1 GiB · 20 GiB | 사람당 · 전체 합(디스크 몫 — 파일마다 4 KiB 블록, 그림 + 곁 JSON) — 넘으면 사람당 먼저 그 사람의 오래된 것부터, 그다음 전체의 오래된 것부터 지운다. 이번 결과의 그림은 지우지 않는다(한 결과가 상한을 넘기면 넘는 그림은 두지 않고 말한다) |
+| `GATEWAY_FIG_OWNER_MAX_COUNT` | 5000 | 사람당 장 수 — 넘으면 그 사람의 오래된 것부터 |
+| `GATEWAY_FIG_TICKET_TTL_S` | 3600 | 받기 표의 수명 |
+| `GATEWAY_FIG_SWEEP_S` | 3600 | 청소 주기(기동 때 한 번 디스크에서 표를 짓는다). 상한은 쓸 때마다 지킨다 |
+
 ## 서버 지침 — initialize 의 instructions
 
 Claude Code · Desktop 이 세션마다 읽는 글이다(`_INSTRUCTIONS` + `_instructions()`). 세션마다 값을 치르므로 짧게 두고, 전체가 2048자 안이어야 한다 — Claude Code 가 거기서 자른다(시험이 가장 긴 조합을 잰다 — 11-02 에 2,031자).

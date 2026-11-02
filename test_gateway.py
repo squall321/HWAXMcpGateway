@@ -32,6 +32,15 @@ def _no_prod_audit(monkeypatch, tmp_path):
     # 루틴 단계 읽기 목록 덧씌우기도 같다 — 박스에 read_tools.local.json 이 있으면 단계 울타리 시험이 그 박스 목록으로 돈다(R3 리뷰 #0)
     monkeypatch.setattr(gw, "READ_TOOLS_LOCAL_PATH", tmp_path / "read_tools.local.json")
     monkeypatch.setattr(gw, "_READ_TOOLS_LOCAL", {"mtime": None, "tools": frozenset(), "deny": frozenset()})
+    # 그림 저장 폴더도 같다 — 안 걸면 시험이 박스의 데이터 루트(/data/svc/mcp-gateway/figures)나 리포 옆 폴더에 그림을 쌓는다. 표도 시험마다 새것이다
+    monkeypatch.setattr(gw, "FIG_DIR", tmp_path / "figures")
+    monkeypatch.setattr(gw, "_FIG_META", {})
+    monkeypatch.setattr(gw, "_FIG_KEY", {})
+    monkeypatch.setattr(gw, "_FIG_USAGE", {})
+    monkeypatch.setattr(gw, "_FIG_COUNT", {})
+    monkeypatch.setattr(gw, "_FIG_TOTAL", {"bytes": 0})
+    monkeypatch.setattr(gw, "_FIG_SWEEP", {"on": False, "added": set(), "dropped": set()})
+    monkeypatch.setattr(gw, "_FIG_LIMITER", {"lim": None})
 
 
 @pytest.fixture(autouse=True)
@@ -102,7 +111,8 @@ def test_visible_tools(monkeypatch):
     local = {t.name for t in (gw.SAVE_CONV_TOOL, gw.SEARCH_CONV_TOOL, gw.LIST_APPS_TOOL,
                               gw.SEARCH_TOOLS_TOOL, gw.INVOKE_TOOL,
                               gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL,
-                              gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL, *gw.ROUTINE_TOOLS, *gw.INSIGHT_TOOLS)}
+                              gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL, *gw.ROUTINE_TOOLS, *gw.INSIGHT_TOOLS,
+                              *gw.FIGURE_TOOLS)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -6228,7 +6238,7 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
         "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4) · 패널 확인용 읽기 목록(HA-20 B-2)은 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
-    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 16, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2
+    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 19, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 3
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
     assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
@@ -6295,7 +6305,7 @@ def test_기준_미만으로_처음_붙는_앱만_한_번_경고하고_막지_�
 def test_게이트웨이_로컬_도구는_제_앱으로_센다(monkeypatch, _fresh_scores):
     """로컬 도구는 route 에 없다 — `_gateway` 앱으로 세고, tools/list 가 붙이는 것과 같은 목록이다(REST 다리는 사이트가 있을
     때만). 목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
-    for rest, n_local in (({}, 16), ({"s": {"base": "http://x"}}, 18)):      # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2(+ REST 다리 둘)
+    for rest, n_local in (({}, 19), ({"s": {"base": "http://x"}}, 21)):      # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 3(+ REST 다리 둘)
         monkeypatch.setattr(gw, "REST", rest)
         _aggregate_tools(monkeypatch, {"sf": [_stool("sf_q", {"q": None})]})
         row = {r["app"]: r for r in gw._ARG_SCORE["apps"]}["_gateway"]
@@ -8184,7 +8194,9 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     # noncore(0.5) · noncore_demote(끔)는 10-31 E2-5 가 더한 새 손잡이다 — 끈 채로 들어와 순위는 그대로다(옮긴 값이 아니다)
     assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2, "noncore": 0.5}
     assert all(v for k, v in d["switches"].items() if k != "noncore_demote") and d["switches"]["noncore_demote"] is False
-    assert len(d["synonyms"]) == 73 and d["synonyms"]["요약"] == ("digest", "summary")
+    # 11-02 그림 저장에서 '그림' 에 figure 를 더하고 '이미지' 를 새로 넣었다(그림 도구를 찾게 — 일부러 바꾼 기본값)
+    assert len(d["synonyms"]) == 74 and d["synonyms"]["요약"] == ("digest", "summary")
+    assert d["synonyms"]["그림"] == ("plot", "render", "figure") and d["synonyms"]["이미지"] == ("figure", "image")
     assert d["fingerprint"] == d["base_fingerprint"] and gw._tuning_health()["overlay"] == {"present": False}
 
 
@@ -11183,3 +11195,723 @@ def test_save_conversation_은_주제가_없으면_종전_본문이고_포털의
                                                          "subject": {"sp_task": "x"}})).content[0].text)
     assert out["insight"] == {"id": "ins:wf:c-9", "status": "draft"}
 
+
+
+# ── 그림 저장 — 도구 결과의 그림을 파일로 두고, 받고, 보고서에 넣는다(사용자 보고 11-02) ─────────────────────────────────────────────
+# StepForge · DynaForge 의 그림이 결과 안에만 있어 받을 길도 보고서에 넣을 길도 없었다. 아래는 그림 블록이 실제 호출 길(_call_tool)을 지나는 꼴로 본다.
+import re as _re  # noqa: E402
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + bytes(range(256)) * 4          # 형식 판정은 머리만 본다
+_PNG2 = _PNG + b"second"
+_SVG = b'<?xml version="1.0" encoding="utf-8"?>\n<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>'
+_FIG_RE = _re.compile(r"fig_[A-Za-z0-9_-]{22}")
+
+
+def _img(raw: bytes, mime: str = "image/png") -> types.ImageContent:
+    return types.ImageContent(type="image", data=base64.b64encode(raw).decode(), mimeType=mime)
+
+
+def _fig_result(raw: bytes = _PNG, mime: str = "image/png") -> types.CallToolResult:
+    return types.CallToolResult(content=[types.TextContent(type="text", text='{"view": "iso"}'), _img(raw, mime)])
+
+
+class _FigSess(_CallSess):
+    """도구 이름마다 결과를 짓는 가짜 세션 — 받은 호출을 기록한다(캐시 적중이면 늘지 않는다)."""
+    def __init__(self, results: dict):
+        super().__init__([_tool(n) for n in results])
+        self.results = results
+
+    async def call_tool(self, original, args, read_timeout_seconds=None):
+        self.calls.append(original)
+        return self.results[original]()
+
+
+def _fig_kit(monkeypatch, user="a@corp.com", results=None, headers=None):
+    """StepForge 꼴 백엔드 하나를 세우고 _call_tool 을 실제로 태운다. 반환은 (호출 함수, 백엔드)."""
+    b = _CallB([])
+    b.session = _FigSess(results or {"render_3d": _fig_result, "get_view": _fig_result})
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": b})
+    for k, v in (("exposed_tools", []), ("route", {}), ("alias_route", {}), ("POLICY", {}), ("_ACCESS_POLICY", {})):
+        monkeypatch.setattr(gw, k, v)
+    monkeypatch.setattr(gw, "_RESP_CACHE", gw.OrderedDict())
+    asyncio.run(gw._aggregate())
+    _set_request_headers(monkeypatch, {**({gw.USER_HEADER: user} if user else {}), **(headers or {})})
+
+    def call(name, args=None):
+        return asyncio.run(gw._call_tool(name, args or {}))
+    return call, b
+
+
+def _fig_ref(res) -> str:
+    m = _FIG_RE.search(res.content[-1].text)
+    assert m, res.content[-1].text
+    return m.group(0)
+
+
+def _audit_rows():
+    return [json.loads(ln) for ln in open(gw.AUDIT_PATH, encoding="utf-8")]
+
+
+def test_그림_저장을_끄면_결과_목록_경로가_지금과_바이트까지_같다(monkeypatch):
+    call, b = _fig_kit(monkeypatch)
+    monkeypatch.setattr(gw, "FIG_STORE_ON", False)
+    want = _fig_result().model_dump_json()
+    assert call("render_3d").model_dump_json() == want, "끄면 결과는 백엔드가 준 그대로다"
+    assert call("get_view").model_dump_json() == want and call("get_view").model_dump_json() == want, "캐시 적중도 그대로다"
+    assert not gw.FIG_DIR.exists(), "끄면 아무것도 두지 않는다"
+    assert not {"figure_get", "figure_list", "figure_to_report"} & {t.name for t in gw._local_tools()}, "끄면 도구 목록도 지금과 같다"
+    assert call("figure_get", {"ref": "fig_" + "a" * 22}).content[0].text == "unknown tool: figure_get"
+    # 경로 — 끄면 /fig/ 는 지금처럼 PAT 인증을 지나 앱으로 간다(받기 길이 없다)
+    seen = []
+
+    async def app(scope, receive, send):
+        seen.append(scope["path"])
+
+    async def no_portal(email, base, **_kw):
+        return None
+    monkeypatch.setattr(gw, "_portal_access", no_portal)
+
+    class _V:
+        async def verify(self, token, aud):
+            return {"email": "a@corp.com", "groups": []}
+    asyncio.run(gw._bearer_gate(app, _V())({"type": "http", "method": "GET", "path": "/fig/fig_" + "a" * 22,
+                                             "headers": [(b"authorization", b"Bearer pat")]}, None, None))
+    assert seen == ["/fig/fig_" + "a" * 22]
+
+
+def test_그림_저장을_켜면_그림_블록은_그대로_두고_글_한_블록과_파일을_둔다(monkeypatch):
+    call, b = _fig_kit(monkeypatch)
+    assert gw.FIG_STORE_ON is True, "기본은 켬이다 — 모든 박스에 지금 필요하다"
+    res = call("render_3d")
+    base = _fig_result()
+    assert res.content[:2] == base.content and len(res.content) == 3 and res.content[2].type == "text", "그림 블록은 그대로다"
+    ref, note = _fig_ref(res), res.content[2].text
+    assert note == (f"그림 저장 — {ref} (png · {round(len(_PNG) / 1024)} KB) · 파일로 받기 figure_get · 보고서에 넣기 figure_to_report"), note
+    assert sorted(p.name for p in gw.FIG_DIR.iterdir()) == [f"{ref}.json", f"{ref}.png"]
+    assert (gw.FIG_DIR / f"{ref}.png").read_bytes() == _PNG
+    side = json.loads((gw.FIG_DIR / f"{ref}.json").read_text(encoding="utf-8"))
+    assert set(side) == {"owner", "tool", "backend", "mime", "bytes", "sha256", "created", "expires"}
+    assert (side["owner"], side["tool"], side["backend"], side["mime"], side["bytes"], side["sha256"]) == (
+        "a@corp.com", "render_3d", "heax-step_forge", "image/png", len(_PNG), hashlib.sha256(_PNG).hexdigest())
+    created, expires = (gw.datetime.fromisoformat(side[k]) for k in ("created", "expires"))
+    assert (expires - created).total_seconds() == gw.FIG_TTL_S == 7 * 86400
+    assert stat.S_IMODE(os.stat(gw.FIG_DIR).st_mode) == 0o700 and stat.S_IMODE(os.stat(gw.FIG_DIR / f"{ref}.png").st_mode) == 0o600
+    # 형식은 백엔드가 단 mimeType 이 아니라 바이트로 가린다 — SVG 를 PNG 라고 달아도 svg 로 둔다
+    call2, _ = _fig_kit(monkeypatch, results={"render_3d": lambda: _fig_result(_SVG, "image/png")})
+    ref2 = _fig_ref(call2("render_3d"))
+    assert (gw.FIG_DIR / f"{ref2}.svg").read_bytes() == _SVG and json.loads((gw.FIG_DIR / f"{ref2}.json").read_text())["mime"] == "image/svg+xml"
+
+
+def test_그림_ref_는_무작위이고_주인이_다르면_같은_바이트도_다른_ref_다(monkeypatch):
+    data = [base64.b64encode(_PNG).decode()]
+    (ra, *_), = gw._fig_store_sync("a@corp.com", "heax-step_forge", "render_3d", data)
+    (rb, *_), = gw._fig_store_sync("b@corp.com", "heax-step_forge", "render_3d", data)
+    (rc, *_), = gw._fig_store_sync("a@corp.com", "heax-step_forge", "section_view", data)
+    sha = hashlib.sha256(_PNG).hexdigest()
+    assert len({ra, rb, rc}) == 3 and all(_FIG_RE.fullmatch(r) for r in (ra, rb, rc))
+    assert not any(sha[:6] in r or sha[-6:] in r for r in (ra, rb, rc)), "내용 해시로 지으면 바이트를 쥔 사람이 남의 파일을 찾는다"
+    seen = []
+    real = gw.secrets.token_urlsafe
+    monkeypatch.setattr(gw.secrets, "token_urlsafe", lambda n: seen.append(n) or real(n))
+    gw._fig_store_sync("c@corp.com", "heax-step_forge", "render_3d", data)
+    assert seen == [16], "ref 는 무작위 16바이트에서 나온다"
+    # 주인 판정 — 남의 ref 는 없는 것과 같은 말이다
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "b@corp.com"})
+    other = asyncio.run(gw._call_tool("figure_get", {"ref": ra}))
+    unknown = asyncio.run(gw._call_tool("figure_get", {"ref": "fig_" + "Z" * 22}))
+    assert other.isError and unknown.isError and other.content[0].text == unknown.content[0].text == f"FIGURE_ERROR: {gw._FIG_MISSING}"
+    mine = asyncio.run(gw._call_tool("figure_get", {"ref": rb}))
+    assert not mine.isError and json.loads(mine.content[0].text)["ref"] == rb
+    _set_request_headers(monkeypatch, {})
+    anon = asyncio.run(gw._call_tool("figure_get", {"ref": ra}))
+    assert anon.isError and "사람 신원이 없는" in anon.content[0].text
+
+
+def test_주인이_없거나_패널_PAT_면_두지_않는다(monkeypatch):
+    want = _fig_result().model_dump_json()
+    call, _ = _fig_kit(monkeypatch, user="")
+    assert call("render_3d").model_dump_json() == want and not gw.FIG_DIR.exists(), "주인이 없으면 남의 칸에 두느니 안 둔다"
+    panel = {gw.PANEL_HEADER: gw.quote(json.dumps({"app": "heax-step_forge", "uri": "ui://step/view"}), safe="")}
+    call, b = _fig_kit(monkeypatch, headers=panel)
+    assert call("render_3d").model_dump_json() == want and b.session.calls == ["render_3d"], "패널 PAT 는 그 앱 도구를 부르되"
+    assert not gw.FIG_DIR.exists(), "패널 PAT 호출은 그림을 두지 않는다"
+    assert "(gateway-tool)" in call("figure_list").content[0].text, "패널은 그림 도구를 부르지 못한다(게이트웨이 자체 도구)"
+    # 대조 — 같은 호출을 주인이 패널 밖에서 하면 둔다(위 둘이 '저장이 아예 없어서' 지나간 것이 아니다)
+    call, _ = _fig_kit(monkeypatch)
+    ref = _fig_ref(call("render_3d"))
+    assert sorted(p.name for p in gw.FIG_DIR.iterdir()) == [f"{ref}.json", f"{ref}.png"]
+
+
+def test_캐시_적중은_같은_ref_를_다시_쓰고_두_벌_두지_않는다(monkeypatch):
+    call, b = _fig_kit(monkeypatch)
+    first, second = call("get_view"), call("get_view")
+    assert b.session.calls == ["get_view"], "둘째는 캐시 적중이다"
+    assert _fig_ref(first) == _fig_ref(second) and first.content == second.content
+    assert len(list(gw.FIG_DIR.iterdir())) == 2, "그림 한 장 · 곁 JSON 하나"
+    (cached,) = [v[0] for v in gw._RESP_CACHE.values()]
+    assert len(cached.content) == 2, "캐시에는 덧붙이기 전 결과가 담긴다(글 블록이 쌓이지 않는다)"
+    rows = [r for r in _audit_rows() if r["tool"] == "get_view"]
+    assert [r.get("note") for r in rows] == [None, "cache-hit"] and all(r["images"] == 1 for r in rows)
+    # 같은 사람의 다른 결과(다른 바이트)는 새 ref, 남의 같은 호출은 그 사람 칸이다(캐시 키에 신원이 든다)
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "b@corp.com"})
+    third = call("get_view")
+    assert _fig_ref(third) != _fig_ref(first) and b.session.calls == ["get_view", "get_view"]
+
+
+def test_보존_기간이_지나면_청소가_지우고_남의_파일은_건드리지_않는다(monkeypatch):
+    data = [base64.b64encode(_PNG).decode()]
+    (ref, *_), = gw._fig_store_sync("a@corp.com", "b", "t", data, now=1_000_000)
+    stray = gw.FIG_DIR / ("fig_" + "s" * 22 + ".png")            # 곁 JSON 없는 그림(한 시간 넘은 것)
+    stray.write_bytes(_PNG)
+    part = gw.FIG_DIR / ("fig_" + "p" * 22 + ".json.part")
+    part.write_bytes(b"{")
+    foreign = gw.FIG_DIR / "README.txt"
+    foreign.write_text("운영자 메모")
+    for p in (stray, part, foreign):
+        os.utime(p, (1_000_000, 1_000_000))
+    got = gw._fig_sweep_sync(now=1_000_000 + 3600 + 1)
+    assert got["expired"] == 0 and got["orphans"] == 2 and ref in gw._FIG_META and foreign.exists() and not stray.exists() and not part.exists()
+    got = gw._fig_sweep_sync(now=1_000_000 + gw.FIG_TTL_S + 1)
+    assert got["expired"] == 1 and gw._FIG_META == {} and gw._FIG_TOTAL["bytes"] == 0
+    assert sorted(p.name for p in gw.FIG_DIR.iterdir()) == ["README.txt"], "끝난 그림과 곁 JSON 을 지운다 — 남의 파일은 그대로"
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com"})
+    assert asyncio.run(gw._call_tool("figure_get", {"ref": ref})).isError
+
+
+def test_사람당_전체_상한은_오래된_것부터_지운다(monkeypatch):
+    blobs = [base64.b64encode(_PNG + bytes([i])).decode() for i in range(6)]
+    u = gw._fig_disk(len(_PNG) + 1)                 # 한 장의 디스크 몫(파일마다 4 KiB 블록 — 그림 바이트가 아니다)
+    assert u == 8192
+    monkeypatch.setattr(gw, "FIG_OWNER_QUOTA", int(2.5 * u))
+    a = [gw._fig_store_sync("a@corp.com", "b", "t", [blobs[i]], now=100 + i)[0][0] for i in range(3)]
+    assert [r in gw._FIG_META for r in a] == [False, True, True], "사람당 상한 — 그 사람의 가장 오래된 것부터"
+    assert not (gw.FIG_DIR / f"{a[0]}.png").exists() and not (gw.FIG_DIR / f"{a[0]}.json").exists()
+    assert gw._FIG_USAGE == {"a@corp.com": 2 * u} and gw._FIG_COUNT == {"a@corp.com": 2} and gw._FIG_TOTAL["bytes"] == 2 * u
+    monkeypatch.setattr(gw, "FIG_TOTAL_CAP", int(3.5 * u))
+    b = [gw._fig_store_sync("b@corp.com", "b", "t", [blobs[3 + i]], now=200 + i)[0][0] for i in range(2)]
+    assert [r in gw._FIG_META for r in a[1:] + b] == [False, True, True, True], "전체 상한 — 모두의 가장 오래된 것부터"
+    assert gw._FIG_TOTAL["bytes"] == 3 * u <= gw.FIG_TOTAL_CAP
+    # 청소도 같은 상한을 지킨다(상한을 낮춘 박스) — 디스크에서 다시 지은 표로
+    monkeypatch.setattr(gw, "FIG_TOTAL_CAP", int(1.5 * u))
+    got = gw._fig_sweep_sync(now=300)
+    assert got["evicted"] == 2 and list(gw._FIG_META) == [b[1]]
+
+
+def test_상한_안의_남의_그림은_지우지_않고_이번_결과의_그림도_지우지_않는다(monkeypatch):
+    """반대 검토 2 — '그 사람이 넘었거나 전체가 넘었으면' 한 번에 지우던 때는 상한 안인 A 의 그림이 B 의 넘침에 지워졌고, 한 결과의 앞 그림이 뒤
+    그림에 밀려 지워져도 글 블록은 '저장' 이라고 말했다."""
+    u = gw._fig_disk(len(_PNG) + 1)
+    blobs = [base64.b64encode(_PNG + bytes([i])).decode() for i in range(10)]
+    monkeypatch.setattr(gw, "FIG_OWNER_QUOTA", int(2.5 * u))
+    monkeypatch.setattr(gw, "FIG_TOTAL_CAP", int(3.5 * u))
+    a_old = gw._fig_store_sync("a@corp.com", "b", "t", [blobs[0]], now=100)[0][0]
+    b1, b2, b3 = (gw._fig_store_sync("b@corp.com", "b", "t", [blobs[i]], now=199 + i)[0][0] for i in (1, 2, 3))
+    assert [r in gw._FIG_META for r in (a_old, b1, b2, b3)] == [True, False, True, True], "B 의 가장 오래된 것 하나로 둘 다 맞는다"
+    # 한 결과의 그림 셋 — 사람당 상한(2.5장) 안의 둘만 두고 셋째는 못 둔다고 말한다(둔 것을 지우지 않는다)
+    multi = types.CallToolResult(content=[_img(_PNG + bytes([i])) for i in (5, 6, 7)])
+    call, _ = _fig_kit(monkeypatch, user="c@corp.com", results={"render_3d": lambda: multi})
+    note = call("render_3d").content[-1].text
+    refs = _FIG_RE.findall(note)
+    assert len(refs) == 2 and all(gw._fig_load(r) is not None for r in refs), note
+    assert note.endswith(" · 못 둔 그림 — 사람당 · 전체 상한보다 큼 1장"), note
+
+
+def test_사람당_장_수_상한과_작은_그림의_디스크_몫(monkeypatch):
+    """반대 검토 9 — 그림 바이트만 세면 작은 그림 2만 장이 160 KB 로 셌다. 디스크 몫(4 KiB 블록 × 두 파일)으로 세고 사람당 장 수도 막는다."""
+    assert gw.FIG_OWNER_MAX_COUNT == 5000 and gw._fig_disk(8) == 8192 and gw._fig_disk(4096) == 8192 and gw._fig_disk(4097) == 12288
+    tiny = [base64.b64encode(b"\x89PNG\r\n\x1a\n" + bytes([i])).decode() for i in range(5)]
+    monkeypatch.setattr(gw, "FIG_OWNER_MAX_COUNT", 3)
+    refs = [gw._fig_store_sync("a@corp.com", "b", "t", [d], now=100 + i)[0][0] for i, d in enumerate(tiny)]
+    assert [r in gw._FIG_META for r in refs] == [False, False, True, True, True] and gw._FIG_COUNT == {"a@corp.com": 3}
+    assert gw._FIG_USAGE == {"a@corp.com": 3 * 8192}, "아홉 바이트 그림도 디스크 몫으로 센다"
+
+
+def test_한_장_상한을_넘는_그림은_두지_않고_말한다(monkeypatch):
+    assert gw.FIG_MAX_BYTES == 8 * 1024 * 1024
+    monkeypatch.setattr(gw, "FIG_MAX_BYTES", 1024)
+    call, _ = _fig_kit(monkeypatch)
+    res = call("render_3d")
+    assert res.content[:2] == _fig_result().content and res.content[2].text == "그림 저장 못 함 — 한 장 상한(1 KB)을 넘음 1장"
+    assert not gw.FIG_DIR.exists()
+    # 큰 base64 는 풀지 않고 길이로 거른다 · 둔 것과 못 둔 것이 섞이면 한 블록에 같이 말한다 · 모르는 형식도 말한다
+    monkeypatch.setattr(gw.base64, "b64decode", lambda d, real=gw.base64.b64decode: (_ for _ in ()).throw(AssertionError)
+                        if len(d) > 4096 else real(d))
+    mixed = types.CallToolResult(content=[_img(b"\x89PNG\r\n\x1a\n" + b"x" * 100), _img(_PNG * 10), _img(b"not an image at all")])
+    call, _ = _fig_kit(monkeypatch, results={"render_3d": lambda: mixed})
+    text = call("render_3d").content[-1].text
+    assert text.startswith("그림 저장 — fig_") and text.endswith(
+        " · 못 둔 그림 — 한 장 상한(1 KB)을 넘음 1장 · 형식을 모름(png · jpeg · gif · webp · svg 만) 1장"), text
+
+
+def _fig_stored(owner="a@corp.com", raw=_PNG, tool="render_3d"):
+    (ref, *_), = gw._fig_store_sync(owner, "heax-step_forge", tool, [base64.b64encode(raw).decode()])
+    return ref
+
+
+class _FigV:
+    """PAT 검증기 가짜 — 받은 청중을 기록한다."""
+    def __init__(self, claims=None, expired=False):
+        self.claims, self.expired, self.auds = claims, expired, []
+
+    async def verify(self, token, aud):
+        self.auds.append(list(aud))
+        if self.expired:
+            raise gw.PatExpired()
+        return self.claims
+
+
+def _fig_get(monkeypatch, path, qs=b"", auth=None, verifier=None, method="GET"):
+    """미들웨어로 /fig/… 를 받는다 — (상태, 머리, 본문)."""
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    sent = []
+
+    async def send(m):
+        sent.append(m)
+
+    async def app(scope, receive, send_):
+        raise AssertionError("받기 길이 앱까지 가면 안 된다")
+    hdrs = [(b"authorization", auth)] if auth else []
+    asyncio.run(gw._bearer_gate(app, verifier)({"type": "http", "method": method, "path": path, "query_string": qs,
+                                                 "headers": hdrs, "client": ("198.51.100.7", 5000)}, None, send))
+    head = {k.decode(): v.decode() for k, v in sent[0]["headers"]}
+    return sent[0]["status"], head, b"".join(m.get("body", b"") for m in sent[1:])
+
+
+def test_받기는_주인의_PAT_나_서명한_표로만_되고_나머지는_같은_404다(monkeypatch):
+    ref = _fig_stored()
+    owner_v = _FigV({"email": "A@Corp.com", "groups": []})
+    st, head, body = _fig_get(monkeypatch, f"/fig/{ref}", auth=b"Bearer pat-a", verifier=owner_v)
+    assert st == 200 and body == _PNG and owner_v.auds == [[gw.MCP_AUDIENCE]], "MCP 청중만 — 패널 청중은 받지 않는다"
+    assert head["content-type"] == "image/png" and head["content-length"] == str(len(_PNG))
+    assert head["content-disposition"] == f'attachment; filename="render_3d-{ref}.png"' and head["x-content-type-options"] == "nosniff"
+    assert "sandbox" in head["content-security-policy"] and "no-store" in head["cache-control"]
+    row = _audit_rows()[-1]
+    assert (row["tool"], row["ok"], row["via"], row["bytes"], row["caller"], row["ip"], row["note"]) == (
+        "GET /fig", True, "pat", len(_PNG), "a@corp.com", "198.51.100.7", ref)
+    nf = (404, b'{"error":"not found"}')
+    # 남의 PAT · 패널 PAT · 없는 ref · 꼴이 틀린 ref(경로 넘기) — 모두 같은 404
+    assert _fig_get(monkeypatch, f"/fig/{ref}", auth=b"Bearer pat-b", verifier=_FigV({"email": "b@corp.com"}))[::2] == nf
+    pv = _FigV({"email": "a@corp.com", "purpose": "mcp-app", "jti": "mcpapp-1", "aud": [gw.PANEL_AUDIENCE], "panel": {}})
+    assert _fig_get(monkeypatch, f"/fig/{ref}", auth=b"Bearer panel", verifier=pv)[::2] == nf
+    for bad in ("fig_" + "Q" * 22, "../audit.jsonl", f"{ref}/../../x", ref + ".png", "fig_..%2F..%2Fx"):
+        assert _fig_get(monkeypatch, f"/fig/{bad}", auth=b"Bearer pat-a", verifier=owner_v)[::2] == nf, bad
+    # 서명한 표 — PAT 없는 PC 셸에서 받는다
+    exp = int(gw.time.time()) + 600
+    good = gw._fig_ticket(ref, "a@corp.com", exp)
+    st, head, body = _fig_get(monkeypatch, f"/fig/{ref}", qs=f"t={good}".encode())
+    assert st == 200 and body == _PNG and _audit_rows()[-1]["via"] == "ticket"
+    expired = gw._fig_ticket(ref, "a@corp.com", int(gw.time.time()) - 5)
+    flipped = good[:-1] + ("0" if good[-1] != "0" else "1")
+    longer = f"v1.{exp + 3600}.{good.rsplit('.', 1)[1]}"
+    other_owner = gw._fig_ticket(ref, "b@corp.com", exp)
+    other_ref = gw._fig_ticket(_fig_stored(raw=_PNG2), "a@corp.com", exp)
+    for t in (expired, flipped, longer, other_owner, other_ref, "v1.x.y", ""):
+        st, _h, body = _fig_get(monkeypatch, f"/fig/{ref}", qs=f"t={t}".encode(), auth=b"Bearer pat-b",
+                                verifier=_FigV({"email": "b@corp.com"}))
+        assert (st, body) == nf, t
+    # 자격이 없거나 PAT 를 검증하지 못하면 401 — ref 와 무관한 답이다
+    assert _fig_get(monkeypatch, f"/fig/{ref}")[0] == 401
+    assert _fig_get(monkeypatch, f"/fig/fig_{'Q' * 22}")[0] == 401
+    assert _fig_get(monkeypatch, f"/fig/{ref}", auth=b"Bearer forged", verifier=_FigV(None))[0] == 401
+    st, _h, body = _fig_get(monkeypatch, f"/fig/{ref}", auth=b"Bearer old", verifier=_FigV(expired=True))
+    assert st == 401 and json.loads(body) == gw.EXPIRED_BODY
+    assert _fig_get(monkeypatch, f"/fig/{ref}", auth=b"Bearer gw-secret", verifier=owner_v)[0] == 401, "공유 비밀은 받기 자격이 아니다"
+    assert _fig_get(monkeypatch, f"/fig/{ref}", method="POST", auth=b"Bearer pat-a", verifier=owner_v)[0] == 405
+    # 공유 비밀이 비면 표를 받지 않는다(누구나 서명할 수 있게 된다)
+    monkeypatch.setattr(gw, "GW_TOKEN", "")
+    assert not gw._fig_ticket_ok(gw._fig_ticket(ref, "a@corp.com", exp), ref, "a@corp.com")
+
+
+def test_figure_get_은_전달된_머리로_바깥_주소와_curl_한_줄을_짓는다(monkeypatch):
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    ref = _fig_stored()
+    fwd = {gw.USER_HEADER: "a@corp.com", gw.VIA_HEADER: "pat", "host": "127.0.0.1:9110",
+           "x-forwarded-host": "portal.corp.example:8443", "x-forwarded-proto": "https"}
+    _set_request_headers(monkeypatch, fwd)
+    out = json.loads(asyncio.run(gw._call_tool("figure_get", {"ref": ref})).content[0].text)
+    assert set(out) == {"ref", "tool", "mime", "bytes", "sha256", "created", "expires", "url", "curl"}
+    assert (out["ref"], out["tool"], out["mime"], out["bytes"]) == (ref, "render_3d", "image/png", len(_PNG))
+    assert out["url"].startswith(f"https://portal.corp.example:8443/mcp-gw/fig/{ref}?t=v1."), "안쪽 주소(127.0.0.1:9110)가 아니다"
+    assert out["curl"] == f'curl -fsS -o "render_3d-{ref}.png" "{out["url"]}"'
+    t = out["url"].split("?t=", 1)[1]
+    exp = int(t.split(".")[1])
+    assert gw._fig_ticket_ok(t, ref, "a@corp.com") and exp <= gw.time.time() + gw.FIG_TICKET_TTL_S + 1
+    # 그 주소로 실제로 받는다(nginx 는 /mcp-gw 를 떼고 넘긴다)
+    assert _fig_get(monkeypatch, f"/fig/{ref}", qs=f"t={t}".encode())[::2] == (200, _PNG)
+    # 박스 안 서비스(웹 챗)가 부른 것은 PC 주소를 모른다 — 안쪽 주소를 내주지 않는다
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", gw.VIA_HEADER: "chat", "host": "127.0.0.1:9110"})
+    out = json.loads(asyncio.run(gw._call_tool("figure_get", {"ref": ref})).content[0].text)
+    assert out["url"] is None and out["curl"] is None and "개인 Claude" in out["note"]
+    # 사람 PAT 로 게이트웨이에 바로 붙은 박스 안 Claude 는 그 Host 그대로다
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", gw.VIA_HEADER: "pat", "host": "127.0.0.1:9110"})
+    out = json.loads(asyncio.run(gw._call_tool("figure_get", {"ref": ref})).content[0].text)
+    assert out["url"].startswith(f"http://127.0.0.1:9110/fig/{ref}?t=v1.")
+    # 셸에 실릴 글자가 섞인 머리는 쓰지 않는다
+    _set_request_headers(monkeypatch, {**fwd, "x-forwarded-host": 'evil.example"; rm -rf ~; "'})
+    out = json.loads(asyncio.run(gw._call_tool("figure_get", {"ref": ref})).content[0].text)
+    assert out["url"] is None and out["curl"] is None
+    # 표는 그림보다 오래 살지 않는다
+    gw._FIG_META.clear()
+    side = gw.FIG_DIR / f"{ref}.json"
+    d = json.loads(side.read_text(encoding="utf-8"))
+    soon = gw.time.time() + 120
+    d["expires"] = gw._fig_iso(soon)
+    side.write_text(json.dumps(d), encoding="utf-8")
+    _set_request_headers(monkeypatch, fwd)
+    out = json.loads(asyncio.run(gw._call_tool("figure_get", {"ref": ref})).content[0].text)
+    assert int(out["url"].split("?t=", 1)[1].split(".")[1]) <= soon
+
+
+def test_figure_list_는_내_그림만_새것부터(monkeypatch):
+    ra = gw._fig_store_sync("a@corp.com", "heax-step_forge", "render_3d", [base64.b64encode(_PNG).decode()], now=gw.time.time() - 10)[0][0]
+    rb = gw._fig_store_sync("a@corp.com", "heax-dynaforge", "plot_energy", [base64.b64encode(_PNG2).decode()])[0][0]
+    gw._fig_store_sync("b@corp.com", "heax-step_forge", "render_3d", [base64.b64encode(_PNG).decode()])
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com"})
+    out = json.loads(asyncio.run(gw._call_tool("figure_list", {})).content[0].text)
+    assert [f["ref"] for f in out["figures"]] == [rb, ra] and out["count"] == 2
+    assert set(out["figures"][0]) == {"ref", "tool", "mime", "bytes", "created", "expires"} and out["figures"][0]["tool"] == "plot_energy"
+    one = json.loads(asyncio.run(gw._call_tool("figure_list", {"limit": 1})).content[0].text)
+    assert [f["ref"] for f in one["figures"]] == [rb] and one["count"] == 2
+
+
+def _fig_portal(monkeypatch, responder):
+    sent = []
+
+    def handler(req):
+        sent.append(req)
+        return responder(req)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(gw.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(gw, "PORTAL", {"api_base": "http://portal.test"})
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    return sent
+
+
+def _multipart(req) -> dict:
+    """요청 본문을 부분별로 — {이름: (filename, content-type, 바이트)}. 바이트를 그대로 보려고 경계로 직접 가른다(줄 끝을 고치지 않는다)."""
+    boundary = req.headers["content-type"].split("boundary=", 1)[1].encode()
+    out = {}
+    for chunk in req.content.split(b"--" + boundary)[1:-1]:
+        head, _sep, body = chunk[2:].partition(b"\r\n\r\n")
+        hdrs = dict(line.split(b": ", 1) for line in head.split(b"\r\n"))
+        disp = hdrs[b"Content-Disposition"].decode()
+        fn = _re.search(r'filename="([^"]*)"', disp)
+        out[_re.search(r'(?<![A-Za-z])name="([^"]*)"', disp).group(1)] = (
+            fn.group(1) if fn else None, (hdrs.get(b"Content-Type") or b"").decode() or None, body[:-2])
+    return out
+
+
+def test_figure_to_report_는_multipart_계약으로_호출자_PAT_를_포털에_넘긴다(monkeypatch):
+    sent = _fig_portal(monkeypatch, lambda req: httpx.Response(200, json={"ok": True, "report_id": "r-1", "file_id": "f-9", "page": 2,
+                                                                          "block_index": 4}))
+    ref = _fig_stored()
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", "authorization": "Bearer pat-a"})
+    res = asyncio.run(gw._call_tool("figure_to_report", {"ref": ref, "report_id": "r-1", "caption": "단면 A-A", "page": 2}))
+    assert not res.isError and json.loads(res.content[0].text) == {"ok": True, "report_id": "r-1", "file_id": "f-9", "page": 2,
+                                                                    "block_index": 4}, "포털의 답을 그대로 준다"
+    (req,) = sent
+    assert req.method == "POST" and str(req.url) == "http://portal.test/agent/figures/to-report"
+    assert req.headers["authorization"] == "Bearer pat-a", "호출자 Authorization 을 그대로 넘긴다"
+    parts = _multipart(req)
+    assert set(parts) == {"meta", "file"}
+    fn, ct, meta = parts["meta"]
+    assert fn is None and ct == "application/json", "meta 는 파일이 아니라 JSON 칸이다"
+    assert json.loads(meta) == {"report_id": "r-1", "caption": "단면 A-A", "page": 2, "tool": "render_3d", "mime": "image/png",
+                                "sha256": hashlib.sha256(_PNG).hexdigest(), "filename": f"render_3d-{ref}.png", "ref": ref}
+    assert parts["file"] == (f"render_3d-{ref}.png", "image/png", _PNG)
+    row = _audit_rows()[-1]
+    assert (row["tool"], row["backend"], row["ok"], row["note"], row["caller"]) == ("figure_to_report", "portal", True, ref, "a@corp.com")
+    # 빈 칸 — caption 없음은 빈 글, page 없음은 null
+    asyncio.run(gw._call_tool("figure_to_report", {"ref": ref, "report_id": "r-1"}))
+    assert json.loads(_multipart(sent[1])["meta"][2])["caption"] == "" and json.loads(_multipart(sent[1])["meta"][2])["page"] is None
+
+
+def test_figure_to_report_는_남의_그림_읽기_전용_공유_비밀을_포털에_보내지_않는다(monkeypatch):
+    sent = _fig_portal(monkeypatch, lambda req: httpx.Response(200, json={"ok": True}))
+    ref = _fig_stored(owner="b@corp.com")
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", "authorization": "Bearer pat-a"})
+    res = asyncio.run(gw._call_tool("figure_to_report", {"ref": ref, "report_id": "r-1"}))
+    assert res.isError and res.content[0].text == f"FIGURE_ERROR: {gw._FIG_MISSING}" and sent == []
+    mine = _fig_stored(owner="a@corp.com")
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", "authorization": "Bearer pat-a", gw.READONLY_HEADER: "1"})
+    res = asyncio.run(gw._call_tool("figure_to_report", {"ref": mine, "report_id": "r-1"}))
+    assert res.isError and res.content[0].text.startswith("read_only: figure_to_report") and sent == []
+    assert not asyncio.run(gw._call_tool("figure_get", {"ref": mine})).isError, "받기 · 목록은 읽기 전용 PAT 도 된다"
+    assert not asyncio.run(gw._call_tool("figure_list", {})).isError
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", "authorization": "Bearer gw-secret"})
+    res = asyncio.run(gw._call_tool("figure_to_report", {"ref": mine, "report_id": "r-1"}))
+    assert res.isError and "사람 PAT 로만" in res.content[0].text and sent == [], "공유 비밀을 포털로 보내지 않는다"
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", "authorization": "Bearer pat-a"})
+    for bad, word in (({"report_id": ""}, "report_id"), ({"report_id": "r", "page": 0}, "page"),
+                      ({"report_id": "r", "caption": "가" * 2001}, "caption")):
+        res = asyncio.run(gw._call_tool("figure_to_report", {"ref": mine, **bad}))
+        assert res.isError and word in res.content[0].text and sent == [], bad
+
+
+@pytest.mark.parametrize("resp,why", [
+    (httpx.Response(404, json={"detail": "Not Found"}), "그림 넣기 창구(/agent/figures/to-report)가 없다"),
+    (httpx.Response(200, text="<html>SPA</html>", headers={"content-type": "text/html"}), "포털이 이 게이트웨이보다 낡았다"),
+    (httpx.Response(401, json={"detail": "x"}), "포털이 이 토큰을 받지 않았다"),
+    (httpx.Response(403, json={"detail": "이 보고서를 고칠 수 없습니다"}), "이 보고서를 고칠 수 없습니다"),
+    (httpx.Response(503, json={"detail": "RA 불통"}), "포털 오류(HTTP 503)")])
+def test_figure_to_report_는_포털의_거절과_낡음을_그대로_말한다(monkeypatch, resp, why):
+    _fig_portal(monkeypatch, lambda req: resp)
+    ref = _fig_stored()
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", "authorization": "Bearer pat-a"})
+    res = asyncio.run(gw._call_tool("figure_to_report", {"ref": ref, "report_id": "r-1"}))
+    assert res.isError and res.content[0].text.startswith("FIGURE_ERROR: ") and why in res.content[0].text, res.content[0].text
+    assert _audit_rows()[-1]["ok"] is False
+
+
+def test_감사_줄은_그림_수와_바이트를_싣고_그림이_없으면_종전_줄이다(monkeypatch):
+    gw._audit("render_3d", "heax-step_forge", True, None, 3, caller="a@corp.com", res=_fig_result())
+    gw._audit("get_x", "b", True, None, 3, caller="a@corp.com",
+              res=types.CallToolResult(content=[types.TextContent(type="text", text="ok")]))
+    gw._audit("GET /fig", "_gateway", True, None, 3, caller="a@corp.com", via="ticket", size=1234)
+    with_img, plain, dl = _audit_rows()
+    assert (with_img["images"], with_img["image_bytes"], with_img["chars"]) == (1, len(_PNG), len('{"view": "iso"}'))
+    assert "images" not in plain and "image_bytes" not in plain and "bytes" not in plain
+    assert (dl["via"], dl["bytes"]) == ("ticket", 1234)
+    # 실제 호출 길 — 그림만 든 결과가 chars:0 으로만 남던 것
+    call, _ = _fig_kit(monkeypatch, results={"render_3d": lambda: types.CallToolResult(content=[_img(_PNG), _img(_SVG)])})
+    call("render_3d")
+    row = [r for r in _audit_rows() if r["tool"] == "render_3d"][-1]
+    assert (row["chars"], row["images"], row["image_bytes"]) == (0, 2, len(_PNG) + len(_SVG))
+
+
+def test_그림_도구는_로컬_목록에_있고_읽기_표지와_읽기_전용_판정이_맞다(monkeypatch):
+    names = [t.name for t in gw._local_tools()]
+    assert {"figure_get", "figure_list", "figure_to_report"} <= set(names) and len(gw.FIGURE_TOOLS) == 3
+    assert gw.FIG_GET_TOOL.annotations.readOnlyHint is True and gw.FIG_LIST_TOOL.annotations.readOnlyHint is True
+    assert gw.FIG_REPORT_TOOL.annotations.readOnlyHint is False and gw.FIG_REPORT_TOOL.annotations.destructiveHint is False
+    for t in gw.FIGURE_TOOLS:
+        props = t.inputSchema.get("properties") or {}
+        assert all((p.get("description") or "").strip() for p in props.values()), f"{t.name} 인자 설명(점수판)"
+        assert gw._panel_denial(t.name, {"app": "heax-step_forge", "uri": "ui://x"}) == "gateway-tool"
+    assert gw._readonly_denial("figure_get", {}) == gw._readonly_denial("figure_list", {}) == ""
+    assert gw._readonly_denial("figure_to_report", {}).startswith("read_only: figure_to_report")
+    monkeypatch.setattr(gw, "FIG_STORE_ON", False)
+    assert gw._readonly_denial("figure_to_report", {}) == "", "끄면 그런 도구가 없다(지금처럼 unknown tool 로 끝난다)"
+
+
+@pytest.mark.parametrize("q,want", [("그림", "figure_get"), ("이미지", "figure_get"), ("보고서에 그림", "figure_to_report"),
+                                    ("그림 파일로 받기", "figure_get"), ("이미지 목록", "figure_list"),
+                                    ("응력 곡선 그림", "plot_curve")])          # 그리는 질의는 그리는 도구가 그대로 앞이다
+def test_search_tools_는_그림_이미지_보고서에_그림으로_그림_도구를_찾는다(monkeypatch, q, want):
+    _search_catalog(monkeypatch)
+    _no_embed(monkeypatch)
+    ranked = json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]
+    assert ranked[0] == want, (q, ranked)
+    assert {"figure_get", "figure_list", "figure_to_report"} <= set(ranked), (q, ranked)
+
+
+def test_받기_표는_게이트웨이_로그에_남지_않는다():
+    """uvicorn 접근 로그는 제 처리기로 찍어 가림 형식기를 타지 않는다 — 표(?t=, 1시간 자격)가 gateway.log 에 그대로 남던 길을 막는다."""
+    import uvicorn
+    uvicorn.Config(lambda scope, receive, send: None, log_level="info")      # main() 이 하는 로그 설정(dictConfig) — 거른이가 남는다
+    acc = logging.getLogger("uvicorn.access")
+    assert any(isinstance(f, gw._MaskAccessQuery) for f in acc.filters)
+    rec = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                            ("198.51.100.7:5000", "GET", "/fig/fig_" + "a" * 22 + "?t=v1.1700000000." + "f" * 64 + "&x=1", "1.1", 200), None)
+    assert all(f.filter(rec) for f in acc.filters)
+    assert rec.getMessage() == f'198.51.100.7:5000 - "GET /fig/fig_{"a" * 22}?t=***&x=1 HTTP/1.1" 200'
+    line = gw._MaskSecretsFormatter("%(message)s").format(logging.LogRecord("x", logging.INFO, __file__, 1, "GET /fig/r?t=v1.9.abc", None, None))
+    assert line == "GET /fig/r?t=***"
+
+
+# ── 그림 저장 반대 검토(11-02) 고침 — 검토가 재현한 결함마다 하나 ─────────────────────────────────────────────────────────────────
+def test_청소는_곁_JSON_을_잠금_밖에서_읽고_그동안_둔_것과_지운_것을_맞춘다(monkeypatch):
+    """반대 검토 1 — 잠금을 쥔 채 곁 JSON 을 다 읽던 때는 그림 10만 장에서 1.6초 동안 그림 든 결과가 모두 멈췄다."""
+    import threading
+    old = _fig_stored(raw=_PNG2)                         # 청소가 읽은 뒤 상한으로 지워진다
+    real = gw._fig_meta_from
+    reading, release = threading.Event(), threading.Event()
+
+    def slow(blob):
+        if not reading.is_set():
+            reading.set()
+            assert release.wait(5)
+        return real(blob)
+    monkeypatch.setattr(gw, "_fig_meta_from", slow)
+    out = {}
+    th = threading.Thread(target=lambda: out.update(gw._fig_sweep_sync()))
+    th.start()
+    try:
+        assert reading.wait(5)
+        assert gw._FIG_LOCK.acquire(timeout=1), "청소가 디스크를 읽는 동안 잠금을 쥐었다"
+        try:
+            release.set()
+            gw.time.sleep(0.3)                           # 청소는 old 를 다 읽고(그림 파일도 있다) 표를 바꿔 끼우려 잠금을 기다린다
+            assert th.is_alive(), "청소가 잠금 없이 표를 바꿔 끼웠다"
+            # 잠금을 쥔 채(쓰기 · 상한과 같은 자리) — 읽는 동안 새로 둔 그림 하나, 청소가 읽은 뒤 상한이 지운 그림 하나
+            new = gw._fig_put("a@corp.com", "heax-step_forge", "render_3d", "image/png", _PNG, hashlib.sha256(_PNG).hexdigest(),
+                              gw.time.time())
+            gw._fig_drop(old)
+        finally:
+            gw._FIG_LOCK.release()
+    finally:
+        release.set()
+        th.join(5)
+    assert new in gw._FIG_META and old not in gw._FIG_META, "읽는 동안 둔 것은 남고, 읽은 뒤 지운 것은 되살아나지 않는다"
+    assert gw._FIG_COUNT == {"a@corp.com": 1} and gw._FIG_SWEEP["on"] is False and out["kept"] == 1
+
+
+def test_그림_일은_따로_둔_일꾼_수_안에서_돌아_기본_풀을_다_잡지_않는다(monkeypatch):
+    """반대 검토 1 — 잠금을 기다리는 그림 결과 40건이 기본 일꾼 풀(PAT 검증 등이 같이 쓴다)을 다 잡아 다른 일이 1.8초 멈췄다."""
+    import threading
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com"})
+    hold = 1.5
+
+    async def main():
+        monkeypatch.setattr(gw, "_FIG_LIMITER", {"lim": anyio.CapacityLimiter(4)})
+        held = threading.Event()
+
+        def holder():
+            with gw._FIG_LOCK:
+                held.set()
+                gw.time.sleep(hold)
+        th = threading.Thread(target=holder)
+        th.start()
+        held.wait()
+        async with anyio.create_task_group() as tg:
+            for i in range(40):
+                tg.start_soon(gw._fig_keep, "heax-step_forge", f"t{i}", _fig_result(_PNG + bytes([i])))
+            await anyio.sleep(0.2)
+            t0 = gw.time.monotonic()
+            await anyio.to_thread.run_sync(lambda: None)
+            hop = gw.time.monotonic() - t0
+        th.join()
+        return hop
+    assert asyncio.run(main()) < hold / 3
+
+
+def test_같은_그림을_다시_받으면_보존_기한이_새로_선다(monkeypatch):
+    """반대 검토 3 — 다시 받은 결과가 옛 ref 를 옛 기한(5초 남음)으로 돌려줘 6초 뒤 '없다' 였다."""
+    data = [base64.b64encode(_PNG).decode()]
+    t0 = 1_000_000.0
+    (r1, *_), = gw._fig_store_sync("a@corp.com", "b", "render_3d", data, now=t0)
+    later = t0 + gw.FIG_TTL_S - 5
+    (r2, *_), = gw._fig_store_sync("a@corp.com", "b", "render_3d", data, now=later)
+    side = json.loads((gw.FIG_DIR / f"{r1}.json").read_text(encoding="utf-8"))
+    assert r1 == r2 and (gw._fig_ts(side["created"]), gw._fig_ts(side["expires"])) == (later, later + gw.FIG_TTL_S)
+    assert gw._fig_load(r1, now=later + 6) is not None and gw._FIG_META[r1]["expires_ts"] == later + gw.FIG_TTL_S
+    assert gw._FIG_COUNT == {"a@corp.com": 1}, "다시 적어도 한 장이다"
+    mtime = (gw.FIG_DIR / f"{r1}.json").stat().st_mtime_ns
+    gw._fig_store_sync("a@corp.com", "b", "render_3d", data, now=later + 60)
+    assert (gw.FIG_DIR / f"{r1}.json").stat().st_mtime_ns == mtime, "한 시간 안의 적중은 다시 쓰지 않는다"
+
+
+def test_유니코드_숫자_표와_판정_중_예외도_같은_404_이고_감사_줄을_남긴다(monkeypatch):
+    """반대 검토 4 — `\\d` 가 유니코드 숫자를 받아 compare_digest 가 던졌다(있는 ref 만 500 — 무인증 존재 신호, 감사 줄 없음)."""
+    ref = _fig_stored()
+    t = "v1." + "%D9%A9" * 10 + "." + "a" * 64
+    nf = (404, b'{"error":"not found"}')
+    assert _fig_get(monkeypatch, f"/fig/{ref}", qs=f"t={t}".encode())[::2] == nf
+    assert _audit_rows()[-1]["tool"] == "GET /fig" and _audit_rows()[-1]["ok"] is False
+    assert _fig_get(monkeypatch, f"/fig/fig_{'Q' * 22}", qs=f"t={t}".encode())[::2] == nf
+    monkeypatch.setattr(gw, "_fig_ticket_ok", lambda *a, **k: (_ for _ in ()).throw(TypeError("boom")))
+    assert _fig_get(monkeypatch, f"/fig/{ref}", qs=b"t=v1.9999999999." + b"a" * 64)[::2] == nf
+
+
+def test_청소는_못_읽은_곁_JSON_을_지우지_않고_이상한_항목_하나에_멈추지_않는다(monkeypatch):
+    """반대 검토 5 — 곁 JSON 이름의 폴더 하나가 표를 비운 채 청소를 매번 멈췄고, 읽지 못한(권한 · I/O) 곁 JSON 의 그림을 지웠다."""
+    expired = gw._fig_store_sync("a@corp.com", "b", "t", [base64.b64encode(_PNG).decode()], now=gw.time.time() - 8 * 86400)[0][0]
+    live = _fig_stored(raw=_PNG2)
+    bad = gw.FIG_DIR / ("fig_" + "D" * 22 + ".json")
+    bad.mkdir()
+    got = gw._fig_sweep_sync()
+    assert (got["expired"], got["unreadable"]) == (1, 1) and not (gw.FIG_DIR / f"{expired}.png").exists()
+    assert live in gw._FIG_META and bad.is_dir(), "이상한 항목은 그대로 두고 나머지는 끝까지 치운다"
+    side = gw.FIG_DIR / f"{live}.json"
+    os.chmod(side, 0)
+    try:
+        if os.access(side, os.R_OK):
+            pytest.skip("root 로 돌아 권한 시험이 안 된다")
+        got = gw._fig_sweep_sync()
+        assert got["unreadable"] == 2 and got["broken"] == 0 and (gw.FIG_DIR / f"{live}.png").exists() and side.exists()
+    finally:
+        os.chmod(side, 0o600)
+    assert gw._fig_sweep_sync()["kept"] == 1 and live in gw._FIG_META, "다시 읽히면 그대로 돌아온다"
+    # 곁 JSON 이름의 폴더를 만날 때마다 fd 가 새지 않는다(fdopen 은 폴더에서 던지면서 fd 를 닫지 않는다)
+    before = len(os.listdir("/proc/self/fd"))
+    for _ in range(20):
+        gw._fig_sweep_sync()
+    assert len(os.listdir("/proc/self/fd")) <= before
+
+
+def test_끄면_읽기_전용_판정_감사_줄_검색_순위도_지금과_같다(monkeypatch):
+    """반대 검토 6 — 끈 박스에서 같은 이름의 백엔드 도구가 읽기 전용 PAT 로 열렸고, 감사 줄과 '이미지' 검색 순위가 지금과 달랐다."""
+    monkeypatch.setattr(gw, "FIG_STORE_ON", False)
+    b = _CallB([])
+    b.session = _CallSess([_tool("figure_get")])
+    monkeypatch.setattr(gw, "backends", {"heax-x": b})
+    for k, v in (("exposed_tools", []), ("route", {}), ("alias_route", {}), ("POLICY", {}), ("_ACCESS_POLICY", {})):
+        monkeypatch.setattr(gw, k, v)
+    asyncio.run(gw._aggregate())
+    assert gw.route.get("figure_get") == ("heax-x", "figure_get"), "끄면 그 이름은 백엔드 도구다(접두 없이 — 지금처럼)"
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", gw.READONLY_HEADER: "1"})
+    res = asyncio.run(gw._call_tool("figure_get", {}))
+    assert res.isError and res.content[0].text.startswith("read_only: 'figure_get'") and b.session.calls == []
+    gw._audit("render_3d", "heax-step_forge", True, None, 3, caller="a@corp.com", res=_fig_result())
+    assert "images" not in _audit_rows()[-1] and "image_bytes" not in _audit_rows()[-1]
+    _search_catalog(monkeypatch, [("heax-x", "image_meta", "Return metadata."), ("heax-x", "get_figure_caption", "Caption text.")])
+    _no_embed(monkeypatch)
+    ranked = lambda q: json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]      # noqa: E731
+    assert ranked("이미지") == [] and "get_figure_caption" not in ranked("그림"), "끄면 그림 저장이 더한 동의어 갈래도 없다"
+    monkeypatch.setattr(gw, "FIG_STORE_ON", True)
+    assert {"image_meta", "get_figure_caption", "figure_get"} <= set(ranked("이미지"))
+
+
+def test_그림_도구와_같은_이름의_백엔드_도구는_접두를_단다(monkeypatch):
+    """반대 검토 7 — 켜면 백엔드 figure_list 가 목록에 같은 이름으로 둘 나왔고 그 이름의 호출은 늘 로컬로 가 백엔드에 닿지 못했다."""
+    b = _CallB([])
+    b.session = _CallSess([_tool("figure_list")])
+    monkeypatch.setattr(gw, "backends", {"heax-x": b})
+    for k, v in (("exposed_tools", []), ("route", {}), ("alias_route", {}), ("POLICY", {}), ("_ACCESS_POLICY", {})):
+        monkeypatch.setattr(gw, k, v)
+    monkeypatch.setattr(gw, "_RESP_CACHE", gw.OrderedDict())
+    asyncio.run(gw._aggregate())
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com"})
+    names = [t.name for t in gw._visible_tools([])]
+    assert names.count("figure_list") == 1 and "heaxx_figure_list" in names
+    assert not asyncio.run(gw._call_tool("heaxx_figure_list", {})).isError and b.session.calls == ["figure_list"]
+    assert "figures" in json.loads(asyncio.run(gw._call_tool("figure_list", {})).content[0].text), "맨 이름은 그림 도구다"
+    assert b.session.calls == ["figure_list"]
+
+
+def test_실패_봉투는_structuredContent_에_있어도_두지_않고_손대지_않는다(monkeypatch):
+    """반대 검토 8 — 그림만 든 결과에 글 블록을 덧붙이면 그 글이 첫 글 블록이 되어 structuredContent 의 오류를 봉투 판정이 못 봤다."""
+    bad = lambda: types.CallToolResult(content=[_img(_PNG)], structuredContent={"error": "render failed"})       # noqa: E731
+    call, _ = _fig_kit(monkeypatch, results={"render_3d": bad})
+    res = call("render_3d")
+    assert res.model_dump_json() == bad().model_dump_json() and gw._envelope_reason(res) == "envelope: render failed"
+    assert not gw.FIG_DIR.exists()
+
+
+def test_figure_to_report_는_포털_한도에_맞추고_2xx_의_ok_false_도_실패로_말한다(monkeypatch):
+    """포털(report_figures) 계약 — caption 은 Report Archive 상한 500자(포털은 넘으면 말없이 줄인다), 실패 꼴 {ok:false, error, detail},
+    Content-Length 없는 본문은 411."""
+    sent = _fig_portal(monkeypatch, lambda req: httpx.Response(200, json={"ok": False, "error": "bad_page", "detail": "그 보고서에는 2쪽까지"}))
+    ref = _fig_stored()
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", "authorization": "Bearer pat-a"})
+    res = asyncio.run(gw._call_tool("figure_to_report", {"ref": ref, "report_id": "7", "caption": "가" * 501}))
+    assert res.isError and "500자" in res.content[0].text and sent == []
+    res = asyncio.run(gw._call_tool("figure_to_report", {"ref": ref, "report_id": "7", "caption": "가" * 500, "page": 3}))
+    assert res.isError and res.content[0].text == "FIGURE_ERROR: 그 보고서에는 2쪽까지"
+    assert sent[0].headers["content-length"] == str(len(sent[0].content)), "포털은 Content-Length 없는 본문을 받지 않는다"
+
+
+def test_받기는_링크를_따라가지_않는다(monkeypatch):
+    ref = _fig_stored()
+    other = gw.FIG_DIR.parent / "secret.png"
+    other.write_bytes(b"\x89PNG\r\n\x1a\n" + b"secret")
+    png = gw.FIG_DIR / f"{ref}.png"
+    png.unlink()
+    png.symlink_to(other)
+    st, _h, body = _fig_get(monkeypatch, f"/fig/{ref}", auth=b"Bearer pat-a", verifier=_FigV({"email": "a@corp.com"}))
+    assert (st, body) == (404, b'{"error":"not found"}')
+
+
+def test_퍼센트로_적은_표_이름도_로그에서_가린다():
+    line = gw._MaskSecretsFormatter("%(message)s").format(logging.LogRecord("x", logging.INFO, __file__, 1, "GET /fig/r?%74=v1.9.abc", None, None))
+    assert line == "GET /fig/r?%74=***"

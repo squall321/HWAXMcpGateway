@@ -8197,7 +8197,9 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2, "noncore": 0.5}
     assert all(v for k, v in d["switches"].items() if k != "noncore_demote") and d["switches"]["noncore_demote"] is False
     # 11-02 그림 저장에서 '그림' 에 figure 를 더하고 '이미지' 를 새로 넣었다(그림 도구를 찾게 — 일부러 바꾼 기본값)
-    assert len(d["synonyms"]) == 74 and d["synonyms"]["요약"] == ("digest", "summary")
+    # 11-02 PC 키트에서 'docx' · '변환기' · '표 칸'(띄어 쓴 열쇠) → kit_get 을 넣었다(변환기를 찾게 — 일부러 바꾼 기본값, HWAXPortal docs/report-figures RF-23)
+    assert len(d["synonyms"]) == 77 and d["synonyms"]["요약"] == ("digest", "summary")
+    assert d["synonyms"]["docx"] == d["synonyms"]["변환기"] == d["synonyms"]["표 칸"] == ("kit_get",)
     assert d["synonyms"]["그림"] == ("plot", "render", "figure") and d["synonyms"]["이미지"] == ("figure", "image")
     assert d["fingerprint"] == d["base_fingerprint"] and gw._tuning_health()["overlay"] == {"present": False}
 
@@ -12090,3 +12092,36 @@ def test_kit_get_은_로컬_목록_읽기_도구_도구_지도에_있고_같은_
     asyncio.run(gw._aggregate())
     assert "kit_get" not in gw.route and gw.route.get("heaxx_kit_get") == ("heax-x", "kit_get"), "맨 이름이면 늘 로컬로 가 백엔드에 닿지 못한다"
 
+
+_KIT_SEARCH_SPECS = _SEARCH_SPECS + [
+    (a, n, "그림을 그린다(plot · render).") for a, n in (
+        ("heax-step_forge", "render_3d"), ("heax-step_forge", "render_interface"), ("heax-step_forge", "render_status"),
+        ("heax-step_forge", "mesh_section_figure"), ("heax-step_forge", "mesh_surface_figure"), ("heax-materialtwin_web", "plot_curves"),
+        ("heax-materialtwin_web", "plot_ashby"), ("heax-materialtwin_web", "stress_strain_plot"), ("heax-kooremapper_mcp", "report_image"),
+        ("heax-kooremapper_mcp", "attach_render"), ("heax-doc_forge", "docx_outline"))]
+
+
+@pytest.mark.parametrize("q", ["docx", "변환기", "표 칸 그림", "md2docx", "표칸그림", "표 칸에 그림 넣기", "docx 변환기", "보고서 docx 표 칸 그림"])
+def test_search_tools_는_docx_변환기_표_칸_그림_md2docx_로_kit_get_을_찾는다(monkeypatch, q):
+    """dev 의 그리는 도구(plot · render · figure 이름 열한 개)가 있는 카탈로그에서 첫 줄이 kit_get 이다 — '표 칸 그림' 은 한 글자 낱말이 버려져
+    '그림' 하나만 남는다(띄어 쓴 열쇠 '표 칸' 이 빈칸을 뺀 질의로 맞춘다)."""
+    _search_catalog(monkeypatch, _KIT_SEARCH_SPECS)
+    _no_embed(monkeypatch)
+    ranked = json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]
+    assert ranked[0] == "kit_get", (q, ranked)
+
+
+def test_띄어_쓴_손_동의어_열쇠는_빈칸을_뺀_질의로_맞추고_맞지_않으면_순위가_그대로다(monkeypatch, tmp_path):
+    _search_catalog(monkeypatch, _KIT_SEARCH_SPECS)
+    _no_embed(monkeypatch)
+
+    def search(q):
+        return json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)
+    ranked = lambda q: search(q)["ranked"]  # noqa: E731
+    assert ranked("그림")[0] == "figure_get" and ranked("그림")[:8].count("kit_get") == 0, "'그림' 만으로는 그리는 도구가 앞이다(kit_get 은 설명으로만)"
+    before = {q: ranked(q) for q in ("그림", "표로 받기", "응력 곡선 그림")}
+    # 박스 덧씌우기로 띄어 쓴 열쇠를 더해도 그 꼴이 없는 질의의 순위는 그대로다
+    gw.SEARCH_TUNING_LOCAL_PATH.write_text(json.dumps({"synonyms": {"메인 기판": {"to": ["list_parts"], "owner": None, "source_fix": None}}},
+                                                      ensure_ascii=False), encoding="utf-8")
+    assert {q: ranked(q) for q in before} == before
+    assert ranked("메인 기판 부품")[0] == "list_parts" and ranked("메인기판")[0] == "list_parts"

@@ -3677,6 +3677,22 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                     vs.append(v)
                     sm.setdefault(v, []).append(f"syn:{k}")
         expand[w], src[w] = tuple(vs), sm
+    # 띄어 쓴 손 동의어 열쇠('표 칸') — 낱말은 빈칸에서 갈라지고 한 글자 낱말('표' · '칸')은 버려져 위 낱말 맞추기로는 늘 못 맞혔다. 빈칸을 뺀 꼴이
+    # 빈칸을 뺀 질의에 들면 그 꼴을 낱말 하나로 더하고(맞힌 비율의 분모에도 든다 — 이미 낱말이면 더하지 않는다) 그 꼴을 담은 낱말('표칸그림')에도
+    # 잇는다 — 붙여 쓴 질의는 '그림' 갈래와 한 낱말이라 그 낱말 하나로는 그리는 도구와 비긴다. 띄어 쓴 열쇠가 맞지 않는 질의의 순위는 지금과 바이트까지
+    # 같다 — 박스 덧씌우기의 띄어 쓴 열쇠(server-setup 7.3 의 예 '메인 PBA')도 이제 먹는다(HWAXPortal docs/report-figures RF-23).
+    for k, ss in syn.items():
+        flat = re.sub(r"\s+", "", k)
+        if flat == k or len(flat) < 2 or flat not in q_flat:
+            continue
+        if flat not in expand:
+            terms.append(flat)
+            expand[flat], src[flat] = (flat,), {}
+        for w in [x for x in expand if flat in x]:
+            add = tuple(v for v in ss if v not in expand[w] and not (no_delib and v == "deliberate_start"))
+            expand[w] += add
+            for v in add:
+                src[w].setdefault(v, []).append(f"syn:{k}")
     write_intent = any(w in q + " " for w in tun["write_intent"])
     if vocab and sw["core_vocab"]:
         # 코어 낱말 → 허브 읽기 도구 이름(R-4 — 타입 이름에 이으면 어느 도구 이름 · 설명에도 없어 0점이었다). 띄어 쓴 꼴('관리 기준')은

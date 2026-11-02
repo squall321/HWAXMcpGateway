@@ -6234,8 +6234,9 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     _aggregate_tools(monkeypatch, {"reportarchive": [leaky, _stool("ra_get", {"id": "보고서 id"})]})
     body = tools_map()
     assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read", "views",
-                          "panel_read"], \
-        "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4) · 패널 확인용 읽기 목록(HA-20 B-2)은 맨 뒤에 덧붙는다"
+                          "panel_read", "orig"], \
+        "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4) · 패널 확인용 읽기 목록(HA-20 B-2) · 원래 이름" \
+        "(ontology-first F0)은 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
     assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 19, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 3
@@ -10450,6 +10451,45 @@ def test_tools_map_은_패널_첫_쓰기_확인의_읽기를_panel_read_로_싣�
                                         if gw._panel_read(next(x for x in gw.exposed_tools if x.name == n), bk, o))
     assert set(body["panel_read"]) <= set(body["routine_read"]), "같은 차례에서 이름 갈래만 뺀다 — routine_read 의 부분이다"
     assert not {x.name for x in gw._local_tools()} & set(body["panel_read"]), "로컬 도구는 백엔드 도구가 아니다"
+
+
+def test_F0_tools_map_은_접두가_붙은_노출_이름의_원래_이름과_선언_백엔드_표지를_싣는다(monkeypatch, _fresh_scores):
+    """HWAXPortal docs/ontology-first F0 · OF-4 — 에이전트 서버의 좌석 자유 조회는 노출 이름의 머리로 읽기를 판정해, 겹침 때문에 접두가 붙은 읽기를 모두
+    버렸다(dev 11-02 — aidatahub_semantic_search · signalforge_semantic_search · heaxstep_forge_list_jobs · ste_list_jobs). 원래 이름은 게이트웨이만
+    확실히 안다 — orig 는 노출 이름 → 원래 이름(둘이 다른 것만 — 겹침 접두 · 허브 가족 접두 · 선언 쪽 접두)이고, 앱 줄의 declared 는 선언 백엔드에만
+    붙는다(부를 때 등록 토큰이 없으면 거절되는 앱 — 엔진이 원래 이름으로 보지 않는다). 칸을 더할 뿐이라 있던 칸은 그대로다."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)          # 정본 rootdesigndatahub 는 허브 가족 — 겹치지 않아도 늘 접두
+    monkeypatch.setattr(gw, "_CONN_ACTIVE", {"stepforge-prod"})           # 선언 백엔드(박스 권한표 connect:)
+    _aggregate_with(monkeypatch, {"aidatahub": ["semantic_search", "agent_search"], "signalforge": ["semantic_search", "get_ontology"],
+                                  "heax-step_forge": ["list_jobs", "list_parts", "find_plm_task", "cancel_job"],
+                                  "ste": ["list_jobs"], "stepforge-prod": ["list_parts", "find_plm_task", "list_rows"],
+                                  "rootdesigndatahub": ["get_guide", "object_resolve"]})
+    st, body = _gate_call(monkeypatch, "/tools-map")
+    assert st == 200
+    assert body["orig"] == {"aidatahub_semantic_search": "semantic_search", "signalforge_semantic_search": "semantic_search",
+                            "heaxstep_forge_list_jobs": "list_jobs", "ste_list_jobs": "list_jobs",
+                            "stepforgeprod_list_parts": "list_parts", "stepforgeprod_find_plm_task": "find_plm_task",
+                            "rootdesigndatahub_get_guide": "get_guide", "rootdesigndatahub_object_resolve": "object_resolve"}, body["orig"]
+    assert body["orig"] == {n: o for n, (_bk, o) in gw.route.items() if n != o}, "route 와 같은 셈이다"
+    assert {"list_parts", "find_plm_task", "agent_search", "get_ontology", "cancel_job", "list_rows"} <= set(body["map"]), \
+        "선언 쪽만 접두가 붙어 정적 백엔드의 맨 이름은 그대로다(974e7ed)"
+    assert not set(body["orig"]) & {t.name for t in gw._local_tools()}, "로컬 도구는 원래 이름이 노출 이름이다"
+    rows = {a["app"]: a for a in body["apps"]}
+    assert [k for k, a in rows.items() if "declared" in a] == ["stepforge-prod"] and rows["stepforge-prod"]["declared"] is True
+    assert rows["rootdesigndatahub"].get("role") == "canonical", "허브 가족은 role 로 따로 보인다(E2-1 — 그대로다)"
+
+
+def test_F0_내장_연결은_선언_백엔드가_아니다(monkeypatch, _fresh_scores):
+    """내장 둘(reportarchive · testscope)은 등록 토큰 길이지만 선언 백엔드가 아니다 — 정적 백엔드로 늘 붙고, 겹치면 정적 백엔드끼리 접두가 붙는다
+    (cae00 의 Report Archive · DynaForge list_reports — 엔진 주석 _RISK_APP_HEAD). 지킴(_CONN_ACTIVE)에 내장 키가 들어와도 declared 를 달지 않는다."""
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
+    _aggregate_with(monkeypatch, {"reportarchive": ["list_reports", "get_guide"], "heax-kooremapper_mcp": ["list_reports", "list_tasks"]})
+    st, body = _gate_call(monkeypatch, "/tools-map")
+    assert st == 200 and not [a["app"] for a in body["apps"] if "declared" in a], body["apps"]
+    assert body["orig"] == {"reportarchive_list_reports": "list_reports", "heaxkooremapper_mcp_list_reports": "list_reports"}, body["orig"]
+    monkeypatch.setattr(gw, "_CONN_ACTIVE", {"reportarchive"})             # 있어서는 안 되는 상태 — 그래도 선언으로 보지 않는다
+    st, body = _gate_call(monkeypatch, "/tools-map")
+    assert st == 200 and not [a["app"] for a in body["apps"] if "declared" in a], body["apps"]
 
 
 def test_동사로도_쓰이는_fetch_resolve_trace_는_조회_낱말이_아니고_그_낱말로만_열리던_진짜_읽기는_읽기_목록으로_연다(monkeypatch):

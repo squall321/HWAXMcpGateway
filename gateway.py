@@ -8038,6 +8038,10 @@ def _bearer_gate(app, pat_verifier=None):
                     _apps[-1]["role"] = _r[0]
                     if _r[1]:
                         _apps[-1]["role_note"] = _r[1]
+                # 선언 백엔드(박스 권한표 connect: — 운영 사본 · MatNexus · FMEA)면 참 — 부를 때 그 사람이 등록한 토큰이 없으면 refused 다. 에이전트
+                # 서버의 좌석 자유 조회는 이 앱의 접두 이름을 원래 이름으로 보지 않는다(HWAXPortal docs/ontology-first F0 · OF-4). 아니면 칸이 없다.
+                if _k in _CONN_ACTIVE and _k not in _BUILTIN_CONN:
+                    _apps[-1]["declared"] = True
             # 영역 — 하는 일로 묶은 두 번째 축(tool_areas.json). 미분류는 숨기지 않고 따로 준다:
             # 새 앱이 붙어 분류표에 한 줄이 빠지면 그 도구들이 UI 에서 '미분류 N' 으로 보여야 한다.
             _areas = {n: _area_of(n, bk) for n, bk in _map.items()}
@@ -8064,6 +8068,11 @@ def _bearer_gate(app, pat_verifier=None):
                 # 패널 첫 쓰기 확인이 읽기로 보는 도구의 노출 이름(정렬, 백엔드 도구만) — _panel_read(표지 · 읽기 목록, 이름 낱말 없이). 포털 패널 창구는
                 # routine_read 가 아니라 이것을 본다 — 이것 밖이면 그 패널 세션의 첫 호출에 확인을 묻는다(HWAXPortal docs/request-1027 HA-20 B-2).
                 "panel_read": sorted(_n for _n, (_bk, _orig) in route.items() if _panel_read(_tool_of.get(_n), _bk, _orig)),
+                # 노출 이름 → 원래 이름(둘이 다른 것만 — 겹침 접두 · 허브 가족 접두, 백엔드 도구만). 원래 이름은 게이트웨이만 확실히 안다 — 노출 이름에서
+                # 접두를 떼어 짐작하면 원래 이름이 그 앱 키로 시작하는 도구에서 틀린다. 에이전트 서버의 좌석 자유 조회가 겹침 때문에 접두가 붙은 읽기를
+                # 원래 이름으로 판정하고(선언 백엔드 · 허브 가족 · 리스크 심사는 빼고), 챗 고정 몫이 (백엔드, 원래 이름)으로 노출 이름을 찾는다
+                # (HWAXPortal docs/ontology-first F0 · OF-4 · OF-5). 이 칸이 있으면 이 게이트웨이가 declared 를 안다. 위 칸들은 그대로다.
+                "orig": {_n: _orig for _n, (_bk, _orig) in sorted(route.items()) if _n != _orig},
             }, ensure_ascii=False).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

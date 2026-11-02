@@ -328,6 +328,10 @@ python3 tool_usage_report.py --days 60 --out unused.md
 - `/tools-map` 의 `panel_read` — 포털 MCP Apps 패널(HWAXPortal docs/request-1027 HA-20)의 첫 쓰기 확인이 읽기로 보는 도구의 노출 이름(`_panel_read` —
   위 `_routine_read` 의 차례에서 마지막 갈래인 이름 낱말만 뺀 것: 닫기 목록 → 앱 표지 → 읽기 목록). 이 밖이면 포털은 그 패널 세션의 첫 호출에 확인을
   묻는다 — 이름 규칙은 울타리가 아니다.
+- `/tools-map` 의 `orig` · 앱 줄의 `declared`(HWAXPortal docs/ontology-first F0) — `orig` 는 노출 이름 → 원래 이름(둘이 다른 것만 — 겹침 접두 · 허브 가족
+  접두, 백엔드 도구만)이고, `declared` 는 선언 백엔드(박스 권한표 `connect:` — 부를 때 그 사람의 등록 토큰이 없으면 거절된다)의 앱 줄에만 `true` 로
+  붙는다. 에이전트 서버의 좌석 자유 조회가 겹침 때문에 접두가 붙은 읽기를 원래 이름으로 판정하고(리스크 심사 · 선언 백엔드 · 허브 가족은 빼고), 웹 챗
+  고정 몫이 (백엔드, 원래 이름)으로 노출 이름을 찾는다. `orig` 가 없으면 옛 게이트웨이로 보고 지금처럼 노출 이름으로 판정한다.
 - MCP prompts — `prompts/list` 는 부른 사람(사람 PAT)이 볼 수 있는 루틴마다 `routine-<루틴 id>`(제목 · 단계 사슬 · 변수 인자 — 필수 표시는 포털 목록의
   `required`)를 낸다. 공유 비밀 · 익명 · 포털 실패는 빈 목록이다(실패는 경고 한 줄, 다만 권한(`feat:routines`)이 없다는 포털 403 은 정상 거절이라 정보 한 줄).
   `prompts/get` 은 계획의 변수로 빠진 필수 · 없는 입력을 먼저 거절하고, 루틴을 `routine_*` 도구로 돌리는

@@ -8194,9 +8194,11 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     # noncore(0.5) · noncore_demote(끔)는 10-31 E2-5 가 더한 새 손잡이다 — 끈 채로 들어와 순위는 그대로다(옮긴 값이 아니다)
     assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2, "noncore": 0.5}
     assert all(v for k, v in d["switches"].items() if k != "noncore_demote") and d["switches"]["noncore_demote"] is False
-    # 11-02 그림 저장에서 '그림' 에 figure 를 더하고 '이미지' 를 새로 넣었다(그림 도구를 찾게 — 일부러 바꾼 기본값)
-    assert len(d["synonyms"]) == 74 and d["synonyms"]["요약"] == ("digest", "summary")
+    # 11-02 그림 저장에서 '그림' 에 figure 를 더하고 '이미지' 를 새로 넣었다(그림 도구를 찾게 — 일부러 바꾼 기본값). 같은 날 figure_to_doc 이
+    # '문서에' · '백서' 를 새로 넣었다(76)
+    assert len(d["synonyms"]) == 76 and d["synonyms"]["요약"] == ("digest", "summary")
     assert d["synonyms"]["그림"] == ("plot", "render", "figure") and d["synonyms"]["이미지"] == ("figure", "image")
+    assert d["synonyms"]["문서에"] == ("document", "figure_to_doc") and d["synonyms"]["백서"] == ("document", "mxwp", "figure_to_doc")
     assert d["fingerprint"] == d["base_fingerprint"] and gw._tuning_health()["overlay"] == {"present": False}
 
 
@@ -12156,3 +12158,22 @@ def test_figure_to_doc_는_쓰기_도구로_목록에_있고_읽기_전용과_�
     monkeypatch.setattr(gw, "FIG_STORE_ON", False)
     assert "figure_to_doc" not in {x.name for x in gw._local_tools()} and gw._readonly_denial("figure_to_doc", {}) == ""
 
+
+@pytest.mark.parametrize("q,first", [("문서에 그림", "figure_to_doc"), ("백서에 그림 넣기", "figure_to_doc"),
+                                     ("MXWP 문서에 그림", "figure_to_doc"), ("MXWP", "figure_to_doc"),
+                                     ("백서", "export_document")])          # 백서만 물으면 MX 백서 자기 도구가 앞이다
+def test_search_tools_는_문서에_그림_백서_MXWP_로_figure_to_doc_을_찾는다(monkeypatch, q, first):
+    _search_catalog(monkeypatch)
+    _no_embed(monkeypatch)
+    ranked = json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]
+    assert ranked[0] == first and "figure_to_doc" in ranked, (q, ranked)
+
+
+def test_그림_저장을_끄면_문서에_백서_동의어_갈래도_없다(monkeypatch):
+    """'문서에' · '백서' 는 figure_to_doc 이 더한 손 동의어다 — 끄면 그 갈래가 없다(검색 순위가 지금과 같다, README 의 끄기 약속)."""
+    _search_catalog(monkeypatch, [("heax-x", "get_document", "Return a record."), ("heax-x", "list_mxwp_pages", "Pages.")])
+    _no_embed(monkeypatch)
+    ranked = lambda q: json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]      # noqa: E731
+    assert "get_document" in ranked("위키 문서에") and {"get_document", "list_mxwp_pages", "figure_to_doc"} <= set(ranked("백서"))
+    monkeypatch.setattr(gw, "FIG_STORE_ON", False)
+    assert not {"get_document", "list_mxwp_pages", "figure_to_doc"} & set(ranked("위키 문서에") + ranked("백서"))

@@ -5732,9 +5732,12 @@ def _fig_tools() -> tuple:
     return FIGURE_TOOLS if FIG_STORE_ON else ()
 
 
-# search_tools 손 동의어 가운데 그림 저장이 더한 갈래(search_tuning.json 의 '그림' · '이미지' 와 맞춘다) — 끄면 뺀다. 두면 끈 박스에서 '그림' ·
-# '이미지' 질의가 이름에 figure · image 가 든 백엔드 도구를 새로 올려 순위가 지금과 달랐다(반대 검토 6).
-_FIG_SYN = {"그림": ("figure",), "이미지": ("figure", "image")}
+# search_tools 손 동의어 가운데 그림 저장이 더한 갈래(search_tuning.json 의 '그림' · '이미지' · '문서에' · '백서' 와 맞춘다) — 끄면 뺀다. 두면 끈
+# 박스에서 '그림' · '이미지' 질의가 이름에 figure · image 가 든 백엔드 도구를 새로 올려 순위가 지금과 달랐다(반대 검토 6).
+# '문서에' · '백서' 는 figure_to_doc 을 찾게 한다(긴급 11-02) — '문서' 가 아니라 '문서에' 다. '문서' 로 잇던 시험 판은 '문서 · 문서가' 질의마다
+# 이름에 document 가 든 도구를 올려 다른 정답을 밀어냈다(평가셋 auto-082 6 → 12위, doc 으로 이으면 19위 — 10-16 카탈로그 스냅샷).
+_FIG_SYN = {"그림": ("figure",), "이미지": ("figure", "image"), "문서에": ("document", "figure_to_doc"),
+            "백서": ("document", "mxwp", "figure_to_doc")}
 
 
 def _fig_unsyn(syn: dict) -> dict:

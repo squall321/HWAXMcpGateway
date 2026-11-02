@@ -5737,7 +5737,27 @@ FIG_REPORT_TOOL = types.Tool(
         "page": {"type": "integer", "minimum": 1, "description": "넣을 쪽(1부터, 비우면 포털이 정한 자리)"}},
         "required": ["ref", "report_id"]},
     annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False))
-FIGURE_TOOLS = (FIG_GET_TOOL, FIG_LIST_TOOL, FIG_REPORT_TOOL)
+# MX 백서(MXWP) 문서의 그림 블록 — 백엔드 키와 블록 상한(MXWP packages/shared/schemas/document.json ImageBlock 의 caption 500 · alt 200).
+FIG_DOC_BACKEND = "mx-white-paper"
+FIG_DOC_CAPTION_MAX = 500
+FIG_DOC_ALT_MAX = 200
+FIG_DOC_TOOL = types.Tool(
+    name="figure_to_doc",
+    # '백서' 는 한 번만 — 세 번 쓴 판은 그림 낱말 없는 '백서 내보내기 · 백서 문서 만들기' 질의에서도 이 도구를 첫 줄로 올렸다(반대 검토 8)
+    description=("저장된 그림(fig_…)을 MX 백서(MXWP) 문서의 섹션에 그림 블록으로 넣는다 — 게이트웨이가 그 사람 이름으로 올리고 넣는다(바이트는 "
+                 "서버끼리 간다). 문서에 그림을 붙일 때 쓴다. png · jpeg · gif · webp 만(svg 는 도구를 png 로 다시 부른다). slug · section_id 는 "
+                 "get_document_outline 으로 본다. 답은 ok · slug · section_id · block_id · image_id · deduped."),
+    inputSchema={"type": "object", "properties": {
+        "ref": _FIG_REF_ARG,
+        "slug": {"type": "string", "maxLength": 200, "description": "넣을 MX 백서 문서의 slug"},
+        "section_id": {"type": "string", "maxLength": 200, "description": "넣을 섹션 id(get_document_outline 의 섹션)"},
+        "caption": {"type": "string", "maxLength": FIG_DOC_CAPTION_MAX, "description": f"그림 설명({FIG_DOC_CAPTION_MAX}자까지, 비우면 없음)"},
+        "alt": {"type": "string", "maxLength": FIG_DOC_ALT_MAX,
+                "description": f"대체 글({FIG_DOC_ALT_MAX}자까지, 비우면 caption — 그것도 비면 그림을 낸 도구 이름)"},
+        "after_block_id": {"type": "string", "maxLength": 200, "description": "이 블록 바로 뒤에 넣는다(비우면 섹션 끝)"}},
+        "required": ["ref", "slug", "section_id"]},
+    annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False))
+FIGURE_TOOLS = (FIG_GET_TOOL, FIG_LIST_TOOL, FIG_REPORT_TOOL, FIG_DOC_TOOL)
 _FIG_NAMES = frozenset(t.name for t in FIGURE_TOOLS)
 _FIG_READ_NAMES = frozenset((FIG_GET_TOOL.name, FIG_LIST_TOOL.name))
 
@@ -5747,9 +5767,12 @@ def _fig_tools() -> tuple:
     return FIGURE_TOOLS if FIG_STORE_ON else ()
 
 
-# search_tools 손 동의어 가운데 그림 저장이 더한 갈래(search_tuning.json 의 '그림' · '이미지' 와 맞춘다) — 끄면 뺀다. 두면 끈 박스에서 '그림' ·
-# '이미지' 질의가 이름에 figure · image 가 든 백엔드 도구를 새로 올려 순위가 지금과 달랐다(반대 검토 6).
-_FIG_SYN = {"그림": ("figure",), "이미지": ("figure", "image")}
+# search_tools 손 동의어 가운데 그림 저장이 더한 갈래(search_tuning.json 의 '그림' · '이미지' · '문서에' · '백서' 와 맞춘다) — 끄면 뺀다. 두면 끈
+# 박스에서 '그림' · '이미지' 질의가 이름에 figure · image 가 든 백엔드 도구를 새로 올려 순위가 지금과 달랐다(반대 검토 6).
+# '문서에' · '백서' 는 figure_to_doc 을 찾게 한다(긴급 11-02) — '문서' 가 아니라 '문서에' 다. '문서' 로 잇던 시험 판은 '문서 · 문서가' 질의마다
+# 이름에 document 가 든 도구를 올려 다른 정답을 밀어냈다(평가셋 auto-082 6 → 12위, doc 으로 이으면 19위 — 10-16 카탈로그 스냅샷).
+_FIG_SYN = {"그림": ("figure",), "이미지": ("figure", "image"), "문서에": ("document", "figure_to_doc"),
+            "백서": ("document", "mxwp", "figure_to_doc")}
 
 
 def _fig_unsyn(syn: dict) -> dict:
@@ -5791,6 +5814,16 @@ def _fig_mine(owner: str) -> list[tuple[str, dict]]:
 _FIG_MISSING = "그런 그림이 없다 — 없거나 · 보존 기간이 지났거나 · 내 것이 아니다(figure_list 로 내 그림을 본다)"
 
 
+async def _fig_bytes(meta: dict) -> bytes:
+    """넣을 그림의 바이트 — 주인을 본 뒤 읽기 전에 지워졌거나(청소 · 상한) 못 읽으면 없는 그림과 같은 말이다. 날것의 예외는 서버 경로를 담아
+    호출자에게 나갔고 감사 줄도 남지 않았다(반대 검토 7 — 보고서 · 문서 넣기 둘 다 이 자리를 지난다)."""
+    try:
+        return await _fig_thread(_fig_read_image, meta["path"])
+    except OSError as exc:
+        log.warning("그림 파일을 읽지 못했다(%s): %r", meta["path"].name, exc)
+        raise _FigError(_FIG_MISSING) from None
+
+
 async def _fig_report(meta: dict, ref: str, a: dict) -> dict:
     """포털 POST /agent/figures/to-report 에 multipart(meta JSON · file)로 — 호출자 PAT 를 그대로 넘긴다(대화 저장과 같은 자세 — 포털이 다시
     검증하고 그 사람이 고칠 수 있는 보고서인지 본다). 게이트웨이 공유 비밀 · 신원 없는 호출은 넘기지 않는다(포털이 사람으로 받지 못한다)."""
@@ -5810,7 +5843,7 @@ async def _fig_report(meta: dict, ref: str, a: dict) -> dict:
     auth = _caller_bearer()
     if not auth:
         raise _FigError("보고서에 넣기는 사람 PAT 로만 된다 — 포털이 그 사람 이름으로 넣는다(게이트웨이 공유 비밀로는 부를 수 없다)")
-    raw = await _fig_thread(_fig_read_image, meta["path"])
+    raw = await _fig_bytes(meta)
     filename = _fig_filename(meta, ref)
     body = {"report_id": report_id, "caption": caption, "page": page, "tool": meta["tool"], "mime": meta["mime"],
             "sha256": meta["sha256"], "filename": filename, "ref": ref}
@@ -5839,12 +5872,145 @@ async def _fig_report(meta: dict, ref: str, a: dict) -> dict:
     return data
 
 
+# MX 백서가 받는 형식 — svg 는 받지 않는다(MXWP API 가 Pillow 로 WebP 로 다시 굽는데 svg 를 읽지 못한다, MXWP upload_image_bytes).
+_FIG_DOC_MIME = frozenset(("image/png", "image/jpeg", "image/gif", "image/webp"))
+# MXWP 의 412 · 409(If-Match 가 어긋나 아무것도 넣지 않았다) 문구 — MXWP mcp/api_client.py CONFLICT_HELP 의 앞부분이다.
+_FIG_DOC_CONFLICT = "문서가 그 사이 변경되었습니다"
+# 넣기 실패 가운데 아무것도 넣지 않은 것이 확실한 꼴 — MXWP api_client 의 4xx('HTTP 4xx …' · '(401)' · '(403)') · 보내기 전 검증 · 모르는 도구 ·
+# 게이트웨이가 부르기 전에 막은 것. 그 밖(시간 초과 · 연결 끊김 · 5xx · 넣은 뒤 클라이언트의 출력 검증 목록 요청 실패 …)은 넣었는지 모른다 — 그것을
+# '넣지 못했다' 로 말하면 다시 불러 같은 그림 블록이 둘 된다(반대 검토 1).
+_FIG_DOC_NOT_PUT = re.compile(r"(?i)\bunknown tool\b|\bHTTP 4\d\d\b|\(40[13]\)|검증 실패 \(API 호출 안 함\)|^(?:forbidden|read_only|panel): ")
+# MXWP 도구가 401 · 토큰 없음에 덧붙이는 PC(stdio) 설정 안내(MXWP api_client TOKEN_HELP) — 게이트웨이 위임 호출에는 틀린 말이라 뗀다(반대 검토 2).
+_FIG_DOC_STDIO_HELP = " MXWP_API_TOKEN 환경변수가"
+_FIG_DOC_SUBJ = {"upload_image_bytes": "upload_image_bytes 가", "insert_image_block": "insert_image_block 이"}
+
+
+def _fig_doc_tool(original: str) -> str:
+    """MXWP 도구 하나의 노출 이름 — 부르기 바로 앞에서(사이에 await 없이) 본다. 부를 수 없으면 _FigError. 사람별 위임이 아닌 MXWP 는 부르지
+    않는다 — 그 길은 서비스 계정(admin@mx.local) 이름으로 나가 그 사람이 아닌 이름으로 문서를 고친다."""
+    if FIG_DOC_BACKEND not in backends:
+        raise _FigError(f"이 게이트웨이에 MX 백서({FIG_DOC_BACKEND})가 붙어 있지 않다")
+    conf = PER_USER_SSO.get(_delegation_app_id(FIG_DOC_BACKEND))
+    if conf is None:
+        raise _FigError(f"MX 백서 사람별 위임이 꺼져 있다(provision.env PER_USER_SSO_APPS 의 {FIG_DOC_BACKEND}:MXWP) — 서비스 계정 이름으로는 "
+                        "문서를 고치지 않는다")
+    if conf.get("token_header"):
+        # 위임 토큰을 다른 머리로 실으면 바탕 Authorization(서비스 토큰)이 그대로 가고 MXWP 는 Authorization 만 읽는다 — 서비스 계정 이름이 된다(반대 검토 4)
+        raise _FigError("MX 백서 위임 설정에 token_header 가 있다 — 그 사람의 토큰이 Authorization 으로 가지 않아 MX 백서가 서비스 계정으로 읽는다. "
+                        "넣지 않는다")
+    exposed = _rt_exposed(FIG_DOC_BACKEND, original)
+    if exposed is None:
+        if not any(r[0] == FIG_DOC_BACKEND for r in route.values()):
+            raise _FigError("MX 백서 도구 목록을 아직 받지 못했다(백엔드가 내려가 있다) — 잠시 뒤 다시")
+        raise _FigError(f"MX 백서 판이 낡았다 — {_FIG_DOC_SUBJ[original]} 없다(MX 백서를 새 판으로)")
+    return exposed
+
+
+def _fig_doc_err(res) -> str | None:
+    """MXWP 호출의 답이 실패면 그 까닭(FastMCP 머리 'Error executing tool X: ' 와 PC 설정 안내는 뗀다), 성공이면 None."""
+    if getattr(res, "isError", False):
+        text = re.sub(r"^Error executing tool \S+: ", "", _rt_text(res).strip())
+        return text.split(_FIG_DOC_STDIO_HELP, 1)[0].strip() or "오류로 답했다"
+    return _envelope_reason(res)
+
+
+def _fig_doc_arg(a: dict, key: str) -> str:
+    """글 인자 — 없으면 ''. 글이 아니면 거절한다 — 입력 검증을 끈 호출 길이라 숫자 · 목록 · 객체가 str() 로 바뀌어 문서에 들어갔다(반대 검토 5)."""
+    v = a.get(key)
+    if v is None:
+        return ""
+    if not isinstance(v, str):
+        raise _FigError(f"{key} 는 글(문자열)이다")
+    return v
+
+
+def _fig_doc_json(res) -> dict:
+    """성공한 MXWP 답의 객체 — structuredContent, 없으면 첫 글 블록의 JSON."""
+    sc = getattr(res, "structuredContent", None)
+    if isinstance(sc, dict):
+        return sc
+    try:
+        obj = json.loads(_rt_text(res) or "null")
+    except ValueError:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+async def _fig_doc(meta: dict, ref: str, a: dict) -> dict:
+    """MX 백서 문서에 넣는다 — 그 사람 이름(사람별 위임)으로 upload_image_bytes → insert_image_block. 둘 다 정상 호출 길(_call_tool_body)이라
+    인가 · 그 사람의 위임 토큰 · 소속 · plat 증명 · 시간 한도 · 감사(도구마다 한 줄)가 다른 MXWP 호출과 같다. 바이트는 서버끼리 간다(모델은 ref 만).
+    넣기는 '문서가 그 사이 변경되었습니다'(412 · 409 — 넣지 않았다)에만 한 번 더 부른다. 시간 초과 · 연결 오류 · 5xx 는 넣었는지 모르므로 다시
+    부르지 않고 '넣었는지 모른다' 로 말한다(같은 그림 블록이 둘 된다). 올리기는 MXWP 가 sha256 으로 겹침을 거르므로 다시 불러도 그림은 한 벌이다."""
+    if meta["mime"] not in _FIG_DOC_MIME:
+        raise _FigError("svg 그림은 지금 MX 백서에 넣지 못한다 — png 여야 한다(MX 백서가 WebP 로 다시 굽는데 svg 를 읽지 못한다). 그림을 낸 "
+                        "도구를 png 로 다시 불러 새 fig_… 로 넣는다")
+    slug, section_id = _fig_doc_arg(a, "slug").strip(), _fig_doc_arg(a, "section_id").strip()
+    if not slug or len(slug) > 200:
+        raise _FigError("slug 를 준다(200자까지) — 넣을 MX 백서 문서")
+    if not section_id or len(section_id) > 200:
+        raise _FigError("section_id 를 준다(200자까지) — 넣을 섹션(MX 백서 get_document_outline 의 섹션 id)")
+    after = _fig_doc_arg(a, "after_block_id").strip()
+    if len(after) > 200:
+        raise _FigError("after_block_id 는 200자까지다(비우면 섹션 끝)")
+    caption = _fig_doc_arg(a, "caption")
+    if len(caption) > FIG_DOC_CAPTION_MAX:
+        raise _FigError(f"caption 은 {FIG_DOC_CAPTION_MAX}자까지다(MX 백서 그림 블록의 설명 상한)")
+    alt = _fig_doc_arg(a, "alt")
+    if len(alt) > FIG_DOC_ALT_MAX:
+        raise _FigError(f"alt 는 {FIG_DOC_ALT_MAX}자까지다(MX 백서 그림 블록의 대체 글 상한)")
+    # 비우면 caption, 그것도 비면 그림을 낸 도구 이름 — 물려받은 값은 alt 상한에서 자른다(caption 은 500자까지라 alt 200자를 넘을 수 있다)
+    alt = (alt if alt.strip() else caption.strip() or meta["tool"])[:FIG_DOC_ALT_MAX]
+    raw = await _fig_bytes(meta)
+    res = await _call_tool_body(_fig_doc_tool("upload_image_bytes"), {
+        "filename": _fig_filename(meta, ref), "data_base64": base64.b64encode(raw).decode("ascii"), "mime": meta["mime"],
+        "sha256": meta["sha256"]})
+    why = _fig_doc_err(res)
+    if why:
+        if re.search(r"(?i)\bunknown tool\b", why):
+            raise _FigError("MX 백서 판이 낡았다 — upload_image_bytes 가 없다(MX 백서를 새 판으로)")
+        hint = (" — MX 백서에서 그 사람에게 쓰기 역할(editor)이 있어야 한다" if "(403)" in why else
+                " — MX 백서가 이 사람의 위임 토큰을 받지 않았다(위임 회수 · 위임 비밀 교체 — 관리자에게)" if "(401)" in why else "")
+        raise _FigError(f"MX 백서에 그림을 올리지 못했다 — {_clip(why, 500)}{hint}")
+    up = _fig_doc_json(res)
+    image_id = up.get("image_id")
+    if not isinstance(image_id, str) or not image_id:
+        raise _FigError("MX 백서가 올린 그림의 image_id 를 주지 않았다")
+    body = {"slug": slug, "section_id": section_id, "image_id": image_id, "alt": alt, "caption": caption}
+    if after:
+        body["after_block_id"] = after
+    kept = f" (그림은 MX 백서에 올려 두었다 — image_id {image_id})"
+    for attempt in (0, 1):
+        res = await _call_tool_body(_fig_doc_tool("insert_image_block"), body)
+        why = _fig_doc_err(res)
+        if not why:
+            break
+        if attempt == 0 and _FIG_DOC_CONFLICT in why:
+            log.info("figure_to_doc %s — MX 백서 문서 %s 가 그 사이 바뀌었다(넣지 않았다) — 한 번 다시 넣는다", ref, slug)
+            continue
+        if re.search(r"(?i)\bunknown tool\b", why):
+            raise _FigError("MX 백서 판이 낡았다 — insert_image_block 이 없다" + kept)
+        if re.search(r"\bHTTP 404\b", why):
+            raise _FigError("MX 백서에 그 문서 · 섹션 · 블록이 없다(404 — slug · section_id · after_block_id 를 get_document_outline 으로 본다) — "
+                            f"{_clip(why, 300)}{kept}")
+        if _FIG_DOC_CONFLICT in why or _FIG_DOC_NOT_PUT.search(why):
+            raise _FigError(f"MX 백서 문서에 그림 블록을 넣지 못했다 — {_clip(why, 500)}{kept}")
+        raise _FigError(f"MX 백서 문서에 그림 블록을 넣었는지 모른다 — {_clip(why, 500)}. 다시 부르기 전에 get_document_outline 으로 그 섹션에 "
+                        f"이 그림(image_id {image_id})의 블록이 있는지 본다 — 있으면 다시 부르지 않는다")
+    block_id = _fig_doc_json(res).get("block_id")
+    if not isinstance(block_id, str) or not block_id:
+        # 넣었다는 답인데 block_id 가 없다 — 실패로 말하면 다시 불러 블록이 둘 된다(반대 검토 6)
+        raise _FigError(f"MX 백서가 넣었다고 답했지만 block_id 를 주지 않았다 — 다시 부르지 말고 get_document_outline 으로 그 섹션의 이 그림"
+                        f"(image_id {image_id}) 블록을 본다")
+    return {"ok": True, "slug": slug, "section_id": section_id, "block_id": block_id, "image_id": image_id,
+            "deduped": bool(up.get("deduped"))}
+
+
 async def _fig_dispatch(name: str, arguments: dict) -> types.CallToolResult:
-    """그림 도구 셋 — 주인(검증된 신원)만. 없는 것 · 끝난 것 · 남의 것은 같은 말이다. 실패는 FIGURE_ERROR 한 줄, 감사는 한 줄."""
+    """그림 도구 넷 — 주인(검증된 신원)만. 없는 것 · 끝난 것 · 남의 것은 같은 말이다. 실패는 FIGURE_ERROR 한 줄, 감사는 한 줄."""
     t0 = time.monotonic()
     a = arguments or {}
     ref = str(a.get("ref") or "").strip()
-    backend = "portal" if name == FIG_REPORT_TOOL.name else "_gateway"
+    backend = {FIG_REPORT_TOOL.name: "portal", FIG_DOC_TOOL.name: FIG_DOC_BACKEND}.get(name, "_gateway")
     try:
         owner = _request_user()
         if not owner:
@@ -5876,7 +6042,7 @@ async def _fig_dispatch(name: str, arguments: dict) -> types.CallToolResult:
                                "/mcp-gw)에서 figure_get 을 부르면 받는 주소가 나온다")
             _audit(name, backend, True, None, round((time.monotonic() - t0) * 1000), note=ref)
             return _rt_json(out)
-        data = await _fig_report(meta, ref, a)
+        data = await (_fig_doc if name == FIG_DOC_TOOL.name else _fig_report)(meta, ref, a)
         _audit(name, backend, True, None, round((time.monotonic() - t0) * 1000), note=ref)
         return _rt_json(data)
     except _FigError as exc:
@@ -6980,10 +7146,12 @@ def _readonly_denial(name: str, arguments: dict) -> str:
         # 루틴 도구는 경로(route)에 없는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸린다 — 실행 · 원장 쓰기는 여기서 막는다(목록 · 계획은 _LOCAL_READ)
         return f"read_only: {name} — 읽기 전용 토큰(scopes 에 read 만)은 루틴을 돌리지 못한다(원장에 쓴다). routine_list · routine_get 만 된다."
     if FIG_STORE_ON and name in _FIG_NAMES:
-        # 그림 도구 — 받기 · 목록은 읽기다. 보고서 쓰기는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸리므로 여기서 막는다. 끄면 이 이름들은 그림
+        # 그림 도구 — 받기 · 목록은 읽기다. 보고서 · 문서 쓰기는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸리므로 여기서 막는다. 끄면 이 이름들은 그림
         # 도구가 아니다 — _LOCAL_READ 에 두면 끈 박스에서 같은 이름의 백엔드 쓰기 도구가 읽기 전용 PAT 로 열렸다(반대 검토 6)
         if name in _FIG_READ_NAMES:
             return ""
+        if name == FIG_DOC_TOOL.name:
+            return "read_only: figure_to_doc — 읽기 전용 토큰(scopes 에 read 만)은 MX 백서 문서에 그림을 넣지 못한다. figure_get · figure_list 만 된다."
         return "read_only: figure_to_report — 읽기 전용 토큰(scopes 에 read 만)은 보고서에 그림을 넣지 못한다. figure_get · figure_list 만 된다."
     resolved = route.get(name) or alias_route.get(name)
     if resolved is None:
@@ -7439,7 +7607,9 @@ def _forget_user_pat(app_id: str, email: str, tok: str) -> None:
 # 폐기된 캐시 토큰을 캐시 수명(12시간) 동안 계속 썼다(HWAXPortal docs/ste-cae00 D-30). 401 은 인증에서 끊긴 것이라 도구가
 # 아무것도 안 했다 — 다시 불러도 두 번 실행되지 않는다. 모양은 좁게 본다: 도구가 **바깥에서** 받은 401 을 옮기는 결과와 섞이면
 # 쓰기 도구를 두 번 부를 수 있다.
-_TOKEN_REJECTED = re.compile(r"^Error executing tool \S+: (?:GET|POST|PUT|PATCH|DELETE) \S+ → HTTP 401\b")
+# MX 백서 도구집은 API 의 401 을 `인증 실패 (401): …` 로 낸다(MXWhitePaper dist/llm-docx-toolkit/mcp/api_client.py) — 그 꼴도 거절로 본다.
+# 모양은 좁게 둔다 — FastMCP 가 감싼 머리 바로 뒤의 두 꼴만(쓰기 도구를 두 번 부르지 않게).
+_TOKEN_REJECTED = re.compile(r"^Error executing tool \S+: (?:(?:GET|POST|PUT|PATCH|DELETE) \S+ → HTTP 401\b|인증 실패 \(401\):)")
 
 
 def _token_rejected(res) -> bool:

@@ -600,6 +600,23 @@
    ],
    "owner": null,
    "source_fix": null
+  },
+  "문서에": {
+   "to": [
+    "document",
+    "figure_to_doc"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "백서": {
+   "to": [
+    "document",
+    "mxwp",
+    "figure_to_doc"
+   ],
+   "owner": null,
+   "source_fix": null
   }
  },
  "quality": {

@@ -12703,3 +12703,16 @@ def test_search_tools_는_그림_낱말_없는_백서_질의에_figure_to_doc_�
         assert ranked[0] == "figure_to_doc", (q, ranked)
     else:
         assert mine in ranked and ranked.index(mine) < (ranked.index("figure_to_doc") if "figure_to_doc" in ranked else 99), (q, ranked)
+
+
+# ── SP 0.4.72(11-03) 새 허브 도구 일곱 — 앱 표지가 없어(SP 의 @tool 은 readOnlyHint 를 안 단다) 이름으로만 가른다 ─────────────────
+# lineage_repin 은 되돌릴 길이 없는 사람 판단인데 SP 의 관리자 전용 목록(DESTRUCTIVE_TOOLS) 밖이다 — 쓰기 낱말에 repin 을 더해 쓰기로 읽는다.
+# 읽기 넷(object_explode · object_lineage · graph_reach · relation_proposals)은 이름에 조회 낱말이 없어 루틴 · 좌석 읽기로 열리지 않는다(모르면 막기) —
+# 열려면 박스 읽기 덧씌우기(read_tools.local.json)에 적는다.
+@pytest.mark.parametrize("original,write", [("lineage_repin", True), ("relation_propose", True), ("relation_proposal_decide", True),
+                                            ("relation_proposals", False), ("object_explode", False), ("object_lineage", False),
+                                            ("graph_reach", False)])
+def test_SP_0472_새_허브_도구의_쓰기_판정(original, write):
+    t = types.Tool(name=f"rootdesigndatahub_{original}", description="", inputSchema={"type": "object", "properties": {}})
+    assert gw._tool_is_write(t, original) is write, original
+    assert gw._routine_read(t, "rootdesigndatahub", original) is False, "앱 표지 · 읽기 목록 · 조회 낱말 어느 것으로도 읽기로 열리지 않는다"

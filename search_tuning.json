@@ -619,6 +619,20 @@
    ],
    "owner": null,
    "source_fix": null
+  },
+  "짝 단면": {
+   "to": [
+    "section_pair_view"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "단면 비교": {
+   "to": [
+    "section_pair_view"
+   ],
+   "owner": "heax-step_forge",
+   "source_fix": "section_pair_view 설명에 '비교' 를 넣는다(지금은 '견줄 때' 뿐)"
   }
  },
  "quality": {

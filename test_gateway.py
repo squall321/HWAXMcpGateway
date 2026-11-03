@@ -8299,7 +8299,8 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     # 11-02 그림 저장에서 '그림' 에 figure 를 더하고 '이미지' 를 새로 넣었다(그림 도구를 찾게 — 일부러 바꾼 기본값)
     # 11-02 PC 키트에서 'docx' · '변환기' · '표 칸'(띄어 쓴 열쇠) → kit_get 을 넣었다(변환기를 찾게 — 일부러 바꾼 기본값, HWAXPortal docs/report-figures RF-23)
     # 같은 날 figure_to_doc 이 '문서에' · '백서' 를 새로 넣었다(79)
-    assert len(d["synonyms"]) == 79 and d["synonyms"]["요약"] == ("digest", "summary")
+    # 11-03 StepForge F1 이 '짝 단면' · '단면 비교'(띄어 쓴 열쇠) → section_pair_view 를 새로 넣었다(81)
+    assert len(d["synonyms"]) == 81 and d["synonyms"]["요약"] == ("digest", "summary")
     assert d["synonyms"]["docx"] == d["synonyms"]["변환기"] == d["synonyms"]["표 칸"] == ("kit_get",)
     assert d["synonyms"]["그림"] == ("plot", "render", "figure") and d["synonyms"]["이미지"] == ("figure", "image")
     assert d["synonyms"]["문서에"] == ("document", "figure_to_doc") and d["synonyms"]["백서"] == ("document", "mxwp", "figure_to_doc")
@@ -12270,6 +12271,36 @@ def test_띄어_쓴_손_동의어_열쇠는_빈칸을_뺀_질의로_맞추고_�
     # 낱말 머리에서만 — '목표 칸' 의 '표 칸' 은 아니다(반대 검토 S4)
     assert "kit_get" not in ranked("목표 칸 채우기") and ranked("표 칸 채우기")[0] == "kit_get"
     assert gw._flat_at_word("표칸", "목표 칸") is False and gw._flat_at_word("표칸", "엑셀 표칸에") is True
+
+# ── StepForge F1 짝 단면(11-03) — '짝' 은 한 글자라 질의에서 버려져 '단면' 만 남는다(단면 도구가 모두 같은 점수다). 띄어 쓴 열쇠 '짝 단면' ·
+# '단면 비교' 가 section_pair_view 를 잇는다(HWAXPortal docs/report-figures — dev 카탈로그 평가에서 8위 → 1위 · 10위 → 2위, 추적 147쌍은 그대로).
+_SECTION_SEARCH_SPECS = _SEARCH_SPECS + [
+    ("heax-step_forge", n, d) for n, d in (
+        ("section_view", "한 과제를 한 평면으로 자른 단면 그림(축 · 자리)."),
+        ("section_report", "단면 위 간극 치수 · 파트 목록(측정 JSON)."),
+        ("section_pair_view", "과제 여럿(두 개정)을 같은 자리에서 자른 짝 단면 한 장 — 두 개정의 같은 자리를 보고서 그림으로 견줄 때."),
+        ("section_profile", "단면 윤곽선 좌표."),
+        ("section_area", "단면 넓이 · 재료별 면적."),
+        ("section_batch_result", "그림 잡(section_batch)의 한 줄을 그림 블록으로."))]
+
+
+@pytest.mark.parametrize("q", ["짝 단면", "짝단면", "짝 단면 그림", "단면 비교", "이전 판과 단면 비교 그림"])
+def test_search_tools_는_짝_단면_단면_비교로_section_pair_view_를_찾는다(monkeypatch, q):
+    _search_catalog(monkeypatch, _SECTION_SEARCH_SPECS)
+    _no_embed(monkeypatch)
+    ranked = json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]
+    assert ranked[0] == "section_pair_view", (q, ranked)
+
+
+def test_짝_단면_열쇠를_빼면_짝_단면이_다시_묻히고_단면_만의_순위는_열쇠와_상관없다(monkeypatch):
+    _search_catalog(monkeypatch, _SECTION_SEARCH_SPECS)
+    _no_embed(monkeypatch)
+    ranked = lambda q: json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]  # noqa: E731
+    plain = {q: ranked(q) for q in ("단면", "단면 그림", "간극 치수")}
+    gw.SEARCH_TUNING_LOCAL_PATH.write_text(json.dumps({"synonyms": {"짝 단면": None, "단면 비교": None}}, ensure_ascii=False),
+                                           encoding="utf-8")
+    assert {q: ranked(q) for q in plain} == plain, "그 꼴이 없는 질의의 순위는 두 열쇠와 상관없다"
+    assert ranked("짝 단면")[0] != "section_pair_view", "열쇠가 없으면 '짝' 이 버려져 단면 도구 사이에 묻힌다 — 이 시험이 지키는 까닭"
 
 # ── figure_to_doc — 저장된 그림을 MX 백서(MXWP) 문서에 넣는다(긴급 11-02) ──────────────────────────────────────────────────────────────
 # 게이트웨이가 그 사람 이름(사람별 위임 — PER_USER_SSO_APPS mx-white-paper:MXWP)으로 MXWP 의 upload_image_bytes → insert_image_block 을 부른다.

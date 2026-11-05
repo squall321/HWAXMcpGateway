@@ -11,6 +11,7 @@ import secrets
 import stat
 import threading
 import time
+import uuid
 from array import array
 from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
@@ -411,6 +412,10 @@ PORTAL_CONN_META: dict[str, dict] = {
 }
 # 내장 둘 — 아래 외부 연결 선언이 덮지도 빼지도 않는다(HWAXPortal docs/ext-connect GW1).
 _BUILTIN_CONN = frozenset(PORTAL_CONN_BACKENDS)
+# 선언 백엔드 호출에 싣는 요청 ID 머리글(HWAXPortal docs/siren-delib HG-27 — 선언의 request_id: false 로 끈다). 내장 둘에는 싣지 않는다.
+CONN_REQUEST_ID_HEADER = "X-Request-Id"
+# 선언 하나의 가림 예외 주소(mask_keep_hosts — 사설 IPv4)의 수 상한(포털 policy.CONNECT_KEEP_HOSTS_MAX 와 같다).
+CONN_KEEP_HOSTS_MAX = 8
 # 외부 연결 선언 — 포털 /internal/access/policy 의 connections(권한 행과 한 응답, 박스 권한표의 connect:). 검사를 통과한 것만 있다(_conn_validate).
 # 선언 키는 PORTAL_CONN_BACKENDS · PORTAL_CONN_META 에 들어가 위 등록 토큰 길(라우팅 · 미등록 거절 · as-conn 감사)을 그대로 탄다(_conn_reconcile).
 _CONN_REG: dict[str, dict] = {}
@@ -835,7 +840,13 @@ def _pii_json_doc(s: str) -> bool:
     return True
 
 
-def _pii_mask_text(text: str) -> tuple[str, int]:
+# 가림 예외 주소 바로 앞 — 링크의 머리(http:// · https://, JSON 이 빗금을 \/ 로 적은 꼴까지)일 때만 그 주소를 그대로 둔다(HG-29).
+_URL_HOST_BEFORE_RX = re.compile(r"https?:(?:\\?/){2}\Z", re.I)
+
+
+def _pii_mask_text(text: str, keep: frozenset = frozenset()) -> tuple[str, int]:
+    """keep — 선언 백엔드의 가림 예외 주소(사설 IPv4 글자, HWAXPortal docs/siren-delib HG-29). 그 주소가 링크의 호스트로 올 때만 가리지 않는다 —
+    같은 주소가 글 속에 따로 오거나 다른 사설 주소는 그대로 가린다."""
     out, n = _pii_mask_keys(text)
     doc = None          # JSON 문서면 [문자열 토큰 훑개, 지금 토큰 자리] — IMEI 꼴 후보가 나올 때 한 번만 잰다
 
@@ -875,6 +886,8 @@ def _pii_mask_text(text: str) -> tuple[str, int]:
             return m.group(0)
         if not any(ip in net for net in _PRIVATE_NETS):
             return m.group(0)
+        if keep and str(ip) in keep and _URL_HOST_BEFORE_RX.search(m.string, max(0, m.start() - 12), m.start()):
+            return m.group(0)
         n += 1
         return "[가림:IP]"
 
@@ -889,17 +902,17 @@ def _pii_mask_text(text: str) -> tuple[str, int]:
     return out, n
 
 
-def _pii_mask_obj(v, n: list, kind: str | None = None):
+def _pii_mask_obj(v, n: list, kind: str | None = None, keep: frozenset = frozenset()):
     """structuredContent 의 가림 — 글 길(_pii_mask_text)과 같은 규칙이다. kind 는 이 값을 쥔 칸의 가림 종류다(목록 원소가 잇는다)."""
     if isinstance(v, dict):
-        return {k: _pii_mask_obj(x, n, _pii_sub_kind(str(k), kind)) for k, x in v.items()}
+        return {k: _pii_mask_obj(x, n, _pii_sub_kind(str(k), kind), keep) for k, x in v.items()}
     if isinstance(v, list):
-        return [_pii_mask_obj(x, n, kind) for x in v]
+        return [_pii_mask_obj(x, n, kind, keep) for x in v]
     if isinstance(v, str):
         if kind and _pii_value_ok(kind, v):
             n[0] += 1
             return f"[가림:{kind}]"
-        t, k = _pii_mask_text(v)
+        t, k = _pii_mask_text(v, keep)
         n[0] += k
         return t
     if kind in _PII_NUM_KINDS and isinstance(v, int) and not isinstance(v, bool) and v >= 0 and len(str(v)) >= 8:
@@ -908,8 +921,9 @@ def _pii_mask_obj(v, n: list, kind: str | None = None):
     return v
 
 
-def _pii_mask(res):
-    """백엔드 도구 결과의 개인정보를 가린 사본 — 가린 것이 없으면 그 결과 그대로다(서식 · 바이트까지)."""
+def _pii_mask(res, keep_hosts: frozenset = frozenset()):
+    """백엔드 도구 결과의 개인정보를 가린 사본 — 가린 것이 없으면 그 결과 그대로다(서식 · 바이트까지). keep_hosts 는 선언 백엔드의 가림 예외
+    주소다(_pii_mask_text — 그 주소로 여는 링크만 그대로 둔다)."""
     if not PII_MASK_ON or res is None:
         return res
     n = [0]
@@ -917,7 +931,7 @@ def _pii_mask(res):
     for c in getattr(res, "content", None) or []:
         txt = getattr(c, "text", None)
         if isinstance(txt, str):
-            t, k = _pii_mask_text(txt)
+            t, k = _pii_mask_text(txt, keep_hosts)
             if k:
                 c, changed = c.model_copy(update={"text": t}), True
                 n[0] += k
@@ -926,7 +940,7 @@ def _pii_mask(res):
     upd = {}
     if isinstance(sc, dict):
         before = n[0]
-        new_sc = _pii_mask_obj(sc, n)
+        new_sc = _pii_mask_obj(sc, n, None, keep_hosts)
         if n[0] != before:
             upd["structuredContent"] = new_sc
     if not changed and not upd:
@@ -1009,7 +1023,7 @@ def _res_images(res) -> tuple[int, int]:
     return n, size
 
 
-def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=None, ip=None, via=None, res=None, size=None):
+def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=None, ip=None, via=None, res=None, size=None, rid=None):
     """호출 1건을 JSONL 감사 로그에 append (감사 실패가 호출을 막지 않게).
 
     ⚠ **`error` 는 실패에만 쓴다.** 종전에는 위임 신원(`as:someone@…`)과 메모(`cache-hit`·
@@ -1032,6 +1046,7 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
                이 칸이 '그때 얼마나 컸나' 를 남긴다.
       images · image_bytes : 그 결과의 그림 블록 수와 바이트(`res` 를 준 자리에서 그림이 있을 때만 — 없으면 줄이 지금과 같다).
       bytes  : 그림 받기(GET /fig/<ref>)가 보낸 바이트(`size` 를 준 자리만).
+      rid    : 선언 백엔드(외부 연결)에 실은 요청 ID(X-Request-Id — 호출마다 새 값). 바깥 팀의 기록과 이 값으로 맞춘다(HWAXPortal docs/siren-delib HG-27).
     `res` 를 준 자리에서 `isError` 는 아닌데 본문이 오류 봉투면 `ok` 를 false 로 고쳐 적고 사유를 `error` 에 싣는다
     (`_envelope_reason`, HG-06). 호출부의 `ok=not isError` 만으로는 점검기 · 사용 통계가 이 실패를 세지 못했다.
     corr·note·error 는 길이를 둔다(무기한 보존·한 호출 한 줄). 잘렸으면 원문 길이를 붙인다(`_clip`) — 실측으로 오류 1,423줄 중
@@ -1063,6 +1078,8 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
                 rec["images"], rec["image_bytes"] = _imgs, _img_bytes
         if size is not None:
             rec["bytes"] = size
+        if rid:
+            rec["rid"] = rid
         purpose = _request_purpose()
         if purpose:
             rec["purpose"] = purpose
@@ -1600,7 +1617,9 @@ def _conn_meta_set(key: str, spec: dict) -> None:
         return
     PORTAL_CONN_BACKENDS[key] = key
     PORTAL_CONN_META[key] = {"label": spec["label"] or key, "hint": spec["hint"] or "…",
-                             "workspace_header": spec["workspace_header"]}
+                             "workspace_header": spec["workspace_header"],
+                             "request_id": spec.get("request_id", True),
+                             "mask_keep_hosts": frozenset(spec.get("mask_keep_hosts") or ())}
     DISCOVERED_META[key] = {"label": spec["label"], "description": spec["desc"]}
 
 
@@ -1667,8 +1686,10 @@ async def _conn_reconcile(tg) -> bool:
             continue
         if b is not None and b.url == spec["mcp_url"] and b.list_fp == fp:
             if b.spec_fp != sfp:
-                # 표시 이름 · read_tools · 부서 헤더만 바뀌었다 — 세션은 두고 재집계만 한다(읽기 도구가 재기동 없이 바로 서게, 1-7 ⑨).
+                # 표시 이름 · read_tools · 부서 헤더 · 가림 예외 · 요청 ID 만 바뀌었다 — 세션은 두고 재집계만 한다(읽기 도구가 재기동 없이 바로 서게,
+                # 1-7 ⑨). 그 백엔드의 응답 캐시는 버린다 — 옛 선언(가림 예외)으로 지은 결과가 TTL 동안 그대로 나가지 않게(반대 검토 11-06).
                 _conn_meta_set(key, spec)
+                _cache_flush_backend(key)
                 b.spec_fp = sfp
                 changed = True
             _conn_set_status(key, "ok" if b.session is not None else "down")
@@ -2113,6 +2134,17 @@ def _conn_url_ok(url: object) -> bool:
         return bool(_CONN_HOST_RE.fullmatch(u.hostname))
 
 
+def _conn_keep_host_ok(h: object) -> bool:
+    """가림 예외 주소 하나인가 — 사설 IPv4 글자(앞자리 0 · 포트 없이). 가림(_pii_mask_text)이 사설 IPv4 만 가리므로 그 밖의 꼴은 받지 않는다."""
+    if not isinstance(h, str):
+        return False
+    try:
+        ip = ipaddress.IPv4Address(h.strip())
+    except ValueError:
+        return False
+    return str(ip) == h.strip() and any(ip in net for net in _PRIVATE_NETS)
+
+
 def _conn_validate(key: str, spec: object, rows: dict) -> tuple[dict | None, str]:
     """선언 하나 → (쓸 모양, 'ok') 또는 (None, 사유). 사유 — collision(정적 · heax · 내장 · 위임 · 신원 전달 키와 겹친다) · no-policy-row(같은
     응답의 권한 행에 없다) · invalid(꼴이 틀렸다). 포털이 이미 걸렀지만 게이트웨이도 닫힌 쪽으로 다시 본다(HWAXPortal docs/ext-connect GW3)."""
@@ -2140,10 +2172,20 @@ def _conn_validate(key: str, spec: object, rows: dict) -> tuple[dict | None, str
     rt = spec.get("read_tools") or []
     if not isinstance(rt, (list, tuple)) or not all(isinstance(t, str) and _CONN_TOOL_RE.fullmatch(t) for t in rt):
         return None, "invalid"
+    # 요청 ID(HG-27) — 모르는 포털이면 칸이 없다(켬). 참 · 거짓이 아니면 틀린 선언이다.
+    rid = spec.get("request_id")
+    rid = True if rid is None else rid
+    if not isinstance(rid, bool):
+        return None, "invalid"
+    # 가림 예외(HG-29) — 사설 IPv4 글자만(그 주소로 여는 링크만 가리지 않는다). 가림이 사설 IPv4 만 가리므로 다른 꼴은 뜻이 없다 — 틀린 선언이다.
+    kh = spec.get("mask_keep_hosts") or []
+    if not isinstance(kh, (list, tuple)) or len(kh) > CONN_KEEP_HOSTS_MAX or not all(_conn_keep_host_ok(h) for h in kh):
+        return None, "invalid"
     return {"platform": texts["platform"].strip(), "label": texts["label"].strip() or key, "desc": texts["desc"].strip(),
             "hint": texts["hint"].strip(), "prefix": texts["prefix"].strip(), "mcp_url": spec["mcp_url"].strip(),
             "list_auth": "open" if la == "open" else "registered:" + la.split(":", 1)[1].strip().lower(),
-            "read_tools": sorted(set(rt)), "workspace_header": wh or None}, "ok"
+            "read_tools": sorted(set(rt)), "workspace_header": wh or None,
+            "request_id": rid, "mask_keep_hosts": sorted({h.strip() for h in kh})}, "ok"
 
 
 def _conn_registry_set(raw: object, rows: dict, *, persist: bool = True) -> bool:
@@ -7666,6 +7708,70 @@ def _http_401(exc: BaseException) -> bool:
     return any(_http_401(e) for e in (getattr(exc, "exceptions", None) or ()) if isinstance(e, BaseException))
 
 
+# 등록 토큰 길(as-conn)의 실패를 그쪽 서버가 준 상태로 가른다(HWAXPortal docs/siren-delib HG-26). 종전엔 무엇이든 '토큰을 다시 등록하세요
+# (만료·폐기 가능성)' 였다 — 한도 초과 · 권한 밖 · 그쪽 서버 오류에도 사람이 멀쩡한 토큰을 다시 발급했다. SIREN 은 오류를 HTTP 200 + JSON-RPC
+# 오류로 주고 문구 맨 앞에 상태를 적는다(`401 token_invalid` · `403 ip_denied` · `429 rate_limited` — 11-04 cae00 실측 · 명세). 가르는 것은
+# 401 · 403 · 429 셋뿐이고 나머지는 '그쪽 서버 오류'다. 어느 쪽이든 게이트웨이는 다시 부르지 않는다(지금 그대로).
+_CONN_HEAD_STATUS_RX = re.compile(r"\s*(401|403|429)(?![0-9])")
+_CONN_REASON_RX = re.compile(r"(?<![0-9])(401|403|429) (?:Unauthorized|Forbidden|Too Many Requests)\b")
+_RETRY_KEYS = ("retry_after", "retryAfter", "Retry-After", "retry-after", "retry_after_s")
+
+
+def _retry_secs(v) -> int | None:
+    """Retry-After 값 → 초(0 ~ 86400). 수가 아니면(HTTP 날짜 꼴 등) None — 날짜는 읽지 않는다."""
+    try:
+        s = float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return int(min(max(s, 0), 86400) + 0.999) if s == s else None
+
+
+def _conn_fail_status(exc: BaseException) -> tuple[int | None, int | None]:
+    """(상태, Retry-After 초) — 401 · 403 · 429 만, 아니면 (None, None). JSON-RPC 오류(McpError)는 문구 맨 앞 · data 의 retry_after, HTTP 오류는
+    응답 상태 · Retry-After 머리글, 둘 다 아니면 문구 속 'NNN 이유' 꼴(httpx 의 "Client error '429 Too Many Requests' …")이다. 묶음
+    (ExceptionGroup — 단발 세션의 태스크 그룹이 한두 겹 싼다)은 안까지 보고 먼저 걸린 것을 쓴다."""
+    for e in getattr(exc, "exceptions", None) or ():
+        if isinstance(e, BaseException):
+            got = _conn_fail_status(e)
+            if got[0] is not None:
+                return got
+    err = getattr(exc, "error", None)
+    if isinstance(exc, McpError) and err is not None:
+        m = _CONN_HEAD_STATUS_RX.match(str(getattr(err, "message", "") or ""))
+        if m:
+            data = getattr(err, "data", None)
+            retry = next((_retry_secs(data[k]) for k in _RETRY_KEYS if k in data), None) if isinstance(data, dict) else None
+            return int(m.group(1)), retry
+    try:
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        if code in (401, 403, 429):
+            return code, _retry_secs(exc.response.headers.get("retry-after"))
+    except Exception:  # noqa: BLE001 — 읽다 터지는 속성은 상태가 아니다
+        pass
+    m = _CONN_REASON_RX.search(str(exc))     # httpx 꼴 'NNN 이유' 만 — 맨 앞의 수는 McpError 에서만 상태다(위)
+    return (int(m.group(1)), None) if m else (None, None)
+
+
+def _conn_fail_text(backend_key: str, email: str, label: str, exc: BaseException) -> tuple[str, int | None]:
+    """등록 토큰 길 실패의 안내 글과 가른 상태 — 401 만 '다시 등록', 429 는 '잠시 뒤', 403 은 '그쪽 권한 · 출발 IP — 관리자에게', 그 밖은
+    '그쪽 서버 오류'. 원래 오류는 끝 괄호에 그대로 싣는다(종전과 같다). 상태 숫자를 괄호 안에 적는다 — 에이전트 서버의 심의가 429 를 보고 그 잡에서
+    그 백엔드를 다시 부르지 않는다(HA-36)."""
+    code, retry = _conn_fail_status(exc)
+    where = "포털 '개인 토큰 › 외부 연결'(/tokens?tab=connect)"
+    if code == 401:
+        why = (f"{label} 이 등록 토큰을 받지 않았습니다(401 — 만료 · 폐기 · 틀린 토큰). {where}에서 {label} 토큰을 다시 등록하세요.")
+    elif code == 429:
+        why = (f"{label} 의 호출 한도를 넘었습니다(429" + (f" — {retry}초 뒤에 다시" if retry is not None else " — 잠시 뒤에 다시") + "). "
+               "토큰 문제가 아닙니다 — 토큰을 다시 등록하지 말고, 같은 호출을 곧바로 되풀이하지 마세요.")
+    elif code == 403:
+        why = (f"{label} 이 이 호출을 막았습니다(403 — 토큰의 권한 범위 밖이거나 출발 IP 가 허용되지 않음). 범위가 모자라면 그 범위를 가진 토큰을 "
+               f"{where}에 다시 등록하고, 출발 IP 때문이면 관리자에게 알리세요.")
+    else:
+        # 상태를 가리지 못한 실패 — 토큰 탓이 아니라고도, 다시 하라고도 단정하지 않는다(가운데서 끊긴 쓰기는 두 번 돌 수 있다 — _late_text 와 같은 자세).
+        why = (f"{label} 서버가 오류를 냈거나 닿지 못했습니다(상태를 가리지 못했다 — 아래 원래 오류를 보세요). 계속되면 관리자에게 알리세요.")
+    return f"{backend_key}: {email} — {why} (원래 오류: {exc!r})", code
+
+
 class _Late(Exception):
     """기한을 넘겼다 — **다시 부르지 않는다**(세션 교체도 토큰 재발급도 없다).
 
@@ -7933,6 +8039,7 @@ async def _read_ui_resource(req: types.ReadResourceRequest):
     async def op(sess):
         return await sess.read_resource(req.params.uri)
     mode = "service"
+    rid = None                       # 선언 백엔드에 실은 요청 ID(HG-27) — 이 읽기의 감사 줄마다 같은 값
     try:
         if app_id in PER_USER_SSO and email:
             tok = await _user_pat(app_id, email)
@@ -7944,8 +8051,11 @@ async def _read_ui_resource(req: types.ReadResourceRequest):
                 raise McpError(types.ErrorData(code=types.INVALID_REQUEST, message=(
                     f"{key}: 이 계정은 그쪽 토큰을 아직 등록하지 않았다 — 포털 '개인 토큰 › 외부 연결'(/tokens?tab=connect)에서 등록한 뒤 연다")))
             extra = {"Authorization": None} if key not in _BUILTIN_CONN else None
-            res = await _call_as_user(b, "", {}, conn["token"], CALL_TIMEOUT_S, extra_headers=extra, op=op)
+            if extra is not None and (PORTAL_CONN_META.get(key) or {}).get("request_id", True):
+                rid = uuid.uuid4().hex
+                extra[CONN_REQUEST_ID_HEADER] = rid
             mode = "as-conn"
+            res = await _call_as_user(b, "", {}, conn["token"], CALL_TIMEOUT_S, extra_headers=extra, op=op)
         elif key in _CONN_ACTIVE and key not in _BUILTIN_CONN:
             raise McpError(types.ErrorData(code=types.INVALID_REQUEST, message=(
                 f"{key}: 사람 신원이 없는 호출은 받지 않는다(서비스 계정 없음)")))
@@ -7956,19 +8066,20 @@ async def _read_ui_resource(req: types.ReadResourceRequest):
                 res = await b.session.read_resource(req.params.uri)
     except McpError as exc:
         _audit(f"resources/read {_clip(uri, 160)}", key, False, _clip(exc.error.message, 200),
-               round((time.monotonic() - t0) * 1000), caller=email or None, mode=mode)
+               round((time.monotonic() - t0) * 1000), caller=email or None, mode=mode, rid=rid)
         raise
     except Exception as exc:  # noqa: BLE001
         _audit(f"resources/read {_clip(uri, 160)}", key, False, repr(exc), round((time.monotonic() - t0) * 1000),
-               caller=email or None, mode=mode)
+               caller=email or None, mode=mode, rid=rid)
         raise McpError(types.ErrorData(code=types.INTERNAL_ERROR, message=f"backend {key} 에서 리소스를 읽지 못했다: {exc!r}")) from None
     size = _res_bytes_of(res)
     if size > RESOURCE_MAX_BYTES:
         _audit(f"resources/read {_clip(uri, 160)}", key, False, f"resource > {RESOURCE_MAX_BYTES}B", round((time.monotonic() - t0) * 1000),
-               caller=email or None, mode=mode)
+               caller=email or None, mode=mode, rid=rid)
         raise McpError(types.ErrorData(code=types.INTERNAL_ERROR, message=(
             f"리소스가 상한 {RESOURCE_MAX_BYTES:,}바이트(GATEWAY_RESOURCE_MAX_BYTES)를 넘는다({size:,}바이트)")))
-    _audit(f"resources/read {_clip(uri, 160)}", key, True, None, round((time.monotonic() - t0) * 1000), caller=email or None, mode=mode)
+    _audit(f"resources/read {_clip(uri, 160)}", key, True, None, round((time.monotonic() - t0) * 1000), caller=email or None, mode=mode,
+           rid=rid)
     return types.ServerResult(res)
 
 
@@ -8161,11 +8272,13 @@ async def _call_tool_body(name: str, arguments: dict):
         _cache_flush_backend(backend_key)
     # 행 걸린 백엔드가 챗 SSE 체인 전체를 무기한 블록하지 않게 호출당 타임아웃을 건다(_call_shared·_oneshot).
     # 기한을 넘긴 호출은 어느 길(사람별·등록 토큰·신원 전달·상주 세션)이든 여기서 **한 번으로** 끝난다 — 문구도 감사 줄도 같다.
-    def _late(exc: _Late):
+    def _late(exc: _Late, *, mode=None, note=None, rid=None):
+        """mode · note · rid — 등록 토큰 길(as-conn)이 넘긴다. 머리글 X-Request-Id 는 이미 나갔으므로 시간 초과 줄에도 같은 값을 남긴다(HG-27 —
+        바깥 팀이 가장 자주 물을 줄이다)."""
         text = _late_text(exc, backend_key, name)
         log.warning("%s", text)
         _audit(name, backend_key, False, text, round((time.monotonic() - t0) * 1000),
-               caller=_request_user() or None, corr=_request_corr())
+               caller=_request_user() or None, corr=_request_corr(), mode=mode, note=note, rid=rid)
         return types.CallToolResult(content=[types.TextContent(type="text", text=text)], isError=True)
 
     # 사용자 위임 — 이 백엔드가 사용자별 스코프를 쓰고 호출자 신원이 있으면, 서비스 계정이 아니라
@@ -8291,33 +8404,38 @@ async def _call_tool_body(name: str, arguments: dict):
             # X-Workspace-Slug 가 남으면 그 부서 명의 오류가 사용자에게 뒤집어씌워진다.
             _wh = _cm.get("workspace_header")
             extra = {_wh: conn.get("workspace") or None} if _wh else None
+            _rid = None
             if _declared:
                 # 바탕 헤더의 Authorization 을 한 번 더 뗀다 — 그 사람의 Bearer 하나만 나간다(목록 토큰이 섞일 길을 닫는다, GW13).
                 extra = {**(extra or {}), "Authorization": None}
+                # 요청 ID — 호출마다 새 값을 그쪽에 싣고 감사 줄에 같은 값을 남긴다. 바깥 팀과 기록을 시각 · 사람이 아니라 이 값으로 맞춘다
+                # (HWAXPortal docs/siren-delib HG-27). 대화 상관 ID(corr)는 싣지 않는다 — 그쪽에 우리 대화의 묶음을 주지 않는다. 끄기는 선언의
+                # request_id: false.
+                if _cm.get("request_id", True):
+                    _rid = uuid.uuid4().hex
+                    extra[CONN_REQUEST_ID_HEADER] = _rid
+            # 선언 키는 토큰 지문을 단다 — 토큰 없이도 포털 사용자와 그쪽 토큰 주인을 잇는다(주인 확인을 안 하는 길이라, GW14).
+            _tok_note = f"tok:{hashlib.sha256(conn['token'].encode('utf-8')).hexdigest()[:10]}" if _declared else None
             try:
                 res = await _call_as_user(b, original, arguments, conn["token"],
                                           CALL_TIMEOUT_S, extra_headers=extra)
             except _Late as exc:
                 # 느린 도구에 '토큰을 다시 등록하세요' 라고 말하지 않는다 — 수 시간짜리 심의의 보고서 저장이 이 길이다.
-                return _late(exc)
+                return _late(exc, mode="as-conn", note=_tok_note, rid=_rid)
             except Exception as exc:  # noqa: BLE001
-                _audit(name, backend_key, False, f"conn-user: {exc!r}",
-                       round((time.monotonic() - t0) * 1000))
                 # 서비스 계정으로 조용히 강등하지 않는다 — 강등하면 보고서가 다시
-                # 서비스 계정 명의로 쌓여 오귀속이 재발한다. 재등록을 안내한다.
-                return types.CallToolResult(
-                    content=[types.TextContent(type="text", text=(
-                        f"{backend_key}: {email} 의 등록 토큰으로 호출하지 못했습니다 "
-                        f"({exc!r}). 포털 '개인 토큰 › 외부 연결'(/tokens?tab=connect)에서 {_label} "
-                        "토큰을 다시 등록하세요(만료·폐기 가능성)."))],
-                    isError=True,
-                )
-            # 선언 키는 토큰 지문을 단다 — 토큰 없이도 포털 사용자와 그쪽 토큰 주인을 잇는다(주인 확인을 안 하는 길이라, GW14).
+                # 서비스 계정 명의로 쌓여 오귀속이 재발한다. 안내는 그쪽이 준 상태로 가른다(HG-26 — 401 만 재등록).
+                _txt, _code = _conn_fail_text(backend_key, email, _label, exc)
+                _audit(name, backend_key, False, f"conn-user: {exc!r}",
+                       round((time.monotonic() - t0) * 1000), caller=email, mode="as-conn", corr=_request_corr(),
+                       note="+".join(n for n in (_tok_note, f"status:{_code}" if _code else None) if n) or None, rid=_rid)
+                return types.CallToolResult(content=[types.TextContent(type="text", text=_txt)], isError=True)
             _audit(name, backend_key, not getattr(res, "isError", False), None,
                    round((time.monotonic() - t0) * 1000),
-                   caller=email, mode="as-conn", corr=_request_corr(), res=res,
-                   note=(f"tok:{hashlib.sha256(conn['token'].encode('utf-8')).hexdigest()[:10]}" if _declared else None))
-            return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res))))
+                   caller=email, mode="as-conn", corr=_request_corr(), res=res, note=_tok_note, rid=_rid)
+            # 가림에서 뺄 주소(선언의 mask_keep_hosts — 그 호스트로 여는 링크만, HG-29). 없으면 지금 그대로다.
+            return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(
+                name, _pii_mask(res, keep_hosts=_cm.get("mask_keep_hosts") or frozenset()))))
 
     # 이 호출이 쓰는 세션의 세대. 실패했을 때 "내가 죽었다고 본 그 세션" 을 가리키므로,
     # 그 사이 다른 호출이 이미 갈아 끼웠다면 새 세션을 또 부수지 않는다. try 밖에서 잡는다 —

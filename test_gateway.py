@@ -8807,8 +8807,9 @@ def test_사람_호출에는_그_사람의_Bearer_하나만_나가고_감사에_
     assert "fmea_user0tok9" not in text and "fmea_list0tok1" not in text
 
 
-def _decl_call_kit(monkeypatch, *, user="u@corp.com", base_headers=None, conn=None, tool="get_fmea"):
-    """선언 백엔드 하나로 `_call_tool` 을 실제로 태운다(`_call_as_user` 는 진짜, 전송 계층만 막는다). 상주(목록) 세션은 받은 호출을 남긴다."""
+def _decl_call_kit(monkeypatch, *, user="u@corp.com", base_headers=None, conn=None, tool="get_fmea", spec=None, reply=None):
+    """선언 백엔드 하나로 `_call_tool` 을 실제로 태운다(`_call_as_user` 는 진짜, 전송 계층만 막는다). 상주(목록) 세션은 받은 호출을 남긴다.
+    spec — 선언(기본 _FMEA), reply — 그쪽 도구 호출의 답을 정하는 함수(받은 원래 이름 · 인자 → 결과, 던지면 그 예외 — 기본은 빈 JSON)."""
     b = _CallB([tool])
     b.headers = dict(base_headers or {})
     b.list_headers, b.list_only = {"Authorization": "Bearer fmea_list0tok1"}, True
@@ -8819,6 +8820,8 @@ def _decl_call_kit(monkeypatch, *, user="u@corp.com", base_headers=None, conn=No
 
         async def call_tool(self, original, arguments, read_timeout_seconds=None):
             one["tool"] = original
+            if reply is not None:
+                return reply(original, arguments)
             return types.CallToolResult(content=[types.TextContent(type="text", text="{}")], isError=False)
 
     def fake_stream(url, headers=None, **_kw):
@@ -8835,7 +8838,7 @@ def _decl_call_kit(monkeypatch, *, user="u@corp.com", base_headers=None, conn=No
     monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
     monkeypatch.setattr(gw, "_request_user", lambda: user)
     monkeypatch.setattr(gw, "_request_groups", lambda: ["plat:fmea"] if user else [gw.SERVICE_GROUP])
-    _declare("fmea", _FMEA)
+    _declare("fmea", spec if spec is not None else _FMEA)
     _portal(monkeypatch, **(conn or {"status": 200, "payload": {"token": "fmea_user0tok9", "workspace": ""}}))
     res = asyncio.run(gw._call_tool(tool, {}))
     return res, b.session.calls, one, _rows()[-1]
@@ -9256,7 +9259,9 @@ def test_HG20_구조화_본문과_rest_call_도_가리고_health_는_수만_싣�
     assert res.structuredContent["rows"][0]["nickname"] == "철수", "원본 객체는 건드리지 않는다(캐시 · 근거 원장이 쥔다)"
     src = open(gw.__file__, encoding="utf-8").read()
     assert 'return _evid_keep("rest_call", _pii_mask(_rest_text(payload)))' in src
-    assert src.count("_cache_put(ckey, _evid_keep(name, _pii_mask(res)))") == 5, "백엔드 결과를 돌려주는 자리 다섯이 모두 가린다"
+    # 등록 토큰 길(as-conn)만 선언의 가림 예외 주소를 넘긴다(HWAXPortal docs/siren-delib HG-29) — 그 자리도 가린다
+    assert src.count("_cache_put(ckey, _evid_keep(name, _pii_mask(res)))") == 4, "백엔드 결과를 돌려주는 자리 다섯이 모두 가린다"
+    assert src.count("name, _pii_mask(res, keep_hosts=_cm.get(\"mask_keep_hosts\") or frozenset()))))") == 1
     assert gw._luhn_ok("352099001761481") and not gw._luhn_ok("352099001761482")
     sent = []
 
@@ -12716,3 +12721,188 @@ def test_SP_0472_새_허브_도구의_쓰기_판정(original, write):
     t = types.Tool(name=f"rootdesigndatahub_{original}", description="", inputSchema={"type": "object", "properties": {}})
     assert gw._tool_is_write(t, original) is write, original
     assert gw._routine_read(t, "rootdesigndatahub", original) is False, "앱 표지 · 읽기 목록 · 조회 낱말 어느 것으로도 읽기로 열리지 않는다"
+
+
+# ── SIREN 연동 뒤 요청(HWAXPortal docs/siren-delib) — HG-26 실패 가르기 · HG-27 요청 ID · HG-28 영역 · HG-29 가림 예외 ─────────────────
+# 사설 주소는 점 찍은 글자로 적지 않는다(추적 파일 사설 주소 가드) — 수로 짓는다.
+import ipaddress  # noqa: E402
+import re  # noqa: E402
+
+_SIREN_IP = str(ipaddress.IPv4Address((10 << 24) | (20 << 16) | (30 << 8) | 40))
+_OTHER_IP = str(ipaddress.IPv4Address((192 << 24) | (168 << 16) | (1 << 8) | 7))
+
+
+def _mcp_err(message: str, data=None):
+    from mcp.shared.exceptions import McpError
+    return McpError(types.ErrorData(code=-32001, message=message, data=data))
+
+
+def _group(*excs):
+    from exceptiongroup import ExceptionGroup            # 파이썬 3.10 — anyio 가 쓰는 백포트
+    return ExceptionGroup("unhandled errors in a TaskGroup", [ExceptionGroup("unhandled errors in a TaskGroup", list(excs))])
+
+
+def _http_err(status: int, headers=None):
+    req = httpx.Request("POST", "http://siren.example/mcp")
+    return httpx.HTTPStatusError(f"Client error '{status} X' for url 'http://siren.example/mcp'", request=req,
+                                 response=httpx.Response(status, headers=headers or {}, request=req))
+
+
+@pytest.mark.parametrize("exc,want", [
+    (_mcp_err("401 token_invalid: 토큰이 틀렸다"), (401, None)),
+    (_mcp_err("401 token_missing"), (401, None)),
+    (_mcp_err("403 ip_denied"), (403, None)),
+    (_mcp_err("403 scope_denied"), (403, None)),
+    (_mcp_err("429 rate_limited", {"retry_after": 30}), (429, 30)),
+    (_mcp_err("429 rate_limited", {"retryAfter": "2.5"}), (429, 3)),
+    (_mcp_err("500 internal"), (None, None)),
+    (_mcp_err("rate limited 429 times"), (None, None)),          # 맨 앞이 아니면 상태가 아니다
+    (_http_err(429, {"Retry-After": "12"}), (429, 12)),
+    (_http_err(401), (401, None)),
+    (_http_err(502), (None, None)),
+    (RuntimeError("Client error '429 Too Many Requests' for url 'http://x/mcp'"), (429, None)),
+    (RuntimeError("connect failed: http://siren.example:4290/mcp"), (None, None)),   # 포트 · 주소의 숫자는 상태가 아니다
+    (OSError("Connection refused"), (None, None)),
+])
+def test_HG26_등록_토큰_길의_실패를_그쪽_상태로_가른다(exc, want):
+    assert gw._conn_fail_status(exc) == want
+    assert gw._conn_fail_status(_group(exc)) == want, "단발 세션의 태스크 그룹이 두 겹 싸도 안까지 본다"
+
+
+def _siren_fail(monkeypatch, exc):
+    def boom(_o, _a):
+        raise exc
+    return _decl_call_kit(monkeypatch, reply=boom)
+
+
+def test_HG26_401_만_다시_등록을_안내하고_429_는_토큰_문제가_아니라고_한다(monkeypatch):
+    res, _svc, one, row = _siren_fail(monkeypatch, _mcp_err("401 token_invalid"))
+    text = res.content[0].text
+    assert res.isError and "401" in text and "다시 등록하세요" in text and "/tokens?tab=connect" in text
+    assert row["mode"] == "as-conn" and row["caller"] == "u@corp.com" and row["ok"] is False and "status:401" in row["note"]
+    assert row["note"].startswith("tok:"), "실패 줄에도 토큰 지문 — 그쪽 토큰 주인과 잇는다"
+
+    res, _svc, one, row = _siren_fail(monkeypatch, _mcp_err("429 rate_limited", {"retry_after": 20}))
+    text = res.content[0].text
+    assert "(429 — 20초 뒤에 다시)" in text and "토큰 문제가 아닙니다" in text and "다시 등록하세요" not in text
+    assert "429 rate_limited" in text, "원래 오류는 괄호에 그대로"
+    assert "status:429" in row["note"] and one["tool"] == "get_fmea", "한 번만 부른다 — 다시 부르지 않는다"
+
+    res, *_ = _siren_fail(monkeypatch, _mcp_err("403 ip_denied"))
+    assert "(403 — 토큰의 권한 범위 밖이거나 출발 IP 가 허용되지 않음)" in res.content[0].text and "관리자에게" in res.content[0].text
+    assert "다시 등록하세요" not in res.content[0].text
+
+    res, _svc, _one, row = _siren_fail(monkeypatch, RuntimeError("boom"))
+    assert "서버가 오류를 냈거나 닿지 못했습니다" in res.content[0].text and "다시 등록하세요" not in res.content[0].text
+    assert "status:" not in row["note"]
+
+
+def test_HG27_선언_호출에는_호출마다_새_요청_ID_를_싣고_감사에_같은_값을_남긴다(monkeypatch):
+    res, _svc, one, row = _decl_call_kit(monkeypatch)
+    rid = one["headers"].get("X-Request-Id")
+    assert not res.isError and isinstance(rid, str) and re.fullmatch(r"[0-9a-f]{32}", rid)
+    assert row["rid"] == rid
+    _res, _svc, one2, row2 = _decl_call_kit(monkeypatch)
+    assert one2["headers"]["X-Request-Id"] != rid and row2["rid"] == one2["headers"]["X-Request-Id"], "호출마다 새 값"
+    # 실패한 호출도 같은 값을 남긴다(그쪽이 오류 기록으로 이 값을 준다)
+    _res, _svc, one3, row3 = _siren_fail(monkeypatch, _mcp_err("429 rate_limited"))
+    assert row3["rid"] == one3["headers"]["X-Request-Id"]
+
+
+def test_HG27_request_id_false_면_싣지_않고_내장_RA_에도_싣지_않는다(monkeypatch):
+    res, _svc, one, row = _decl_call_kit(monkeypatch, spec={**_FMEA, "request_id": False})
+    assert not res.isError and "X-Request-Id" not in one["headers"] and "rid" not in row
+    _res, _svc, _user, row = _ra_kit(monkeypatch, "get_report", status=200, payload={"token": "rat_u", "workspace": "dept"})
+    assert row["mode"] == "as-conn" and "rid" not in row
+
+
+def test_HG27_HG29_선언의_새_칸을_검사한다():
+    ok, why = gw._conn_validate("fmea", {**_FMEA, "request_id": False, "mask_keep_hosts": [_SIREN_IP]}, {"fmea": ["plat:fmea"]})
+    assert why == "ok" and ok["request_id"] is False and ok["mask_keep_hosts"] == [_SIREN_IP]
+    ok, why = gw._conn_validate("fmea", dict(_FMEA), {"fmea": ["plat:fmea"]})
+    assert why == "ok" and ok["request_id"] is True and ok["mask_keep_hosts"] == [], "모르는 포털(칸 없음)이면 켬 · 예외 없음"
+    for bad in ({"request_id": "no"}, {"mask_keep_hosts": "x"}, {"mask_keep_hosts": ["8.8.8.8"]},
+                {"mask_keep_hosts": ["siren.example"]}, {"mask_keep_hosts": [_SIREN_IP + ":8080"]},
+                {"mask_keep_hosts": ["0" + _SIREN_IP]}, {"mask_keep_hosts": [_SIREN_IP] * 9}):
+        assert gw._conn_validate("fmea", {**_FMEA, **bad}, {"fmea": ["plat:fmea"]}) == (None, "invalid"), bad
+
+
+def test_HG28_SIREN_다섯_도구는_품질_불량_이력_영역이다():
+    for t in ("siren_search_cases", "siren_get_case", "siren_list_groups", "siren_list_docs", "siren_get_doc"):
+        assert gw._area_of(t, "siren") == "quality", t
+
+
+def test_HG29_가림_예외_주소는_그_주소로_여는_링크만_그대로_둔다():
+    keep = frozenset({_SIREN_IP})
+    text = json.dumps({"hits": [{"link": f"http://{_SIREN_IP}:8501/?case=7", "note": f"서버 {_SIREN_IP} · 다른 {_OTHER_IP}"},
+                                {"link": f"https://{_OTHER_IP}/x"}]}, ensure_ascii=False)
+    out, n = gw._pii_mask_text(text, keep)
+    assert f"http://{_SIREN_IP}:8501/?case=7" in out, "예외 주소의 링크는 그대로"
+    assert f"서버 [가림:IP]" in out and f"https://[가림:IP]/x" in out and _OTHER_IP not in out, "글 속 같은 주소 · 다른 사설 주소는 가린다"
+    assert n == 3
+    esc = '{"link":"http:\\/\\/' + _SIREN_IP + ':8501\\/"}'
+    assert _SIREN_IP in gw._pii_mask_text(esc, keep)[0], "JSON 이 빗금을 \\/ 로 적은 링크도"
+    assert gw._pii_mask_text(text)[0].count("[가림:IP]") == 4, "예외가 없으면 지금 그대로 다 가린다"
+
+
+def test_HG29_선언_결과에서만_예외가_먹는다(monkeypatch):
+    body = json.dumps({"hits": [{"link": f"http://{_SIREN_IP}:8501/?case=7"}]})
+
+    def answer(_o, _a):
+        return types.CallToolResult(content=[types.TextContent(type="text", text=body)], isError=False,
+                                    structuredContent={"hits": [{"link": f"http://{_SIREN_IP}:8501/?case=7"}]})
+    res, *_ = _decl_call_kit(monkeypatch, spec={**_FMEA, "mask_keep_hosts": [_SIREN_IP]}, reply=answer)
+    assert f"http://{_SIREN_IP}:8501/?case=7" in res.content[0].text
+    assert res.structuredContent["hits"][0]["link"] == f"http://{_SIREN_IP}:8501/?case=7"
+    res, *_ = _decl_call_kit(monkeypatch, reply=answer)
+    assert _SIREN_IP not in res.content[0].text and "[가림:IP]" in res.content[0].text, "예외를 적지 않은 선언은 지금 그대로 가린다"
+
+
+def test_HG26_맨_앞의_수는_JSON_RPC_오류에서만_상태다():
+    """반대 검토 11-06 — 다른 예외 문구 맨 앞의 수(429 bytes read · 401.5 seconds)를 상태로 읽지 않는다. httpx 꼴 'NNN 이유' 는 그대로 본다."""
+    assert gw._conn_fail_status(RuntimeError("429 bytes read")) == (None, None)
+    assert gw._conn_fail_status(RuntimeError("401.5 seconds elapsed")) == (None, None)
+    assert gw._conn_fail_status(RuntimeError("Client error '403 Forbidden' for url 'http://x/mcp'")) == (403, None)
+
+
+def test_HG26_403_은_범위_토큰_재등록과_관리자_둘을_말하고_모르는_실패는_단정하지_않는다():
+    text, code = gw._conn_fail_text("siren", "u@corp.com", "SIREN", _mcp_err("403 scope_denied"))
+    assert code == 403 and "그 범위를 가진 토큰을" in text and "/tokens?tab=connect" in text and "관리자에게" in text
+    text, code = gw._conn_fail_text("siren", "u@corp.com", "SIREN", _mcp_err("Unauthorized: token expired"))
+    assert code is None and "상태를 가리지 못했다" in text
+    assert "토큰 문제가 아닙니다" not in text and "잠시 뒤" not in text, "모르는 실패에 토큰 탓이 아니라거나 다시 하라고 단정하지 않는다"
+
+
+def test_HG27_시간_초과_길도_요청_ID_와_as_conn_을_감사에_남긴다(monkeypatch):
+    """반대 검토 11-06 — 머리글은 이미 나갔으므로 시간 초과 줄에도 같은 값이 있어야 바깥 팀과 맞춘다."""
+    seen: dict = {}
+
+    async def late(b, hdrs, original, arguments, timeout_s, op=None):
+        seen.update(hdrs)
+        raise gw._Late("call")
+    monkeypatch.setattr(gw, "_oneshot", late)
+    res, _svc, _one, row = _decl_call_kit(monkeypatch)
+    assert res.isError and row["rid"] == seen["X-Request-Id"] and row["mode"] == "as-conn" and row["note"].startswith("tok:")
+
+
+def test_HG29_선언이_바뀌면_그_백엔드의_응답_캐시를_버린다(monkeypatch):
+    """반대 검토 11-06 — 가림 예외를 걷어도 옛 선언으로 지은 결과(가리지 않은 링크)가 캐시 TTL 동안 나가지 않게."""
+    _conn_kit(monkeypatch)
+    gw._conn_registry_set({"matnexus": dict(_MNX)}, _ROWS)
+
+    async def go(tg):
+        await gw._conn_reconcile(tg)
+        gw._RESP_CACHE.clear()
+        gw._RESP_CACHE[("matnexus", "get_material", "{}", "u@corp.com")] = (object(), _clock.monotonic() + 300, 10)
+        gw._RESP_CACHE[("fmea", "get_fmea", "{}", "u@corp.com")] = (object(), _clock.monotonic() + 300, 10)
+        gw._conn_registry_set({"matnexus": {**_MNX, "mask_keep_hosts": [_SIREN_IP]}}, _ROWS)
+        changed = await gw._conn_reconcile(tg)
+        return changed, sorted(k[0] for k in gw._RESP_CACHE)
+    changed, left = _in_tg(go)
+    assert changed is True and left == ["fmea"], left
+    assert gw.PORTAL_CONN_META["matnexus"]["mask_keep_hosts"] == frozenset({_SIREN_IP})
+
+
+def test_HG27_request_id_빈_값은_기본이다():
+    got, why = gw._conn_validate("fmea", {**_FMEA, "request_id": None}, {"fmea": ["plat:fmea"]})
+    assert why == "ok" and got["request_id"] is True

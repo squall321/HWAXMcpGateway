@@ -8140,13 +8140,13 @@ def test_read_tools_deny_는_StepForge_mesh_size_advice_를_루틴_단계에서_
 def test_read_tools_override_는_앱이_readOnlyHint_False_를_적어도_읽기로_다룬다(monkeypatch, _fresh_scores):
     """앱 표지가 읽기가 아니어도 포털이 읽기로 다루는 도구(read_tools.json override — 사용자 결정으로만). StepForge 가 잡 · 파일을 남기는
     단면 · 적층 도구 넷의 readOnlyHint 를 뗐지만(StepForge D-677 S7) 측정 잡은 읽기 토큰 · 루틴으로도 스스로 건다(HWAXPortal
-    docs/report-figures RF-29 — 11-07 사용자 결정 RF-33 으로 유지). 읽기 전용 PAT · 루틴 단계 · 패널 읽기 · 쓰기 칸이 앱 표지보다 먼저 본다.
+    docs/report-figures RF-29 — 11-07 사용자 결정 RF-39 으로 유지). 읽기 전용 PAT · 루틴 단계 · 패널 읽기 · 쓰기 칸이 앱 표지보다 먼저 본다.
     destructiveHint 와 닫기 목록(deny)은 그대로 이기고, 클라이언트가 보는 표지는 앱이 적은 그대로다."""
     data = json.load(open(gw.Path(gw.__file__).with_name("read_tools.json"), encoding="utf-8"))
     ov = data["override"]
     assert ov == sorted(set(ov)) and all(x.count(":") == 1 and all(x.split(":")) for x in ov)
     four = {f"heax-step_forge:{n}" for n in ("section_pair_view", "section_batch", "compare_stackup", "stackup_figure")}
-    assert four <= set(ov), "StepForge 단면 · 적층 잡 도구 넷(RF-33)"
+    assert four <= set(ov), "StepForge 단면 · 적층 잡 도구 넷(RF-39)"
     assert gw.READ_OVERRIDE == frozenset(ov) and gw.READ_OVERRIDE <= gw.READ_TOOLS
     ann = types.ToolAnnotations
 

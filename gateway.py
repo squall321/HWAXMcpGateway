@@ -6533,7 +6533,7 @@ def _load_read_deny() -> frozenset:
 
 def _load_read_override() -> frozenset:
     """read_tools.json 의 override — 앱이 readOnlyHint=False 를 적었어도 포털이 읽기로 다루는 '백엔드키:원래 이름'(사용자 결정으로만 더한다 —
-    첫 넷은 StepForge 단면 · 적층 잡 도구, HWAXPortal docs/report-figures RF-33). 칸이 없으면 빈 목록, 못 읽거나 목록이 아니면 빈 목록과
+    첫 넷은 StepForge 단면 · 적층 잡 도구, HWAXPortal docs/report-figures RF-39). 칸이 없으면 빈 목록, 못 읽거나 목록이 아니면 빈 목록과
     경고 한 줄(닫힌 쪽 — 앱 표지가 이긴다)."""
     try:
         with open(Path(__file__).with_name("read_tools.json"), encoding="utf-8") as f:

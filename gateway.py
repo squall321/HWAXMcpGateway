@@ -3025,7 +3025,7 @@ async def _tool_rank_fused(raw_q: str, rows: list, tools: list[types.Tool]) -> t
         if t.name not in cand:
             app, original = route.get(t.name, ("_gateway", t.name))[:2]
             label = str((_app_meta(app) if app != "_gateway" else {}).get("label") or "")
-            cand[t.name] = (0, t.name, app, (t.description or "").strip(), t, _tool_is_write(t, original), original,
+            cand[t.name] = (0, t.name, app, (t.description or "").strip(), t, _tool_is_write(t, original, app), original,
                             1 if _COPY_LABEL.search(label) else 0, 0, ("embedding",))
     # 줄의 꼬리(쓰기 표지 · 원래 이름 · 사본 표지 — search_tools 의 줄 꼴)는 그대로 들고 간다. 점수 자리만 RRF 로 바꾼다.
     fused = [(1 / (_TOOL_RRF_K + emb[n]) + (1 / (_TOOL_RRF_K + lex[n]) if n in lex else 0.0), *r[1:])
@@ -3689,11 +3689,15 @@ def _named(names: set[str], v: str, q_flat: str) -> bool:
     return False
 
 
-def _tool_is_write(t, original: str) -> bool:
+def _tool_is_write(t, original: str, backend: str | None = None) -> bool:
     ann = getattr(t, "annotations", None)
     if getattr(ann, "readOnlyHint", None) is True:
         return False
-    if getattr(ann, "destructiveHint", None) is True or getattr(ann, "readOnlyHint", None) is False:
+    if getattr(ann, "destructiveHint", None) is True:
+        return True
+    if backend is not None and f"{backend}:{original}" in READ_OVERRIDE:
+        return False       # 앱이 readOnlyHint=False 를 적었어도 포털이 읽기로 다루는 도구(read_tools.json override — 사용자 결정으로만)
+    if getattr(ann, "readOnlyHint", None) is False:
         return True
     return bool(_WRITE_NAME.search(original)) and not _READ_NAME_HINT.search(original)
 
@@ -3858,7 +3862,7 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
             # 커버리지 승수 — 질의어를 더 많이 맞힌 도구가 개별 단어 빈도보다 앞선다.
             final = score * (1 + w_cov * covered / max(1, len(terms)))
             base_final = base * (1 + w_cov * base_cov / max(1, len(terms))) if base > 0 else 0
-            is_write = _tool_is_write(t, original)
+            is_write = _tool_is_write(t, original, app)
             if is_write and not write_intent and sw["write_penalty"]:
                 final *= wt["write_penalty"]                     # 쓰기 낱말이 없는 질문 — 쓰기 · 잡 시작 도구를 내린다(HG-01)
                 base_final *= wt["write_penalty"]
@@ -3914,7 +3918,7 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                 if ct is None and any(r[2] in family for r in g):
                     ct = canon_named.get(k[0])                # 가족 무리 — 정본은 같은 이름이면 설명이 달라도 그 무리의 정본이다
                 if mine is None and ct is not None:            # 정본 사본이 점수 0 이라 줄에 없다 — 이 무리의 자리에 세운다
-                    mine = (head[0], ct.name, canon, (ct.description or "").strip(), ct, _tool_is_write(ct, k[0]), k[0],
+                    mine = (head[0], ct.name, canon, (ct.description or "").strip(), ct, _tool_is_write(ct, k[0], canon), k[0],
                             1 if _COPY_LABEL.search(str(_app_meta(canon).get("label") or "")) else 0, head[8], head[9])
                     g = [mine] + g
                 head = mine or head
@@ -3934,7 +3938,7 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
         row = next((r for r in rows if r[4] is exact), None) or next((r for r in scored if r[4] is exact), None)
         if row is None:
             e_app, e_orig = route.get(exact.name, ("_gateway", exact.name))[:2]
-            row = (0, exact.name, e_app, (exact.description or "").strip(), exact, _tool_is_write(exact, e_orig), e_orig, 0, 0, ())
+            row = (0, exact.name, e_app, (exact.description or "").strip(), exact, _tool_is_write(exact, e_orig, e_app), e_orig, 0, 0, ())
         rows = [row] + [r for r in rows if r[4] is not exact]
         for lst in folded.values():
             lst[:] = [x for x in lst if x["tool"] != exact.name]
@@ -6527,6 +6531,26 @@ def _load_read_deny() -> frozenset:
         return frozenset()
 
 
+def _load_read_override() -> frozenset:
+    """read_tools.json 의 override — 앱이 readOnlyHint=False 를 적었어도 포털이 읽기로 다루는 '백엔드키:원래 이름'(사용자 결정으로만 더한다 —
+    첫 넷은 StepForge 단면 · 적층 잡 도구, HWAXPortal docs/report-figures RF-33). 칸이 없으면 빈 목록, 못 읽거나 목록이 아니면 빈 목록과
+    경고 한 줄(닫힌 쪽 — 앱 표지가 이긴다)."""
+    try:
+        with open(Path(__file__).with_name("read_tools.json"), encoding="utf-8") as f:
+            raw = json.load(f).get("override") or []
+        if not isinstance(raw, list):
+            raise TypeError("override 는 목록이어야 한다")
+        return frozenset(str(x) for x in raw if str(x))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("read_tools.json 의 override 를 읽지 못했다 — 앱이 readOnlyHint=False 를 적은 도구는 쓰기로 다룬다: %r", exc)
+        return frozenset()
+
+
+# 덧씌우기 — 읽기 전용 PAT 판정(READ_TOOLS 에 들어간다) · 루틴 단계(_routine_read) · 쓰기 분류(_tool_is_write)가 앱의 readOnlyHint=False 보다
+# 먼저 본다. destructiveHint 와 닫기 목록(deny)은 그대로 이긴다. 박스 덧씌우기(read_tools.local.json)에는 이 칸이 없다 — git 으로만 바꾼다.
+READ_OVERRIDE = _load_read_override()
+
+
 # 닫기 목록 — 박스가 이름 꼴 · 앱 표지로 열린 쓰기를 코드 고침 없이 닫는다. _routine_read 가 다른 어느 판정보다(앱의 readOnlyHint=True
 # 보다도) 먼저 본다. 루틴 단계만이다 — 읽기 전용 PAT 판정(_readonly_denial)은 보지 않는다.
 READ_DENY = _load_read_deny()
@@ -6566,7 +6590,9 @@ def _routine_read_deny() -> frozenset:
 
 def _routine_read(t, backend: str, original: str, *, by_name: bool = True) -> bool:
     """루틴 단계에서 부를 수 있는 읽기 도구인가 — 확인된 것만 참이다(모르면 거짓). 닫기 목록(deny)이 맨 먼저다 — 거기 있으면 표지와 무관하게
-    거짓. 다음은 앱 표지 — readOnlyHint=False · destructiveHint 면 거짓, readOnlyHint=True 면 참. 다음은 읽기 목록('백엔드키:원래 이름'), 끝으로
+    거짓. 다음은 destructiveHint 면 거짓, 그다음 덧씌우기(read_tools.json override — 앱이 readOnlyHint=False 를 적었어도 포털이 읽기로
+    다루는 도구, 사용자 결정으로만)면 참. 다음은 앱 표지 — readOnlyHint=False 면 거짓, readOnlyHint=True 면 참. 다음은 읽기 목록
+    ('백엔드키:원래 이름'), 끝으로
     원래 이름의 조회 낱말(밑줄로 가른 조각) — 쓰기 동사(_WRITE_NAME)가 없을 때만이다. _tool_is_write 의 안내 · 미리보기 예외(_READ_NAME_HINT —
     status · history · preview …)는 쓰지 않는다 — update_status · delete_history · apply_preview 같은 쓰기가 읽기로 열렸다(R3 리뷰 2차 #5). 그 예외로만
     열리던 진짜 읽기(upload_instructions · report_upload_instructions · preview_publish — 소스로 확인)는 읽기 목록에 있다.
@@ -6575,7 +6601,11 @@ def _routine_read(t, backend: str, original: str, *, by_name: bool = True) -> bo
     if key in _routine_read_deny():
         return False
     ann = getattr(t, "annotations", None)
-    if getattr(ann, "readOnlyHint", None) is False or getattr(ann, "destructiveHint", None) is True:
+    if getattr(ann, "destructiveHint", None) is True:
+        return False
+    if key in READ_OVERRIDE:
+        return True        # 앱이 readOnlyHint=False 를 적었어도 포털이 읽기로 다루는 도구(read_tools.json override — 사용자 결정으로만)
+    if getattr(ann, "readOnlyHint", None) is False:
         return False
     if getattr(ann, "readOnlyHint", None) is True:
         return True
@@ -7208,7 +7238,7 @@ def _load_read_tools() -> frozenset:
         return frozenset()
 
 
-READ_TOOLS = _load_read_tools()
+READ_TOOLS = _load_read_tools() | READ_OVERRIDE      # 덧씌우기(override)도 읽기 전용 PAT 이 부른다(위 READ_OVERRIDE)
 
 
 def _readonly_denial(name: str, arguments: dict) -> str:
@@ -8624,7 +8654,7 @@ def _bearer_gate(app, pat_verifier=None):
                 "arg_scores": _ARG_SCORE or _arg_scoreboard([]),
                 # 쓰기 도구의 노출 이름(정렬, 백엔드 도구만) — _tool_is_write(readOnlyHint · destructiveHint → 이름 낱말)로 가른다. routine_read 를
                 # 모르는 옛 포털이 이것을 뺀다(HWAXPortal docs/analysis-routines R3-D6). 위 칸들은 그대로다.
-                "write": sorted(_n for _n, (_bk, _orig) in route.items() if _tool_is_write(_tool_of.get(_n), _orig)),
+                "write": sorted(_n for _n, (_bk, _orig) in route.items() if _tool_is_write(_tool_of.get(_n), _orig, _bk)),
                 # 루틴 단계에서 부를 수 있는 읽기 도구의 노출 이름(정렬, 백엔드 도구만) — 닫힌 쪽 판정 _routine_read(표지 · 읽기 목록 · 조회 낱말),
                 # routine_call 과 같은 판정이다. 포털 계획은 이것과 겹치는 도구만 단계에 묶는다(R3 리뷰 #0 — 모르는 도구는 쓰기로 본다).
                 "routine_read": sorted(_n for _n, (_bk, _orig) in route.items() if _routine_read(_tool_of.get(_n), _bk, _orig)),

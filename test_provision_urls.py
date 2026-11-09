@@ -537,7 +537,7 @@ def test_StepForge_단언_쓰기는_비밀이_있으면_rest_sso_와_쓰기_경�
     assert out["heax_registry"]["rest_sso"] == {"step_forge": _SF_SSO_ENTRY}
     sf = out["rest"]["step-forge"]
     assert sf == {"base": "https://hub.example:8443/apps/step_forge", "inject": {"header": "Authorization", "value": "Bearer heax-svc"},
-                  "delegate": "step_forge", "write_paths": ["/api/onto-link", "/api/onto-put", "/api/onto-define", "/api/onto-fill"]}
+                  "delegate": "step_forge", "write_paths": ["/api/onto-link", "/api/onto-put", "/api/onto-define", "/api/onto-fill", "/api/plm-sync"]}
     import rest_proxy
     assert rest_proxy.allowed_methods(sf) == ["GET", "HEAD"], "REST 프록시(/api/step-forge/)는 단언을 싣지 않아 읽기만 그대로다"
     assert "step_forge" not in (out["heax_registry"].get("per_user_sso") or {}), "per_user_sso 와 따로 — StepForge MCP 길은 공유 세션 그대로"

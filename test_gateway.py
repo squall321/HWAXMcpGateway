@@ -13451,7 +13451,7 @@ def test_SRC13_두_리포_계약_포털이_찍는_서비스_PAT_를_게이트웨
 # 작업)의 서명 단언을 싣는다. GET · HEAD 와 MCP 길은 그대로(inject · 공유 세션). 가짜 StepForge 는 발급 창구와 REST 를 한 처리기로 낸다.
 _SF_BASE = "http://hub.test/apps/step_forge"
 _SF_SSO = "http://hub.test/apps/step_forge/api/auth/sso"
-_SF_WRITES = ["/api/onto-link", "/api/onto-put", "/api/onto-define", "/api/onto-fill"]
+_SF_WRITES = ["/api/onto-link", "/api/onto-put", "/api/onto-define", "/api/onto-fill", "/api/plm-sync"]
 
 
 def _sf_token(claims: dict) -> str:

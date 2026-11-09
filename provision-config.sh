@@ -960,12 +960,13 @@ if e.get("HEAX_MCP_TOKEN"):
                            (e.get("HEAX_MCP_BASE") or "http://127.0.0.1:4180").rstrip("/")
                            + "/apps/step_forge"),
         "inject": {"header": "Authorization", "value": f"Bearer {e['HEAX_MCP_TOKEN']}"}}
-    # 단언 쓰기가 켜졌으면(위 rest_sso.step_forge) 정해진 쓰기 경로만 그 명의로 연다 — 게이트웨이 rest_call 이 이 POST 넷에만 단언을 싣고 그 밖의
+    # 단언 쓰기가 켜졌으면(위 rest_sso.step_forge) 정해진 쓰기 경로만 그 명의로 연다 — 게이트웨이 rest_call 이 이 POST 다섯에만 단언을 싣고 그 밖의
     # 쓰기는 405 다. GET · HEAD 는 위 inject 그대로이고, REST 프록시(/api/step-forge/)는 단언을 싣지 않아 읽기만 그대로다(rest_proxy.allowed_methods).
     if "step_forge" in ((cfg.get("heax_registry") or {}).get("rest_sso") or {}):
         rest["step-forge"]["delegate"] = "step_forge"
-        # 넷째 /api/onto-fill — StepForge 가 채우기 잡을 거는 고정 경로(그쪽 core-link 답 11-09 · 사람 단언은 넷 다, 서비스 단언은 onto-link · onto-fill 만)
-        rest["step-forge"]["write_paths"] = ["/api/onto-link", "/api/onto-put", "/api/onto-define", "/api/onto-fill"]
+        # /api/onto-fill · /api/plm-sync — StepForge 가 채우기 잡 · 허브 받기 잡을 거는 고정 경로(그쪽 core-link 답 11-09). 사람 단언은 다섯 다,
+        # 서비스 단언은 plm-sync · onto-link(규칙 단) · onto-fill(증명 규칙)만 StepForge 가 받는다 — 박스 작업의 허용은 service_tools.local.json.
+        rest["step-forge"]["write_paths"] = ["/api/onto-link", "/api/onto-put", "/api/onto-define", "/api/onto-fill", "/api/plm-sync"]
 cfg["rest"] = rest
 # 허용 청중은 **rest 사이트와 정확히 같다.** 손으로 적어 두면 두 방향으로 어긋난다 —
 #   · 사이트는 있는데 청중에 없으면 프록시가 `unknown site` 404 로 답한다(`handle()`).

@@ -7319,15 +7319,17 @@ def _panel_denial(name: str, panel: dict) -> str | None:
 # 작업에 내줄 수 없었다(CK-4). 사람 신원은 싣지 않는다 — 사람별 위임 앱(리스크 · MX 백서 · DynaForge · ste)은 서비스 계정으로 불린다. 그룹은
 # gateway:service 라 포털 접근 정책을 건너뛴다 — 울타리는 아래 박스 허용 목록이다(tools/list · tools/call · invoke_tool · rest_call 이 같은 표를 본다).
 def _service_scope(claims: dict) -> tuple[bool, dict | None]:
-    """검증된 PAT 클레임이 서비스 PAT 인가 — (서비스라 주장하나, 범위 {job, jti} 또는 None). 서비스 표지(purpose · 청중 · jti 머리 · sub 머리
-    system: · scopes 의 service) 가운데 하나라도 있으면 서비스로 다룬다. 그때 꼴이 하나라도 어긋나면 범위가 None 이라 미들웨어가 401 로 닫는다 —
-    일반 PAT 로 떨어뜨리지 않는다(_panel_scope 와 같은 자세). 꼴 — purpose=service · jti 머리 svc- · 청중에 서비스 청중(MCP · 패널 청중과 함께 오면
-    거절) · sub 는 system:<작업>(작업은 ^[a-z0-9][a-z0-9-]{0,39}$) · scope=api · scopes 는 ["service"] 그대로 · panel 칸 없음 · 수명은
-    SERVICE_MAX_TTL_S 안. 이메일 · 그룹은 보지 않는다(실려 와도 쓰지 않는다). 포털 service_pat 가 찍는 꼴과 같다(두 리포 계약 시험)."""
+    """검증된 PAT 클레임이 서비스 PAT 인가 — (서비스라 주장하나, 범위 {job, jti} 또는 None). 서비스 표지(purpose · 청중 · sub 머리 system: ·
+    scopes 의 service) 가운데 하나라도 있으면 서비스로 다룬다. 그때 꼴이 하나라도 어긋나면 범위가 None 이라 미들웨어가 401 로 닫는다 — 일반 PAT 로
+    떨어뜨리지 않는다(_panel_scope 와 같은 자세). jti 머리는 표지가 아니다 — 사람 PAT 의 jti 는 secrets.token_urlsafe(24)(포털
+    backend/app/auth/routes/pat.py)라 약 64⁴ 에 하나가 우연히 svc- 로 시작하고, 표지로 두면 그 사람 PAT 가 영영 401 이다. 꼴 검사에는 남긴다.
+    꼴 — purpose=service · jti 머리 svc- · 청중에 서비스 청중(MCP · 패널 청중과 함께 오면 거절) · sub 는 system:<작업>(작업은
+    ^[a-z0-9][a-z0-9-]{0,39}$) · scope=api · scopes 는 ["service"] 그대로 · panel 칸 없음 · 수명은 SERVICE_MAX_TTL_S 안. 이메일 · 그룹은 보지 않는다
+    (실려 와도 쓰지 않는다). 포털 service_pat 가 찍는 꼴과 같다(두 리포 계약 시험)."""
     aud = claims.get("aud")
     auds = [aud] if isinstance(aud, str) else [str(x) for x in aud] if isinstance(aud, list) else []
     jti, sub, scopes = str(claims.get("jti") or ""), str(claims.get("sub") or ""), claims.get("scopes")
-    if not (str(claims.get("purpose") or "") == SERVICE_PURPOSE or SERVICE_AUDIENCE in auds or jti.startswith(SERVICE_JTI_PREFIX)
+    if not (str(claims.get("purpose") or "") == SERVICE_PURPOSE or SERVICE_AUDIENCE in auds
             or sub.startswith("system:") or (isinstance(scopes, list) and SERVICE_SCOPES[0] in scopes)):
         return False, None
     m = _SERVICE_SUB_RE.fullmatch(sub)

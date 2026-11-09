@@ -45,8 +45,9 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
 내주지 않는다(CK-4).
 
 - 받는 꼴(`_service_scope`) — 청중 `mcp-gateway-service`(MCP · 패널 청중과 함께 오면 거절) · `purpose: service` · jti 머리 `svc-` ·
-  `sub: system:<작업>`(작업은 `^[a-z0-9][a-z0-9-]{0,39}$`) · `scope: api` · `scopes: ["service"]` · 수명 365일까지. 이 표지 가운데 하나라도 있는데
-  꼴이 어긋나면 401(감사 `unauthorized: bad-service-token`)이다 — 일반 PAT 로 떨어지지 않는다. 이메일 · 그룹 칸은 보지 않는다.
+  `sub: system:<작업>`(작업은 `^[a-z0-9][a-z0-9-]{0,39}$`) · `scope: api` · `scopes: ["service"]` · 수명 365일까지. 서비스 표지(purpose · 서비스 청중 ·
+  `system:` sub · `service` scope) 가운데 하나라도 있는데 꼴이 어긋나면 401(감사 `unauthorized: bad-service-token`)이다 — 일반 PAT 로 떨어지지
+  않는다. jti 머리는 표지가 아니다(사람 PAT 의 jti 는 무작위라 우연히 `svc-` 로 시작할 수 있다 — 꼴 검사에만 쓴다). 이메일 · 그룹 칸은 보지 않는다.
 - 허용 목록 — 리포 루트의 `service_tools.local.json`(gitignore). 바뀐 시각이 다르면 재기동 없이 다시 읽고, 꼴이 하나라도 틀리면 통째로 버려
   모든 서비스 호출을 막는다(경고 한 줄). 파일에 없는 작업의 토큰은 문에서 **403** 이다.
 

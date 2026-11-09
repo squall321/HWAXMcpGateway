@@ -13071,6 +13071,23 @@ def test_SRC13_꼴이_어긋난_서비스_PAT_는_401_이고_일반_PAT_로_떨�
     assert [r["error"] for r in _rows()] == ["unauthorized: bad-service-token"], why
 
 
+def test_SRC13_jti_머리는_서비스_표지가_아니다_사람_PAT_의_jti_가_우연히_svc_로_시작해도_일반_PAT_다(monkeypatch):
+    """사람 PAT 의 jti 는 secrets.token_urlsafe(24)(포털 backend/app/auth/routes/pat.py) — 약 64⁴ 에 하나가 우연히 svc- 로 시작한다. jti 머리를
+    표지로 두면 그 사람 PAT 가 영영 401 이었다. 꼴 검사에는 남는다 — purpose=service 인데 jti 머리가 없으면 그대로 401 이다."""
+    human = {"sub": "S-1", "email": "u@corp.com", "groups": [], "aud": [gw.MCP_AUDIENCE], "scope": "api", "scopes": ["read", "write"],
+             "jti": "svc-Qx3_kZ8aLm0pRt5vWy7bNc2dFg9hJk1"}
+    assert gw._service_scope(human) == (False, None)
+    h, st = _gate_headers(monkeypatch, b"Bearer me", human)
+    assert st is None and h[gw.VIA_HEADER] == ["pat"] and h[gw.USER_HEADER] == ["u@corp.com"], h
+    assert gw.SERVICE_HEADER not in h, "일반 PAT 로 받았다 — 서비스 작업 머리가 붙지 않는다"
+    plain = _svc_claims(jti="0123abcd4567ef89")
+    assert gw._service_scope(plain) == (True, None), "purpose=service 가 표지다 — jti 머리가 없으면 꼴이 어긋난다"
+    open(gw.AUDIT_PATH, "w").close()
+    _svc_file({_SVC_JOB: {"tools": []}})
+    h2, st2, _body, _auds = _svc_gate(monkeypatch, plain)
+    assert st2 == 401 and not h2 and [r["error"] for r in _rows()] == ["unauthorized: bad-service-token"]
+
+
 def test_SRC13_서비스_PAT_는_작업_이름과_자격을_싣고_사람_신원과_클라이언트_사본은_버린다(monkeypatch):
     _svc_file({_SVC_JOB: {"tools": ["heax-step_forge:run_job"]}})
     forged = ((gw.USER_HEADER.encode(), b"boss%40corp.com"), (gw.SERVICE_HEADER.encode(), b"other-job"),

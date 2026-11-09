@@ -28,7 +28,10 @@ _HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 _NEVER_FORWARD = {"x-hwax-delegate-email", "x-hwax-delegate-service",
                   # 소속 · plat 증명(gateway AFF_HEADER · PLAT_HEADER) — 사람별 경로에서 게이트웨이가 지은 것만 간다. 클라이언트 사본은
                   # 서명이 맞을 리 없지만, 같은 이름이 둘 실리면 앱이 어느 쪽을 읽을지 모른다(HWAXPortal docs/mxwp-wiki P4).
-                  "x-heax-user-affiliation", "x-heax-aff-proof", "x-heax-user-plat", "x-heax-plat-proof"}
+                  "x-heax-user-affiliation", "x-heax-aff-proof", "x-heax-user-plat", "x-heax-plat-proof",
+                  # 서명 단언(StepForge · 리스크 앱의 X-Heax-Sso-Assertion) — 게이트웨이가 받은 것만 싣는다(rest_call 의 단언 쓰기 · per_user 의
+                  # token_header 는 거르기 뒤에 제 값을 넣는다). 클라이언트 사본을 넘기면 가로챈 단언이 수명(최대 한 시간) 동안 이 길로 되쓰인다.
+                  "x-heax-sso-assertion"}
 
 
 

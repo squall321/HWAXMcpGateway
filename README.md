@@ -44,7 +44,7 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
 폐기 목록(`revoked.json`, 60초마다 읽는다)이다. 게이트웨이 공유 비밀(GW_TOKEN)은 `x-hwax-user` 를 믿어 아무 사람으로나 행세하므로 박스 작업에
 내주지 않는다(CK-4).
 
-- 받는 꼴(`_service_scope`) — 청중 `mcp-gateway-service`(MCP · 패널 청중과 함께 오면 거절) · `purpose: service` · jti 머리 `svc-` ·
+- 받는 꼴(`_service_scope`) — 청중은 `mcp-gateway-service` 하나뿐(다른 청중이 섞이면 거절) · `purpose: service` · jti 머리 `svc-` ·
   `sub: system:<작업>`(작업은 `^[a-z0-9][a-z0-9-]{0,39}$`) · `scope: api` · `scopes: ["service"]` · 수명 365일까지. 서비스 표지(purpose · 서비스 청중 ·
   `system:` sub · `service` scope) 가운데 하나라도 있는데 꼴이 어긋나면 401(감사 `unauthorized: bad-service-token`)이다 — 일반 PAT 로 떨어지지
   않는다. jti 머리는 표지가 아니다(사람 PAT 의 jti 는 무작위라 우연히 `svc-` 로 시작할 수 있다 — 꼴 검사에만 쓴다). 이메일 · 그룹 칸은 보지 않는다.
@@ -68,6 +68,10 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
 - 사람별 위임 앱(리스크 · MX 백서 · DynaForge · ste)은 신원이 없어 서비스 계정으로 불린다. RA · TestScope 는 서비스 세션이 실제 사람의 토큰이라
   서비스 작업이 부르면 그 사람 행세가 된다(CK-4) — 허용 목록에 적어도 읽을 때 빼고(작업 · 도구를 짚는 ⚠ 한 줄, 기동 포함) 호출은
   `service-denied(impersonation)` 이다.
+- 신원 전달 백엔드(`IDENTITY_FWD_BACKENDS`, 기본이자 dev 값 `hwax-deliberation`)도 같은 자리에서 빼고 호출은 `service-denied(identity-forward)` 다.
+  서비스 요청은 사람 · 작업 머리 없이 `gateway:service` 그룹만 실려 그쪽에는 공유 비밀의 내부 호출로 보이고, 심의 엔진은 GW_TOKEN 으로
+  게이트웨이를 다시 불러(서비스 울타리 밖) 지정 도구를 돌리고 RA 공유 세션으로 쓰며, 목록 도구는 모든 사람의 잡을 본다. 서비스 신원을 실어
+  보낼 길이 생기기 전까지 닫아 둔다.
 
 ## 설정 — `gateway_config.json` (gitignore, 시크릿)
 **전체 스키마·플레이스홀더는 커밋된 `gateway_config.example.json` 참고** — fresh 배포 시 이걸 복사해 실토큰만 채운다. `gateway_config.json` 자체는 gitignore(600).
@@ -111,7 +115,8 @@ MCP fan-out과 같은 패턴("호출자 토큰 1개 → 백엔드별 네이티�
 
 챗의 사람(또는 서비스 PAT 의 작업)이 `rest_call(site="step-forge", method="POST", path=…)` 로 StepForge 온톨로지 적용을 **그 명의로** 부른다.
 GET · HEAD 는 지금 그대로(`inject` — 허브 서비스 토큰)이고, StepForge MCP 길도 공유 세션 그대로다 — 발급 칸을 `per_user_sso` 와 따로
-(`rest_sso.step_forge`) 둔 까닭이다(CK-3). REST 프록시(`/api/step-forge/`)는 단언을 싣지 않아 읽기만 그대로다(`allowed_methods`).
+(`rest_sso.step_forge`) 둔 까닭이다(CK-3). REST 프록시(`/api/step-forge/`)는 단언을 싣지 않아 읽기만 그대로다(`allowed_methods`) — 클라이언트가
+보낸 `X-Heax-Sso-Assertion` 도 상류로 넘기지 않는다(가로챈 단언을 그 수명 동안 되쓰지 못하게).
 
 - 쓰기 — `write_paths`(`/api/onto-link` · `/api/onto-put` · `/api/onto-define`)의 POST 만 연다. 사람(PAT · 챗의 그 사람 이메일)은 사람 단언, 서비스는
   그 작업의 `rest` 항목에 있을 때만 서비스 단언이다. 신원이 없으면(GW_TOKEN 만) `신원이 없다`(`status: 403`), 그 밖의 쓰기 메서드 · 경로는
@@ -119,8 +124,9 @@ GET · HEAD 는 지금 그대로(`inject` — 허브 서비스 토큰)이고, St
 - 운반 — `Authorization: Bearer <허브 서비스 토큰>`(Caddy 문) + `X-Heax-Sso-Assertion: <단언>`(주체). `x-forwarded-user` 는 사람일 때 지금처럼 싣는다.
 - 발급 — `POST <sso_url>` 에 `X-Heax-Gateway-Secret` · 주체 하나(`X-Hwax-Delegate-Email` 또는 `X-Hwax-Delegate-Service`) · `X-Heax-Client` · Caddy 용
   `Authorization`. 답 `{"token": "sfsso_…", "expires_in": N}` 을 주체마다 `expires_in − 60초` 까지 캐시한다(60초 이하 · 없음은 담지 않는다). 받은
-  단언의 주체(`e` · `s`)가 청한 것과 다르면(둘 다 실렸거나 읽을 수 없어도) 발급 실패다 — 서비스 토큰으로 쓰지 않는다. 위층이 401 · 403 이면 그
-  단언을 캐시에서 버린다(쓰기라 다시 보내지는 않는다).
+  토큰은 `sfsso_` 머리에 읽히는 몸이어야 하고(아니면 — 예: 주소가 다른 앱 창구를 가리켜 개인 토큰이 왔다 — 발급 실패), 주체 칸은 정확히 하나
+  (`e` 또는 `s` — 값이 아니라 칸이 있는지로 본다)가 청한 것과 같아야 한다. 어긋나면 발급 실패다 — 서비스 토큰으로 쓰지 않는다. 위층이 401 · 403
+  이면 그 단언을 캐시에서 버린다(쓰기라 다시 보내지는 않는다).
 - 감사 — `caller` 는 그 이메일 또는 `system:<작업>`, 쓰기 경로 호출은 `note` 에 `rest:POST <경로>`(버렸으면 `+assertion-dropped`).
 - 설정 — `provision-config.sh` 가 `STEPFORGE_SSO_SECRET` 으로 만든다(아래 표). 칸이 없으면 쓰기는 거절하고 켜는 법을 말한다. `rest_catalog` 는
   켜진 사이트에만 `write_paths` 를 싣는다.

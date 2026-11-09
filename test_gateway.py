@@ -13028,6 +13028,7 @@ def test_SRC13_서비스_PAT_꼴(monkeypatch):
     """받는 꼴의 경계 — 작업 이름 1 ~ 40자(소문자 · 숫자 · 하이픈, 첫 글자는 하이픈이 아니다) · 수명 365일까지. 서비스 표지가 없는 일반 · 패널 PAT 는
     서비스로 다루지 않는다(그 분기의 판별이 그대로 간다)."""
     assert gw._service_scope(_svc_claims()) == (True, {"job": _SVC_JOB, "jti": _SVC_JTI})
+    assert gw._service_scope(_svc_claims(aud=gw.SERVICE_AUDIENCE))[1] is not None, "청중이 글 하나로 와도 같다"
     for job in ("a", "0", "a" * 40, "nightly-sync-2"):
         assert gw._service_scope(_svc_claims(sub=f"system:{job}")) == (True, {"job": job, "jti": _SVC_JTI}), job
     now = int(_ptime.time())
@@ -13044,6 +13045,8 @@ def test_SRC13_서비스_PAT_꼴(monkeypatch):
     ({"aud": ["mcp-gateway"]}, "서비스 청중 없음 — 다른 표지(purpose · jti · sub)가 있어 일반 PAT 로 떨어지지 않는다"),
     ({"aud": ["mcp-gateway-service", "mcp-gateway"]}, "MCP 청중과 함께 — 포털 챗 · 옛 게이트웨이가 받는 꼴"),
     ({"aud": ["mcp-gateway-service", "mcp-app-panel"]}, "패널 청중과 함께"),
+    ({"aud": ["mcp-gateway-service", "step-forge"]}, "다른 청중이 섞였다 — REST 프록시 사이트 청중(검토 5)"),
+    ({"aud": "mcp-gateway"}, "글 하나로 온 MCP 청중"),
     ({"sub": "core-link"}, "sub 머리 system: 없음"),
     ({"sub": "system:Core-Link"}, "대문자"),
     ({"sub": "system:-core"}, "하이픈으로 시작"),
@@ -13167,6 +13170,47 @@ def test_SRC13_RA_TestScope_도구는_읽을_때_빼고_경고하며_호출은_i
     _svc_file({_SVC_JOB: {"tools": ["heax-step_forge:run_job"]}})          # 목록에 없어도 같은 까닭이다
     assert "service-denied(impersonation)" in asyncio.run(gw._call_tool("create_report_draft", {})).content[0].text
     assert not asyncio.run(gw._call_tool("run_job", {})).isError and sf.calls == ["run_job"]
+
+
+def test_SRC13_신원_전달_백엔드는_서비스_허용_목록에서_빼고_identity_forward_로_막는다(monkeypatch, caplog):
+    """검토 R4 — 신원 전달 백엔드(IDENTITY_FWD, dev 기본 hwax-deliberation)에는 서비스 신원이 실리지 않는다. gateway:service 그룹만 실려 그쪽에는
+    공유 비밀의 내부 호출로 보이고, 심의 엔진은 GW_TOKEN 으로 게이트웨이를 다시 불러(서비스 울타리 밖) 지정 도구를 돌리고 RA 공유 세션으로 쓰며,
+    목록 도구는 모든 사람의 잡을 본다. 허용 목록에 적어도 읽을 때 빼고(⚠ 한 줄) 호출은 직접이든 invoke_tool 이든 service-denied(identity-forward)
+    다. 서비스가 아니면 종전대로 그 신원을 실어 보낸다(대조군)."""
+    sent = []
+
+    async def fake_oneshot(b, hdrs, original, arguments, timeout_s, op=None):
+        sent.append((original, dict(hdrs)))
+        return types.CallToolResult(content=[types.TextContent(type="text", text='{"job_id": "j1"}')])
+    delib = _PanelCallSess([_tool("deliberate_start"), _tool("deliberate_list")], [])
+    sf = _PanelCallSess([_tool("run_job")], [])
+    _panel_kit(monkeypatch, {"hwax-deliberation": delib, "heax-step_forge": sf}, groups=(gw.SERVICE_GROUP,))
+    monkeypatch.setattr(gw, "IDENTITY_FWD", {"hwax-deliberation"})
+    monkeypatch.setattr(gw, "_oneshot", fake_oneshot)
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        _svc_file({_SVC_JOB: {"tools": ["hwax-deliberation:deliberate_start", "heax-step_forge:run_job"]}})
+        assert gw._service_tools()["jobs"][_SVC_JOB]["tools"] == frozenset({"heax-step_forge:run_job"}), "읽을 때 뺀다"
+    warns = [r.getMessage() for r in caplog.records if "⚠" in r.getMessage()]
+    assert len(warns) == 1 and _SVC_JOB in warns[0] and "hwax-deliberation:deliberate_start" in warns[0], warns
+    assert "identity-forward" in warns[0] and "heax-step_forge" not in warns[0]
+    _as_service(monkeypatch)
+    assert {t.name for t in asyncio.run(gw._list_tools(types.ListToolsRequest()))} == {"run_job"}
+    open(gw.AUDIT_PATH, "w").close()
+    for name, args in (("deliberate_start", {"question": "q", "tools": ["reportarchive_create_report_draft"]}),
+                       ("invoke_tool", {"name": "deliberate_start", "arguments": {"question": "q"}}),
+                       ("deliberate_list", {})):                                              # 목록에 없어도 같은 까닭이다
+        res = asyncio.run(gw._call_tool(name, args))
+        text = res.content[0].text
+        assert res.isError and text.startswith("forbidden:") and "service-denied(identity-forward)" in text, (name, text)
+    assert sent == [] and delib.calls == [], "심의 엔진까지 가지 않는다"
+    assert [r["error"] for r in _rows()] == ["service-denied:identity-forward"] * 3
+    assert not asyncio.run(gw._call_tool("run_job", {})).isError and sf.calls == ["run_job"], "허용 목록의 다른 도구는 그대로"
+    # 대조군 — 사람 요청은 종전대로 그 신원을 실어 심의로 보낸다
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["mes-user"])
+    _set_request(monkeypatch, {gw.VIA_HEADER: "pat"}, "198.51.100.4")
+    assert not asyncio.run(gw._call_tool("deliberate_start", {"question": "q"})).isError
+    assert [o for o, _h in sent] == ["deliberate_start"] and sent[0][1].get(gw.USER_HEADER) == "u@corp.com"
 
 
 def test_SRC13_health_는_작업마다_도구_수와_REST_수만_싣는다(monkeypatch):
@@ -13518,20 +13562,54 @@ def test_SRC15_서비스_작업의_쓰기는_그_작업의_rest_항목만_서비
     assert out2["status"] == 403 and "service-denied" in out2["error"] and len(mints) == 1 and len(ups) == 1, out2
 
 
-def test_SRC15_서비스로_청했는데_다른_주체의_단언이면_발급_실패(monkeypatch):
-    tok = _sf_token({"e": "boss@corp.com", "x": 9999999999, "d": 1})
+@pytest.mark.parametrize("claims", [{"e": "boss@corp.com", "x": 9999999999, "d": 1}, {"s": "other-job", "x": 9999999999, "d": 1},
+                                    {"s": "core-link", "e": "", "x": 9999999999, "d": 1}])
+def test_SRC15_서비스로_청했는데_다른_주체의_단언이면_발급_실패(monkeypatch, claims):
+    tok = _sf_token(claims)
     mints, ups = _sf_kit(monkeypatch, user="", service=_SVC_JOB,
                          mint=lambda req: httpx.Response(200, json={"token": tok, "expires_in": 900}))
     out = _sf_call("POST", "/api/onto-link")
     assert out["error"] == f"{_SVC_JOB} 명의 단언을 받지 못했다" and "접혔다" in out["detail"] and ups == [], out
+    assert gw._REST_ASSERTIONS == {}
+
+
+@pytest.mark.parametrize("tok", ["pat_of_hub_owner_xyz",                                          # 주소가 다른 앱 창구를 가리켜 개인 토큰이 왔다
+                                 "sfsso_%%%.sig",                                                 # 몸을 읽을 수 없다
+                                 "sfsso_" + base64.urlsafe_b64encode(b"[1, 2]").decode().rstrip("=") + ".sig",   # 몸이 객체가 아니다
+                                 "rrsso_" + base64.urlsafe_b64encode(b'{"e": "u@corp.com"}').decode().rstrip("=") + ".sig"])
+def test_SRC15_발급_답이_sfsso_단언_꼴이_아니면_발급_실패이고_담지도_싣지도_않는다(monkeypatch, tok):
+    """주체를 모르는 토큰을 담아 단언 머리에 실으면 그 토큰 주인의 명의로 쓴다(검토 R2 — 예: STEPFORGE_SSO_URL 이 다른 앱의 /api/auth/sso
+    를 가리켜 하루짜리 개인 토큰이 왔다). StepForge 단언 꼴(sfsso_ 머리 · 읽히는 몸)이 아니면 발급 실패다."""
+    mints, ups = _sf_kit(monkeypatch, user="", service=_SVC_JOB,
+                         mint=lambda req: httpx.Response(200, json={"token": tok, "expires_in": 86400}))
+    out = _sf_call("POST", "/api/onto-link")
+    assert out["error"] == f"{_SVC_JOB} 명의 단언을 받지 못했다" and "꼴" in out["detail"] and "STEPFORGE_SSO_URL" in out["detail"], out
+    assert ups == [] and gw._REST_ASSERTIONS == {}
+
+
+def test_SRC15_REST_프록시는_클라이언트가_보낸_단언_머리를_상류로_넘기지_않는다(monkeypatch):
+    """검토 R1 — /api/<site>/ 프록시가 X-Heax-Sso-Assertion 을 그대로 넘기면 가로챈 단언을 그 수명(최대 한 시간) 동안 이 길로 되쓸 수 있다."""
+    monkeypatch.setattr(gw, "POLICY", {"sec": []})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    sent: list = []
+    resp, _shots, _asked = _rest_gate(monkeypatch, {"keys": []}, [], headers=[
+        (b"x-heax-sso-assertion", _sf_token({"e": "victim@corp.com", "x": 9999999999, "d": 1}).encode()),
+        (b"x-hwax-delegate-service", b"core-link"), (b"x-hwax-delegate-email", b"victim@corp.com"), (b"x-keep", b"1")], sent=sent)
+    assert resp.status_code == 200 and sent[0].get("x-keep") == "1", "다른 머리는 그대로 간다(대조)"
+    for gone in ("x-heax-sso-assertion", "x-hwax-delegate-service", "x-hwax-delegate-email"):
+        assert gone not in sent[0], gone
 
 
 @pytest.mark.parametrize("claims", [{"e": "boss@corp.com", "x": 9999999999, "d": 1},              # 남의 이메일
                                     {"s": "core-link", "x": 9999999999, "d": 1},                  # 사람으로 청했는데 서비스 단언
                                     {"e": "u@corp.com", "s": "core-link", "x": 9999999999},       # 주체가 둘
-                                    None])                                                        # 몸을 읽을 수 없다
+                                    {"e": "u@corp.com", "s": "", "x": 9999999999},                # 칸이 둘 — 빈 값이라도(참거짓이 아니라 칸으로 본다)
+                                    {"e": "u@corp.com", "s": None, "x": 9999999999},
+                                    {"e": 7, "x": 9999999999},                                    # 글이 아니다
+                                    {"x": 9999999999}])                                           # 주체 칸 없음
 def test_SRC15_받은_단언의_주체가_청한_것과_다르면_발급_실패이고_담지_않는다(monkeypatch, claims):
-    tok = _sf_token(claims) if claims is not None else "sfsso_%%%.sig"
+    tok = _sf_token(claims)
     mints, ups = _sf_kit(monkeypatch, mint=lambda req: httpx.Response(200, json={"token": tok, "expires_in": 900}))
     out = _sf_call("POST", "/api/onto-link")
     assert out["error"] == "u@corp.com 명의 단언을 받지 못했다" and "접혔다" in out["detail"], out
@@ -13602,7 +13680,7 @@ def test_SRC15_catalog_은_단언_쓰기_경로를_알리고_REST_프록시는_�
     assert "write_paths" not in sf and sf["readonly"] is True, "켜지지 않았으면 알리지 않는다"
     # REST 프록시(/api/step-forge/)는 단언을 싣지 않는다 — delegate · write_paths 가 있어도 GET · HEAD 그대로(rest_proxy.allowed_methods)
     assert rest_proxy.allowed_methods(gw.REST["step-forge"]) == ["GET", "HEAD"]
-    assert "x-hwax-delegate-service" in rest_proxy._NEVER_FORWARD and "x-hwax-delegate-email" in rest_proxy._NEVER_FORWARD
+    assert {"x-hwax-delegate-service", "x-hwax-delegate-email", "x-heax-sso-assertion"} <= rest_proxy._NEVER_FORWARD
 
 
 def test_SRC15_클라이언트가_보낸_위임_서비스_머리는_모든_분기가_버린다(monkeypatch):

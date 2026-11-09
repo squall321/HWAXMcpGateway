@@ -7323,9 +7323,9 @@ def _service_scope(claims: dict) -> tuple[bool, dict | None]:
     scopes 의 service) 가운데 하나라도 있으면 서비스로 다룬다. 그때 꼴이 하나라도 어긋나면 범위가 None 이라 미들웨어가 401 로 닫는다 — 일반 PAT 로
     떨어뜨리지 않는다(_panel_scope 와 같은 자세). jti 머리는 표지가 아니다 — 사람 PAT 의 jti 는 secrets.token_urlsafe(24)(포털
     backend/app/auth/routes/pat.py)라 약 64⁴ 에 하나가 우연히 svc- 로 시작하고, 표지로 두면 그 사람 PAT 가 영영 401 이다. 꼴 검사에는 남긴다.
-    꼴 — purpose=service · jti 머리 svc- · 청중에 서비스 청중(MCP · 패널 청중과 함께 오면 거절) · sub 는 system:<작업>(작업은
-    ^[a-z0-9][a-z0-9-]{0,39}$) · scope=api · scopes 는 ["service"] 그대로 · panel 칸 없음 · 수명은 SERVICE_MAX_TTL_S 안. 이메일 · 그룹은 보지 않는다
-    (실려 와도 쓰지 않는다). 포털 service_pat 가 찍는 꼴과 같다(두 리포 계약 시험)."""
+    꼴 — purpose=service · jti 머리 svc- · 청중은 서비스 청중 하나뿐(다른 청중이 섞이면 거절 — 포털 챗 · REST 프록시 같은 곳에서도 통하는 꼴이
+    된다) · sub 는 system:<작업>(작업은 ^[a-z0-9][a-z0-9-]{0,39}$) · scope=api · scopes 는 ["service"] 그대로 · panel 칸 없음 · 수명은
+    SERVICE_MAX_TTL_S 안. 이메일 · 그룹은 보지 않는다(실려 와도 쓰지 않는다). 포털 service_pat 가 찍는 꼴과 같다(두 리포 계약 시험)."""
     aud = claims.get("aud")
     auds = [aud] if isinstance(aud, str) else [str(x) for x in aud] if isinstance(aud, list) else []
     jti, sub, scopes = str(claims.get("jti") or ""), str(claims.get("sub") or ""), claims.get("scopes")
@@ -7338,7 +7338,7 @@ def _service_scope(claims: dict) -> tuple[bool, dict | None]:
     except (TypeError, ValueError):
         ttl = -1
     ok = (str(claims.get("purpose") or "") == SERVICE_PURPOSE and jti.startswith(SERVICE_JTI_PREFIX)
-          and SERVICE_AUDIENCE in auds and MCP_AUDIENCE not in auds and PANEL_AUDIENCE not in auds
+          and set(auds) == {SERVICE_AUDIENCE}
           and m is not None and claims.get("scope") == "api" and scopes == SERVICE_SCOPES and "panel" not in claims
           and 0 < ttl <= SERVICE_MAX_TTL_S)
     return True, ({"job": m.group(1), "jti": jti} if ok else None)
@@ -7399,8 +7399,11 @@ def _service_parse(data) -> dict:
 
 def _service_tools() -> dict:
     """박스 허용 목록 {"jobs": {작업: {tools, rest}}} — 바뀐 시각이 다르면 다시 읽는다. 없거나 못 읽으면 빈 표다(모든 서비스 호출이 막힌다).
-    RA · TestScope 의 도구는 읽을 때 뺀다(작업마다 ⚠ 한 줄 — 기동 때도 읽는다). 그 서비스 세션은 실제 사람의 토큰이라 서비스 작업이 부르면 그
-    사람 행세가 된다(CK-4 · 계약 §3) — 호출은 service-denied(impersonation) 다(_service_denial)."""
+    두 갈래의 도구는 읽을 때 뺀다(작업마다 ⚠ 한 줄 — 기동 때도 읽는다). 호출은 _service_denial 이 같은 까닭으로 막는다.
+      · RA · TestScope — 그 서비스 세션은 실제 사람의 토큰이라 서비스 작업이 부르면 그 사람 행세가 된다(CK-4 · 계약 §3) → impersonation.
+      · 신원 전달 백엔드(IDENTITY_FWD — dev 기본 hwax-deliberation) — 서비스 요청은 사람 · 작업 머리 없이 gateway:service 그룹만 실려 그쪽에는
+        게이트웨이 공유 비밀의 내부 호출로 보인다. 심의 엔진은 그 길로 게이트웨이를 다시 부르며(GW_TOKEN — 서비스 울타리 밖) 지정 도구를 돌리고
+        RA 공유 세션으로 쓰며, 목록 도구는 모든 사람의 잡을 본다 → identity-forward(닫힌 쪽 — 서비스 신원을 실어 보낼 길이 생기기 전까지)."""
     try:
         mt = SERVICE_TOOLS_LOCAL_PATH.stat().st_mtime_ns
     except OSError:
@@ -7415,11 +7418,16 @@ def _service_tools() -> dict:
                             SERVICE_TOOLS_LOCAL_PATH, _clip(exc, 300))
         for job, spec in jobs.items():
             person = sorted(t for t in spec["tools"] if t.partition(":")[0] in _BUILTIN_CONN)
+            fwd = sorted(t for t in spec["tools"] if t.partition(":")[0] in IDENTITY_FWD)
+            spec["tools"] = spec["tools"] - frozenset(person) - frozenset(fwd)
             if person:
-                spec["tools"] = spec["tools"] - frozenset(person)
                 log.warning("⚠ 서비스 작업 %s 의 허용 목록에서 %s 를 뺐다 — RA · TestScope 의 서비스 세션은 실제 사람의 토큰이라 서비스 작업이 "
                             "부르면 그 사람 행세가 된다. 호출은 service-denied(impersonation) 다(HWAXPortal docs/core-link CK-4 · §3)",
                             job, ", ".join(person))
+            if fwd:
+                log.warning("⚠ 서비스 작업 %s 의 허용 목록에서 %s 를 뺐다 — 신원 전달 백엔드(IDENTITY_FWD)에는 서비스 신원이 실리지 않아 공유 비밀의 "
+                            "내부 호출로 보이고, 그쪽이 게이트웨이를 다시 부르면 서비스 울타리 밖이다. 호출은 service-denied(identity-forward) 다"
+                            "(HWAXPortal docs/core-link §3)", job, ", ".join(fwd))
         _SERVICE_TOOLS.update(mtime=mt, jobs=jobs)
     return _SERVICE_TOOLS
 
@@ -7439,6 +7447,8 @@ def _service_denial(name: str, svc: dict) -> str | None:
         return "unknown-tool"
     if resolved[0] in _BUILTIN_CONN:
         return "impersonation"       # RA · TestScope — 서비스 세션이 실제 사람의 토큰이다(읽을 때 목록에서도 뺐다, _service_tools)
+    if resolved[0] in IDENTITY_FWD:
+        return "identity-forward"    # 심의 등 — 서비스 신원이 실리지 않아 내부 호출로 보이고 게이트웨이를 다시 부른다(같은 자리에서 뺐다)
     return None if f"{resolved[0]}:{resolved[1]}" in spec["tools"] else "not-listed"
 
 
@@ -7619,8 +7629,9 @@ def _sso_fold_note(tok: str, email: str) -> str | None:
 
 # ── REST 다리의 단언 쓰기(HWAXPortal docs/core-link §5 · CK-3) — StepForge 의 정해진 쓰기 경로에 부르는 사람(또는 서비스 작업)의 서명 단언 ──────
 # 발급은 리스크 앱 위임과 같은 창구 꼴이다 — POST <sso_url> 에 공유 비밀 · 주체 머리 하나(사람 이메일 또는 서비스 작업) · 클라이언트 · Caddy 용
-# Authorization. 단언은 무상태 HMAC `sfsso_<b64u JSON {e | s, x, d}>.<서명>` 이고 주체마다 expires_in − 60초까지 캐시한다. 받은 단언의 주체가 청한
-# 것과 다르면 발급 실패다(rrsso_ 접힘 검사와 같은 꼴 — 이 창구는 처음부터 주체 머리를 알아 '옛 앱' 갈래가 없다). 서비스 토큰으로 내려가지 않는다.
+# Authorization. 단언은 무상태 HMAC `sfsso_<b64u JSON {e | s, x, d}>.<서명>` 이고 주체마다 expires_in − 60초까지 캐시한다. 받은 토큰은 그 꼴(sfsso_
+# 머리 · 읽히는 몸)이어야 하고 주체 칸은 정확히 하나(e 또는 s — 칸이 있는지로 본다)가 청한 것과 같아야 한다. 아니면 발급 실패다(rrsso_ 접힘 검사와
+# 같은 자세 — 이 창구는 처음부터 주체 머리를 알아 '옛 앱' 갈래가 없다). 서비스 토큰으로 내려가지 않는다.
 _REST_SSO_PREFIX = "sfsso_"
 _REST_SSO_MARGIN_S = 60
 _REST_ASSERTIONS: dict[tuple[str, str, str], tuple[str, float]] = {}       # {(app_id, e|s, 주체): (단언, 버릴 monotonic)}
@@ -7647,14 +7658,18 @@ async def _rest_assertion(app_id: str, kind: str, subject: str) -> str:
         tok = data.get("token") if isinstance(data, dict) else None
         if not isinstance(tok, str) or not tok:
             raise RuntimeError(f"SSO 응답에 token 이 없다: {_clip(json.dumps(data, ensure_ascii=False), 200)}")
-        if tok.startswith(_REST_SSO_PREFIX):
-            claims = _sso_assertion_claims(tok, _REST_SSO_PREFIX) or {}
-            got = str(claims.get("e") or "").strip().lower() if kind == "e" else str(claims.get("s") or "")
-            if got != subject or claims.get("s" if kind == "e" else "e"):
-                # 주체가 다르거나 둘 다 실렸다 — 그 단언으로 부르면 남의 명의(또는 서비스 명의)로 쓴다. 조용히 성공하느니 발급 실패로 돌린다.
-                log.warning("REST 단언 접힘: %s %s 로 청했는데 다른 주체의 단언이 왔다(%s)", "사람" if kind == "e" else "서비스 작업",
-                            subject, conf.get("sso_url"))
-                raise RuntimeError(f"단언이 청한 주체({subject})가 아닌 다른 주체로 발급됐다 — 위임이 접혔다. 허브 · Caddy 의 머리 설정을 본다")
+        claims = _sso_assertion_claims(tok, _REST_SSO_PREFIX)
+        if claims is None:
+            # StepForge 단언이 아니다(예: 발급 주소가 다른 앱의 /api/auth/sso 를 가리켜 개인 토큰이 왔다) — 주체를 모르는 토큰을 담아 싣지 않는다.
+            log.warning("REST 단언 꼴 아님: %s 의 답이 sfsso_ 단언(읽히는 몸)이 아니다 — 발급 실패로 돌린다", conf.get("sso_url"))
+            raise RuntimeError("발급 응답의 token 이 StepForge 단언 꼴(sfsso_<b64u JSON>.<서명>)이 아니다 — 발급 주소(STEPFORGE_SSO_URL)를 본다")
+        val = claims.get(kind)
+        got = (val.strip().lower() if kind == "e" else val) if isinstance(val, str) else None
+        if {k for k in ("e", "s") if k in claims} != {kind} or got != subject:
+            # 주체가 다르거나 칸이 둘 다 있다(빈 값이라도) — 그 단언으로 부르면 남의 명의(또는 서비스 명의)로 쓴다. 조용히 성공하느니 발급 실패로 돌린다.
+            log.warning("REST 단언 접힘: %s %s 로 청했는데 다른 주체의 단언이 왔다(%s)", "사람" if kind == "e" else "서비스 작업",
+                        subject, conf.get("sso_url"))
+            raise RuntimeError(f"단언이 청한 주체({subject})가 아닌 다른 주체로 발급됐다 — 위임이 접혔다. 허브 · Caddy 의 머리 설정을 본다")
         exp = data.get("expires_in")
         ttl = float(exp) - _REST_SSO_MARGIN_S if isinstance(exp, (int, float)) and not isinstance(exp, bool) else 0.0
         if ttl > 0:
@@ -8531,6 +8546,8 @@ async def _call_tool_body(name: str, arguments: dict):
                 f"forbidden: {name} — service-denied({_why}): " + (
                     "RA · TestScope 의 서비스 세션은 실제 사람의 토큰이라 서비스 작업은 부르지 않는다(허용 목록에 적어도 뺀다 — "
                     "HWAXPortal docs/core-link CK-4)" if _why == "impersonation" else
+                    "신원 전달 백엔드(심의 등)에는 서비스 신원이 실리지 않아 내부 호출로 보이고 그쪽이 게이트웨이를 다시 부른다 — 서비스 작업은 "
+                    "부르지 않는다(허용 목록에 적어도 뺀다)" if _why == "identity-forward" else
                     f"서비스 작업 '{_svc.get('job') or '?'}' 의 허용 목록(게이트웨이 service_tools.local.json)에 없는 도구다. 필요하면 "
                     "운영자가 그 작업의 tools 에 '백엔드키:원래 이름' 을 더한다")))], isError=True)
     # 읽기 전용 포털 PAT — 허용 목록 · readOnlyHint · 게이트웨이 자체 조회만(HWAXPortal docs/followups-1017 결정 5).

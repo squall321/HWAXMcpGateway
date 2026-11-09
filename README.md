@@ -118,7 +118,7 @@ GET · HEAD 는 지금 그대로(`inject` — 허브 서비스 토큰)이고, St
 (`rest_sso.step_forge`) 둔 까닭이다(CK-3). REST 프록시(`/api/step-forge/`)는 단언을 싣지 않아 읽기만 그대로다(`allowed_methods`) — 클라이언트가
 보낸 `X-Heax-Sso-Assertion` 도 상류로 넘기지 않는다(가로챈 단언을 그 수명 동안 되쓰지 못하게).
 
-- 쓰기 — `write_paths`(`/api/onto-link` · `/api/onto-put` · `/api/onto-define`)의 POST 만 연다. 사람(PAT · 챗의 그 사람 이메일)은 사람 단언, 서비스는
+- 쓰기 — `write_paths`(`/api/onto-link` · `/api/onto-put` · `/api/onto-define` · `/api/onto-fill`)의 POST 만 연다. 사람(PAT · 챗의 그 사람 이메일)은 사람 단언, 서비스는
   그 작업의 `rest` 항목에 있을 때만 서비스 단언이다. 신원이 없으면(GW_TOKEN 만) `신원이 없다`(`status: 403`), 그 밖의 쓰기 메서드 · 경로는
   `method not allowed for this path`(`status: 405`)다. 읽기 전용 토큰 · 루틴은 지금처럼 `rest_call` 쓰기를 막는다.
 - 운반 — `Authorization: Bearer <허브 서비스 토큰>`(Caddy 문) + `X-Heax-Sso-Assertion: <단언>`(주체). `x-forwarded-user` 는 사람일 때 지금처럼 싣는다.

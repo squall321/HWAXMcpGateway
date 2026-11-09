@@ -171,13 +171,14 @@ def _no_proxy_health() -> dict:
 
 
 GW, BACKENDS, REST, PORTAL, HEAX = _load_config()
-# 클라이언트를 하나라도 만들기 **전에** 환경을 세운다. 게이트웨이가 직접 부르는 주소 전부다 — 백엔드 · 사람별 위임(sso_url·portal_pat_url) ·
+# 클라이언트를 하나라도 만들기 **전에** 환경을 세운다. 게이트웨이가 직접 부르는 주소 전부다 — 백엔드 · 사람별 위임(sso_url·portal_pat_url) · 단언 쓰기(rest_sso) ·
 # REST 사이트 · 포털 · heax 레지스트리(앱 주소는 base + 경로라 base 하나로 덮인다. 뒤늦게 발견되는 앱은 _discover_heax 가 더한다) ·
 # search_tools 의미 순위의 임베더(켰을 때만 — TOOL_SEARCH_EMBED_URL 은 아래에서 같은 env 를 읽는다).
 if not _bypass_proxy_for(
         [v.get("url") for v in BACKENDS.values()]
         + [v.get(k) for v in (HEAX.get("per_user_sso") or {}).values() if isinstance(v, dict)
            for k in ("sso_url", "portal_pat_url")]
+        + [v.get("sso_url") for v in (HEAX.get("rest_sso") or {}).values() if isinstance(v, dict)]
         + [v.get("base") for v in REST.values() if isinstance(v, dict)]
         + [PORTAL.get(k) for k in ("api_base", "jwks_url", "revoked_url")]
         + [HEAX.get(k) for k in ("servers_url", "base")]
@@ -304,6 +305,9 @@ PLAT_PROOF_HEADER = "X-Heax-Plat-Proof"
 # 앱이 시크릿 대조 뒤 먼저 읽는다(HWAXRisk post_auth_sso). 값은 **게이트웨이가 확인한 신원**(`_request_user`)만 싣는다 —
 # 클라이언트가 실어 보낸 사본은 인증 미들웨어(/mcp)와 REST 프록시(/api/)가 버린다.
 DELEGATE_HEADER = "X-Hwax-Delegate-Email"
+# 위임 발급의 **서비스** 주체(서비스 PAT 의 작업 이름) — REST 다리의 단언 쓰기(rest_sso)만 싣고, 이때는 위 이메일 머리를 싣지 않는다(주체는 정확히
+# 하나다, HWAXPortal docs/core-link §5 · §6). 값은 인증 미들웨어가 검증한 작업(_request_service)뿐이다 — 클라이언트 사본은 위 머리와 같이 버린다.
+DELEGATE_SERVICE_HEADER = "X-Hwax-Delegate-Service"
 # 이 호출이 **포털 절차 실행기**에서 왔나. 검증된 PAT 의 `purpose` 클레임에서만 나오고, 클라이언트가
 # 실어 보낸 같은 이름 헤더는 미들웨어가 버린다(groups·user 와 같은 규칙).
 # 쓰임은 하나다 — `invoke_tool` 의 **정확이름 차단 면제**(_INVOKE_DENY_EXACT). 절차는 늘 별칭으로
@@ -388,6 +392,11 @@ def _plat_proof(secret: str, email: str, plats: list[str], now: float | None = N
 # 값이 있는 백엔드만 사용자별 자격증명으로 호출한다(나머지는 종전대로 서비스 계정).
 PER_USER_SSO: dict[str, dict] = {k: v for k, v in (HEAX.get("per_user_sso") or {}).items()
                                  if isinstance(v, dict) and v.get("sso_url") and v.get("secret")}
+# REST 다리 단언 쓰기의 발급 칸 — {app_id: {sso_url, secret, client, auth?, token_header}}(HWAXPortal docs/core-link §5 · CK-3). per_user_sso 와 **따로**
+# 둔다 — 거기 두면 이 표를 보는 MCP 목록 · 호출 갈래가 그 앱의 MCP 호출 전부를 사람별 세션으로 바꾼다(StepForge 도구 94). 이 칸은 rest.<사이트>.delegate
+# 가 가리키는 사이트의 정해진 쓰기 경로(write_paths)에만 쓰인다(_rest_call). GET · HEAD 와 MCP 길은 지금 그대로다.
+REST_SSO: dict[str, dict] = {k: v for k, v in (HEAX.get("rest_sso") or {}).items()
+                             if isinstance(v, dict) and v.get("sso_url") and v.get("secret")}
 def _delegation_app_id(backend_key: str) -> str:
     """이 백엔드의 **사용자 위임 식별자**. 위임 대상이 아니면 빈 문자열.
 
@@ -4858,6 +4867,10 @@ async def _rest_catalog(args: dict) -> types.CallToolResult:
             "methods": allowed or ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
             "readonly": allowed is not None and {m.upper() for m in allowed} <= {"GET", "HEAD"},
         }
+        if conf.get("delegate") in REST_SSO and isinstance(conf.get("write_paths"), list) and conf["write_paths"]:
+            # 단언 쓰기(HWAXPortal docs/core-link §5) — 이 경로의 POST 만 부르는 사람(또는 서비스 작업) 명의로 간다. 그 밖의 쓰기는 405 다
+            info["write_paths"] = {"method": "POST", "paths": list(conf["write_paths"])}
+            info["readonly"] = False
         doc = await _openapi_of(s)
         if doc is None:
             info["paths"] = None
@@ -4924,7 +4937,43 @@ async def _rest_call(args: dict) -> types.CallToolResult:
     if not path.startswith("/"):
         path = "/" + path
     allowed = allowed_methods(conf)
-    if allowed is not None and method not in {m.upper() for m in allowed}:
+    dlg = str(conf.get("delegate") or "")
+    asr = None           # (app_id, e|s, 주체, 단언) — 정해진 쓰기 경로에 실은 단언(위층이 401 · 403 이면 캐시에서 버린다)
+    note_w = None        # 쓰기 경로 호출의 감사 note
+    if dlg and method not in ("GET", "HEAD"):
+        # 단언 쓰기(HWAXPortal docs/core-link §5 · CK-3) — 정해진 쓰기 경로(write_paths)의 POST 만 부르는 사람(또는 서비스 작업) 명의 단언으로 연다.
+        # 그 밖의 쓰기 메서드 · 경로는 405 다(사이트마다 열던 '쓰기 기본 닫힘' 을 경로까지 좁힌 것). GET · HEAD 는 아래 inject 그대로다 — 읽기를
+        # 사람 명의로 바꾸면 서비스 계정으로 읽는 흐름(리스크 앱 캡처)의 보이는 범위가 바뀐다.
+        wpaths = conf.get("write_paths") if isinstance(conf.get("write_paths"), list) else []
+        if method != "POST" or path not in wpaths:
+            _audit(f"rest_call {method} {path}", site, False, "method not allowed", 0, caller=caller)
+            return _rest_text({"error": "method not allowed for this path", "status": 405,
+                               "detail": f"{site} 의 쓰기는 POST {' · '.join(str(p) for p in wpaths) or '(정해진 경로 없음)'} 만 연다(부르는 사람 "
+                                         "명의 단언) — 그 밖의 쓰기 메서드 · 경로는 닫혀 있다."})
+        note_w = f"rest:POST {path}"
+        if dlg not in REST_SSO:
+            _audit(f"rest_call {method} {path}", site, False, f"assertion: rest_sso.{dlg} 없음", 0, caller=caller, note=note_w)
+            return _rest_text({"error": f"{site} 의 단언 쓰기가 꺼져 있다",
+                               "detail": f"게이트웨이 heax_registry.rest_sso.{dlg} 가 없다 — 켜려면 provision.env(포털은 infra/.env)에 "
+                                         "STEPFORGE_SSO_SECRET(StepForge 의 STEPFORGE_GATEWAY_SECRET 과 같은 값)을 적고 provision-config.sh "
+                                         "--force 뒤 게이트웨이를 다시 띄운다."})
+        if svc is not None:
+            kind, subject = "s", str(svc.get("job") or "")     # 위에서 그 작업의 rest 항목과 맞춰 봤다
+        elif caller:
+            kind, subject = "e", caller
+        else:
+            _audit(f"rest_call {method} {path}", site, False, "forbidden: no identity", 0, caller=caller, note=note_w)
+            return _rest_text({"error": "신원이 없다", "status": 403,
+                               "detail": f"{site} {path} 쓰기는 부르는 사람(포털 PAT 의 이메일) 또는 서비스 PAT 의 작업 명의로만 간다 — "
+                                         "게이트웨이 공유 비밀만으로는 쓰지 않는다."})
+        try:
+            asr = (dlg, kind, subject, await _rest_assertion(dlg, kind, subject))
+        except Exception as e:  # noqa: BLE001
+            _audit(f"rest_call {method} {path}", site, False, f"assertion: {e!r}", round((time.monotonic() - t0) * 1000),
+                   caller=caller, note=note_w)
+            # 서비스 토큰(inject)으로 조용히 쓰지 않는다 — 그러면 누가 했는지가 사라진다.
+            return _rest_text({"error": f"{subject} 명의 단언을 받지 못했다", "detail": _clip(e, 300)})
+    elif allowed is not None and method not in {m.upper() for m in allowed}:
         _audit(f"rest_call {method} {path}", site, False, "method not allowed", 0, caller=caller)
         return _rest_text({"error": "method not allowed for this site",
                            "detail": f"{site} 는 {'/'.join(allowed)} 만 허용한다. 쓰기가 필요하면 "
@@ -4962,6 +5011,10 @@ async def _rest_call(args: dict) -> types.CallToolResult:
     elif mode == "inject":
         inj = conf["inject"]
         headers[inj["header"]] = inj["value"]          # 그 사이트의 자기 서비스 자격
+    if asr is not None:
+        # 주체는 단언이다 — 위 inject(Authorization: Bearer 허브 서비스 토큰)는 Caddy 문을 지나기 위한 것이고, 앱은 단언이 있으면 표지 머리를 보지
+        # 않는다(StepForge R2 — core-link §6).
+        headers[REST_SSO[dlg].get("token_header") or "X-Heax-Sso-Assertion"] = asr[3]
     if caller:
         headers["x-forwarded-user"] = caller           # 신원 힌트(사이트가 무시할 수 있다)
     body = args.get("body")
@@ -5002,12 +5055,12 @@ async def _rest_call(args: dict) -> types.CallToolResult:
             # 느린 것과 안 닿는 것을 가른다 — 연결 시간 초과(ConnectTimeout)는 아래 'unreachable' 로 간다.
             ms = round((time.monotonic() - t0) * 1000)
             late = f"{site} 가 {REST_CALL_TIMEOUT_S:g}초 안에 답하지 않았다(GATEWAY_REST_CALL_TIMEOUT)"
-            _audit(f"rest_call {method} {path}", site, False, late, ms, caller=caller)
+            _audit(f"rest_call {method} {path}", site, False, late, ms, caller=caller, note=note_w)
             return _rest_text({"error": late, "site": site, "method": method, "path": path,
                                "detail": "사이트는 아직 일하고 있을 수 있다 — 쓰기였다면 다시 보내기 전에 결과를 조회하라."})
         except Exception as e:  # noqa: BLE001
             ms = round((time.monotonic() - t0) * 1000)
-            _audit(f"rest_call {method} {path}", site, False, f"upstream: {e!r}", ms, caller=caller)
+            _audit(f"rest_call {method} {path}", site, False, f"upstream: {e!r}", ms, caller=caller, note=note_w)
             return _rest_text({"error": "upstream unreachable", "site": site, "detail": _clip(e, 300)})
 
     got = await _fetch()
@@ -5037,7 +5090,7 @@ async def _rest_call(args: dict) -> types.CallToolResult:
 
     ms = round((time.monotonic() - t0) * 1000)
     if too_big:
-        _audit(f"rest_call {method} {path}", site, False, f"response > {cap}B", ms, caller=caller)
+        _audit(f"rest_call {method} {path}", site, False, f"response > {cap}B", ms, caller=caller, note=note_w)
         return _rest_text({"error": f"응답이 상한 {cap:,}바이트(GATEWAY_REST_CALL_MAX_BYTES)를 넘는다 — 자르지 않고 "
                                     "이 도구로 나르지 않는다",
                            "site": site, "method": method, "path": path, "status": status,
@@ -5045,7 +5098,12 @@ async def _rest_call(args: dict) -> types.CallToolResult:
                            "detail": "목록·조회면 그 사이트가 받는 쿼리(rest_catalog 의 params — limit·page_size·필드 선택 등)로 "
                                      "좁혀 다시 불러라. 파일·아카이브는 전용 도구(예: ste 의 get_job_file·ste-sync)로 받는다. "
                                      "rest_call 은 모델에 보일 텍스트/JSON 답 전용이다."})
-    _audit(f"rest_call {method} {path}", site, status < 400, None, ms, caller=caller, note="re-minted" if retried else None)
+    dropped = asr is not None and status in (401, 403)
+    if dropped:
+        # 위층이 단언의 쓰기를 돌려보냈다 — 캐시에서 버린다(비밀이 바뀐 뒤 캐시 수명 동안 헛돌지 않게). 쓰기라 다시 보내지는 않는다.
+        _forget_rest_assertion(*asr)
+    _audit(f"rest_call {method} {path}", site, status < 400, None, ms, caller=caller,
+           note="+".join(n for n in (note_w, "re-minted" if retried else None, "assertion-dropped" if dropped else None) if n) or None)
     try:
         parsed = json.loads(raw.decode("utf-8"))
     except Exception:  # noqa: BLE001 — JSON 이 아니면 본문을 글로 그대로 보인다
@@ -7525,12 +7583,13 @@ _SSO_DELEGATED_CLAIM = "d"
 _SSO_FOLD_NOTE = "folded-old-app"
 
 
-def _sso_assertion_claims(tok: str) -> dict | None:
+def _sso_assertion_claims(tok: str, prefix: str = _SSO_ASSERTION_PREFIX) -> dict | None:
     """리스크 앱 단언(`rrsso_<b64u JSON {e, x[, d]}>.<서명>`, HWAXRisk identity.mint_sso_assertion)의 claims. 그 꼴이 아니면 None.
-    서명은 보지 않는다(시크릿은 앱이 쥔 것과 같지만 검증은 앱 몫이다) — 여기서는 '누구 단언인가' 만 묻는다."""
-    if not isinstance(tok, str) or not tok.startswith(_SSO_ASSERTION_PREFIX):
+    서명은 보지 않는다(시크릿은 앱이 쥔 것과 같지만 검증은 앱 몫이다) — 여기서는 '누구 단언인가' 만 묻는다. StepForge 단언(`sfsso_`)도 같은 꼴이다
+    (prefix 로 고른다 — _rest_assertion)."""
+    if not isinstance(tok, str) or not tok.startswith(prefix):
         return None
-    body = tok[len(_SSO_ASSERTION_PREFIX):].partition(".")[0]
+    body = tok[len(prefix):].partition(".")[0]
     try:
         claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
     except (ValueError, TypeError):
@@ -7550,6 +7609,60 @@ def _sso_fold_note(tok: str, email: str) -> str | None:
     if who is not None and who != email and _SSO_DELEGATED_CLAIM not in claims:
         return _SSO_FOLD_NOTE
     return None
+
+
+# ── REST 다리의 단언 쓰기(HWAXPortal docs/core-link §5 · CK-3) — StepForge 의 정해진 쓰기 경로에 부르는 사람(또는 서비스 작업)의 서명 단언 ──────
+# 발급은 리스크 앱 위임과 같은 창구 꼴이다 — POST <sso_url> 에 공유 비밀 · 주체 머리 하나(사람 이메일 또는 서비스 작업) · 클라이언트 · Caddy 용
+# Authorization. 단언은 무상태 HMAC `sfsso_<b64u JSON {e | s, x, d}>.<서명>` 이고 주체마다 expires_in − 60초까지 캐시한다. 받은 단언의 주체가 청한
+# 것과 다르면 발급 실패다(rrsso_ 접힘 검사와 같은 꼴 — 이 창구는 처음부터 주체 머리를 알아 '옛 앱' 갈래가 없다). 서비스 토큰으로 내려가지 않는다.
+_REST_SSO_PREFIX = "sfsso_"
+_REST_SSO_MARGIN_S = 60
+_REST_ASSERTIONS: dict[tuple[str, str, str], tuple[str, float]] = {}       # {(app_id, e|s, 주체): (단언, 버릴 monotonic)}
+_REST_ASSERTION_LOCKS: dict[tuple[str, str, str], anyio.Lock] = {}
+
+
+async def _rest_assertion(app_id: str, kind: str, subject: str) -> str:
+    """REST_SSO[app_id] 에서 이 주체의 단언을 받는다(캐시, 주체마다 잠근다) — kind 는 'e'(사람 이메일, 소문자) 또는 's'(서비스 작업). 실패하면 예외."""
+    conf = REST_SSO[app_id]
+    key = (app_id, kind, subject)
+    async with _REST_ASSERTION_LOCKS.setdefault(key, anyio.Lock()):
+        hit = _REST_ASSERTIONS.get(key)
+        if hit and hit[1] > time.monotonic():
+            return hit[0]
+        headers = {"X-Heax-Gateway-Secret": conf["secret"], "X-Heax-Client": conf.get("client") or "gateway",
+                   (DELEGATE_HEADER if kind == "e" else DELEGATE_SERVICE_HEADER): subject}
+        if conf.get("auth") == "heax" and HEAX.get("token"):
+            headers["Authorization"] = f"Bearer {HEAX['token']}"        # Caddy forward_auth 문 — _sso_headers 와 같은 까닭
+        async with httpx.AsyncClient(timeout=15) as cli:
+            resp = await cli.post(conf["sso_url"], headers=headers)
+        if resp.status_code != 200:
+            raise RuntimeError(f"SSO {resp.status_code}: {_clip(resp.text, 200)}")
+        data = resp.json()
+        tok = data.get("token") if isinstance(data, dict) else None
+        if not isinstance(tok, str) or not tok:
+            raise RuntimeError(f"SSO 응답에 token 이 없다: {_clip(json.dumps(data, ensure_ascii=False), 200)}")
+        if tok.startswith(_REST_SSO_PREFIX):
+            claims = _sso_assertion_claims(tok, _REST_SSO_PREFIX) or {}
+            got = str(claims.get("e") or "").strip().lower() if kind == "e" else str(claims.get("s") or "")
+            if got != subject or claims.get("s" if kind == "e" else "e"):
+                # 주체가 다르거나 둘 다 실렸다 — 그 단언으로 부르면 남의 명의(또는 서비스 명의)로 쓴다. 조용히 성공하느니 발급 실패로 돌린다.
+                log.warning("REST 단언 접힘: %s %s 로 청했는데 다른 주체의 단언이 왔다(%s)", "사람" if kind == "e" else "서비스 작업",
+                            subject, conf.get("sso_url"))
+                raise RuntimeError(f"단언이 청한 주체({subject})가 아닌 다른 주체로 발급됐다 — 위임이 접혔다. 허브 · Caddy 의 머리 설정을 본다")
+        exp = data.get("expires_in")
+        ttl = float(exp) - _REST_SSO_MARGIN_S if isinstance(exp, (int, float)) and not isinstance(exp, bool) else 0.0
+        if ttl > 0:
+            _REST_ASSERTIONS[key] = (tok, time.monotonic() + ttl)
+        else:
+            _REST_ASSERTIONS.pop(key, None)      # 수명을 모르거나 60초 안쪽이면 담지 않는다(다음 쓰기가 새로 받는다)
+        return tok
+
+
+def _forget_rest_assertion(app_id: str, kind: str, subject: str, tok: str) -> None:
+    """위층이 이 단언의 쓰기를 401 · 403 으로 돌려보냈다 — 캐시가 아직 그 단언일 때만 버린다. 비밀이 바뀐 뒤 캐시 수명 동안 헛돌지 않게 한다(HG-04 와
+    같은 자세). 발급은 무상태라 다시 받아도 해가 없다. 다시 보내지는 않는다 — 쓰기다."""
+    if (_REST_ASSERTIONS.get((app_id, kind, subject)) or (None,))[0] == tok:
+        _REST_ASSERTIONS.pop((app_id, kind, subject), None)
 
 
 # ── 포털 PAT 건네기 — 위임 발급 응답의 `portal_pat_wanted` 에 토큰 교환을 대신 건다(HWAXPortal docs/risk-credentials §4.2·C-2) ──
@@ -9024,7 +9137,8 @@ def _bearer_gate(app, pat_verifier=None):
             # 보기 머리(E-4)도 버린다 — 에이전트 서버 · 심의는 늘 전체 목록이다.
             _kept = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
-                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode(),
+                                          DELEGATE_HEADER.lower().encode(), DELEGATE_SERVICE_HEADER.lower().encode(),
+                                          READONLY_HEADER.encode(),
                                           VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode(),
                                           SERVICE_HEADER.encode())]
             if GROUPS_HEADER.encode() not in headers:
@@ -9069,7 +9183,8 @@ def _bearer_gate(app, pat_verifier=None):
             fresh = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (GROUPS_HEADER.encode(), USER_HEADER.encode(),
                                           PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
-                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode(),
+                                          DELEGATE_HEADER.lower().encode(), DELEGATE_SERVICE_HEADER.lower().encode(),
+                                          READONLY_HEADER.encode(),
                                           VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode(),
                                           SERVICE_HEADER.encode())]
             fresh += [(GROUPS_HEADER.encode(), SERVICE_GROUP.encode()), (SERVICE_HEADER.encode(), _job.encode()),
@@ -9112,7 +9227,8 @@ def _bearer_gate(app, pat_verifier=None):
             fresh = [(k, v) for (k, v) in (scope.get("headers") or [])
                      if k.lower() not in (GROUPS_HEADER.encode(), USER_HEADER.encode(),
                                           PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
-                                          DELEGATE_HEADER.lower().encode(), READONLY_HEADER.encode(),
+                                          DELEGATE_HEADER.lower().encode(), DELEGATE_SERVICE_HEADER.lower().encode(),
+                                          READONLY_HEADER.encode(),
                                           VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode(),
                                           SERVICE_HEADER.encode())]
             if is_read_only(claims):

@@ -50,6 +50,9 @@
 #  10) SmartTwinMCP: SMARTTWIN_MCP_URL(> 직전 config 의 **기본값이 아닌** 주소)이 있으면 smart-twin-mcp 백엔드.
 #      예전처럼 같은 박스 기본 주소로 무조건 등재하지 않는다 — 띄운 적 없는 박스에서 가짜 DOWN 이 남았다.
 #      같은 박스에서 쓰는 곳(dev)도 provision.env 에 SMARTTWIN_MCP_URL=http://127.0.0.1:5013/mcp 를 적는다.
+#  11) StepForge 단언 쓰기: STEPFORGE_SSO_SECRET(StepForge 의 STEPFORGE_GATEWAY_SECRET 과 같은 값, + STEPFORGE_SSO_URL — 기본은
+#      <HEAX_MCP_BASE>/apps/step_forge/api/auth/sso)이 있으면 heax_registry.rest_sso.step_forge 와 rest.step-forge 의 delegate · write_paths.
+#      per_user_sso 와 따로 둔다(StepForge MCP 길은 공유 세션 그대로 — HWAXPortal docs/core-link CK-3). 비밀이 없는 실행은 직전 항목을 이어받는다.
 #
 # 사용:  bash provision-config.sh            # 이미 config 있으면 건드리지 않음
 #        bash provision-config.sh --force    # 재생성(기존은 .bak 백업)
@@ -881,6 +884,25 @@ for _k in (e.get("PER_USER_SSO_OFF") or "").split():
         print(f"  · {_SSO_OFF_KEYS[_k][1]} 사람별 위임 끔({_SSO_OFF_KEYS[_k][0]} 비어 있음) — {_to}")
 if per_user:
     cfg.setdefault("heax_registry", {})["per_user_sso"] = per_user
+# StepForge 단언 쓰기(HWAXPortal docs/core-link §5 · CK-3) — 챗의 사람(또는 서비스 PAT 의 작업)이 REST 다리로 StepForge 의 정해진 쓰기 경로
+# (온톨로지 잇기 · 넣기 · 정의)를 그 명의로 부른다. per_user_sso 와 **따로** 둔다(rest_sso) — 거기 두면 게이트웨이가 StepForge MCP 호출 전부를
+# 사람별 세션으로 바꾼다. 비밀은 StepForge 의 STEPFORGE_GATEWAY_SECRET 과 같은 값이고, 주소는 hwax_risk 처럼 Caddy 경로(forward_auth 를 서비스
+# 토큰으로 통과 — auth heax, 단언은 token_header 로). 비밀이 없는 실행은 직전 항목을 이어받는다(hwax_risk 와 같은 규칙).
+rest_sso = dict(_prev("heax_registry", "rest_sso") or {})
+if e.get("STEPFORGE_SSO_SECRET"):
+    rest_sso["step_forge"] = {
+        "sso_url": e.get("STEPFORGE_SSO_URL") or (
+            (e.get("HEAX_MCP_BASE") or "http://127.0.0.1:4180").rstrip("/") + "/apps/step_forge/api/auth/sso"),
+        "secret": e["STEPFORGE_SSO_SECRET"],
+        "client": "gateway",
+        "auth": "heax",
+        "token_header": "X-Heax-Sso-Assertion"}
+    print(f"  ✓ StepForge 단언 쓰기(rest_sso.step_forge) — {rest_sso['step_forge']['sso_url']}")
+elif "step_forge" not in rest_sso:
+    print("  · StepForge 단언 쓰기 꺼짐(rest_sso.step_forge 없음) — 챗의 StepForge 온톨로지 적용(REST POST)은 거절된다. 켜려면 provision.env 에 "
+          "STEPFORGE_SSO_SECRET(StepForge 의 STEPFORGE_GATEWAY_SECRET 과 같은 값) 을 적고 update-all 재실행(손으로 돌릴 때는 env 로 주고 --force)")
+if rest_sso:
+    cfg.setdefault("heax_registry", {})["rest_sso"] = rest_sso
 
 # TestScope MCP 백엔드 — 모양은 두 방식이 같다. 사람별 호출의 자격만 다르다 — 기본은 사람이 그쪽에서 받은 tsc_pat_ 를
 # 포털 '개인 토큰 › 외부 연결' 에 등록한 것(PORTAL_CONN_BACKENDS), 위 per_user_sso.testscope 가 있으면 그 위임 토큰.
@@ -938,6 +960,11 @@ if e.get("HEAX_MCP_TOKEN"):
                            (e.get("HEAX_MCP_BASE") or "http://127.0.0.1:4180").rstrip("/")
                            + "/apps/step_forge"),
         "inject": {"header": "Authorization", "value": f"Bearer {e['HEAX_MCP_TOKEN']}"}}
+    # 단언 쓰기가 켜졌으면(위 rest_sso.step_forge) 정해진 쓰기 경로만 그 명의로 연다 — 게이트웨이 rest_call 이 이 POST 셋에만 단언을 싣고 그 밖의
+    # 쓰기는 405 다. GET · HEAD 는 위 inject 그대로이고, REST 프록시(/api/step-forge/)는 단언을 싣지 않아 읽기만 그대로다(rest_proxy.allowed_methods).
+    if "step_forge" in ((cfg.get("heax_registry") or {}).get("rest_sso") or {}):
+        rest["step-forge"]["delegate"] = "step_forge"
+        rest["step-forge"]["write_paths"] = ["/api/onto-link", "/api/onto-put", "/api/onto-define"]
 cfg["rest"] = rest
 # 허용 청중은 **rest 사이트와 정확히 같다.** 손으로 적어 두면 두 방향으로 어긋난다 —
 #   · 사이트는 있는데 청중에 없으면 프록시가 `unknown site` 404 로 답한다(`handle()`).

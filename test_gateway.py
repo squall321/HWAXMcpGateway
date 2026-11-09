@@ -13366,3 +13366,235 @@ def test_SRC13_두_리포_계약_포털이_찍는_서비스_PAT_를_게이트웨
     asyncio.run(gw._bearer_gate(app, v)({"type": "http", "method": "POST", "path": "/mcp", "client": ("198.51.100.4", 0),
                                           "headers": [(b"authorization", b"Bearer " + tok.encode())]}, None, None))
     assert seen["h"][gw.SERVICE_HEADER] == _SVC_JOB and seen["h"][gw.VIA_HEADER] == "service" and gw.USER_HEADER not in seen["h"]
+
+
+# ── REST 다리의 단언 쓰기(HWAXPortal docs/core-link SRC-15 · 계약 design §5 · CK-3) — StepForge 의 정해진 쓰기 경로에만 부르는 사람(또는 서비스
+# 작업)의 서명 단언을 싣는다. GET · HEAD 와 MCP 길은 그대로(inject · 공유 세션). 가짜 StepForge 는 발급 창구와 REST 를 한 처리기로 낸다.
+_SF_BASE = "http://hub.test/apps/step_forge"
+_SF_SSO = "http://hub.test/apps/step_forge/api/auth/sso"
+_SF_WRITES = ["/api/onto-link", "/api/onto-put", "/api/onto-define"]
+
+
+def _sf_token(claims: dict) -> str:
+    body = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).decode().rstrip("=")
+    return f"sfsso_{body}.sig"
+
+
+def _sf_kit(monkeypatch, *, user="u@corp.com", service=None, sso=True, mint=None, upstream=None):
+    """가짜 StepForge 와 rest.step-forge(delegate · write_paths) · rest_sso.step_forge 를 세운다 → (발급 요청들, 상류 요청들)."""
+    mints, ups = [], []
+
+    def handler(req):
+        if str(req.url) == _SF_SSO:
+            mints.append(req)
+            if mint is not None:
+                return mint(req)
+            who = req.headers.get("x-hwax-delegate-email")
+            claims = ({"e": who} if who else {"s": req.headers.get("x-hwax-delegate-service")}) | {"x": 9999999999, "d": 1}
+            return httpx.Response(200, json={"token": _sf_token(claims), "expires_in": 900})
+        assert str(req.url).startswith(_SF_BASE + "/"), str(req.url)
+        ups.append(req)
+        return upstream(req) if upstream else httpx.Response(200, json={"ok": True})
+    _mock_http(monkeypatch, handler)
+    monkeypatch.setattr(gw, "REST", {"step-forge": {"base": _SF_BASE, "inject": {"header": "Authorization", "value": "Bearer hub-svc"},
+                                                    "delegate": "step_forge", "write_paths": list(_SF_WRITES)}})
+    monkeypatch.setattr(gw, "REST_SSO", {"step_forge": {"sso_url": _SF_SSO, "secret": "sf-secret", "client": "gateway", "auth": "heax",
+                                                        "token_header": "X-Heax-Sso-Assertion"}} if sso else {})
+    monkeypatch.setattr(gw, "HEAX", {**gw.HEAX, "token": "hub-svc"})
+    monkeypatch.setattr(gw, "_REST_ASSERTIONS", {})
+    monkeypatch.setattr(gw, "_REST_ASSERTION_LOCKS", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_user", lambda: user)
+    if service:
+        _svc_file({service: {"rest": [{"site": "step-forge", "method": "POST", "path": "/api/onto-link"}]}})
+        _as_service(monkeypatch, job=service)
+    else:
+        _set_request(monkeypatch, {}, "198.51.100.4")
+    open(gw.AUDIT_PATH, "w").close()
+    return mints, ups
+
+
+def _sf_call(method, path, body=None):
+    return _payload(asyncio.run(gw._rest_call({"site": "step-forge", "method": method, "path": path, **({"body": body} if body else {})})))
+
+
+def _rc_rows():
+    return [r for r in _rows() if r["tool"].startswith("rest_call")]
+
+
+def test_SRC15_사람의_정해진_쓰기는_사람_단언을_싣고_Caddy_문_자격과_표지도_그대로_싣는다(monkeypatch):
+    mints, ups = _sf_kit(monkeypatch)
+    out = _sf_call("post", "/api/onto-link", {"dry_run": False})
+    assert out["status"] == 200 and "error" not in out, out
+    [m] = mints
+    assert (m.method, m.headers["x-heax-gateway-secret"], m.headers["x-heax-client"]) == ("POST", "sf-secret", "gateway")
+    assert m.headers["x-hwax-delegate-email"] == "u@corp.com" and "x-hwax-delegate-service" not in m.headers, "주체는 정확히 하나"
+    assert m.headers["authorization"] == "Bearer hub-svc", "발급도 Caddy 문을 허브 서비스 토큰으로 지난다"
+    [u] = ups
+    assert (u.method, u.url.path) == ("POST", "/apps/step_forge/api/onto-link")
+    assert u.headers["authorization"] == "Bearer hub-svc", "Caddy 문 자격(inject)은 그대로 싣는다"
+    assert gw._sso_assertion_claims(u.headers["x-heax-sso-assertion"], "sfsso_")["e"] == "u@corp.com", "주체는 단언이다"
+    assert u.headers["x-forwarded-user"] == "u@corp.com" and json.loads(u.content) == {"dry_run": False}
+    [row] = _rc_rows()
+    assert (row["ok"], row["caller"], row["note"]) == (True, "u@corp.com", "rest:POST /api/onto-link")
+
+
+def test_SRC15_GET_HEAD_는_지금처럼_inject_만이고_단언을_받지_않는다(monkeypatch):
+    mints, ups = _sf_kit(monkeypatch)
+    for m in ("GET", "HEAD"):
+        assert _sf_call(m, "/api/onto-link")["status"] == 200, m
+    assert mints == [] and [u.method for u in ups] == ["GET", "HEAD"]
+    assert all("x-heax-sso-assertion" not in u.headers and u.headers["authorization"] == "Bearer hub-svc" for u in ups)
+    assert all("note" not in r for r in _rc_rows()), "읽기는 쓰기 경로 표지를 남기지 않는다"
+
+
+@pytest.mark.parametrize("method,path", [("POST", "/api/onto-confirm"), ("PUT", "/api/onto-link"), ("DELETE", "/api/onto-link"),
+                                         ("PATCH", "/api/onto-put"), ("POST", "/api/onto-link/x"), ("POST", "/api/onto-link?x=1"),
+                                         ("POST", "/API/ONTO-LINK")])
+def test_SRC15_정해진_경로의_POST_밖의_쓰기는_405(monkeypatch, method, path):
+    mints, ups = _sf_kit(monkeypatch)
+    out = _sf_call(method, path)
+    assert out["status"] == 405 and out["error"] == "method not allowed for this path", out
+    assert "/api/onto-link" in out["detail"] and mints == [] and ups == []
+
+
+def test_SRC15_신원이_없으면_403_이고_서비스_토큰으로_쓰지_않는다(monkeypatch):
+    mints, ups = _sf_kit(monkeypatch, user="")
+    out = _sf_call("POST", "/api/onto-put")
+    assert out["status"] == 403 and out["error"] == "신원이 없다" and mints == [] and ups == [], out
+    [row] = _rc_rows()
+    assert (row["error"], row["note"]) == ("forbidden: no identity", "rest:POST /api/onto-put")
+
+
+def test_SRC15_서비스_작업의_쓰기는_그_작업의_rest_항목만_서비스_단언으로(monkeypatch):
+    mints, ups = _sf_kit(monkeypatch, user="", service=_SVC_JOB)
+    out = _sf_call("POST", "/api/onto-link")
+    assert out["status"] == 200, out
+    [m] = mints
+    assert m.headers["x-hwax-delegate-service"] == _SVC_JOB and "x-hwax-delegate-email" not in m.headers, "서비스는 이메일 머리를 싣지 않는다"
+    [u] = ups
+    claims = gw._sso_assertion_claims(u.headers["x-heax-sso-assertion"], "sfsso_")
+    assert claims["s"] == _SVC_JOB and "e" not in claims and "x-forwarded-user" not in u.headers
+    [row] = _rc_rows()
+    assert (row["caller"], row["via"], row["note"]) == (f"system:{_SVC_JOB}", "service", "svc:svc-0123+rest:POST /api/onto-link")
+    out2 = _sf_call("POST", "/api/onto-define")                       # 정해진 셋 안이어도 그 작업의 rest 항목 밖
+    assert out2["status"] == 403 and "service-denied" in out2["error"] and len(mints) == 1 and len(ups) == 1, out2
+
+
+def test_SRC15_서비스로_청했는데_다른_주체의_단언이면_발급_실패(monkeypatch):
+    tok = _sf_token({"e": "boss@corp.com", "x": 9999999999, "d": 1})
+    mints, ups = _sf_kit(monkeypatch, user="", service=_SVC_JOB,
+                         mint=lambda req: httpx.Response(200, json={"token": tok, "expires_in": 900}))
+    out = _sf_call("POST", "/api/onto-link")
+    assert out["error"] == f"{_SVC_JOB} 명의 단언을 받지 못했다" and "접혔다" in out["detail"] and ups == [], out
+
+
+@pytest.mark.parametrize("claims", [{"e": "boss@corp.com", "x": 9999999999, "d": 1},              # 남의 이메일
+                                    {"s": "core-link", "x": 9999999999, "d": 1},                  # 사람으로 청했는데 서비스 단언
+                                    {"e": "u@corp.com", "s": "core-link", "x": 9999999999},       # 주체가 둘
+                                    None])                                                        # 몸을 읽을 수 없다
+def test_SRC15_받은_단언의_주체가_청한_것과_다르면_발급_실패이고_담지_않는다(monkeypatch, claims):
+    tok = _sf_token(claims) if claims is not None else "sfsso_%%%.sig"
+    mints, ups = _sf_kit(monkeypatch, mint=lambda req: httpx.Response(200, json={"token": tok, "expires_in": 900}))
+    out = _sf_call("POST", "/api/onto-link")
+    assert out["error"] == "u@corp.com 명의 단언을 받지 못했다" and "접혔다" in out["detail"], out
+    assert ups == [] and gw._REST_ASSERTIONS == {} and _rc_rows()[-1]["error"].startswith("assertion:")
+
+
+def test_SRC15_발급_창구가_거절하면_그대로_알리고_inject_로_쓰지_않는다(monkeypatch):
+    mints, ups = _sf_kit(monkeypatch, mint=lambda req: httpx.Response(403, json={"detail": "bad secret"}))
+    out = _sf_call("POST", "/api/onto-link")
+    assert out["error"] == "u@corp.com 명의 단언을 받지 못했다" and "SSO 403" in out["detail"] and ups == [], out
+
+
+def test_SRC15_단언은_주체마다_캐시하고_expires_in_빼기_60초에_버린다(monkeypatch):
+    mints, ups = _sf_kit(monkeypatch)
+    assert _sf_call("POST", "/api/onto-link")["status"] == 200 and _sf_call("POST", "/api/onto-put")["status"] == 200
+    assert len(mints) == 1 and len(ups) == 2, "같은 사람의 두 번째 쓰기는 캐시한 단언으로 간다"
+    key = ("step_forge", "e", "u@corp.com")
+    tok, until = gw._REST_ASSERTIONS[key]
+    assert 900 - 60 - 5 < until - _clock.monotonic() <= 900 - 60
+    assert ups[0].headers["x-heax-sso-assertion"] == ups[1].headers["x-heax-sso-assertion"] == tok
+    monkeypatch.setattr(gw, "_request_user", lambda: "v@corp.com")
+    assert _sf_call("POST", "/api/onto-link")["status"] == 200 and len(mints) == 2, "다른 사람은 따로 받는다"
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    gw._REST_ASSERTIONS[key] = (tok, _clock.monotonic() - 1)
+    assert _sf_call("POST", "/api/onto-link")["status"] == 200 and len(mints) == 3, "수명이 지나면 새로 받는다"
+
+
+@pytest.mark.parametrize("exp", [60, 30, None, "900", True])
+def test_SRC15_수명이_60초_안쪽이거나_읽을_수_없으면_담지_않는다(monkeypatch, exp):
+    mints, ups = _sf_kit(monkeypatch, mint=lambda req: httpx.Response(200, json={
+        "token": _sf_token({"e": "u@corp.com", "x": 9999999999, "d": 1}), **({"expires_in": exp} if exp is not None else {})}))
+    assert _sf_call("POST", "/api/onto-link")["status"] == 200 and _sf_call("POST", "/api/onto-link")["status"] == 200
+    assert len(mints) == 2 and len(ups) == 2 and gw._REST_ASSERTIONS == {}, exp
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_SRC15_위층이_단언의_쓰기를_돌려보내면_캐시에서_버리고_다시_보내지_않는다(monkeypatch, code):
+    mints, ups = _sf_kit(monkeypatch, upstream=lambda req: httpx.Response(code, json={"detail": "identity_refused: assertion_invalid"}))
+    out = _sf_call("POST", "/api/onto-link")
+    assert out["status"] == code and len(ups) == 1 and len(mints) == 1 and gw._REST_ASSERTIONS == {}, out
+    assert _rc_rows()[-1]["note"] == "rest:POST /api/onto-link+assertion-dropped"
+
+
+def test_SRC15_rest_sso_가_없으면_쓰기는_거절하고_켜는_법을_말하고_읽기는_그대로다(monkeypatch):
+    mints, ups = _sf_kit(monkeypatch, sso=False)
+    out = _sf_call("POST", "/api/onto-link")
+    assert "꺼져 있다" in out["error"] and "STEPFORGE_SSO_SECRET" in out["detail"] and mints == [] and ups == [], out
+    assert _sf_call("GET", "/api/parts")["status"] == 200 and mints == []
+
+
+def test_SRC15_읽기_전용_토큰은_지금처럼_rest_call_쓰기를_막는다(monkeypatch):
+    mints, ups = _sf_kit(monkeypatch)
+    _set_request(monkeypatch, {gw.READONLY_HEADER: "1"}, "198.51.100.4")
+    res = asyncio.run(gw._call_tool("rest_call", {"site": "step-forge", "method": "POST", "path": "/api/onto-link"}))
+    assert res.isError and res.content[0].text.startswith("read_only: rest_call POST") and mints == [] and ups == []
+
+
+def test_SRC15_catalog_은_단언_쓰기_경로를_알리고_REST_프록시는_읽기만_그대로다(monkeypatch):
+    _sf_kit(monkeypatch)
+
+    async def no_doc(site):
+        return None
+    monkeypatch.setattr(gw, "_openapi_of", no_doc)
+    [sf] = _payload(asyncio.run(gw._rest_catalog({})))["sites"]
+    assert sf["write_paths"] == {"method": "POST", "paths": _SF_WRITES} and sf["readonly"] is False
+    monkeypatch.setattr(gw, "REST_SSO", {})
+    [sf] = _payload(asyncio.run(gw._rest_catalog({})))["sites"]
+    assert "write_paths" not in sf and sf["readonly"] is True, "켜지지 않았으면 알리지 않는다"
+    # REST 프록시(/api/step-forge/)는 단언을 싣지 않는다 — delegate · write_paths 가 있어도 GET · HEAD 그대로(rest_proxy.allowed_methods)
+    assert rest_proxy.allowed_methods(gw.REST["step-forge"]) == ["GET", "HEAD"]
+    assert "x-hwax-delegate-service" in rest_proxy._NEVER_FORWARD and "x-hwax-delegate-email" in rest_proxy._NEVER_FORWARD
+
+
+def test_SRC15_클라이언트가_보낸_위임_서비스_머리는_모든_분기가_버린다(monkeypatch):
+    forged = ((gw.DELEGATE_SERVICE_HEADER.lower().encode(), b"core-link"),)
+    h, _st = _gate_headers(monkeypatch, b"Bearer gw-secret", None, forged)
+    assert gw.DELEGATE_SERVICE_HEADER.lower() not in h
+    h2, _st = _gate_headers(monkeypatch, b"Bearer me", {"email": "u@corp.com", "groups": [], "jti": "j"}, forged)
+    assert gw.DELEGATE_SERVICE_HEADER.lower() not in h2
+    _svc_file({_SVC_JOB: {"tools": []}})
+    h3, _st, _b, _a = _svc_gate(monkeypatch, _svc_claims(), forged)
+    assert gw.DELEGATE_SERVICE_HEADER.lower() not in h3
+
+
+def test_SRC15_StepForge_MCP_길은_rest_sso_가_있어도_공유_세션_그대로다(monkeypatch):
+    """rest_sso 는 per_user_sso 와 따로다 — MCP 목록 · 호출 갈래는 PER_USER_SSO 만 본다(CK-3). 사람의 StepForge MCP 호출이 사람별 세션(as-user-pat)
+    으로 바뀌지 않고 발급 창구도 부르지 않는다."""
+    sf = _PanelCallSess([_tool("onto_link")], [])
+    _panel_kit(monkeypatch, {"heax-step_forge": sf}, user="u@corp.com")
+    monkeypatch.setattr(gw, "PER_USER_SSO", {})
+    monkeypatch.setattr(gw, "REST_SSO", {"step_forge": {"sso_url": _SF_SSO, "secret": "s", "auth": "heax",
+                                                        "token_header": "X-Heax-Sso-Assertion"}})
+
+    def no_http(req):
+        raise AssertionError(f"MCP 길이 HTTP 를 불렀다: {req.url}")
+    _mock_http(monkeypatch, no_http)
+    _set_request(monkeypatch, {gw.VIA_HEADER: "pat"}, "198.51.100.4")
+    open(gw.AUDIT_PATH, "w").close()
+    assert not asyncio.run(gw._call_tool("onto_link", {"dry_run": True})).isError and sf.calls == ["onto_link"]
+    [row] = _rows()
+    assert row["mode"] == "service" and row["caller"] == "u@corp.com"

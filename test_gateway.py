@@ -32,6 +32,9 @@ def _no_prod_audit(monkeypatch, tmp_path):
     # 루틴 단계 읽기 목록 덧씌우기도 같다 — 박스에 read_tools.local.json 이 있으면 단계 울타리 시험이 그 박스 목록으로 돈다(R3 리뷰 #0)
     monkeypatch.setattr(gw, "READ_TOOLS_LOCAL_PATH", tmp_path / "read_tools.local.json")
     monkeypatch.setattr(gw, "_READ_TOOLS_LOCAL", {"mtime": None, "tools": frozenset(), "deny": frozenset()})
+    # 서비스 PAT 허용 목록도 같다 — 박스에 service_tools.local.json 이 있으면 서비스 시험이 그 박스 표로 돈다(HWAXPortal docs/core-link §3)
+    monkeypatch.setattr(gw, "SERVICE_TOOLS_LOCAL_PATH", tmp_path / "service_tools.local.json")
+    monkeypatch.setattr(gw, "_SERVICE_TOOLS", {"mtime": None, "jobs": {}})
     # 그림 저장 폴더도 같다 — 안 걸면 시험이 박스의 데이터 루트(/data/svc/mcp-gateway/figures)나 리포 옆 폴더에 그림을 쌓는다. 표도 시험마다 새것이다
     monkeypatch.setattr(gw, "FIG_DIR", tmp_path / "figures")
     monkeypatch.setattr(gw, "_FIG_META", {})
@@ -12964,3 +12967,402 @@ def test_HG29_선언이_바뀌면_그_백엔드의_응답_캐시를_버린다(mo
 def test_HG27_request_id_빈_값은_기본이다():
     got, why = gw._conn_validate("fmea", {**_FMEA, "request_id": None}, {"fmea": ["plat:fmea"]})
     assert why == "ok" and got["request_id"] is True
+
+
+# ── 서비스 PAT(HWAXPortal docs/core-link SRC-13 · 계약 design §3) — 박스 작업의 신원. 사람 신원 없이 박스 허용 목록 안만 부른다 ──────────────
+# 포털 관리자가 작업마다 찍는다(청중 mcp-gateway-service · sub system:<작업> · jti svc-). 꼴이 어긋나면 401(일반 PAT 로 떨어지지 않는다), 허용 목록
+# (service_tools.local.json)에 없는 작업은 문에서 403, 목록 밖 도구는 forbidden … service-denied 다. 감사 caller 는 system:<작업>, note 는 svc:<jti 앞 8자>.
+_SVC_JOB = "core-link"
+_SVC_JTI = "svc-0123abcd4567ef89"
+_SVC_MT = {"n": 0}
+
+
+def _svc_claims(**over):
+    now = int(_ptime.time())
+    body = {"iss": "https://portal.example", "sub": f"system:{_SVC_JOB}", "aud": [gw.SERVICE_AUDIENCE], "scope": "api",
+            "scopes": ["service"], "purpose": "service", "pat_name": f"service:{_SVC_JOB}", "jti": _SVC_JTI,
+            "iat": now, "nbf": now, "exp": now + 30 * 86400}
+    body.update(over)
+    return {k: v for k, v in body.items() if v is not _DROP}
+
+
+def _svc_file(jobs=None, raw=None):
+    """박스 허용 목록을 쓴다(autouse 가 tmp 로 건 자리) — 바뀐 시각을 매번 다르게 찍는다(같은 틱 안의 두 번 쓰기도 다시 읽힌다)."""
+    p = gw.SERVICE_TOOLS_LOCAL_PATH
+    p.write_text(raw if raw is not None else json.dumps({"jobs": jobs or {}}), encoding="utf-8")
+    _SVC_MT["n"] += 1
+    os.utime(p, ns=(_SVC_MT["n"] * 10 ** 15, _SVC_MT["n"] * 10 ** 15))
+    return p
+
+
+def _svc_gate(monkeypatch, claims, extra=()):
+    """인증 미들웨어를 태워 (앱이 받은 헤더 {이름: [값…]}, 응답 상태, 응답 몸, 검증에 준 청중들)을 돌려준다. 서비스 PAT 는 포털 권한 조회를 타지 않는다."""
+    seen, sent, auds = {}, [], []
+
+    async def app(scope, receive, send):
+        seen["h"] = list(scope["headers"])
+
+    async def send(m):
+        sent.append(m)
+
+    async def no_access(email, base, **_kw):
+        raise AssertionError("서비스 PAT 가 사람 권한 조회(포털)를 탔다")
+    monkeypatch.setattr(gw, "_portal_access", no_access)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        async def verify(self, token, aud):
+            auds.append(list(aud))
+            return claims
+    asyncio.run(gw._bearer_gate(app, _V())({"type": "http", "method": "POST", "path": "/mcp", "client": ("198.51.100.4", 0),
+                                             "headers": [(b"authorization", b"Bearer s"), *extra]}, None, send))
+    out: dict = {}
+    for k, v in seen.get("h", []):
+        out.setdefault(k.decode().lower(), []).append(v.decode())
+    status = next((m["status"] for m in sent if m["type"] == "http.response.start"), None)
+    body = next((json.loads(m["body"]) for m in sent if m["type"] == "http.response.body"), None)
+    return out, status, body, auds
+
+
+def test_SRC13_서비스_PAT_꼴(monkeypatch):
+    """받는 꼴의 경계 — 작업 이름 1 ~ 40자(소문자 · 숫자 · 하이픈, 첫 글자는 하이픈이 아니다) · 수명 365일까지. 서비스 표지가 없는 일반 · 패널 PAT 는
+    서비스로 다루지 않는다(그 분기의 판별이 그대로 간다)."""
+    assert gw._service_scope(_svc_claims()) == (True, {"job": _SVC_JOB, "jti": _SVC_JTI})
+    for job in ("a", "0", "a" * 40, "nightly-sync-2"):
+        assert gw._service_scope(_svc_claims(sub=f"system:{job}")) == (True, {"job": job, "jti": _SVC_JTI}), job
+    now = int(_ptime.time())
+    assert gw._service_scope(_svc_claims(iat=now, exp=now + 365 * 86400))[1] is not None, "365일은 받는다"
+    assert gw._service_scope(_svc_claims(email="x@corp.com", groups=["portal-admin"]))[1] is not None, "이메일 · 그룹은 보지 않는다"
+    assert gw._service_scope({"sub": "S-1", "email": "u@corp.com", "aud": [gw.MCP_AUDIENCE], "jti": "j", "scope": "api"}) == (False, None)
+    assert gw._service_scope(_panel_claims()) == (False, None), "패널 PAT 는 패널 분기가 가른다"
+
+
+@pytest.mark.parametrize("over,why", [
+    ({"purpose": "procedure"}, "purpose 가 서비스가 아니다"),
+    ({"purpose": _DROP}, "purpose 없음"),
+    ({"jti": "j-plain"}, "jti 머리"),
+    ({"aud": ["mcp-gateway"]}, "서비스 청중 없음 — 다른 표지(purpose · jti · sub)가 있어 일반 PAT 로 떨어지지 않는다"),
+    ({"aud": ["mcp-gateway-service", "mcp-gateway"]}, "MCP 청중과 함께 — 포털 챗 · 옛 게이트웨이가 받는 꼴"),
+    ({"aud": ["mcp-gateway-service", "mcp-app-panel"]}, "패널 청중과 함께"),
+    ({"sub": "core-link"}, "sub 머리 system: 없음"),
+    ({"sub": "system:Core-Link"}, "대문자"),
+    ({"sub": "system:-core"}, "하이픈으로 시작"),
+    ({"sub": "system:core_link"}, "밑줄"),
+    ({"sub": "system:" + "a" * 41}, "41자"),
+    ({"sub": "system:core-link\n"}, "줄바꿈 꼬리($ 가 받아 주는 꼴)"),
+    ({"sub": "system:"}, "작업 없음"),
+    ({"scope": "chat"}, "scope 가 api 가 아니다"),
+    ({"scopes": ["read"]}, "scopes 가 service 가 아니다 — 읽기 전용 PAT 로 읽힐 꼴"),
+    ({"scopes": ["service", "read"]}, "scopes 에 더 붙었다"),
+    ({"scopes": "service"}, "scopes 가 목록이 아니다"),
+    ({"scopes": _DROP}, "scopes 없음"),
+    ({"panel": {"app": "simflow", "uri": "ui://simflow/x"}}, "panel 칸"),
+    ({"exp": int(_ptime.time()) + 366 * 86400}, "365일보다 길다"),
+    ({"exp": int(_ptime.time()) - 10}, "수명이 0 이하"),
+    ({"iat": _DROP}, "수명을 셀 수 없다"),
+])
+def test_SRC13_꼴이_어긋난_서비스_PAT_는_401_이고_일반_PAT_로_떨어지지_않는다(monkeypatch, over, why):
+    _svc_file({_SVC_JOB: {"tools": []}})
+    claims = _svc_claims(**over)
+    assert gw._service_scope(claims) == (True, None), why
+    open(gw.AUDIT_PATH, "w").close()
+    h, st, body, _auds = _svc_gate(monkeypatch, claims)
+    assert st == 401 and not h and body == {"error": "unauthorized"}, why
+    assert [r["error"] for r in _rows()] == ["unauthorized: bad-service-token"], why
+
+
+def test_SRC13_서비스_PAT_는_작업_이름과_자격을_싣고_사람_신원과_클라이언트_사본은_버린다(monkeypatch):
+    _svc_file({_SVC_JOB: {"tools": ["heax-step_forge:run_job"]}})
+    forged = ((gw.USER_HEADER.encode(), b"boss%40corp.com"), (gw.SERVICE_HEADER.encode(), b"other-job"),
+              (gw.GROUPS_HEADER.encode(), b"portal-admin"), (gw.VIA_HEADER.encode(), b"pat"), (gw.PANEL_HEADER.encode(), b"%7B%7D"),
+              (gw.READONLY_HEADER.encode(), b"1"), (gw.PURPOSE_HEADER.encode(), b"procedure"), (gw.MUTED_HEADER.encode(), b"x"))
+    h, st, _body, auds = _svc_gate(monkeypatch, _svc_claims(email="ignored@corp.com", groups=["portal-admin"]), forged)
+    assert st is None, "앱까지 갔다"
+    assert auds == [[gw.MCP_AUDIENCE, gw.PANEL_AUDIENCE, gw.SERVICE_AUDIENCE]], auds
+    assert (h[gw.SERVICE_HEADER], h[gw.VIA_HEADER], h[gw.GROUPS_HEADER]) == ([_SVC_JOB], ["service"], [gw.SERVICE_GROUP]), h
+    for gone in (gw.USER_HEADER, gw.PANEL_HEADER, gw.READONLY_HEADER, gw.PURPOSE_HEADER, gw.MUTED_HEADER, gw.VIEW_HEADER):
+        assert gone not in h, gone
+
+
+def test_SRC13_클라이언트가_보낸_x_hwax_service_는_GW_TOKEN_과_사람_PAT_길에서도_버린다(monkeypatch):
+    forged = ((gw.SERVICE_HEADER.encode(), _SVC_JOB.encode()),)
+    h, _st = _gate_headers(monkeypatch, b"Bearer gw-secret", None, forged)
+    assert gw.SERVICE_HEADER not in h and h[gw.VIA_HEADER] == ["gw-token"]
+    h2, _st = _gate_headers(monkeypatch, b"Bearer me", {"email": "u@corp.com", "groups": [], "jti": "j"}, forged)
+    assert gw.SERVICE_HEADER not in h2 and h2[gw.VIA_HEADER] == ["pat"]
+
+
+def test_SRC13_허용_목록에_없는_작업은_문에서_403_이고_파일은_재기동_없이_다시_읽는다(monkeypatch):
+    open(gw.AUDIT_PATH, "w").close()
+    _, st0, _, _ = _svc_gate(monkeypatch, _svc_claims())
+    assert st0 == 403, "파일이 없으면 모든 작업이 403"
+    _svc_file({"other-job": {"tools": []}})
+    h, st, body, _ = _svc_gate(monkeypatch, _svc_claims())
+    assert st == 403 and not h and body["error"] == "forbidden" and "service-denied" in body["detail"], body
+    rows = _rows()
+    assert len(rows) == 2 and all(r["error"].startswith("forbidden: service-denied") for r in rows)
+    assert {(r["caller"], r["via"], r["mode"], r["note"]) for r in rows} == {(f"system:{_SVC_JOB}", "service", "refused", "svc:svc-0123")}
+    _svc_file({_SVC_JOB: {"tools": []}})
+    _h, st2, _, _ = _svc_gate(monkeypatch, _svc_claims())
+    assert st2 is None, "작업을 더하면 재기동 없이 연다"
+
+
+@pytest.mark.parametrize("raw", [
+    '{"jobs": {"core-link": {"tools": ["heax-step_forge:run_job"]}, "bad": {"tools": "x:y"}}}',      # 다른 작업의 tools 가 목록이 아니다
+    '{"jobs": {"core-link": {"tools": ["heax-step_forge:run_job"]}, "Bad_Job": {}}}',                # 작업 이름 꼴
+    '{"jobs": {"core-link": {"tools": ["run_job"]}}}',                                                # 백엔드 없는 키
+    '{"jobs": {"core-link": {"tools": ["heax-step_forge:run_job"], "rest": [{"site": "s", "method": "POST", "path": "x"}]}}}',
+    '{"jobs": {"core-link": {"rest": [{"site": "s", "path": "/x"}]}}}',                               # 메서드 없음
+    '{"jobs": ["core-link"]}', '{"core-link": {}}', "{not json",
+])
+def test_SRC13_깨진_허용_목록은_통째로_버려_모든_서비스_호출을_막고_경고는_한_번(monkeypatch, caplog, raw):
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        _svc_file(raw=raw)
+        assert gw._service_tools()["jobs"] == {} and gw._service_tools()["jobs"] == {}
+        _, st, _, _ = _svc_gate(monkeypatch, _svc_claims())
+    assert st == 403, "깨진 파일 = 모든 작업이 문에서 403"
+    assert sum("service_tools.local.json" in r.getMessage() for r in caplog.records) == 1, caplog.text
+
+
+def test_SRC13_RA_TestScope_도구를_적은_작업은_읽을_때_경고_한_줄이고_막지는_않는다(monkeypatch, caplog):
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        _svc_file({_SVC_JOB: {"tools": ["reportarchive:create_report_draft", "testscope:resolve", "heax-step_forge:run_job"]}})
+        assert len(gw._service_tools()["jobs"][_SVC_JOB]["tools"]) == 3
+        gw._service_tools()                                              # 바뀐 시각이 같으면 다시 읽지 않는다 — 경고도 한 번
+    warns = [r.getMessage() for r in caplog.records if "⚠" in r.getMessage()]
+    assert len(warns) == 1 and "reportarchive:create_report_draft" in warns[0] and "testscope:resolve" in warns[0], warns
+    assert "heax-step_forge" not in warns[0]
+
+
+def test_SRC13_health_는_작업마다_도구_수와_REST_수만_싣는다(monkeypatch):
+    _svc_file({_SVC_JOB: {"tools": ["heax-step_forge:run_job", "heax-kooremapper_mcp:plan_task_links"],
+                          "rest": [{"site": "step-forge", "method": "POST", "path": "/api/onto-link"}]},
+               "nightly": {}})
+    st, body = _gate_call(monkeypatch, "/health", token="nope")
+    assert st == 200 and body["service_jobs"] == {_SVC_JOB: {"tools": 2, "rest": 1}, "nightly": {"tools": 0, "rest": 0}}
+    text = json.dumps(body)
+    assert "svc-" not in text and "onto-link" not in text and "run_job" not in text
+
+
+def _svc_bearer(jti=_SVC_JTI):
+    """검증은 미들웨어 몫이다 — 요청 문맥에는 꼴만 맞는 토큰을 둔다(가운데 조각의 jti 앞 8자를 감사 note 가 읽는다)."""
+    seg = base64.urlsafe_b64encode(json.dumps({"jti": jti}).encode()).decode().rstrip("=")
+    return f"Bearer h.{seg}.s"
+
+
+def _as_service(monkeypatch, job=_SVC_JOB):
+    _set_request(monkeypatch, {gw.SERVICE_HEADER: job, gw.VIA_HEADER: "service", gw.GROUPS_HEADER: gw.SERVICE_GROUP,
+                               "authorization": _svc_bearer()}, "198.51.100.4")
+
+
+def _svc_kit(monkeypatch, jobs, *, rest=None):
+    """백엔드 둘(같은 이름 list_parts 가 겹쳐 노출 이름에 접두가 붙는다) · 사람에게는 권한이 필요한 앱 정책 · 서비스 요청 문맥."""
+    sf = _PanelCallSess([_tool("run_job"), _tool("list_parts"), _panel_tool("open_sf_panel", "ui://step_forge/panel")],
+                        [types.Resource(uri="ui://step_forge/panel", name="p")])
+    krm = _PanelCallSess([_tool("plan_task_links"), _tool("list_parts")], [])
+    _panel_kit(monkeypatch, {"heax-step_forge": sf, "heax-kooremapper_mcp": krm}, groups=(gw.SERVICE_GROUP,))
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {"heax-step_forge": ["plat:stepforge"], "heax-kooremapper_mcp": ["plat:dynaforge"]})
+    monkeypatch.setattr(gw, "REST", rest if rest is not None else {})
+    gw._RESP_CACHE.clear()
+    _svc_file(jobs)
+    _as_service(monkeypatch)
+    return sf, krm
+
+
+def test_SRC13_서비스_PAT_의_목록은_그_작업의_허용_도구뿐이고_리소스_프롬프트는_없다(monkeypatch):
+    _svc_kit(monkeypatch, {_SVC_JOB: {"tools": ["heax-step_forge:run_job", "heax-kooremapper_mcp:list_parts"]}})
+    want = {n for n, r in gw.route.items() if r in {("heax-step_forge", "run_job"), ("heax-kooremapper_mcp", "list_parts")}}
+    assert len(want) == 2 and "list_parts" not in want, "겹친 이름은 접두가 붙은 노출 이름으로 보인다"
+    assert {t.name for t in asyncio.run(gw._list_tools(types.ListToolsRequest()))} == want
+    assert {t.name for t in asyncio.run(gw._list_tools(None))} == want, "호출 검증용 캐시 채우기도 같은 표"
+    monkeypatch.setattr(gw, "REST", {"step-forge": {"base": "http://sf.invalid"}})
+    _svc_file({_SVC_JOB: {"tools": ["heax-step_forge:run_job"],
+                          "rest": [{"site": "step-forge", "method": "post", "path": "/api/onto-link"}]}})
+    assert {t.name for t in asyncio.run(gw._list_tools(types.ListToolsRequest()))} == {"run_job", "rest_call"}, "rest 항목이 있으면 rest_call"
+    asked = []
+
+    async def portal(*a, **k):
+        asked.append(a)
+        return {"routines": []}
+    monkeypatch.setattr(gw, "_routine_portal", portal)
+    assert asyncio.run(gw._list_resources()) == [] and asyncio.run(gw._list_resource_templates()) == []
+    assert asyncio.run(gw._list_prompts()) == [] and asked == [], "포털에 서비스 토큰을 보내지 않는다"
+    with pytest.raises(gw.McpError):
+        _read("ui://step_forge/panel")
+    with pytest.raises(gw.McpError):
+        asyncio.run(gw._get_prompt("routine-r1", {}))
+    assert asked == []
+    _svc_file({"other-job": {}})
+    assert asyncio.run(gw._list_tools(types.ListToolsRequest())) == [], "문을 지난 뒤 작업이 빠지면 아무것도 보이지 않는다"
+    # 대조군 — 서비스가 아니면(사람 PAT) 같은 리소스 · 프롬프트가 보인다(위의 빈 답이 그 자리에 아무것도 없어서가 아니다)
+    _set_request(monkeypatch, {gw.VIA_HEADER: "pat", "authorization": "Bearer person"}, "198.51.100.4")
+    assert [str(r.uri) for r in asyncio.run(gw._list_resources())] == ["ui://step_forge/panel"]
+    assert _read("ui://step_forge/panel").root.contents
+    asyncio.run(gw._list_prompts())
+    assert asked, "사람 PAT 는 포털에 루틴 목록을 묻는다"
+
+
+def test_SRC13_서비스_PAT_의_호출은_허용_목록만_닿고_밖은_forbidden_service_denied(monkeypatch):
+    sf, krm = _svc_kit(monkeypatch, {_SVC_JOB: {"tools": ["heax-step_forge:run_job"]}})
+    open(gw.AUDIT_PATH, "w").close()
+
+    def call(name, args=None):
+        res = asyncio.run(gw._call_tool(name, args or {}))
+        return not res.isError, res.content[0].text
+    assert call("run_job")[0], "사람에게 권한이 필요한 앱도 서비스는 정책을 건너뛴다 — 울타리는 허용 목록이다"
+    assert call("invoke_tool", {"name": "run_job", "arguments": {}})[0], "invoke_tool 은 안쪽 이름으로 같은 판정"
+    sf_list = next(n for n, r in gw.route.items() if r == ("heax-step_forge", "list_parts"))
+    for name, args in ((sf_list, {}), ("plan_task_links", {}),                                        # 목록 밖 — 같은 앱 · 다른 앱
+                       ("invoke_tool", {"name": "plan_task_links", "arguments": {}}),                  # 경유도 안쪽 이름으로
+                       ("search_tools", {"query": "q"}), ("list_tool_apps", {}), ("save_conversation", {}),   # 게이트웨이 자체
+                       ("rest_catalog", {}), ("routine_list", {}),
+                       ("rest_call", {"site": "step-forge", "path": "/x"}),                            # 그 작업에 rest 항목이 없다
+                       ("no_such_tool", {})):
+        ok, text = call(name, args)
+        assert not ok and text.startswith("forbidden:") and "service-denied" in text, (name, text)
+    assert sf.calls == ["run_job", "run_job"] and krm.calls == [], (sf.calls, krm.calls)
+    rows = _rows()
+    assert all(r["caller"] == f"system:{_SVC_JOB}" and r["via"] == "service" and r["note"] == "svc:svc-0123" for r in rows), rows
+    assert [r["ok"] for r in rows[:2]] == [True, True] and rows[0]["mode"] == "service"
+    assert all(r["mode"] == "refused" and r["error"].startswith("service-denied:") for r in rows[2:]), rows[2:]
+    assert {r["error"] for r in rows[2:]} == {"service-denied:not-listed", "service-denied:gateway-tool", "service-denied:no-rest",
+                                              "service-denied:unknown-tool"}
+
+
+def test_SRC13_서비스가_아니면_같은_호출이_통한다_대조군(monkeypatch):
+    sf, krm = _svc_kit(monkeypatch, {_SVC_JOB: {"tools": ["heax-step_forge:run_job"]}})
+    _set_request(monkeypatch, {gw.VIA_HEADER: "gw-token", gw.GROUPS_HEADER: gw.SERVICE_GROUP}, "198.51.100.4")
+    assert not asyncio.run(gw._call_tool("plan_task_links", {})).isError and krm.calls == ["plan_task_links"], "막은 것은 서비스 울타리다"
+
+
+def test_SRC13_작업_머리가_꼴이_아니면_아무것도_열지_않는다(monkeypatch):
+    sf, _krm = _svc_kit(monkeypatch, {_SVC_JOB: {"tools": ["heax-step_forge:run_job"]}})
+    _as_service(monkeypatch, job="Bad Job")
+    assert gw._request_service() == {"job": "", "jti8": ""}
+    assert asyncio.run(gw._call_tool("run_job", {})).isError and sf.calls == [], "일반 요청으로 떨어지면 정책을 건너뛰는 그룹으로 돈다"
+    assert asyncio.run(gw._list_tools(types.ListToolsRequest())) == []
+
+
+def test_SRC13_서비스_PAT_의_rest_call_은_사이트_메서드_경로가_글자_그대로_맞을_때만(monkeypatch):
+    rest = {"step-forge": {"base": "http://sf.invalid", "inject": {"header": "Authorization", "value": "Bearer hub"}},
+            "other": {"base": "http://other.invalid"}}
+    _svc_kit(monkeypatch, {_SVC_JOB: {"rest": [{"site": "step-forge", "method": "get", "path": "/api/parts"}]}}, rest=rest)
+    seen = []
+
+    def handler(req):
+        seen.append((req.method, req.url.path))
+        return httpx.Response(200, json={"ok": True})
+    _mock_http(monkeypatch, handler)
+    open(gw.AUDIT_PATH, "w").close()
+    ok = _payload(asyncio.run(gw._rest_call({"site": "step-forge", "method": "GET", "path": "api/parts"})))   # 앞 / 는 붙여서 본다
+    assert ok["status"] == 200 and seen == [("GET", "/api/parts")], ok
+    for args in ({"site": "step-forge", "method": "HEAD", "path": "/api/parts"},              # HEAD 도 적어야 연다
+                 {"site": "step-forge", "path": "/api/parts/1"},                              # 앞머리 맞춤 없음
+                 {"site": "step-forge", "path": "/api/parts?x=1"},
+                 {"site": "step-forge", "method": "POST", "path": "/api/parts"},
+                 {"site": "other", "path": "/api/parts"}, {"site": "nope", "path": "/api/parts"}):
+        out = _payload(asyncio.run(gw._rest_call(args)))
+        assert out["error"].startswith("forbidden: rest_call") and "service-denied" in out["error"] and out["status"] == 403, (args, out)
+        assert "known" not in out, "목록 밖 호출에 이 박스의 사이트 목록을 알려 주지 않는다"
+    assert seen == [("GET", "/api/parts")], "막힌 호출이 상류로 나갔다"
+    rows = [r for r in _rows() if r["tool"].startswith("rest_call")]
+    assert rows[0]["ok"] and rows[0]["caller"] == f"system:{_SVC_JOB}" and rows[0]["note"] == "svc:svc-0123"
+    assert len(rows) == 7 and all(r["mode"] == "refused" and r["error"] == "service-denied:rest-not-listed" for r in rows[1:])
+
+
+def test_SRC13_진짜_RS256_서비스_PAT_는_세_청중_검증으로만_통하고_회수되면_닫힌다(monkeypatch):
+    """청중을 새로 둔 까닭 — MCP 청중 하나로 검증하는 옛 게이트웨이 · 포털 챗 · 그림 받기는 서비스 PAT 를 받지 않는다. 회수는 기존 폐기 목록이다."""
+    v = _verifier(monkeypatch)
+    revoked: set = set()
+
+    async def revoked_set():
+        return revoked
+    monkeypatch.setattr(v, "_revoked_set", revoked_set)
+    tok = _jwt.encode(_svc_claims(), _rsa()[0], algorithm="RS256", headers={"kid": "k1"})
+    assert asyncio.run(v.verify(tok, gw.MCP_AUDIENCE)) is None, "MCP 청중 하나로는 통하지 않는다"
+    assert asyncio.run(v.verify(tok, [gw.MCP_AUDIENCE, gw.PANEL_AUDIENCE])) is None, "패널을 아는 옛 게이트웨이도"
+    _svc_file({_SVC_JOB: {"tools": []}})
+    seen, sent = {}, []
+
+    async def app(scope, receive, send):
+        seen["h"] = {k.decode().lower(): val.decode() for k, val in scope["headers"]}
+
+    async def send(m):
+        sent.append(m)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    def gate():
+        seen.clear()
+        sent.clear()
+        asyncio.run(gw._bearer_gate(app, v)({"type": "http", "method": "POST", "path": "/mcp", "client": ("198.51.100.9", 0),
+                                              "headers": [(b"authorization", b"Bearer " + tok.encode())]}, None, send))
+    gate()
+    assert seen["h"][gw.SERVICE_HEADER] == _SVC_JOB and seen["h"][gw.VIA_HEADER] == "service" and gw.USER_HEADER not in seen["h"]
+    revoked.add(_SVC_JTI)
+    gate()
+    assert not seen and [m["status"] for m in sent if m["type"] == "http.response.start"] == [401], "회수(revoked.json)되면 닫힌다"
+
+
+def test_SRC13_감사_note_는_서비스_표지를_앞에_붙인다(monkeypatch):
+    _as_service(monkeypatch)
+    gw._audit("t", "b", True, None, 1, note="cache-hit")
+    r = _rows()[-1]
+    assert (r["caller"], r["via"], r["note"]) == (f"system:{_SVC_JOB}", "service", "svc:svc-0123+cache-hit")
+    _set_request(monkeypatch, {gw.VIA_HEADER: "pat", gw.USER_HEADER: "u%40x.io"}, "203.0.113.7")
+    gw._audit("t", "b", True, None, 1, note="cache-hit")
+    r = _rows()[-1]
+    assert (r["caller"], r["note"]) == ("u@x.io", "cache-hit"), "사람 호출은 그대로다"
+
+
+def _portal_service_mod():
+    """형제 포털 리포의 서비스 PAT 클레임(backend/app/auth/service_pat.py — 표준 라이브러리만 쓴다). 워크트리에서는 HWAX_PORTAL_REPO 로 가리킨다."""
+    from pathlib import Path
+    root = Path(os.environ.get("HWAX_PORTAL_REPO") or Path(gw.__file__).resolve().parent.parent / "HWAXPortal")
+    p = root / "backend" / "app" / "auth" / "service_pat.py"
+    if not p.exists():
+        pytest.skip(f"형제 포털 리포에 서비스 PAT 모듈이 아직 없다({p}) — 포털 가지(core-link SRC-13)가 올라오면 이 계약 시험이 돈다")
+    spec = importlib.util.spec_from_file_location("portal_service_pat", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_SRC13_두_리포_계약_포털이_찍는_서비스_PAT_를_게이트웨이가_같은_작업으로_가른다(monkeypatch):
+    """한쪽만 바꾸면 양쪽 시험이 각자 초록인 채 박스 작업이 401 로 죽거나 판별이 넓어진다. 포털 모듈의 service_claims 가 지은 클레임을 판별에
+    넣고, 진짜 RS256 으로 서명해 진짜 검증기 · 진짜 미들웨어에도 넣는다. 인자 이름은 포털 모듈이 정한다 — 이 시험이 아는 것(iss · job · days · now ·
+    note · issued_by)만 넘기고, 모르는 필수 인자가 있으면 그 이름을 말한다."""
+    import inspect
+    mod = _portal_service_mod()
+    for const, want in (("SERVICE_AUDIENCE", gw.SERVICE_AUDIENCE), ("SERVICE_PURPOSE", gw.SERVICE_PURPOSE),
+                        ("SERVICE_JTI_PREFIX", gw.SERVICE_JTI_PREFIX)):
+        if hasattr(mod, const):
+            assert getattr(mod, const) == want, const
+    build = getattr(mod, "service_claims", None)
+    assert callable(build), "포털 모듈은 service_claims(...) 로 클레임을 짓는다 — 이름이 다르면 이 시험과 함께 고친다"
+    params = inspect.signature(build).parameters
+    pool = {"iss": "https://portal.example", "job": _SVC_JOB, "days": 30, "now": int(_ptime.time()), "note": "", "issued_by": "admin@corp.com"}
+    unknown = [n for n, p in params.items() if p.default is inspect.Parameter.empty and n not in pool
+               and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
+    assert not unknown, f"계약 시험이 모르는 필수 인자: {unknown}"
+    kw = {n: v for n, v in pool.items() if n in params}
+    claims = build(**kw)
+    assert gw._service_scope(claims) == (True, {"job": _SVC_JOB, "jti": claims["jti"]}), claims
+    if "days" in params:
+        assert gw._service_scope(build(**{**kw, "days": 365}))[1] is not None, "365일 토큰도 받는다"
+    assert claims["jti"] != build(**kw)["jti"], "jti 는 매번 새것이다(하나씩 회수할 수 있다)"
+    v = _verifier(monkeypatch)
+
+    async def none_revoked():
+        return set()
+    monkeypatch.setattr(v, "_revoked_set", none_revoked)
+    tok = _jwt.encode(claims, _rsa()[0], algorithm="RS256", headers={"kid": "k1"})
+    assert asyncio.run(v.verify(tok, gw.MCP_AUDIENCE)) is None, "포털 챗 · 옛 게이트웨이(MCP 청중 하나)는 받지 않는다"
+    _svc_file({_SVC_JOB: {"tools": []}})
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["h"] = {k.decode().lower(): val.decode() for k, val in scope["headers"]}
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    asyncio.run(gw._bearer_gate(app, v)({"type": "http", "method": "POST", "path": "/mcp", "client": ("198.51.100.4", 0),
+                                          "headers": [(b"authorization", b"Bearer " + tok.encode())]}, None, None))
+    assert seen["h"][gw.SERVICE_HEADER] == _SVC_JOB and seen["h"][gw.VIA_HEADER] == "service" and gw.USER_HEADER not in seen["h"]

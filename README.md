@@ -38,6 +38,35 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
 - 판정 밖 — 읽기 PAT 로 포털 `/agent/chat` · 카드 대조를 부르면 포털이 챗 PAT 를 새로 찍어 심의(RA 초안 저장)가 돈다. 리스크 앱 패널의
   길이라 그대로 둔다(결정 FU-D17).
 
+## 서비스 PAT — 박스 작업의 신원(HWAXPortal docs/core-link SRC-13 · 계약 design §3)
+
+박스 작업(update-all 훅 등)이 사람 손 없이 부르는 신원이다. 포털 관리자가 작업마다 찍고(`POST /auth/pat/service`, 1 ~ 365일), 회수는 기존
+폐기 목록(`revoked.json`, 60초마다 읽는다)이다. 게이트웨이 공유 비밀(GW_TOKEN)은 `x-hwax-user` 를 믿어 아무 사람으로나 행세하므로 박스 작업에
+내주지 않는다(CK-4).
+
+- 받는 꼴(`_service_scope`) — 청중 `mcp-gateway-service`(MCP · 패널 청중과 함께 오면 거절) · `purpose: service` · jti 머리 `svc-` ·
+  `sub: system:<작업>`(작업은 `^[a-z0-9][a-z0-9-]{0,39}$`) · `scope: api` · `scopes: ["service"]` · 수명 365일까지. 이 표지 가운데 하나라도 있는데
+  꼴이 어긋나면 401(감사 `unauthorized: bad-service-token`)이다 — 일반 PAT 로 떨어지지 않는다. 이메일 · 그룹 칸은 보지 않는다.
+- 허용 목록 — 리포 루트의 `service_tools.local.json`(gitignore). 바뀐 시각이 다르면 재기동 없이 다시 읽고, 꼴이 하나라도 틀리면 통째로 버려
+  모든 서비스 호출을 막는다(경고 한 줄). 파일에 없는 작업의 토큰은 문에서 **403** 이다.
+
+  ```json
+  {"jobs": {"core-link": {"tools": ["heax-step_forge:run_job", "heax-kooremapper_mcp:plan_task_links"],
+                          "rest":  [{"site": "step-forge", "method": "POST", "path": "/api/onto-link"}]}}}
+  ```
+
+  `tools` 는 `백엔드키:원래 이름`(노출 이름 · 별칭은 원래 이름으로 푼다), `rest` 는 사이트 · 메서드 · 경로가 글자 그대로 맞아야 연다(앞머리
+  맞춤 없음 — GET · HEAD 도 적는다).
+- 요청 신원 — `x-hwax-user` 를 싣지 않고 안쪽 머리 `x-hwax-service: <작업>` 를 싣는다(클라이언트가 보낸 사본은 모든 분기가 버린다). `via=service`,
+  그룹은 `gateway:service` 라 포털 접근 정책을 건너뛴다 — 울타리는 허용 목록이다.
+- 집행 — tools/list 는 그 작업의 도구만(rest 항목이 있으면 `rest_call` 도) 낸다. 목록 밖 tools/call 은 `forbidden: <도구> — service-denied(…)` 와
+  감사 `mode=refused` 이고, `invoke_tool` 을 거쳐도 안쪽 이름으로 같은 판정이다. `rest_call` 은 rest 항목과 맞을 때만 간다. 리소스 · 프롬프트는
+  보이지 않는다.
+- 감사 — `caller=system:<작업>` · `note=svc:<jti 앞 8자>` · `via=service`. `/health` 의 `service_jobs` 가 작업마다 도구 수 · REST 수를 싣는다(토큰 ·
+  jti 없음). 기동 로그에 작업 줄이 하나 남는다.
+- 사람별 위임 앱(리스크 · MX 백서 · DynaForge · ste)은 신원이 없어 서비스 계정으로 불린다. RA · TestScope 는 서비스 세션이 실제 사람의 토큰이라
+  허용 목록에 넣지 않는다 — 넣으면 읽을 때마다(기동 포함) ⚠ 한 줄을 남긴다(막지는 않는다).
+
 ## 설정 — `gateway_config.json` (gitignore, 시크릿)
 **전체 스키마·플레이스홀더는 커밋된 `gateway_config.example.json` 참고** — fresh 배포 시 이걸 복사해 실토큰만 채운다. `gateway_config.json` 자체는 gitignore(600).
 현 `mcp_servers.json`과 동일 JSON 스키마 + 최상위 `_gateway` 블록. 백엔드에 선택적 `allowed_groups`(미지정 = 전체 공개).

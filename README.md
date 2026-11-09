@@ -29,7 +29,9 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
   확인하고 더했다. 루틴 단계의 이름 규칙을 좁히며(아래 — R3 리뷰 2차) 그 규칙으로만 열리던 진짜 읽기 일곱도 소스로 확인하고 더했다
   (`signalforge:resolve_product_keyword` · `heax-step_forge:resolve_materials` · `reportarchive:resolve` · `testscope:resolve` — `resolve` 가 조회 낱말에서
   빠졌다, `heax-step_forge:upload_instructions` · `heax-kooremapper_mcp:report_upload_instructions` — 안내 글만 준다, `reportarchive:preview_publish` — 게시
-  미리보기, 게시하지 않고 확인 토큰은 서명뿐이라 저장이 없다). 같은 파일의 `deny` 는 루틴 단계만 닫는다 — 읽기 전용 PAT 판정은 보지 않는다.
+  미리보기, 게시하지 않고 확인 토큰은 서명뿐이라 저장이 없다). 11-09 에 쓰기 낱말(`_WRITE_NAME`)에 `link` · `edit` · `sync` 를 더하며
+  둘을 더했다 — 그 낱말로 막히게 된 `ste:get_sync_settings`(설정 조회)와 쓰지 않는 미리 보기 `heax-kooremapper_mcp:plan_task_links`
+  (HWAXPortal docs/core-link CK-5). 같은 파일의 `deny` 는 루틴 단계만 닫는다 — 읽기 전용 PAT 판정은 보지 않는다.
 - 게이트웨이 자체 도구 — 조회(search_tools · list_tool_apps · rest_catalog · search_conversations · browse_experts · use_experts ·
   verify_answer)는 열고 `save_conversation` 은 막는다. `rest_call` 과 REST 다리(`/api/<site>/`)는 GET · HEAD 만. `invoke_tool` 은 안쪽 도구로 본다.
 - 표지 `x-hwax-readonly` 는 PAT 분기에서만 싣고 클라이언트 사본은 두 분기(GW_TOKEN · PAT) 모두 버린다.

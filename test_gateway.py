@@ -12751,13 +12751,34 @@ def test_search_tools_는_그림_낱말_없는_백서_질의에_figure_to_doc_�
 # lineage_repin 은 되돌릴 길이 없는 사람 판단인데 SP 의 관리자 전용 목록(DESTRUCTIVE_TOOLS) 밖이다 — 쓰기 낱말에 repin 을 더해 쓰기로 읽는다.
 # 읽기 넷(object_explode · object_lineage · graph_reach · relation_proposals)은 이름에 조회 낱말이 없어 루틴 · 좌석 읽기로 열리지 않는다(모르면 막기) —
 # 열려면 박스 읽기 덧씌우기(read_tools.local.json)에 적는다.
+# link · edit · sync(HWAXPortal docs/core-link CK-5) — unlink 만 있고 짝이 없어 잇기 · 고치기 · 동기화 쓰기를 운영자 동기화가 짚지 못했다.
 @pytest.mark.parametrize("original,write", [("lineage_repin", True), ("relation_propose", True), ("relation_proposal_decide", True),
                                             ("relation_proposals", False), ("object_explode", False), ("object_lineage", False),
-                                            ("graph_reach", False)])
+                                            ("graph_reach", False),
+                                            ("link_sp_core", True), ("ontology_link", True), ("link_objects", True),
+                                            ("sync_sp_core", True), ("bulk_edit", True)])
 def test_SP_0472_새_허브_도구의_쓰기_판정(original, write):
     t = types.Tool(name=f"rootdesigndatahub_{original}", description="", inputSchema={"type": "object", "properties": {}})
     assert gw._tool_is_write(t, original) is write, original
     assert gw._routine_read(t, "rootdesigndatahub", original) is False, "앱 표지 · 읽기 목록 · 조회 낱말 어느 것으로도 읽기로 열리지 않는다"
+
+
+def test_core_link_새_쓰기_낱말에_걸리는_읽기_둘은_읽기_목록이_지킨다(monkeypatch):
+    """ste get_sync_settings 는 sync 가 쓰기 낱말이 되며 이름 꼴로 닫히고, DynaForge plan_task_links 는 조회 낱말이 없어 원래 닫혀 있었다 —
+    둘 다 쓰지 않는 조회라 읽기 목록(read_tools.json)에 넣었다(CK-5). 루틴 단계 · 읽기 전용 PAT 둘 다 연다. tools-map write 에는
+    get_sync_settings 가 남는다(이름 규칙은 읽기 목록을 보지 않는다 — AIDataHub get_record 와 같은 지금의 꼴)."""
+    two = {"ste": "get_sync_settings", "heax-kooremapper_mcp": "plan_task_links"}
+    assert {f"{bk}:{n}" for bk, n in two.items()} <= gw.READ_TOOLS, "추적 읽기 목록에 있다"
+    _aggregate_tools(monkeypatch, {bk: [_tool(n)] for bk, n in two.items()})
+    for bk, n in two.items():
+        assert gw.route[n] == (bk, n)
+        assert gw._routine_read(_tool(n), bk, n) is True, n
+        assert gw._readonly_denial(n, {}) == "", n
+    assert gw._tool_is_write(_tool("get_sync_settings"), "get_sync_settings") is True
+    assert gw._tool_is_write(_tool("plan_task_links"), "plan_task_links") is False, "links 는 link 낱말이 아니다"
+    monkeypatch.setattr(gw, "READ_TOOLS", frozenset())
+    assert gw._routine_read(_tool("get_sync_settings"), "ste", "get_sync_settings") is False, "읽기 목록이 없으면 이름 꼴(sync)로 닫힌다"
+    assert gw._readonly_denial("plan_task_links", {}).startswith("read_only:"), "읽기 목록이 없으면 읽기 전용 PAT 도 막힌다"
 
 
 # ── SIREN 연동 뒤 요청(HWAXPortal docs/siren-delib) — HG-26 실패 가르기 · HG-27 요청 ID · HG-28 영역 · HG-29 가림 예외 ─────────────────

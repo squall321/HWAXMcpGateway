@@ -1063,7 +1063,7 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
                주소 형식일 때만 남긴다. ⚠ 박스 안에서 게이트웨이로 직접 붙는 프로세스는 X-Forwarded-For 로
                아무 주소나 주장할 수 있다 — 127.0.0.1 을 믿는 uvicorn 기본값이다(docs/gateway-audit-ip).
       via    : 어느 자격으로 들어왔나(gw-token · chat · procedure · pat · mcp-app · service). 127.0.0.1 을 읽는 열쇠다.
-               서비스 PAT(via=service)는 사람 신원이 없어 caller 가 `system:<작업>` 이고 note 앞에 `svc:<jti 앞 8자>` 가 붙는다(_request_service).
+               서비스 PAT(via=service)는 사람 신원이 없어 caller 가 `system:<작업>` 이고 note 앞에 `svc:<jti 의 svc- 뒤 8자>` 가 붙는다(_request_service).
       uri    : 패널 PAT(via=mcp-app) 호출이면 그 패널의 ui:// 주소 — 요청에서 읽는다(_request_panel).
       chars  : 호출자에게 돌려준 도구 결과의 글자 수(`res` 를 준 자리만). 게이트웨이는 결과를 자르지 않는다 —
                이 칸이 '그때 얼마나 컸나' 를 남긴다.
@@ -7343,9 +7343,9 @@ def _service_scope(claims: dict) -> tuple[bool, dict | None]:
 
 
 def _request_service() -> dict | None:
-    """이 요청이 서비스 PAT 로 들어왔으면 {job, jti8}, 아니면 None. 머리는 게이트웨이가 서비스 분기에서만 싣는다(클라이언트 사본은 버린다).
+    """이 요청이 서비스 PAT 로 들어왔으면 {job, jti8}(jti 의 svc- 머리 뒤 8자), 아니면 None. 머리는 게이트웨이가 서비스 분기에서만 싣는다(클라이언트 사본은 버린다).
     ⚠ 머리가 있는데 작업 꼴이 아니면 **아무것도 열지 않는 작업**(job '')을 돌려준다 — None(일반 요청)으로 떨어뜨리면 정책을 건너뛰는 그룹을 단
-    채로 사람 요청처럼 돈다. jti 앞 8자는 감사 note 만 쓴다 — 인증 미들웨어가 검증한 그 토큰(Authorization, 두 번 실리면 이미 거절됐다)에서 읽는다."""
+    채로 사람 요청처럼 돈다. jti8 은 감사 note 만 쓴다 — 인증 미들웨어가 검증한 그 토큰(Authorization, 두 번 실리면 이미 거절됐다)에서 읽는다."""
     try:
         req = _low.request_context.request
     except LookupError:
@@ -7358,7 +7358,7 @@ def _request_service() -> dict | None:
         return {"job": "", "jti8": ""}
     auth = str(req.headers.get("authorization") or "").strip()
     claims = _pat_claims(auth[7:].strip()) if auth[:7].lower() == "bearer " else None
-    return {"job": job, "jti8": str((claims or {}).get("jti") or "")[:8]}
+    return {"job": job, "jti8": str((claims or {}).get("jti") or "").removeprefix(SERVICE_JTI_PREFIX)[:8]}
 
 
 # 박스 허용 목록(gitignore) — {"jobs": {"<작업>": {"tools": ["<백엔드키>:<원래 이름>", …], "rest": [{"site", "method", "path"}, …]}}}. 바뀐 시각이
@@ -7397,8 +7397,8 @@ def _service_parse(data) -> dict:
 
 def _service_tools() -> dict:
     """박스 허용 목록 {"jobs": {작업: {tools, rest}}} — 바뀐 시각이 다르면 다시 읽는다. 없거나 못 읽으면 빈 표다(모든 서비스 호출이 막힌다).
-    RA · TestScope 의 도구를 적은 작업은 읽을 때마다 ⚠ 한 줄을 남긴다 — 그 서비스 세션은 실제 사람의 토큰이라 그 사람 명의로 쓰고 읽는다(계약 §3).
-    막지는 않는다(운영자가 정한다)."""
+    RA · TestScope 의 도구는 읽을 때 뺀다(작업마다 ⚠ 한 줄 — 기동 때도 읽는다). 그 서비스 세션은 실제 사람의 토큰이라 서비스 작업이 부르면 그
+    사람 행세가 된다(CK-4 · 계약 §3) — 호출은 service-denied(impersonation) 다(_service_denial)."""
     try:
         mt = SERVICE_TOOLS_LOCAL_PATH.stat().st_mtime_ns
     except OSError:
@@ -7414,8 +7414,10 @@ def _service_tools() -> dict:
         for job, spec in jobs.items():
             person = sorted(t for t in spec["tools"] if t.partition(":")[0] in _BUILTIN_CONN)
             if person:
-                log.warning("⚠ 서비스 작업 %s 의 허용 목록에 %s 가 있다 — RA · TestScope 의 서비스 세션은 실제 사람의 토큰이라 그 사람 명의로 "
-                            "쓰고 읽는다. 허용 목록에서 뺀다(HWAXPortal docs/core-link §3)", job, ", ".join(person))
+                spec["tools"] = spec["tools"] - frozenset(person)
+                log.warning("⚠ 서비스 작업 %s 의 허용 목록에서 %s 를 뺐다 — RA · TestScope 의 서비스 세션은 실제 사람의 토큰이라 서비스 작업이 "
+                            "부르면 그 사람 행세가 된다. 호출은 service-denied(impersonation) 다(HWAXPortal docs/core-link CK-4 · §3)",
+                            job, ", ".join(person))
         _SERVICE_TOOLS.update(mtime=mt, jobs=jobs)
     return _SERVICE_TOOLS
 
@@ -7433,6 +7435,8 @@ def _service_denial(name: str, svc: dict) -> str | None:
     resolved = route.get(name) or alias_route.get(name)
     if resolved is None:
         return "unknown-tool"
+    if resolved[0] in _BUILTIN_CONN:
+        return "impersonation"       # RA · TestScope — 서비스 세션이 실제 사람의 토큰이다(읽을 때 목록에서도 뺐다, _service_tools)
     return None if f"{resolved[0]}:{resolved[1]}" in spec["tools"] else "not-listed"
 
 
@@ -8522,8 +8526,11 @@ async def _call_tool_body(name: str, arguments: dict):
             _audit(name, (route.get(name) or alias_route.get(name) or (None,))[0], False, f"service-denied:{_why}", 0,
                    mode="refused", corr=_request_corr())
             return types.CallToolResult(content=[types.TextContent(type="text", text=(
-                f"forbidden: {name} — service-denied({_why}): 서비스 작업 '{_svc.get('job') or '?'}' 의 허용 목록(게이트웨이 "
-                "service_tools.local.json)에 없는 도구다. 필요하면 운영자가 그 작업의 tools 에 '백엔드키:원래 이름' 을 더한다"))], isError=True)
+                f"forbidden: {name} — service-denied({_why}): " + (
+                    "RA · TestScope 의 서비스 세션은 실제 사람의 토큰이라 서비스 작업은 부르지 않는다(허용 목록에 적어도 뺀다 — "
+                    "HWAXPortal docs/core-link CK-4)" if _why == "impersonation" else
+                    f"서비스 작업 '{_svc.get('job') or '?'}' 의 허용 목록(게이트웨이 service_tools.local.json)에 없는 도구다. 필요하면 "
+                    "운영자가 그 작업의 tools 에 '백엔드키:원래 이름' 을 더한다")))], isError=True)
     # 읽기 전용 포털 PAT — 허용 목록 · readOnlyHint · 게이트웨이 자체 조회만(HWAXPortal docs/followups-1017 결정 5).
     if _request_readonly():
         _ro = _readonly_denial(name, arguments or {})
@@ -9173,7 +9180,7 @@ def _bearer_gate(app, pat_verifier=None):
                 _m = scope.get("method", "")
                 _m = _m if _m in ("GET", "POST", "DELETE", "PUT", "PATCH", "HEAD", "OPTIONS") else "OTHER"
                 _audit(f"{_m} {_clip(scope.get('path') or '', 120)}", None, False, "forbidden: service-denied (작업이 허용 목록에 없다)", 0,
-                       caller=f"system:{_job}", mode="refused", note=f"svc:{_svc['jti'][:8]}", via="service",
+                       caller=f"system:{_job}", mode="refused", note=f"svc:{_svc['jti'].removeprefix(SERVICE_JTI_PREFIX)[:8]}", via="service",
                        ip=(scope.get("client") or (None,))[0])
                 await send({"type": "http.response.start", "status": 403, "headers": [(b"content-type", b"application/json")]})
                 await send({"type": "http.response.body", "body": json.dumps(

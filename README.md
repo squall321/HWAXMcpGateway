@@ -62,10 +62,11 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
 - 집행 — tools/list 는 그 작업의 도구만(rest 항목이 있으면 `rest_call` 도) 낸다. 목록 밖 tools/call 은 `forbidden: <도구> — service-denied(…)` 와
   감사 `mode=refused` 이고, `invoke_tool` 을 거쳐도 안쪽 이름으로 같은 판정이다. `rest_call` 은 rest 항목과 맞을 때만 간다. 리소스 · 프롬프트는
   보이지 않는다.
-- 감사 — `caller=system:<작업>` · `note=svc:<jti 앞 8자>` · `via=service`. `/health` 의 `service_jobs` 가 작업마다 도구 수 · REST 수를 싣는다(토큰 ·
+- 감사 — `caller=system:<작업>` · `note=svc:<jti 의 svc- 뒤 8자>`(예 `svc:0123abcd`) · `via=service`. `/health` 의 `service_jobs` 가 작업마다 도구 수 · REST 수를 싣는다(토큰 ·
   jti 없음). 기동 로그에 작업 줄이 하나 남는다.
 - 사람별 위임 앱(리스크 · MX 백서 · DynaForge · ste)은 신원이 없어 서비스 계정으로 불린다. RA · TestScope 는 서비스 세션이 실제 사람의 토큰이라
-  허용 목록에 넣지 않는다 — 넣으면 읽을 때마다(기동 포함) ⚠ 한 줄을 남긴다(막지는 않는다).
+  서비스 작업이 부르면 그 사람 행세가 된다(CK-4) — 허용 목록에 적어도 읽을 때 빼고(작업 · 도구를 짚는 ⚠ 한 줄, 기동 포함) 호출은
+  `service-denied(impersonation)` 이다.
 
 ## 설정 — `gateway_config.json` (gitignore, 시크릿)
 **전체 스키마·플레이스홀더는 커밋된 `gateway_config.example.json` 참고** — fresh 배포 시 이걸 복사해 실토큰만 채운다. `gateway_config.json` 자체는 gitignore(600).

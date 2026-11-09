@@ -13101,7 +13101,7 @@ def test_SRC13_허용_목록에_없는_작업은_문에서_403_이고_파일은_
     assert st == 403 and not h and body["error"] == "forbidden" and "service-denied" in body["detail"], body
     rows = _rows()
     assert len(rows) == 2 and all(r["error"].startswith("forbidden: service-denied") for r in rows)
-    assert {(r["caller"], r["via"], r["mode"], r["note"]) for r in rows} == {(f"system:{_SVC_JOB}", "service", "refused", "svc:svc-0123")}
+    assert {(r["caller"], r["via"], r["mode"], r["note"]) for r in rows} == {(f"system:{_SVC_JOB}", "service", "refused", "svc:0123abcd")}
     _svc_file({_SVC_JOB: {"tools": []}})
     _h, st2, _, _ = _svc_gate(monkeypatch, _svc_claims())
     assert st2 is None, "작업을 더하면 재기동 없이 연다"
@@ -13124,14 +13124,32 @@ def test_SRC13_깨진_허용_목록은_통째로_버려_모든_서비스_호출�
     assert sum("service_tools.local.json" in r.getMessage() for r in caplog.records) == 1, caplog.text
 
 
-def test_SRC13_RA_TestScope_도구를_적은_작업은_읽을_때_경고_한_줄이고_막지는_않는다(monkeypatch, caplog):
+def test_SRC13_RA_TestScope_도구는_읽을_때_빼고_경고하며_호출은_impersonation_으로_막는다(monkeypatch, caplog):
+    """RA · TestScope 의 서비스 세션은 실제 사람의 토큰이다 — 서비스 작업이 부르면 그 사람 행세가 된다(CK-4). 허용 목록에 적어도 읽을 때 빼고
+    작업 · 도구를 짚는 ⚠ 한 줄을 남기며(기동 때도 읽는다), 호출은 service-denied(impersonation) 다(목록에 없어도 같은 까닭으로 막는다)."""
+    ra = _PanelCallSess([_tool("create_report_draft")], [])
+    sf = _PanelCallSess([_tool("run_job")], [])
+    _panel_kit(monkeypatch, {"reportarchive": ra, "heax-step_forge": sf}, groups=(gw.SERVICE_GROUP,))
     with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
         _svc_file({_SVC_JOB: {"tools": ["reportarchive:create_report_draft", "testscope:resolve", "heax-step_forge:run_job"]}})
-        assert len(gw._service_tools()["jobs"][_SVC_JOB]["tools"]) == 3
+        assert gw._service_tools()["jobs"][_SVC_JOB]["tools"] == frozenset({"heax-step_forge:run_job"}), "읽을 때 뺀다"
         gw._service_tools()                                              # 바뀐 시각이 같으면 다시 읽지 않는다 — 경고도 한 번
     warns = [r.getMessage() for r in caplog.records if "⚠" in r.getMessage()]
-    assert len(warns) == 1 and "reportarchive:create_report_draft" in warns[0] and "testscope:resolve" in warns[0], warns
-    assert "heax-step_forge" not in warns[0]
+    assert len(warns) == 1 and _SVC_JOB in warns[0], warns
+    assert "reportarchive:create_report_draft" in warns[0] and "testscope:resolve" in warns[0] and "heax-step_forge" not in warns[0]
+    assert gw._service_health() == {_SVC_JOB: {"tools": 1, "rest": 0}}, "/health 도 뺀 뒤의 수를 싣는다"
+    _as_service(monkeypatch)
+    assert {t.name for t in asyncio.run(gw._list_tools(types.ListToolsRequest()))} == {"run_job"}
+    open(gw.AUDIT_PATH, "w").close()
+    for name, args in (("create_report_draft", {}), ("invoke_tool", {"name": "create_report_draft", "arguments": {}})):
+        res = asyncio.run(gw._call_tool(name, args))
+        text = res.content[0].text
+        assert res.isError and text.startswith("forbidden:") and "service-denied(impersonation)" in text, (name, text)
+    assert ra.calls == [], "사람의 토큰으로 된 서비스 세션까지 가지 않는다"
+    assert [r["error"] for r in _rows()] == ["service-denied:impersonation", "service-denied:impersonation"]
+    _svc_file({_SVC_JOB: {"tools": ["heax-step_forge:run_job"]}})          # 목록에 없어도 같은 까닭이다
+    assert "service-denied(impersonation)" in asyncio.run(gw._call_tool("create_report_draft", {})).content[0].text
+    assert not asyncio.run(gw._call_tool("run_job", {})).isError and sf.calls == ["run_job"]
 
 
 def test_SRC13_health_는_작업마다_도구_수와_REST_수만_싣는다(monkeypatch):
@@ -13222,7 +13240,7 @@ def test_SRC13_서비스_PAT_의_호출은_허용_목록만_닿고_밖은_forbid
         assert not ok and text.startswith("forbidden:") and "service-denied" in text, (name, text)
     assert sf.calls == ["run_job", "run_job"] and krm.calls == [], (sf.calls, krm.calls)
     rows = _rows()
-    assert all(r["caller"] == f"system:{_SVC_JOB}" and r["via"] == "service" and r["note"] == "svc:svc-0123" for r in rows), rows
+    assert all(r["caller"] == f"system:{_SVC_JOB}" and r["via"] == "service" and r["note"] == "svc:0123abcd" for r in rows), rows
     assert [r["ok"] for r in rows[:2]] == [True, True] and rows[0]["mode"] == "service"
     assert all(r["mode"] == "refused" and r["error"].startswith("service-denied:") for r in rows[2:]), rows[2:]
     assert {r["error"] for r in rows[2:]} == {"service-denied:not-listed", "service-denied:gateway-tool", "service-denied:no-rest",
@@ -13266,7 +13284,7 @@ def test_SRC13_서비스_PAT_의_rest_call_은_사이트_메서드_경로가_글
         assert "known" not in out, "목록 밖 호출에 이 박스의 사이트 목록을 알려 주지 않는다"
     assert seen == [("GET", "/api/parts")], "막힌 호출이 상류로 나갔다"
     rows = [r for r in _rows() if r["tool"].startswith("rest_call")]
-    assert rows[0]["ok"] and rows[0]["caller"] == f"system:{_SVC_JOB}" and rows[0]["note"] == "svc:svc-0123"
+    assert rows[0]["ok"] and rows[0]["caller"] == f"system:{_SVC_JOB}" and rows[0]["note"] == "svc:0123abcd"
     assert len(rows) == 7 and all(r["mode"] == "refused" and r["error"] == "service-denied:rest-not-listed" for r in rows[1:])
 
 
@@ -13307,7 +13325,7 @@ def test_SRC13_감사_note_는_서비스_표지를_앞에_붙인다(monkeypatch)
     _as_service(monkeypatch)
     gw._audit("t", "b", True, None, 1, note="cache-hit")
     r = _rows()[-1]
-    assert (r["caller"], r["via"], r["note"]) == (f"system:{_SVC_JOB}", "service", "svc:svc-0123+cache-hit")
+    assert (r["caller"], r["via"], r["note"]) == (f"system:{_SVC_JOB}", "service", "svc:0123abcd+cache-hit")
     _set_request(monkeypatch, {gw.VIA_HEADER: "pat", gw.USER_HEADER: "u%40x.io"}, "203.0.113.7")
     gw._audit("t", "b", True, None, 1, note="cache-hit")
     r = _rows()[-1]
@@ -13478,7 +13496,7 @@ def test_SRC15_서비스_작업의_쓰기는_그_작업의_rest_항목만_서비
     claims = gw._sso_assertion_claims(u.headers["x-heax-sso-assertion"], "sfsso_")
     assert claims["s"] == _SVC_JOB and "e" not in claims and "x-forwarded-user" not in u.headers
     [row] = _rc_rows()
-    assert (row["caller"], row["via"], row["note"]) == (f"system:{_SVC_JOB}", "service", "svc:svc-0123+rest:POST /api/onto-link")
+    assert (row["caller"], row["via"], row["note"]) == (f"system:{_SVC_JOB}", "service", "svc:0123abcd+rest:POST /api/onto-link")
     out2 = _sf_call("POST", "/api/onto-define")                       # 정해진 셋 안이어도 그 작업의 rest 항목 밖
     assert out2["status"] == 403 and "service-denied" in out2["error"] and len(mints) == 1 and len(ups) == 1, out2
 

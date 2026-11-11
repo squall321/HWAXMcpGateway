@@ -563,6 +563,8 @@ def test_StepForge_단언_쓰기는_주소를_env_로_바꾸고_비밀이_없으
     assert "rest_sso" not in (out.get("heax_registry") or {})
     assert set(out["rest"]["step-forge"]) == {"base", "inject"}, "단언 칸이 없으면 사이트는 지금 그대로다"
     assert "StepForge 단언 쓰기 꺼짐" in log[0] and "STEPFORGE_SSO_SECRET" in log[0], "안 켠 것도 켜는 법과 함께 말한다"
+    assert "secrets.env 의 STEPFORGE_SSO_SECRET 과 같은 값" in log[0] and "GATEWAY_SECRET 과 같은" not in log[0], \
+        "맞출 값은 StepForge 가 따로 둔 STEPFORGE_SSO_SECRET 이다 — 포털 신원 검증의 STEPFORGE_GATEWAY_SECRET 이 아니다(StepForge 착지 11-11)"
 
 # ── 일반 앱 위임(PER_USER_SSO_APPS) — 여섯 번째 앱부터 provision-config.sh 를 고치지 않는다(change-request-8-10 #8) ──
 GENERIC_MARK = {"managed_by": "PER_USER_SSO_APPS"}      # 순회가 쓴 항목의 표지 — 목록에서 뺀 앱을 끌 때 이것으로 가린다

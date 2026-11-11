@@ -4955,7 +4955,7 @@ async def _rest_call(args: dict) -> types.CallToolResult:
             _audit(f"rest_call {method} {path}", site, False, f"assertion: rest_sso.{dlg} 없음", 0, caller=caller, note=note_w)
             return _rest_text({"error": f"{site} 의 단언 쓰기가 꺼져 있다",
                                "detail": f"게이트웨이 heax_registry.rest_sso.{dlg} 가 없다 — 켜려면 provision.env(포털은 infra/.env)에 "
-                                         "STEPFORGE_SSO_SECRET(StepForge 의 STEPFORGE_GATEWAY_SECRET 과 같은 값)을 적고 provision-config.sh "
+                                         "STEPFORGE_SSO_SECRET(StepForge secrets.env 의 STEPFORGE_SSO_SECRET 과 같은 값 — STEPFORGE_GATEWAY_SECRET 과는 따로)을 적고 provision-config.sh "
                                          "--force 뒤 게이트웨이를 다시 띄운다."})
         if svc is not None:
             kind, subject = "s", str(svc.get("job") or "")     # 위에서 그 작업의 rest 항목과 맞춰 봤다

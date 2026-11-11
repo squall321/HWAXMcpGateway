@@ -13657,6 +13657,8 @@ def test_SRC15_rest_sso_가_없으면_쓰기는_거절하고_켜는_법을_말�
     mints, ups = _sf_kit(monkeypatch, sso=False)
     out = _sf_call("POST", "/api/onto-link")
     assert "꺼져 있다" in out["error"] and "STEPFORGE_SSO_SECRET" in out["detail"] and mints == [] and ups == [], out
+    # 맞출 값은 StepForge 가 따로 둔 secrets.env 의 STEPFORGE_SSO_SECRET 이다 — 포털 신원 검증의 STEPFORGE_GATEWAY_SECRET 이 아니다(StepForge 착지 11-11)
+    assert "secrets.env 의 STEPFORGE_SSO_SECRET 과 같은 값" in out["detail"] and "GATEWAY_SECRET 과 같은" not in out["detail"], out["detail"]
     assert _sf_call("GET", "/api/parts")["status"] == 200 and mints == []
 
 

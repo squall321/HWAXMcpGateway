@@ -50,7 +50,8 @@
 #  10) SmartTwinMCP: SMARTTWIN_MCP_URL(> 직전 config 의 **기본값이 아닌** 주소)이 있으면 smart-twin-mcp 백엔드.
 #      예전처럼 같은 박스 기본 주소로 무조건 등재하지 않는다 — 띄운 적 없는 박스에서 가짜 DOWN 이 남았다.
 #      같은 박스에서 쓰는 곳(dev)도 provision.env 에 SMARTTWIN_MCP_URL=http://127.0.0.1:5013/mcp 를 적는다.
-#  11) StepForge 단언 쓰기: STEPFORGE_SSO_SECRET(StepForge 의 STEPFORGE_GATEWAY_SECRET 과 같은 값, + STEPFORGE_SSO_URL — 기본은
+#  11) StepForge 단언 쓰기: STEPFORGE_SSO_SECRET(StepForge secrets.env 의 STEPFORGE_SSO_SECRET 과 같은 값 — STEPFORGE_GATEWAY_SECRET 과는 따로,
+#      + STEPFORGE_SSO_URL — 기본은
 #      <HEAX_MCP_BASE>/apps/step_forge/api/auth/sso)이 있으면 heax_registry.rest_sso.step_forge 와 rest.step-forge 의 delegate · write_paths.
 #      per_user_sso 와 따로 둔다(StepForge MCP 길은 공유 세션 그대로 — HWAXPortal docs/core-link CK-3). 비밀이 없는 실행은 직전 항목을 이어받는다.
 #
@@ -886,7 +887,8 @@ if per_user:
     cfg.setdefault("heax_registry", {})["per_user_sso"] = per_user
 # StepForge 단언 쓰기(HWAXPortal docs/core-link §5 · CK-3) — 챗의 사람(또는 서비스 PAT 의 작업)이 REST 다리로 StepForge 의 정해진 쓰기 경로
 # (온톨로지 잇기 · 넣기 · 정의)를 그 명의로 부른다. per_user_sso 와 **따로** 둔다(rest_sso) — 거기 두면 게이트웨이가 StepForge MCP 호출 전부를
-# 사람별 세션으로 바꾼다. 비밀은 StepForge 의 STEPFORGE_GATEWAY_SECRET 과 같은 값이고, 주소는 hwax_risk 처럼 Caddy 경로(forward_auth 를 서비스
+# 사람별 세션으로 바꾼다. 비밀은 StepForge secrets.env 의 STEPFORGE_SSO_SECRET 과 같은 값이고(발급 비밀이자 단언의 HMAC 키 — 포털 신원 검증의
+# STEPFORGE_GATEWAY_SECRET 과는 따로다), 주소는 hwax_risk 처럼 Caddy 경로(forward_auth 를 서비스
 # 토큰으로 통과 — auth heax, 단언은 token_header 로). 비밀이 없는 실행은 직전 항목을 이어받는다(hwax_risk 와 같은 규칙).
 rest_sso = dict(_prev("heax_registry", "rest_sso") or {})
 if e.get("STEPFORGE_SSO_SECRET"):
@@ -900,7 +902,8 @@ if e.get("STEPFORGE_SSO_SECRET"):
     print(f"  ✓ StepForge 단언 쓰기(rest_sso.step_forge) — {rest_sso['step_forge']['sso_url']}")
 elif "step_forge" not in rest_sso:
     print("  · StepForge 단언 쓰기 꺼짐(rest_sso.step_forge 없음) — 챗의 StepForge 온톨로지 적용(REST POST)은 거절된다. 켜려면 provision.env 에 "
-          "STEPFORGE_SSO_SECRET(StepForge 의 STEPFORGE_GATEWAY_SECRET 과 같은 값) 을 적고 update-all 재실행(손으로 돌릴 때는 env 로 주고 --force)")
+          "STEPFORGE_SSO_SECRET(StepForge secrets.env 의 STEPFORGE_SSO_SECRET 과 같은 값 — STEPFORGE_GATEWAY_SECRET 과는 따로) 을 적고 update-all 재실행"
+          "(손으로 돌릴 때는 env 로 주고 --force)")
 if rest_sso:
     cfg.setdefault("heax_registry", {})["rest_sso"] = rest_sso
 

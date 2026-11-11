@@ -55,6 +55,7 @@
     "fmea": "quality",
     "siren": "quality",
     "odb-hub": "cad",
+    "devlab-checklist": "cad",
     "arp": "result",
     "simflow": "sim",
     "simengbay": "sim",

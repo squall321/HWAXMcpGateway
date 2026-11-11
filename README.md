@@ -29,12 +29,49 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
   확인하고 더했다. 루틴 단계의 이름 규칙을 좁히며(아래 — R3 리뷰 2차) 그 규칙으로만 열리던 진짜 읽기 일곱도 소스로 확인하고 더했다
   (`signalforge:resolve_product_keyword` · `heax-step_forge:resolve_materials` · `reportarchive:resolve` · `testscope:resolve` — `resolve` 가 조회 낱말에서
   빠졌다, `heax-step_forge:upload_instructions` · `heax-kooremapper_mcp:report_upload_instructions` — 안내 글만 준다, `reportarchive:preview_publish` — 게시
-  미리보기, 게시하지 않고 확인 토큰은 서명뿐이라 저장이 없다). 같은 파일의 `deny` 는 루틴 단계만 닫는다 — 읽기 전용 PAT 판정은 보지 않는다.
+  미리보기, 게시하지 않고 확인 토큰은 서명뿐이라 저장이 없다). 11-09 에 쓰기 낱말(`_WRITE_NAME`)에 `link` · `edit` · `sync` 를 더하며
+  둘을 더했다 — 그 낱말로 막히게 된 `ste:get_sync_settings`(설정 조회)와 쓰지 않는 미리 보기 `heax-kooremapper_mcp:plan_task_links`
+  (HWAXPortal docs/core-link CK-5). 같은 파일의 `deny` 는 루틴 단계만 닫는다 — 읽기 전용 PAT 판정은 보지 않는다.
 - 게이트웨이 자체 도구 — 조회(search_tools · list_tool_apps · rest_catalog · search_conversations · browse_experts · use_experts ·
   verify_answer)는 열고 `save_conversation` 은 막는다. `rest_call` 과 REST 다리(`/api/<site>/`)는 GET · HEAD 만. `invoke_tool` 은 안쪽 도구로 본다.
 - 표지 `x-hwax-readonly` 는 PAT 분기에서만 싣고 클라이언트 사본은 두 분기(GW_TOKEN · PAT) 모두 버린다.
 - 판정 밖 — 읽기 PAT 로 포털 `/agent/chat` · 카드 대조를 부르면 포털이 챗 PAT 를 새로 찍어 심의(RA 초안 저장)가 돈다. 리스크 앱 패널의
   길이라 그대로 둔다(결정 FU-D17).
+
+## 서비스 PAT — 박스 작업의 신원(HWAXPortal docs/core-link SRC-13 · 계약 design §3)
+
+박스 작업(update-all 훅 등)이 사람 손 없이 부르는 신원이다. 포털 관리자가 작업마다 찍고(`POST /auth/pat/service`, 1 ~ 365일), 회수는 기존
+폐기 목록(`revoked.json`, 60초마다 읽는다)이다. 게이트웨이 공유 비밀(GW_TOKEN)은 `x-hwax-user` 를 믿어 아무 사람으로나 행세하므로 박스 작업에
+내주지 않는다(CK-4).
+
+- 받는 꼴(`_service_scope`) — 청중은 `mcp-gateway-service` 하나뿐(다른 청중이 섞이면 거절) · `purpose: service` · jti 머리 `svc-` ·
+  `sub: system:<작업>`(작업은 `^[a-z0-9][a-z0-9-]{0,39}$`) · `scope: api` · `scopes: ["service"]` · 수명 365일까지. 서비스 표지(purpose · 서비스 청중 ·
+  `system:` sub · `service` scope) 가운데 하나라도 있는데 꼴이 어긋나면 401(감사 `unauthorized: bad-service-token`)이다 — 일반 PAT 로 떨어지지
+  않는다. jti 머리는 표지가 아니다(사람 PAT 의 jti 는 무작위라 우연히 `svc-` 로 시작할 수 있다 — 꼴 검사에만 쓴다). 이메일 · 그룹 칸은 보지 않는다.
+- 허용 목록 — 리포 루트의 `service_tools.local.json`(gitignore). 바뀐 시각이 다르면 재기동 없이 다시 읽고, 꼴이 하나라도 틀리면 통째로 버려
+  모든 서비스 호출을 막는다(경고 한 줄). 파일에 없는 작업의 토큰은 문에서 **403** 이다.
+
+  ```json
+  {"jobs": {"core-link": {"tools": ["heax-step_forge:run_job", "heax-kooremapper_mcp:plan_task_links"],
+                          "rest":  [{"site": "step-forge", "method": "POST", "path": "/api/onto-link"}]}}}
+  ```
+
+  `tools` 는 `백엔드키:원래 이름`(노출 이름 · 별칭은 원래 이름으로 푼다), `rest` 는 사이트 · 메서드 · 경로가 글자 그대로 맞아야 연다(앞머리
+  맞춤 없음 — GET · HEAD 도 적는다).
+- 요청 신원 — `x-hwax-user` 를 싣지 않고 안쪽 머리 `x-hwax-service: <작업>` 를 싣는다(클라이언트가 보낸 사본은 모든 분기가 버린다). `via=service`,
+  그룹은 `gateway:service` 라 포털 접근 정책을 건너뛴다 — 울타리는 허용 목록이다.
+- 집행 — tools/list 는 그 작업의 도구만(rest 항목이 있으면 `rest_call` 도) 낸다. 목록 밖 tools/call 은 `forbidden: <도구> — service-denied(…)` 와
+  감사 `mode=refused` 이고, `invoke_tool` 을 거쳐도 안쪽 이름으로 같은 판정이다. `rest_call` 은 rest 항목과 맞을 때만 간다. 리소스 · 프롬프트는
+  보이지 않는다.
+- 감사 — `caller=system:<작업>` · `note=svc:<jti 의 svc- 뒤 8자>`(예 `svc:0123abcd`) · `via=service`. `/health` 의 `service_jobs` 가 작업마다 도구 수 · REST 수를 싣는다(토큰 ·
+  jti 없음). 기동 로그에 작업 줄이 하나 남는다.
+- 사람별 위임 앱(리스크 · MX 백서 · DynaForge · ste)은 신원이 없어 서비스 계정으로 불린다. RA · TestScope 는 서비스 세션이 실제 사람의 토큰이라
+  서비스 작업이 부르면 그 사람 행세가 된다(CK-4) — 허용 목록에 적어도 읽을 때 빼고(작업 · 도구를 짚는 ⚠ 한 줄, 기동 포함) 호출은
+  `service-denied(impersonation)` 이다.
+- 신원 전달 백엔드(`IDENTITY_FWD_BACKENDS`, 기본이자 dev 값 `hwax-deliberation`)도 같은 자리에서 빼고 호출은 `service-denied(identity-forward)` 다.
+  서비스 요청은 사람 · 작업 머리 없이 `gateway:service` 그룹만 실려 그쪽에는 공유 비밀의 내부 호출로 보이고, 심의 엔진은 GW_TOKEN 으로
+  게이트웨이를 다시 불러(서비스 울타리 밖) 지정 도구를 돌리고 RA 공유 세션으로 쓰며, 목록 도구는 모든 사람의 잡을 본다. 서비스 신원을 실어
+  보낼 길이 생기기 전까지 닫아 둔다.
 
 ## 설정 — `gateway_config.json` (gitignore, 시크릿)
 **전체 스키마·플레이스홀더는 커밋된 `gateway_config.example.json` 참고** — fresh 배포 시 이걸 복사해 실토큰만 채운다. `gateway_config.json` 자체는 gitignore(600).
@@ -51,7 +88,7 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
 ## 내부 목적지는 사내 프록시를 거치지 않는다 — `NO_PROXY` 자동 유도
 httpx 는 환경의 `HTTP(S)_PROXY` 를 따른다(`trust_env` 기본값). 사내 프록시가 걸린 박스에서는 내부 백엔드 호출까지 프록시로 나가고, 상대가 IP 허용목록으로 거절한다(RA 사람별 위임 403). 게이트웨이는 **설정을 읽은 직후**(클라이언트를 하나도 만들기 전에) 자기가 부르는 주소의 호스트를 `NO_PROXY`·`no_proxy` 에 더한다 — 운영자가 셸에 따로 적지 않아도 된다.
 
-- 모으는 곳 — 백엔드 `url` · `heax_registry.per_user_sso.*.sso_url`·`portal_pat_url` · `rest.*.base` · `portal.api_base`·`jwks_url`·`revoked_url` · `heax_registry.servers_url`·`base`. 레지스트리로 뒤늦게 발견되는 앱은 발견할 때 같은 함수로 더한다. `127.0.0.1`·`localhost`·`::1` 은 늘 넣는다.
+- 모으는 곳 — 백엔드 `url` · `heax_registry.per_user_sso.*.sso_url`·`portal_pat_url` · `heax_registry.rest_sso.*.sso_url` · `rest.*.base` · `portal.api_base`·`jwks_url`·`revoked_url` · `heax_registry.servers_url`·`base`. 레지스트리로 뒤늦게 발견되는 앱은 발견할 때 같은 함수로 더한다. `127.0.0.1`·`localhost`·`::1` 은 늘 넣는다.
 - 있던 값은 지우지 않는다. 한쪽 철자에만 있으면 다른 쪽이 그 값을 이어받고(파이썬은 소문자를 먼저 본다), 둘 다 있으면 각자 제 값 뒤에 붙인다. 값이 `*` 하나면 그대로 둔다.
 - 호스트만 적는다(포트·계정·쿼리는 뺀다). CIDR 이나 `.example.com` 항목이 이미 있어도 주소를 따로 더한다 — httpx 는 CIDR 을 대역으로 읽지 않고, 점으로 시작하는 항목은 하위 도메인만 덮는다.
 - 무엇을 더했는지는 기동 로그에 호스트 이름으로 남는다(`NO_PROXY 에 내부 목적지 N곳을 더했다`). IP·평범한 DNS 이름이 아닌 호스트는 적지 않고 경고를 남긴다.
@@ -74,6 +111,26 @@ MCP fan-out과 같은 패턴("호출자 토큰 1개 → 백엔드별 네이티�
 
 포털 PAT는 `POST /auth/pat`(세션+CSRF, `audiences`는 config `portal.audience_ok` 내에서), 폐기는 `DELETE /auth/pat/{jti}` → `/auth/pat/revoked.json`에 등장(게이트웨이가 폴링).
 
+### StepForge 단언 쓰기 — `rest.step-forge.delegate` · `heax_registry.rest_sso`(HWAXPortal docs/core-link SRC-15 · 계약 §5)
+
+챗의 사람(또는 서비스 PAT 의 작업)이 `rest_call(site="step-forge", method="POST", path=…)` 로 StepForge 온톨로지 적용을 **그 명의로** 부른다.
+GET · HEAD 는 지금 그대로(`inject` — 허브 서비스 토큰)이고, StepForge MCP 길도 공유 세션 그대로다 — 발급 칸을 `per_user_sso` 와 따로
+(`rest_sso.step_forge`) 둔 까닭이다(CK-3). REST 프록시(`/api/step-forge/`)는 단언을 싣지 않아 읽기만 그대로다(`allowed_methods`) — 클라이언트가
+보낸 `X-Heax-Sso-Assertion` 도 상류로 넘기지 않는다(가로챈 단언을 그 수명 동안 되쓰지 못하게).
+
+- 쓰기 — `write_paths`(`/api/onto-link` · `/api/onto-put` · `/api/onto-define` · `/api/onto-fill` · `/api/plm-sync`)의 POST 만 연다. 사람(PAT · 챗의 그 사람 이메일)은 사람 단언, 서비스는
+  그 작업의 `rest` 항목에 있을 때만 서비스 단언이다. 신원이 없으면(GW_TOKEN 만) `신원이 없다`(`status: 403`), 그 밖의 쓰기 메서드 · 경로는
+  `method not allowed for this path`(`status: 405`)다. 읽기 전용 토큰 · 루틴은 지금처럼 `rest_call` 쓰기를 막는다.
+- 운반 — `Authorization: Bearer <허브 서비스 토큰>`(Caddy 문) + `X-Heax-Sso-Assertion: <단언>`(주체). `x-forwarded-user` 는 사람일 때 지금처럼 싣는다.
+- 발급 — `POST <sso_url>` 에 `X-Heax-Gateway-Secret` · 주체 하나(`X-Hwax-Delegate-Email` 또는 `X-Hwax-Delegate-Service`) · `X-Heax-Client` · Caddy 용
+  `Authorization`. 답 `{"token": "sfsso_…", "expires_in": N}` 을 주체마다 `expires_in − 60초` 까지 캐시한다(60초 이하 · 없음은 담지 않는다). 받은
+  토큰은 `sfsso_` 머리에 읽히는 몸이어야 하고(아니면 — 예: 주소가 다른 앱 창구를 가리켜 개인 토큰이 왔다 — 발급 실패), 주체 칸은 정확히 하나
+  (`e` 또는 `s` — 값이 아니라 칸이 있는지로 본다)가 청한 것과 같아야 한다. 어긋나면 발급 실패다 — 서비스 토큰으로 쓰지 않는다. 위층이 401 · 403
+  이면 그 단언을 캐시에서 버린다(쓰기라 다시 보내지는 않는다).
+- 감사 — `caller` 는 그 이메일 또는 `system:<작업>`, 쓰기 경로 호출은 `note` 에 `rest:POST <경로>`(버렸으면 `+assertion-dropped`).
+- 설정 — `provision-config.sh` 가 `STEPFORGE_SSO_SECRET` 으로 만든다(아래 표). 칸이 없으면 쓰기는 거절하고 켜는 법을 말한다. `rest_catalog` 는
+  켜진 사이트에만 `write_paths` 를 싣는다.
+
 ## ste 방식 사람별 위임 — `heax_registry.per_user_sso`
 게이트웨이가 서비스의 `POST /api/auth/sso` 에 공유 비밀(`X-Heax-Gateway-Secret`)과 호출자 이메일을 보내 **그 사람 토큰**을 받아 그 명의로 부른다. 토큰은 12시간 캐시하되 응답의 `expires_in` 이 더 짧으면 그보다 2분 먼저 버린다. 그 2분은 위임 백엔드의 도구가 짧거나 토큰을 요청이 도착할 때만 본다는 전제이고, **발급자가 주는 수명은 호출 한도(`GATEWAY_CALL_TIMEOUT`, 600초)보다 길어야 한다**(hwax_risk `HWAXRISK_SSO_TTL_S` 900초) — 길지 않으면 발급 때 경고를 남긴다. 백엔드가 401 이면 한 번 다시 받고, 받지 못하면 거부한다(서비스 계정으로 강등하지 않는다). 포털은 토큰을 쥐지 않는다.
 
@@ -94,6 +151,7 @@ MCP fan-out과 같은 패턴("호출자 토큰 1개 → 백엔드별 네이티�
 | `STE_SSO_SECRET` · `STE_SSO_URL` | `per_user_sso.ste` |
 | `RA_SSO_SECRET` · `RA_SSO_URL`(기본 `http://127.0.0.1:3000/api/auth/sso`) | `per_user_sso.reportarchive` + `strip_headers: ["X-Workspace-Slug"]`. 서비스 백엔드(`RAT_TOKEN`)는 그대로 — 도구 목록은 그 세션으로 모은다 |
 | `TESTSCOPE_SSO_SECRET` · `TESTSCOPE_SSO_URL`(기본 없음 — 운영에서는 포털이 `TESTSCOPE_BASE_URL` 에서 유도해 넘긴다) | `per_user_sso.testscope`(부서 헤더가 없어 `strip_headers` 없음). 주소를 모르면 만들지 않고 생략을 로그에 남긴다 |
+| `STEPFORGE_SSO_SECRET`(StepForge 의 `STEPFORGE_GATEWAY_SECRET` 과 같은 값) · `STEPFORGE_SSO_URL`(기본 `<HEAX_MCP_BASE>/apps/step_forge/api/auth/sso`) | `rest_sso.step_forge`(`per_user_sso` 가 **아니다** — 위 'StepForge 단언 쓰기') + 허브 토큰이 있으면 `rest.step-forge` 의 `delegate` · `write_paths`. 비밀이 없는 실행은 직전 항목을 이어받고, 없으면 꺼짐을 로그에 남긴다 |
 | `PER_USER_SSO_APPS`(공백 구분 `<per_user 키>:<ENV 접두>`, 예 `newapp:NEWAPP`) + `<접두>_SSO_SECRET` · `<접두>_SSO_URL`(기본 없음) | `per_user_sso.<키>` = `{sso_url, secret, client: "gateway", managed_by: "PER_USER_SSO_APPS"}` — 이 모양의 앱은 `provision-config.sh` 를 고치지 않고 붙는다. `managed_by` 는 이 순회가 쓴 항목이라는 표지다(게이트웨이는 읽지 않는다 — 목록에서 뺀 앱을 끌 때 가린다). 규칙은 TestScope 와 같고(env > 직전 config 주소, 주소를 모르면 만들지 않고 로그에 남긴다, 비밀 없는 실행은 이어받는다), 손으로 붙여 둔 필드(`strip_headers` 등)는 남는다. 스크립트가 직접 만드는 다섯 키(`kooremapper_mcp`·`hwax_risk`·`ste`·`reportarchive`·`testscope`)와 못 읽은 쌍은 건너뛰고 그 사실을 로그에 남긴다. 한 키를 두 번 적으면 **먼저 적힌 쌍만** 쓰고 뒤 쌍은 경고와 함께 건너뛴다(HWAXPortal update-all 과 같은 읽기 — 끄기 판정도 먼저 적힌 쌍의 비밀을 본다) |
 | `PER_USER_SSO_OFF`(공백 구분 `reportarchive`·`testscope` — HWAXPortal update-all 이 infra/.env 의 빈 비밀을 보고 넘긴다 — 와 일반 앱의 키) | 그 위임 항목을 지운다(토큰 등록으로 되돌리기 — 일반 앱은 등록 토큰 길이 없어 서비스 계정으로 나간다). 비밀 없는 손 실행은 직전 값을 이어받으므로 끄는 길은 이것뿐이다. 비밀이 같이 오면 끄지 않는다. 일반 앱은 두 경우에 꺼진다 — 그 실행의 `PER_USER_SSO_APPS` 에 쌍이 있고 비밀이 비었을 때, 또는 쌍째 빠졌고 항목에 `managed_by` 표지가 있을 때(앱을 걷으며 줄을 지운 경우). 어느 쪽이든 이름이 와야 한다 — 목록이 비었다고 스크립트가 스스로 지우지는 않는다(손 실행에는 목록이 없다). 넘기는 쪽은 provision.env 를 읽은 호출자다(update-all, 손으로는 `PER_USER_SSO_OFF=<키>` 를 주고 `--force`). 표지 없는 항목(손으로 붙인 위임, `ste`·`hwax_risk` 등)은 이름이 와도 지우지 않는다 |
 | `KOORM_SEND_PLAT`(1 · true · yes · on 이면 켬, 그 밖의 값이면 — 빈 값도 — 끔, 안 적으면 직전 config) | `per_user_sso.kooremapper_mcp.send_plat` — DynaForge 위임 호출에 호출자의 `plat:` 권한을 서명과 함께(`X-Heax-User-Plat` · `X-Heax-Plat-Proof`) 싣는다. 위임 항목은 env 가 아니라 KooRemapper `.env` 의 게이트웨이 비밀로 생기고, 비밀을 다시 읽어 항목을 새로 쓰는 실행도 직전 값을 잇는다. 일반 앱의 `<접두>_SEND_PLAT` 과 한 곳이 다르다 — 그것은 그 앱의 비밀이 있는 실행에서만 읽혀 비밀 없는 실행에서는 `0` 도 끄지 못하고, 이것은 비밀 없이 항목째 이어받은 실행에도 먹는다(켬 · 끔 둘 다 — 이 비밀은 provision.env 가 아니라 KooRemapper `.env` 에 있어 heax 토큰이나 그 리포가 없는 실행은 읽지 못한다). 그래서 이것을 본떠 판정하는 쪽(포털의 드리프트 판정 등)은 비밀이 아니라 항목이 있는지로 가른다. 위임이 없으면 칸만 만들지 않고 생략을 로그에 남긴다. 값은 호출자의 환경에서 읽는다(이 스크립트는 provision.env 를 읽지 않는다). provision.env 에 적은 값은 그 파일을 export 해 넘기는 실행에서 그대로 먹으니(HWAXPortal update-all 의 MCP 자동 복구가 이미 그렇게 넘긴다) 켤 때가 되기 전에는 적지 않는다. 손으로 켤 때는 이 디렉터리에서 `( set -a; . ./provision.env; set +a; KOORM_SEND_PLAT=1 bash provision-config.sh --force )` 로 돌리고 게이트웨이를 다시 띄운다 — provision.env 없이 맨손으로 돌리면 거기에만 적힌 설정이 빠진다(예: `SMARTTWIN_MCP_URL` 만 믿던 smart-twin-mcp 백엔드가 config 에서 빠진다) |

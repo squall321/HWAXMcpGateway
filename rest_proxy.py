@@ -25,10 +25,13 @@ _HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
         "trailers", "transfer-encoding", "upgrade", "host", "content-length", "authorization"}
 # 클라이언트가 실어 보내도 상류로 넘기지 않는 것 — 위임 발급의 호출자 헤더는 게이트웨이만 싣는다(gateway.DELEGATE_HEADER).
 # 앱은 시크릿 대조 뒤 이 값을 그대로 믿고, Caddy 는 이 이름을 지우지 않는다.
-_NEVER_FORWARD = {"x-hwax-delegate-email",
+_NEVER_FORWARD = {"x-hwax-delegate-email", "x-hwax-delegate-service",
                   # 소속 · plat 증명(gateway AFF_HEADER · PLAT_HEADER) — 사람별 경로에서 게이트웨이가 지은 것만 간다. 클라이언트 사본은
                   # 서명이 맞을 리 없지만, 같은 이름이 둘 실리면 앱이 어느 쪽을 읽을지 모른다(HWAXPortal docs/mxwp-wiki P4).
-                  "x-heax-user-affiliation", "x-heax-aff-proof", "x-heax-user-plat", "x-heax-plat-proof"}
+                  "x-heax-user-affiliation", "x-heax-aff-proof", "x-heax-user-plat", "x-heax-plat-proof",
+                  # 서명 단언(StepForge · 리스크 앱의 X-Heax-Sso-Assertion) — 게이트웨이가 받은 것만 싣는다(rest_call 의 단언 쓰기 · per_user 의
+                  # token_header 는 거르기 뒤에 제 값을 넣는다). 클라이언트 사본을 넘기면 가로챈 단언이 수명(최대 한 시간) 동안 이 길로 되쓰인다.
+                  "x-heax-sso-assertion"}
 
 
 
@@ -94,6 +97,10 @@ def allowed_methods(conf: dict) -> list[str] | None:
     # **유일한 관문**이라 '권한 상승이 없다' 가 아니라 '아무 통제도 없다' 였다. 게다가 이제
     # `rest_call` 로 LLM 이 부를 수 있어서, 전문가챗 허가만 있는 사람(feat:expert-chat 이
     # plat:aidatahub 를 함의한다)이 변경 op 를 그대로 부를 수 있었다.
+    #
+    # ⚠ `delegate` · `write_paths`(StepForge — HWAXPortal docs/core-link §5)는 여기서 열지 않는다. 그 쓰기는 MCP 다리(`gateway._rest_call`)만
+    # 부르는 사람의 서명 단언을 실어 보낸다. 이 프록시(`/api/<site>/`)는 단언을 싣지 않으므로 그런 사이트도 GET · HEAD 그대로다 — 열면 서비스
+    # 토큰(inject)으로 쓰기가 나간다.
     return None if credential_mode(conf) == "per_user" else ["GET", "HEAD"]
 
 class PortalPatVerifier:

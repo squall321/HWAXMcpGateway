@@ -25,3 +25,6 @@ search_tuning.local.json
 # 루틴 단계 읽기 목록의 박스 덧씌우기(HWAXPortal docs/analysis-routines R3 리뷰 #0) — read_tools.json 과 같은 꼴, 박스에서 커밋 없이 더한다.
 # 무시 목록에 없으면 deploy-all · update-all 의 git stash -u 가 치운다
 read_tools.local.json
+# 서비스 PAT 작업별 허용 목록(HWAXPortal docs/core-link SRC-13) — 박스마다 운영자가 쓴다. 무시 목록에 없으면 deploy-all · update-all 의
+# git stash -u 가 치운다
+service_tools.local.json

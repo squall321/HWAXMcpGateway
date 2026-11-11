@@ -524,6 +524,46 @@ def test_리스크_포털_PAT_등록_주소는_env_로_바꾸고_유도할_수_�
     assert "portal_pat_url" not in out["heax_registry"]["per_user_sso"]["hwax_risk"], "모르는 주소를 지어내지 않는다"
     assert "portal_pat_url 생략" in log[0] and "HWAXRISK_PORTAL_PAT_URL" in log[0], "빠진 사실과 켜는 법을 말해야 한다"
 
+
+# ── StepForge 단언 쓰기(HWAXPortal docs/core-link SRC-15 · 계약 §5 · CK-3) — rest_sso 는 per_user_sso 와 따로, 쓰기 경로는 셋만 ──────────────
+_SF_SSO_ENTRY = {"sso_url": "https://hub.example:8443/apps/step_forge/api/auth/sso", "secret": "sf-s", "client": "gateway",
+                 "auth": "heax", "token_header": "X-Heax-Sso-Assertion"}
+
+
+def test_StepForge_단언_쓰기는_비밀이_있으면_rest_sso_와_쓰기_경로를_만들고_비밀_없는_실행은_이어받는다(tmp_path):
+    env = {"HEAX_MCP_TOKEN": "heax-svc", "HEAX_MCP_BASE": "https://hub.example:8443/", "STEPFORGE_SSO_SECRET": "sf-s"}
+    log: list = []
+    out = _run_provision(tmp_path, env, log)
+    assert out["heax_registry"]["rest_sso"] == {"step_forge": _SF_SSO_ENTRY}
+    sf = out["rest"]["step-forge"]
+    assert sf == {"base": "https://hub.example:8443/apps/step_forge", "inject": {"header": "Authorization", "value": "Bearer heax-svc"},
+                  "delegate": "step_forge", "write_paths": ["/api/onto-link", "/api/onto-put", "/api/onto-define", "/api/onto-fill", "/api/plm-sync"]}
+    import rest_proxy
+    assert rest_proxy.allowed_methods(sf) == ["GET", "HEAD"], "REST 프록시(/api/step-forge/)는 단언을 싣지 않아 읽기만 그대로다"
+    assert "step_forge" not in (out["heax_registry"].get("per_user_sso") or {}), "per_user_sso 와 따로 — StepForge MCP 길은 공유 세션 그대로"
+    assert "StepForge 단언 쓰기(rest_sso.step_forge)" in log[0] and "sf-s" not in log[0], "켰다고 말하되 비밀은 찍지 않는다"
+    # 비밀을 못 읽은 실행은 직전 항목을 이어받는다(hwax_risk 와 같은 규칙) — 쓰기 경로도 따라 남는다
+    _force_backup(tmp_path)
+    carried = _run_provision(tmp_path, {"HEAX_MCP_TOKEN": "heax-svc", "HEAX_MCP_BASE": "https://hub.example:8443/"})
+    assert carried["heax_registry"]["rest_sso"] == {"step_forge": _SF_SSO_ENTRY}
+    assert carried["rest"]["step-forge"]["delegate"] == "step_forge" and carried["rest"]["step-forge"]["write_paths"] == sf["write_paths"]
+
+
+def test_StepForge_단언_쓰기는_주소를_env_로_바꾸고_비밀이_없으면_만들지_않고_말한다(tmp_path):
+    out = _run_provision(tmp_path, {"HEAX_MCP_TOKEN": "heax-svc", "STEPFORGE_SSO_SECRET": "sf-s",
+                                    "STEPFORGE_SSO_URL": "http://127.0.0.1:9301/api/auth/sso"})
+    assert out["heax_registry"]["rest_sso"]["step_forge"]["sso_url"] == "http://127.0.0.1:9301/api/auth/sso"
+    (tmp_path / "gateway_config.json").unlink()
+    out = _run_provision(tmp_path, {"STEPFORGE_SSO_SECRET": "sf-s"})
+    assert out["heax_registry"]["rest_sso"]["step_forge"]["sso_url"] == "http://127.0.0.1:4180/apps/step_forge/api/auth/sso", "기본은 허브 Caddy 경로"
+    assert "step-forge" not in out["rest"], "허브 토큰이 없으면 사이트가 없다(종전대로) — 단언 칸만 남는다"
+    (tmp_path / "gateway_config.json").unlink()
+    log: list = []
+    out = _run_provision(tmp_path, {"HEAX_MCP_TOKEN": "heax-svc"}, log)
+    assert "rest_sso" not in (out.get("heax_registry") or {})
+    assert set(out["rest"]["step-forge"]) == {"base", "inject"}, "단언 칸이 없으면 사이트는 지금 그대로다"
+    assert "StepForge 단언 쓰기 꺼짐" in log[0] and "STEPFORGE_SSO_SECRET" in log[0], "안 켠 것도 켜는 법과 함께 말한다"
+
 # ── 일반 앱 위임(PER_USER_SSO_APPS) — 여섯 번째 앱부터 provision-config.sh 를 고치지 않는다(change-request-8-10 #8) ──
 GENERIC_MARK = {"managed_by": "PER_USER_SSO_APPS"}      # 순회가 쓴 항목의 표지 — 목록에서 뺀 앱을 끌 때 이것으로 가린다
 

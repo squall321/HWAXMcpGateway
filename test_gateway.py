@@ -46,6 +46,10 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "_FIG_LIMITER", {"lim": None})
     # PC 키트 폴더도 같다 — 안 걸면 시험이 형제 리포(HWAXPortal infra/pc-kit)의 실제 변환기를 읽는다. 기본은 없는 폴더, 키트 시험이 제 파일을 둔다
     monkeypatch.setattr(gw, "KIT_DIR", tmp_path / "pc-kit")
+    # 앱 키 표의 박스 덧씌우기 · 띄운 셸의 GATEWAY_ENV 도 같다 — 박스에 app_keys.local.json 이 있으면 env 시험이 그 박스 값으로 돈다(GW-05)
+    monkeypatch.setattr(gw, "APP_KEYS_LOCAL_PATH", tmp_path / "app_keys.local.json")
+    monkeypatch.setattr(gw, "_APP_KEYS", {"key": None, "data": None, "error": None, "overlay": None})
+    monkeypatch.setattr(gw, "GATEWAY_ENV", "")
 
 
 @pytest.fixture(autouse=True)
@@ -13964,3 +13968,127 @@ def test_SRC15_StepForge_MCP_길은_rest_sso_가_있어도_공유_세션_그대�
     assert not asyncio.run(gw._call_tool("onto_link", {"dry_run": True})).isError and sf.calls == ["onto_link"]
     [row] = _rows()
     assert row["mode"] == "service" and row["caller"] == "u@corp.com"
+
+
+# ── GW-05 앱 키 · 환경 · 정본 · 옛 키(HWAXPortal docs/request-1117) ─────────────────────────────────────────────
+def _gw05_kit(monkeypatch):
+    class _S:
+        session = object()
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": _S(), "heax-kooremapper_mcp": _S(), "sibling-copy": _S()})
+    monkeypatch.setattr(gw, "exposed_tools", [_tool("section_pair_view"), _tool("report_summary"), _tool("copy_tool")])
+    monkeypatch.setattr(gw, "route", {"section_pair_view": ("heax-step_forge", "section_pair_view"),
+                                      "report_summary": ("heax-kooremapper_mcp", "report_summary"),
+                                      "copy_tool": ("sibling-copy", "copy_tool")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)          # 위임 앱(kooremapper_mcp)이 정책 미수신으로 닫히지 않게
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+
+
+def _apps_body(args=None):
+    return json.loads(asyncio.run(gw._list_tool_apps(args or {})).content[0].text)
+
+
+def test_GW05_추적_앱_키_표는_주소가_없고_옛_선언_키_둘을_새_허브_앱으로_잇는다():
+    raw = gw.APP_KEYS_PATH.read_text(encoding="utf-8")
+    assert "://" not in raw and not re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", raw), "추적 파일에 주소가 있다"
+    data = json.loads(raw)
+    assert "default_env" not in data and "apps" not in data, "환경 · 정본 여부는 박스의 사실 — 추적 파일에 적지 않는다"
+    got, errs = gw._app_keys_parse(data)
+    assert errs == []
+    assert got["retired"]["dynaforge-prod"]["now"] == "heax-kooremapper_mcp" and got["retired"]["dynaforge-prod"]["prefix"] == "dynaforgeprod_"
+    assert got["retired"]["stepforge-prod"]["now"] == "heax-step_forge" and got["retired"]["stepforge-prod"]["prefix"] == "stepforgeprod_"
+
+
+def test_GW05_list_tool_apps_의_앱마다_env_canonical_aliases_가_찬다(monkeypatch):
+    _gw05_kit(monkeypatch)
+    body = _apps_body()
+    apps = {a["app"]: a for a in body["apps"]}
+    assert set(apps) == {"_gateway", "heax-step_forge", "heax-kooremapper_mcp", "sibling-copy"}
+    assert all(a["env"] == "unknown" for a in apps.values()), "박스가 적지 않으면 지어내지 않는다(unknown)"
+    assert body["env"]["box"] == "unknown" and body["env"]["source"] == "unset" and "app_keys.local.json" in body["env"]["note"]
+    assert apps["heax-step_forge"]["aliases"] == [{"key": "stepforge-prod", "prefix": "stepforgeprod_"}]
+    assert apps["heax-kooremapper_mcp"]["aliases"] == [{"key": "dynaforge-prod", "prefix": "dynaforgeprod_"}]
+    assert all(a["canonical"] is True for a in apps.values())
+    # 띄운 셸의 GATEWAY_ENV
+    monkeypatch.setattr(gw, "GATEWAY_ENV", "prod")
+    body = _apps_body()
+    assert {a["env"] for a in body["apps"]} == {"prod"} and body["env"] == {"box": "prod", "source": "GATEWAY_ENV"}
+    # 박스 덧씌우기 — default_env 가 GATEWAY_ENV 보다 먼저, 앱별 값이 그보다 먼저. 바뀐 시각으로 재기동 없이 다시 읽는다
+    gw.APP_KEYS_LOCAL_PATH.write_text(json.dumps({"default_env": "dev", "apps": {"sibling-copy": {"env": "staging", "canonical": False,
+                                                                                                   "note": "시험 사본"}}}), encoding="utf-8")
+    body = _apps_body()
+    apps = {a["app"]: a for a in body["apps"]}
+    assert body["env"] == {"box": "dev", "source": "app_keys.local.json"}
+    assert apps["heax-step_forge"]["env"] == "dev" and apps["sibling-copy"]["env"] == "staging"
+    assert apps["sibling-copy"]["canonical"] is False and apps["sibling-copy"]["env_note"] == "시험 사본"
+    # 깨진 덧씌우기는 버린다 — 기본값으로 돌고 까닭을 싣는다
+    gw.APP_KEYS_LOCAL_PATH.write_text("{broken", encoding="utf-8")
+    st = gw.APP_KEYS_LOCAL_PATH.stat()
+    os.utime(gw.APP_KEYS_LOCAL_PATH, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    body = _apps_body()
+    assert body["env"]["box"] == "prod" and any("덧씌우기를 버렸다" in e for e in body["env"]["errors"]), body["env"]
+    # 틀린 값 칸은 그 칸만 버린다
+    gw.APP_KEYS_LOCAL_PATH.write_text(json.dumps({"default_env": "production", "apps": {"heax-step_forge": {"env": "dev"}}}), encoding="utf-8")
+    os.utime(gw.APP_KEYS_LOCAL_PATH, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+    body = _apps_body()
+    apps = {a["app"]: a for a in body["apps"]}
+    assert "default_env" in body["env"]["errors"] and apps["heax-step_forge"]["env"] == "dev" and apps["_gateway"]["env"] == "prod"
+
+
+def test_GW05_옛_키가_아직_붙어_있으면_정본이_아니고_새_키를_말한다_시험_사본도_정본이_아니다(monkeypatch, tmp_path):
+    _gw05_kit(monkeypatch)
+    class _S:
+        session = object()
+    monkeypatch.setattr(gw, "backends", {**gw.backends, "stepforge-prod": _S()})
+    monkeypatch.setattr(gw, "route", {**gw.route, "stepforgeprod_old_view": ("stepforge-prod", "old_view")})
+    monkeypatch.setattr(gw, "exposed_tools", [*gw.exposed_tools, _tool("stepforgeprod_old_view")])
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _real_vocab_with_staging(tmp_path, "sibling-copy"))
+    apps = {a["app"]: a for a in _apps_body()["apps"]}
+    assert apps["stepforge-prod"]["canonical"] is False and apps["stepforge-prod"]["replaced_by"] == "heax-step_forge"
+    assert apps["sibling-copy"]["canonical"] is False, "코어 어휘표의 시험 사본"
+    assert apps["heax-step_forge"]["canonical"] is True
+
+
+def test_GW05_옛_키로_앱을_물으면_새_키를_안내하고_도구를_대신_싣지_않는다(monkeypatch):
+    _gw05_kit(monkeypatch)
+    one = _apps_body({"app": "stepforge-prod"})
+    assert one["apps"] == [] and one["error"].startswith("unknown app: stepforge-prod — 옛 키다") and "heax-step_forge" in one["error"]
+    assert one["moved"] == {"old": "stepforge-prod", "now": "heax-step_forge", "prefix": "stepforgeprod_"}
+    assert _apps_body({"app": "nope"})["error"] == "unknown app: nope" and "moved" not in _apps_body({"app": "nope"})
+
+
+def test_GW05_옛_접두_이름으로_부르면_새_이름을_안내하고_대신_부르지_않는다(monkeypatch):
+    b = _CallB(["section_pair_view"])
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": b})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    asyncio.run(gw._aggregate())
+    r = asyncio.run(gw._call_tool("stepforgeprod_section_pair_view", {}))
+    text = r.content[0].text
+    assert r.isError and text.startswith("unknown tool: stepforgeprod_section_pair_view — 옛 키 'stepforge-prod'"), text
+    assert "'heax-step_forge' 의 'section_pair_view'" in text and "대신 부르지 않는다" in text
+    assert b.session.calls == [], "옛 이름을 조용히 새 앱으로 돌렸다"
+    r2 = asyncio.run(gw._call_tool("invoke_tool", {"name": "stepforgeprod_section_pair_view", "arguments": {}}))
+    assert r2.isError and "section_pair_view" in r2.content[0].text and b.session.calls == [], "invoke_tool 도 같다"
+    r3 = asyncio.run(gw._call_tool("dynaforgeprod_report_summary", {}))
+    assert r3.isError and "heax-kooremapper_mcp" in r3.content[0].text and "목록에 없다" in r3.content[0].text, "새 앱에 없으면 찾는 길을 말한다"
+    rows = _rows()
+    assert rows[-1]["error"] == "unknown tool" and rows[-1]["note"] == "retired-key"
+    assert asyncio.run(gw._call_tool("no_such_tool", {})).content[0].text == "unknown tool: no_such_tool", "옛 키가 아니면 지금 그대로"
+
+
+def test_GW05_옛_키나_접두를_담은_질의는_검색_답에_새_키를_싣고_그_밖은_그대로다(monkeypatch):
+    _gw05_kit(monkeypatch)
+    plain = json.loads(asyncio.run(gw._search_tools({"query": "section pair view"}, embed=False, log_query=False)).content[0].text)
+    assert "moved" not in plain
+    got = json.loads(asyncio.run(gw._search_tools({"query": "stepforgeprod_section_pair_view"}, embed=False,
+                                                  log_query=False)).content[0].text)
+    assert got["moved"] == [{"old": "stepforge-prod", "now": "heax-step_forge", "tool": "section_pair_view"}]
+    got = json.loads(asyncio.run(gw._search_tools({"query": "dynaforge-prod 리포트"}, embed=False, log_query=False)).content[0].text)
+    assert got["moved"] == [{"old": "dynaforge-prod", "now": "heax-kooremapper_mcp"}]
+    assert list(got)[:4] == ["query", "match_count", "ranked", "moved"], "이름 순위 뒤 · 전문 앞"

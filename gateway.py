@@ -4075,6 +4075,10 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
         payload.update(mode)        # 어느 순위로 답했나 — rrf, 또는 못 섞었으면 substring 과 그 까닭(mode_reason)
     payload["match_count"] = len(rows)
     payload["ranked"] = [m["tool"] for m in matches]
+    _moved = _retired_in_query(q)
+    if _moved:
+        # 옛 키 · 옛 접두를 담은 질의(GW-05) — 새 키(이름이 보이면 새 도구)를 말한다. 옛 이름은 대신 부르지 않는다
+        payload["moved"] = _moved
     if lookup_tool is not None:
         payload["hint"] = (f"먼저 {ONTO_LOOKUP_TOOL.name} 으로 정본 key 를 얻고 그 답의 next 를 따른다 — 후보(candidates)면 고르지 말고 사람에게 "
                            "묻는다")
@@ -4168,6 +4172,171 @@ async def _needs_connect(keys) -> set[str]:
     return out
 
 
+# ── 앱 키 · 환경 · 정본 · 옛 키(HWAXPortal docs/request-1117 GW-05) ───────────────────────────────────────────────
+# list_tool_apps 의 앱 줄마다 env(dev · staging · prod) · canonical · aliases 를 싣는다. 옛 키(은퇴한 선언 백엔드 키 · 그 접두 이름)로 부르거나 찾으면
+# 새 키 · 새 이름을 **안내만** 한다 — 대신 부르지 않는다(옛 이름이 조용히 다른 앱으로 가면 무엇을 불렀는지가 흐려진다).
+#  · 옛 키 표는 추적 app_keys.json 의 retired(주소 없음). 환경 · 정본 여부는 박스의 사실이라 박스 덧씌우기 app_keys.local.json(gitignore — merge patch,
+#    바뀐 시각을 보고 재기동 없이 다시 읽는다)에 default_env · apps.<키>.env · canonical 로 적는다. 게이트웨이를 띄우는 셸의 GATEWAY_ENV 가 그다음이다.
+#    둘 다 없으면 env 는 unknown 이다 — 지어내지 않는다(그 박스가 값을 적어야 수용 기준 '모든 앱에 env' 가 선다).
+#  · canonical 은 덧씌우기 값이 먼저고, 없으면 옛 키(아직 붙어 있어도) · 코어 어휘표의 시험 사본(staging)이 거짓, 나머지는 참이다.
+APP_KEYS_PATH = Path(__file__).with_name("app_keys.json")
+APP_KEYS_LOCAL_PATH = Path(__file__).with_name("app_keys.local.json")
+APP_ENVS = ("dev", "staging", "prod")
+GATEWAY_ENV = (os.environ.get("GATEWAY_ENV") or "").strip().lower()
+_APP_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+_APP_KEYS: dict = {"key": None, "data": None, "error": None, "overlay": None}
+
+
+def _app_keys_parse(d: dict) -> tuple[dict, list[str]]:
+    """app_keys 꼴 → 쓰는 값과 버린 칸의 까닭. 칸 하나가 틀리면 그 칸만 버린다(옛 키 하나 때문에 환경 표 전체를 잃지 않는다)."""
+    if not isinstance(d, dict):
+        raise TypeError("객체여야 한다")
+    errs: list[str] = []
+    retired: dict[str, dict] = {}
+    for old, spec in (d.get("retired") or {}).items():
+        now = (spec or {}).get("now") if isinstance(spec, dict) else None
+        if not (isinstance(old, str) and _APP_KEY_RE.fullmatch(old) and isinstance(now, str) and _APP_KEY_RE.fullmatch(now) and now != old):
+            errs.append(f"retired.{old}")
+            continue
+        prefix = spec.get("prefix") if isinstance(spec.get("prefix"), str) and spec.get("prefix") else old.replace("-", "") + "_"
+        retired[old] = {"now": now, "prefix": prefix, "note": str(spec.get("note") or "")[:300]}
+    default_env = d.get("default_env")
+    if default_env is not None and default_env not in APP_ENVS:
+        errs.append("default_env")
+        default_env = None
+    apps: dict[str, dict] = {}
+    for key, spec in (d.get("apps") or {}).items():
+        if not (isinstance(key, str) and isinstance(spec, dict)):
+            errs.append(f"apps.{key}")
+            continue
+        one = {}
+        if spec.get("env") in APP_ENVS:
+            one["env"] = spec["env"]
+        elif spec.get("env") is not None:
+            errs.append(f"apps.{key}.env")
+        if isinstance(spec.get("canonical"), bool):
+            one["canonical"] = spec["canonical"]
+        elif spec.get("canonical") is not None:
+            errs.append(f"apps.{key}.canonical")
+        if spec.get("note"):
+            one["note"] = str(spec["note"])[:300]
+        apps[key] = one
+    return {"retired": retired, "default_env": default_env, "apps": apps}, errs
+
+
+def _app_keys() -> dict:
+    """지금 쓰는 앱 키 표 — 추적 기본값에 박스 덧씌우기를 얹은 것. 두 파일의 바뀐 시각이 같으면 다시 읽지 않는다(검색 손잡이 _tuning 과 같은 꼴).
+    기본값을 못 읽으면 마지막 값, 그것도 없으면 빈 표다. 덧씌우기가 깨지면 버리고 기본값으로 돈다(까닭은 list_tool_apps 의 env.errors)."""
+    def mt(p: Path):
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return None
+    key = (mt(APP_KEYS_PATH), mt(APP_KEYS_LOCAL_PATH))
+    if key == _APP_KEYS["key"] and _APP_KEYS["data"] is not None:
+        return _APP_KEYS["data"]
+    error, errs = None, []
+    try:
+        base_raw = json.loads(APP_KEYS_PATH.read_text(encoding="utf-8"))
+        data, errs = _app_keys_parse(base_raw)
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        error = f"기본값을 못 읽음({type(exc).__name__})"
+        log.warning("앱 키 표(%s)를 못 읽었다 — 옛 키 안내 없이 돈다: %r", APP_KEYS_PATH, exc)
+        if _APP_KEYS["data"] is not None:
+            _APP_KEYS.update(key=key, error=error)
+            return _APP_KEYS["data"]
+        base_raw, data = {}, {"retired": {}, "default_env": None, "apps": {}}
+    overlay = {"present": key[1] is not None}
+    if key[1] is not None:
+        try:
+            patch = json.loads(APP_KEYS_LOCAL_PATH.read_text(encoding="utf-8"))
+            if not isinstance(patch, dict):
+                raise TypeError("덧씌우기는 객체여야 한다")
+            data, errs = _app_keys_parse(_merge_patch(base_raw, patch))
+            overlay["fingerprint"] = _json_fp(patch)
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            overlay["error"] = f"덧씌우기를 버렸다({type(exc).__name__}: {str(exc)[:120]})"
+            log.warning("앱 키 덧씌우기(%s)를 버리고 기본값으로 돈다: %r", APP_KEYS_LOCAL_PATH, exc)
+    if errs:
+        log.warning("앱 키 표에서 꼴이 틀린 칸을 버렸다: %s", ", ".join(errs[:20]))
+    data = {**data, "errors": errs[:40]}
+    _APP_KEYS.update(key=key, data=data, error=error, overlay=overlay)
+    return data
+
+
+def _box_env() -> tuple[str, str]:
+    """이 박스의 기본 환경과 그 출처 — 덧씌우기 default_env > GATEWAY_ENV > unknown(unset)."""
+    d = _app_keys()
+    if d.get("default_env"):
+        return d["default_env"], "app_keys.local.json"
+    if GATEWAY_ENV in APP_ENVS:
+        return GATEWAY_ENV, "GATEWAY_ENV"
+    return "unknown", "unset"
+
+
+def _app_env_entry(key: str) -> dict:
+    """앱 줄에 싣는 env · canonical · aliases(+ 옛 키면 replaced_by). 앱마다 env 가 늘 찬다(모르면 unknown)."""
+    d = _app_keys()
+    one = (d.get("apps") or {}).get(key) or {}
+    env = one.get("env") or _box_env()[0]
+    retired = d.get("retired") or {}
+    if "canonical" in one:
+        canonical = one["canonical"]
+    else:
+        canonical = key not in retired and key not in ((_CORE_VOCAB["data"] or {}).get("staging") or frozenset())
+    out = {"env": env, "canonical": canonical,
+           "aliases": [{"key": old, "prefix": s["prefix"]} for old, s in sorted(retired.items()) if s["now"] == key]}
+    if key in retired:
+        out["replaced_by"] = retired[key]["now"]
+    if one.get("note"):
+        out["env_note"] = one["note"]
+    return out
+
+
+def _retired_key(text: str) -> tuple[str, dict] | None:
+    """앱 키 글이 옛 키인가 — 그대로거나 하이픈을 뺀 꼴(dynaforgeprod)까지. 아니면 None."""
+    t = str(text or "").strip().lower()
+    for old, spec in (_app_keys().get("retired") or {}).items():
+        if t in (old.lower(), old.lower().replace("-", "")):
+            return old, spec
+    return None
+
+
+def _exposed_name(backend: str, original: str) -> str | None:
+    """(백엔드, 원래 이름) 의 지금 노출 이름 — 없으면 None."""
+    return next((n for n, (bk, orig) in route.items() if bk == backend and orig == original), None)
+
+
+def _retired_tool_hint(name: str) -> str | None:
+    """옛 키의 접두 이름(예 stepforgeprod_section_pair_view)이면 새 키 · 새 이름을 말하는 안내 한 줄. 아니면 None. 대신 부르지 않는다."""
+    for old, spec in (_app_keys().get("retired") or {}).items():
+        p = spec["prefix"]
+        if p and name.startswith(p) and len(name) > len(p):
+            orig = name[len(p):]
+            new = _exposed_name(spec["now"], orig)
+            if new:
+                return (f"옛 키 '{old}' 의 이름이다 — 지금은 앱 '{spec['now']}' 의 '{new}' 로 부른다(게이트웨이는 옛 이름을 대신 부르지 않는다)")
+            return (f"옛 키 '{old}' 의 이름이다 — 지금 그 도구는 앱 '{spec['now']}' 에 있어야 하는데 '{orig}' 가 지금 목록에 없다. "
+                    f"search_tools 로 찾거나 list_tool_apps(app='{spec['now']}') 로 본다")
+    return None
+
+
+def _retired_in_query(q: str) -> list[dict]:
+    """검색 질의가 옛 키 · 옛 접두를 담았으면 새 키(와 이름이 있으면 새 도구)를 말하는 줄. 없으면 []."""
+    q = str(q or "").lower()
+    out = []
+    for old, spec in sorted((_app_keys().get("retired") or {}).items()):
+        p = spec["prefix"].lower()
+        if old.lower() in q or old.lower().replace("-", "") in q or (p and p in q):
+            row = {"old": old, "now": spec["now"]}
+            m = re.search(re.escape(p) + r"([a-z0-9_]+)", q) if p else None
+            if m:
+                new = _exposed_name(spec["now"], m.group(1))
+                row["tool"] = new or None
+            out.append(row)
+    return out
+
+
 async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     groups = _request_groups()
     _core_vocab()                                    # 앱 역할(role)을 지금 어휘표로 — 덧씌우기를 고쳤으면 다시 읽는다
@@ -4229,6 +4398,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             "status": "ok" if (accessible and reachable) else
                       ("no_access" if not accessible else "backend_down"),
         }
+        # 환경 · 정본 · 옛 키(GW-05) — 앱마다 env 가 늘 찬다(모르면 unknown — 박스가 app_keys.local.json · GATEWAY_ENV 로 적는다)
+        entry.update(_app_env_entry(key))
         role = None if local else _app_role(key)
         if role:
             # 어휘표의 앱 역할(E2-1 · C-B) — 정본 · 형제(같은 허브 도구, 담은 데이터가 다르다) · 비코어(코어 객체가 없다 — note 는 그 앱이 갖는 것)
@@ -4272,12 +4443,27 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         # 이 연결의 개인 보기(E-4) — tools/list 에 실은 수 · 보기로 뺀 수(목록 밖도 search_tools → invoke_tool 로 닿는다)
         "view": _view_info(groups),
     }
+    # 이 박스의 기본 환경과 출처(GW-05) — 앱 줄의 env 는 이것이거나 박스 덧씌우기의 앱별 값이다
+    _env, _src = _box_env()
+    payload["env"] = {"box": _env, "source": _src}
+    if _env == "unknown":
+        payload["env"]["note"] = ("이 박스는 환경을 적지 않았다 — 운영자가 게이트웨이 app_keys.local.json 에 default_env(dev · staging · prod)를 적거나 "
+                                  "게이트웨이를 GATEWAY_ENV 와 함께 띄운다")
+    _ak = _app_keys()
+    if _ak.get("errors") or (_APP_KEYS.get("overlay") or {}).get("error"):
+        payload["env"]["errors"] = [*(_ak.get("errors") or []), *([_APP_KEYS["overlay"]["error"]] if (_APP_KEYS.get("overlay") or {}).get("error") else [])]
     if want_app and not apps:
+        _moved = _retired_key(want_app) if not denied else None
         if denied:
             d0 = denied_apps[0]
             payload["error"] = (f"not_ready: {want_app} — {d0['how']}" if d0["reason"] == "policy_not_ready"
                                 else f"no_access: {want_app} — 이 계정에는 권한이 없는 앱이다. {d0['how']}")
             payload["denied"] = d0
+        elif _moved:
+            # 옛 키(GW-05) — 새 키를 안내만 한다(그 앱의 도구를 대신 싣지 않는다)
+            payload["error"] = (f"unknown app: {want_app} — 옛 키다. 지금은 '{_moved[1]['now']}' 다 — list_tool_apps(app='{_moved[1]['now']}') 로 "
+                                "다시 본다")
+            payload["moved"] = {"old": _moved[0], "now": _moved[1]["now"], "prefix": _moved[1]["prefix"]}
         else:
             payload["error"] = f"unknown app: {want_app}"
     return types.CallToolResult(
@@ -8908,10 +9094,12 @@ async def _call_tool_body(name: str, arguments: dict):
     # `route` 를 **먼저** 본다 — bare 이름의 뜻은 그대로다. 없을 때만 호출 전용 별칭.
     resolved = route.get(name) or alias_route.get(name)
     if resolved is None:
+        # 옛 키의 접두 이름이면 새 키 · 새 이름을 안내한다 — 대신 부르지 않는다(GW-05)
+        _moved = _retired_tool_hint(name)
         _audit(name, None, False, "unknown tool", 0,
-               caller=_request_user() or None, corr=_request_corr())
+               caller=_request_user() or None, corr=_request_corr(), note="retired-key" if _moved else None)
         return types.CallToolResult(
-            content=[types.TextContent(type="text", text=f"unknown tool: {name}")],
+            content=[types.TextContent(type="text", text=f"unknown tool: {name}" + (f" — {_moved}" if _moved else ""))],
             isError=True,
         )
     backend_key, original = resolved

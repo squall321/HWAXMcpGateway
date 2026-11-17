@@ -28,3 +28,6 @@ read_tools.local.json
 # 서비스 PAT 작업별 허용 목록(HWAXPortal docs/core-link SRC-13) — 박스마다 운영자가 쓴다. 무시 목록에 없으면 deploy-all · update-all 의
 # git stash -u 가 치운다
 service_tools.local.json
+# 앱 키 표의 박스 덧씌우기(HWAXPortal docs/request-1117 GW-05) — 환경(default_env · apps.<키>.env) · 정본 여부는 박스의 사실이다. 무시 목록에 없으면
+# deploy-all · update-all 의 git stash -u 가 치운다
+app_keys.local.json

@@ -349,6 +349,13 @@ python3 tool_usage_report.py --days 60 --out unused.md
 - 게이트웨이 자체 도구(`_gateway`)는 감사에 다 남지 않아 세지 않는다. 도구가 생긴 날은 모른다 — 최근에 붙은 앱은 안 불린 것이 당연할 수 있다.
 - 보고서에는 도구 이름과 수만 있다(부른 사람 · 주소는 없다). 감사 경로는 게이트웨이와 같은 규칙이다(`GATEWAY_AUDIT`, 없으면 이 리포의 `audit.jsonl`).
 
+## 도구 등록 점검표 — 문서 + 읽기만 하는 훑기(HWAXPortal docs/request-1117 GW-04)
+
+배치 원칙(데이터를 가진 플랫폼이 함수를 갖는다 · 포털 · 게이트웨이는 노출 · 연결만 · 보고만 하는 함수는 주인 플랫폼으로)과 점검 항목은
+`docs/tool-registration-checklist.md`, 훑기는 `tool_registration_scan.py`(`/tools-map` 또는 저장한 파일 · 선택으로 설명 스냅숏 → 앱마다 도구 · 데이터
+주인 추정 · 보고만 의심 · 까닭, 끝에 질의 점검 D1 — 낙하 · 부분 충격 해석 결과는 DynaForge 만, Report Archive 의 분석 실행 도구 넷은 그 질의에서 1위가
+아니어야 한다). 관리자 도구 · 저장 없음(사용자 결정) — 아무것도 쓰지 않는다. 기본 검색 순위는 이 일로 바꾸지 않는다(박스 덧씌우기 제안은 그 문서).
+
 ## search_tools 의미 순위 — 선택, 기본 꺼짐
 
 `search_tools` 의 부분문자열 순위에 AIDataHub 임베딩 순위를 RRF(k=60)로 **더한다**(갈아 끼우지 않는다 — 한국어 업무어는 부분문자열이 이기는 사례가 있다). 켤지는 평가 결과를 보고 정한다 — 평가셋·러너·숫자는 `tool_search_eval/README.md`.

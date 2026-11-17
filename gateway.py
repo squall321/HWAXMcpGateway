@@ -4184,12 +4184,13 @@ async def _needs_connect(keys) -> set[str]:
 # 새 키 · 새 이름을 **안내만** 한다 — 대신 부르지 않는다(옛 이름이 조용히 다른 앱으로 가면 무엇을 불렀는지가 흐려진다).
 #  · 옛 키 표는 추적 app_keys.json 의 retired(주소 없음). 환경 · 정본 여부는 박스의 사실이라 박스 덧씌우기 app_keys.local.json(gitignore — merge patch,
 #    바뀐 시각을 보고 재기동 없이 다시 읽는다)에 default_env · apps.<키>.env · canonical 로 적는다. 게이트웨이를 띄우는 셸의 GATEWAY_ENV 가 그다음이다.
-#    둘 다 없으면 env 는 dev 로 찬다 — 운영이라고 지어내지 않는 쪽이다(박스가 적지 않았다는 것은 list_tool_apps 의 env.source 'unset' 과 note 가 말한다).
+#    둘 다 없으면 env 는 unknown 이다 — dev 로도 prod 로도 지어내지 않는다(운영 박스가 적지 않은 사이에 운영 앱이 dev 로 보이면 요청이 막으려던 오판이다 —
+#    HWAXPortal docs/request-1117 contracts §5 '모르면 unknown'). 박스가 적지 않았다는 것은 list_tool_apps 의 env.source 'unset' 과 note 가 말한다.
 #  · canonical 은 덧씌우기 값이 먼저고, 없으면 옛 키(아직 붙어 있어도) · 코어 어휘표의 시험 사본(staging)이 거짓, 나머지는 참이다.
 APP_KEYS_PATH = Path(__file__).with_name("app_keys.json")
 APP_KEYS_LOCAL_PATH = Path(__file__).with_name("app_keys.local.json")
 APP_ENVS = ("dev", "prod")
-APP_ENV_UNSET = "dev"                    # 박스가 적지 않았을 때의 값 — 운영(prod)이라고 지어내지 않는다
+APP_ENV_UNSET = "unknown"                # 박스가 적지 않았을 때의 값 — 어느 쪽으로도 지어내지 않는다(이름 셋째 값, 박스가 적는 값은 APP_ENVS 둘뿐)
 GATEWAY_ENV = (os.environ.get("GATEWAY_ENV") or "").strip().lower()
 _APP_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _APP_KEYS: dict = {"key": None, "data": None, "error": None, "overlay": None}
@@ -4273,7 +4274,7 @@ def _app_keys() -> dict:
 
 
 def _box_env() -> tuple[str, str]:
-    """이 박스의 기본 환경과 그 출처 — 덧씌우기 default_env > GATEWAY_ENV > dev(출처 unset)."""
+    """이 박스의 기본 환경과 그 출처 — 덧씌우기 default_env > GATEWAY_ENV > unknown(출처 unset)."""
     d = _app_keys()
     if d.get("default_env"):
         return d["default_env"], "app_keys.local.json"
@@ -4406,7 +4407,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             "status": "ok" if (accessible and reachable) else
                       ("no_access" if not accessible else "backend_down"),
         }
-        # 환경 · 정본 · 옛 키(GW-05) — 앱마다 env 가 dev · prod 로 늘 찬다(박스가 app_keys.local.json · GATEWAY_ENV 로 적는다 — 없으면 dev)
+        # 환경 · 정본 · 옛 키(GW-05) — 앱마다 env 가 dev · prod 로 찬다(박스가 app_keys.local.json · GATEWAY_ENV 로 적는다 — 없으면 unknown)
         entry.update(_app_env_entry(key))
         role = None if local else _app_role(key)
         if role:
@@ -4455,7 +4456,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     _env, _src = _box_env()
     payload["env"] = {"box": _env, "source": _src}
     if _src == "unset":
-        payload["env"]["note"] = (f"이 박스는 환경을 적지 않아 {APP_ENV_UNSET} 로 적었다 — 운영 박스면 운영자가 게이트웨이 app_keys.local.json 에 "
+        payload["env"]["note"] = (f"이 박스는 환경을 적지 않아 {APP_ENV_UNSET} 로 적었다 — 운영자가 게이트웨이 app_keys.local.json 에 "
                                   "default_env(dev · prod)를 적거나 게이트웨이를 GATEWAY_ENV 와 함께 띄운다")
     _ak = _app_keys()
     if _ak.get("errors") or (_APP_KEYS.get("overlay") or {}).get("error"):

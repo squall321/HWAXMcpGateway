@@ -14014,8 +14014,8 @@ def test_GW05_list_tool_apps_의_앱마다_env_canonical_aliases_가_찬다(monk
     body = _apps_body()
     apps = {a["app"]: a for a in body["apps"]}
     assert set(apps) == {"_gateway", "heax-step_forge", "heax-kooremapper_mcp", "sibling-copy"}
-    assert all(a["env"] == "dev" for a in apps.values()), "박스가 적지 않으면 운영이라고 지어내지 않는다(dev)"
-    assert body["env"]["box"] == "dev" and body["env"]["source"] == "unset" and "app_keys.local.json" in body["env"]["note"]
+    assert all(a["env"] == "unknown" for a in apps.values()), "박스가 적지 않으면 dev · prod 어느 쪽으로도 지어내지 않는다(unknown — contracts §5)"
+    assert body["env"]["box"] == "unknown" and body["env"]["source"] == "unset" and "app_keys.local.json" in body["env"]["note"]
     assert apps["heax-step_forge"]["aliases"] == [{"key": "stepforge-prod", "prefix": "stepforgeprod_"}]
     assert apps["heax-kooremapper_mcp"]["aliases"] == [{"key": "dynaforge-prod", "prefix": "dynaforgeprod_"}]
     assert all(a["canonical"] is True for a in apps.values())

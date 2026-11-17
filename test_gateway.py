@@ -9560,8 +9560,8 @@ def test_HG20_구조화_본문과_rest_call_도_가리고_health_는_수만_싣�
     src = open(gw.__file__, encoding="utf-8").read()
     assert 'return _evid_keep("rest_call", _pii_mask(_rest_text(payload)))' in src
     # 등록 토큰 길(as-conn)만 선언의 가림 예외 주소를 넘긴다(HWAXPortal docs/siren-delib HG-29) — 그 자리도 가린다
-    assert src.count("_cache_put(ckey, _evid_keep(name, _pii_mask(res)))") == 4, "백엔드 결과를 돌려주는 자리 다섯이 모두 가린다"
-    assert src.count("name, _pii_mask(res, keep_hosts=_cm.get(\"mask_keep_hosts\") or frozenset()))))") == 1
+    assert src.count("_cache_put(ckey, _evid_keep(name, _pii_mask(res, tool=(backend_key, original))))") == 4, "백엔드 결과를 돌려주는 자리 다섯이 모두 가린다"
+    assert src.count("name, _pii_mask(res, keep_hosts=_cm.get(\"mask_keep_hosts\") or frozenset(), tool=(backend_key, original)))))") == 1
     assert gw._luhn_ok("352099001761481") and not gw._luhn_ok("352099001761482")
     sent = []
 
@@ -14587,3 +14587,13 @@ def test_쓰기_동사_subscribe_recheck_는_표지가_없어도_루틴_읽기�
         assert gw._WRITE_NAME.search(n), n
         assert gw._routine_read(t, "heax-step_forge", n) is False, n
     assert not gw._WRITE_NAME.search("subscription_status") and not gw._WRITE_NAME.search("rechecked_list"), "낱말 단위로만"
+
+
+def test_리스크_앱_근거_묶음만_게이트웨이_가림에서_빠진다(monkeypatch):
+    """HWAXPortal docs/request-1117 R-12 ① — 앱이 늘 가리고 엔진이 지문을 다시 재는 묶음 하나만 뺀다. 다른 도구 · 같은 앱의 다른 도구는 그대로 가린다."""
+    body = '{"evidence": [{"result": "담당 hong@example.com · 10.1.2.30"}]}'
+    mk = lambda: types.CallToolResult(content=[types.TextContent(type="text", text=body)])  # noqa: E731
+    assert gw._pii_mask(mk(), tool=("heax-hwax_risk", "risk_get_evidence_bundle")).content[0].text == body
+    for other in (("heax-hwax_risk", "risk_get_registry"), ("signalforge", "risk_get_evidence_bundle"), None):
+        assert "[가림:" in gw._pii_mask(mk(), tool=other).content[0].text, other
+    assert gw._PII_MASK_EXEMPT == frozenset({("heax-hwax_risk", "risk_get_evidence_bundle")}), "빼는 것은 하나뿐이다(늘리려면 사용자 결정)"

@@ -698,6 +698,9 @@ def _envelope_reason(res) -> str | None:
 #  · 게이트웨이 자체 도구(대화 · 조직도 · 검색)는 대상이 아니다 — 백엔드 도구 결과와 rest_call 만. 바이트를 그대로 흘리는 REST 프록시
 #    (`/api/<site>/` — 파일 · 프로그램 길)도 가리지 않는다. 끄기 — GATEWAY_PII_MASK=0(박스 손잡이).
 PII_MASK_ON = os.environ.get("GATEWAY_PII_MASK", "1").strip() != "0"
+# 가림에서 빼는 도구(백엔드 키, 원래 이름) — 리스크 앱 근거 묶음은 앱이 늘 가리고(가림을 끌 수 없다) 엔진이 묶음 지문을 다시 재어 대조한다. 여기서 한 번
+# 더 가리면 글이 바뀌어 지문이 늘 어긋나 묶음이 근거에서 빠졌다(HWAXPortal docs/request-1117 R-12 ① — 사용자 결정 11-17, 개인정보는 앱 한 곳이 책임).
+_PII_MASK_EXEMPT = frozenset({("heax-hwax_risk", "risk_get_evidence_bundle")})
 _PII_KEYS = {
     "이름": ("author", "author_name", "writer", "writer_name", "username", "user_name", "nickname", "screen_name", "detector",
            "detector_name", "detected_by", "inspector", "inspector_name", "reporter", "reporter_name", "worker_name",
@@ -943,10 +946,10 @@ def _pii_mask_obj(v, n: list, kind: str | None = None, keep: frozenset = frozens
     return v
 
 
-def _pii_mask(res, keep_hosts: frozenset = frozenset()):
+def _pii_mask(res, keep_hosts: frozenset = frozenset(), tool: tuple | None = None):
     """백엔드 도구 결과의 개인정보를 가린 사본 — 가린 것이 없으면 그 결과 그대로다(서식 · 바이트까지). keep_hosts 는 선언 백엔드의 가림 예외
-    주소다(_pii_mask_text — 그 주소로 여는 링크만 그대로 둔다)."""
-    if not PII_MASK_ON or res is None:
+    주소다(_pii_mask_text — 그 주소로 여는 링크만 그대로 둔다). tool(백엔드 키, 원래 이름)이 _PII_MASK_EXEMPT 에 있으면 가리지 않는다."""
+    if not PII_MASK_ON or res is None or (tool is not None and tuple(tool) in _PII_MASK_EXEMPT):
         return res
     n = [0]
     blocks, changed = [], False
@@ -9805,7 +9808,7 @@ async def _call_tool_body(name: str, arguments: dict):
                        caller=email, mode="as-user-pat", corr=_request_corr(),
                        note="+".join(n for n in ("re-minted" if attempt else None, _sso_fold_note(tok, email), *pp_notes) if n)
                        or None, res=res)
-                return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res))))
+                return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res, tool=(backend_key, original)))))
     elif backend_key in PORTAL_CONN_BACKENDS:
         # 포털 등록 연결 토큰 위임(RA 등). 신원이 있는 호출은 **본인 토큰으로만** 간다. 서비스 계정(cae00 에선
         # 실제 사람의 RA 토큰)으로 대신 보내면 그 사람 개인 공간에 글이 쌓이고 그 사람의 '내 글' 이 남에게
@@ -9884,7 +9887,7 @@ async def _call_tool_body(name: str, arguments: dict):
                    caller=email, mode="as-conn", corr=_request_corr(), res=res, note=_tok_note, rid=_rid)
             # 가림에서 뺄 주소(선언의 mask_keep_hosts — 그 호스트로 여는 링크만, HG-29). 없으면 지금 그대로다.
             return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(
-                name, _pii_mask(res, keep_hosts=_cm.get("mask_keep_hosts") or frozenset()))))
+                name, _pii_mask(res, keep_hosts=_cm.get("mask_keep_hosts") or frozenset(), tool=(backend_key, original)))))
 
     # 이 호출이 쓰는 세션의 세대. 실패했을 때 "내가 죽었다고 본 그 세션" 을 가리키므로,
     # 그 사이 다른 호출이 이미 갈아 끼웠다면 새 세션을 또 부수지 않는다. try 밖에서 잡는다 —
@@ -9903,12 +9906,12 @@ async def _call_tool_body(name: str, arguments: dict):
             _audit(name, backend_key, not getattr(res, "isError", False), None,
                    round((time.monotonic() - t0) * 1000),
                    caller=_u or None, mode="identity-fwd", corr=_request_corr(), res=res)
-            return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res))))
+            return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res, tool=(backend_key, original)))))
         res = await _call_shared(b, backend_key, original, arguments)
         _audit(name, backend_key, not getattr(res, "isError", False), None,
                round((time.monotonic() - t0) * 1000),
                caller=_u or None, mode="service", note=note, corr=_request_corr(), res=res)
-        return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res))))
+        return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res, tool=(backend_key, original)))))
     except _Late as late:
         return _late(late)
     except Exception as e:  # noqa: BLE001
@@ -9939,7 +9942,7 @@ async def _call_tool_body(name: str, arguments: dict):
                            caller=_u or None, mode="identity-fwd" if _fwd else "service",
                            note="reconnected" + (f"+{note}" if note else ""),
                            corr=_request_corr(), res=res)
-                    return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res))))
+                    return await _fig_keep(backend_key, original, _cache_put(ckey, _evid_keep(name, _pii_mask(res, tool=(backend_key, original)))))
         except _Late as late:
             return _late(late)
         except Exception as e2:  # noqa: BLE001 — 재시도 실패도 정돈된 isError 로 (프로토콜 에러 방지)
@@ -10004,7 +10007,7 @@ def _bearer_gate(app, pat_verifier=None):
                 "conn_since": {k: _CONN_SINCE[k] for k in sorted(_CONN_SINCE) if k in _CONN_STATUS},
                 # 프록시 우회 보정 — 수만(주소는 싣지 않는다). 포털 출구 점검이 게이트웨이 목적지를 이것으로 판정한다(HG-18).
                 "no_proxy": _no_proxy_health(),
-                "pii_mask": {"on": PII_MASK_ON, "masked": _PII_STAT["masked"]},     # 수만(HG-20) — 무인증 칸이다
+                "pii_mask": {"on": PII_MASK_ON, "masked": _PII_STAT["masked"], "exempt": sorted(f"{b}:{t}" for b, t in _PII_MASK_EXEMPT)},     # 수만(HG-20) — 무인증 칸이다
                 **({"policy": POLICY, "access_policy": _ACCESS_POLICY} if _detail else {}),
                 # 코어 어휘표를 읽었나 — 못 읽으면 search_tools 가 손 낱말로 돈다(HWAXPortal docs/request-1029 C-11). 경로는 싣지 않는다
                 "core_vocab": _core_vocab_health(),

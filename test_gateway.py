@@ -46,6 +46,14 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "_FIG_LIMITER", {"lim": None})
     # PC 키트 폴더도 같다 — 안 걸면 시험이 형제 리포(HWAXPortal infra/pc-kit)의 실제 변환기를 읽는다. 기본은 없는 폴더, 키트 시험이 제 파일을 둔다
     monkeypatch.setattr(gw, "KIT_DIR", tmp_path / "pc-kit")
+    # 앱 키 표의 박스 덧씌우기 · 띄운 셸의 GATEWAY_ENV 도 같다 — 박스에 app_keys.local.json 이 있으면 env 시험이 그 박스 값으로 돈다(GW-05)
+    monkeypatch.setattr(gw, "APP_KEYS_LOCAL_PATH", tmp_path / "app_keys.local.json")
+    monkeypatch.setattr(gw, "_APP_KEYS", {"key": None, "data": None, "error": None, "overlay": None})
+    monkeypatch.setattr(gw, "GATEWAY_ENV", "")
+    # 적재 경로 선언의 박스 덧씌우기 · 점검 기록도 같다 — 박스에 ingest_routes.local.json 이 있으면 중계 시험이 그 박스 상류 · 준비 폴더로 돈다(GW-01)
+    monkeypatch.setattr(gw, "INGEST_ROUTES_LOCAL_PATH", tmp_path / "ingest_routes.local.json")
+    monkeypatch.setattr(gw, "_INGEST", {"key": None, "data": None, "error": None, "overlay": None})
+    monkeypatch.setattr(gw, "_INGEST_CHECK", {})
 
 
 @pytest.fixture(autouse=True)
@@ -6258,7 +6266,8 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
         "(ontology-first F0)은 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
-    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 22, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1
+    # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 관리자 읽기 목록 보기 1(GW-02 — tools/list 는 관리자에게만)
+    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 23, "reportarchive": 2}
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
     assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
@@ -10567,7 +10576,8 @@ def test_루틴_읽기_판정은_앱_표지가_먼저이고_읽기_목록이_다
 
 def test_박스_읽기_목록_덧씌우기는_바뀐_시각을_보고_재기동_없이_연다(monkeypatch, caplog):
     """이름 꼴로는 막히는 조회 도구(risk_next_step)를 박스가 커밋 없이 연다 — read_tools.local.json(gitignore, read_tools.json 과 같은 꼴).
-    바뀐 시각이 다르면 다시 읽고(재기동 없음), 깨진 파일은 버려 닫힌 쪽으로 돈다(경고 한 줄), 지우면 다시 막힌다."""
+    바뀐 시각이 다르면 다시 읽고(재기동 없음), 깨진 파일은 마지막으로 읽은 값 그대로 돈다(경고 한 줄 — deny 를 놓지 않게, 11-17 검토 L1), 지우면 다시
+    막힌다."""
     monkeypatch.setattr(gw, "READ_TOOLS", frozenset())
     seen, inner = _rt_platform_kit(monkeypatch, {"heax-hwax_risk": ["risk_next_step"]})
     local = gw.READ_TOOLS_LOCAL_PATH                                  # autouse 가 tmp 로 건 자리
@@ -10582,14 +10592,17 @@ def test_박스_읽기_목록_덧씌우기는_바뀐_시각을_보고_재기동_
     local.write_text('{"tools": "heax-hwax_risk:risk_next_step"}', encoding="utf-8")   # 꼴이 틀렸다(목록이 아니다)
     os.utime(local, ns=(2_000_000_000_000_000_000, 2_000_000_000_000_000_000))
     with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
-        assert call() == refused, "깨진 덧씌우기는 버린다(닫힌 쪽)"
+        assert call() != refused, "깨진 덧씌우기는 마지막 값 그대로다"
     assert any("read_tools.local.json" in r.getMessage() for r in caplog.records), caplog.text
-    local.write_text(json.dumps({"tools": ["heax-hwax_risk:risk_next_step"]}), encoding="utf-8")
+    local.write_text(json.dumps({"tools": []}), encoding="utf-8")
     os.utime(local, ns=(3_000_000_000_000_000_000, 3_000_000_000_000_000_000))
+    assert call() == refused, "고쳐 쓰면 그 값이다"
+    local.write_text(json.dumps({"tools": ["heax-hwax_risk:risk_next_step"]}), encoding="utf-8")
+    os.utime(local, ns=(4_000_000_000_000_000_000, 4_000_000_000_000_000_000))
     assert call() != refused
     local.unlink()
     assert call() == refused, "지우면 다시 막힌다"
-    assert [i[0] for i in inner] == ["risk_next_step", "risk_next_step"]
+    assert [i[0] for i in inner] == ["risk_next_step"] * 3
 
 
 def test_이름_꼴로_막히던_조회_넷은_추적_읽기_목록으로_루틴_단계와_읽기_전용_PAT_에_열린다(monkeypatch):
@@ -10934,11 +10947,11 @@ def test_동사로도_쓰이는_fetch_resolve_trace_는_조회_낱말이_아니�
 _RT_DENIED_MSG = "ROUTINE_ERROR: 단계 안에서는 읽기로 확인된 도구만 부른다(v1) — '{}' 는 이 박스가 닫았다(read_tools.json · read_tools.local.json 의 deny)"
 
 
-def test_닫기_목록은_표지_읽기_목록_이름_꼴보다_먼저_닫고_루틴_단계에만_든다(monkeypatch, tmp_path, caplog, _fresh_scores):
+def test_닫기_목록은_표지_읽기_목록_이름_꼴보다_먼저_닫고_루틴_단계와_읽기_전용_PAT_에_든다(monkeypatch, tmp_path, caplog, _fresh_scores):
     """R3 리뷰 2차 #0 — 박스가 이름 꼴 · 앱 표지 · 읽기 목록으로 열린 쓰기를 코드 고침 없이 닫는다. read_tools.json 과 박스 덧씌우기
     read_tools.local.json 의 deny 를 _routine_read 가 맨 먼저 본다(앱의 readOnlyHint=True 보다도). routine_call 은 '이 박스가 닫았다' 로 거절하고
     (읽기 목록에 더하라는 안내는 틀린 길이다) 안쪽 도구도 원장도 건드리지 않는다. /tools-map 의 routine_read 에서도 빠진다. 덧씌우기는 바뀐 시각을
-    보고 재기동 없이 다시 읽고, 깨지면 통째로 버린다(deny 도 빠진다 — 경고 한 줄). 루틴만이다 — 읽기 전용 PAT 의 허용 목록은 그대로 연다."""
+    보고 재기동 없이 다시 읽고, 깨지면 통째로 버린다(deny 도 빠진다 — 경고 한 줄). 11-17 부터 읽기 전용 PAT 도 같은 닫기 목록을 먼저 본다(R-7 · GW-02)."""
     ann = types.ToolAnnotations
     local = gw.READ_TOOLS_LOCAL_PATH                                  # autouse 가 tmp 로 건 자리
 
@@ -10962,18 +10975,25 @@ def test_닫기_목록은_표지_읽기_목록_이름_꼴보다_먼저_닫고_�
         res, text = call(n)
         assert not res.isError and inner[-1][0] == n, (n, text)
     monkeypatch.setattr(gw, "tool_readonly_hint", {})
-    assert gw._readonly_denial("corpus_check", {}) == "", "읽기 전용 PAT 는 deny 를 보지 않는다(허용 목록 그대로)"
+    # 11-17 사용자 결정 R-7(HWAXPortal docs/request-1117 GW-02) — 읽기 전용 PAT 도 박스 덧씌우기를 읽고 닫기 목록이 먼저 이긴다(종전 '읽기 전용 PAT 는
+    # deny 를 보지 않는다' 를 뒤집음)
+    why = gw._readonly_denial("corpus_check", {})
+    assert why.startswith("read_only: 'corpus_check'") and "read-only" in why and "deny" in why and "sf:corpus_check" in why, why
     overlay({"tools": ["sf:risk_next_step"]}, 2)
     for n in ("start_view", "corpus_check"):
         assert not call(n)[0].isError, ("덧씌우기에서 빼면 재기동 없이 다시 열린다", n)
     assert call("search_voc")[1] == _RT_DENIED_MSG.format("sf:search_voc"), "추적 deny 는 그대로다"
-    overlay({"tools": ["sf:risk_next_step"], "deny": "sf:job_status"}, 3)          # 꼴이 틀렸다(목록이 아니다)
+    overlay({"tools": ["sf:risk_next_step"], "deny": ["sf:job_status"]}, 3)
+    assert call("job_status")[1] == _RT_DENIED_MSG.format("sf:job_status")
+    overlay({"tools": ["sf:risk_next_step"], "deny": "sf:job_status"}, 4)          # 꼴이 틀렸다(목록이 아니다)
     with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
-        assert not call("job_status")[0].isError, "깨진 덧씌우기는 통째로 버린다 — deny 도 빠진다"
-        assert call("risk_next_step")[1] == _RT_NOT_READ_MSG.format("sf:risk_next_step"), "tools 도 빠진다"
+        # 11-17 검토 L1 — 깨진 덧씌우기는 마지막으로 읽은 tools · deny 를 그대로 둔다(종전 '통째로 버린다 — deny 도 빠진다' 는 열리는 쪽이었다)
+        assert call("job_status")[1] == _RT_DENIED_MSG.format("sf:job_status"), "깨져도 deny 를 놓지 않는다"
+        assert not call("risk_next_step")[0].isError, "tools 도 마지막 값 그대로"
     assert any("read_tools.local.json" in r.getMessage() and "deny" in r.getMessage() for r in caplog.records), caplog.text
+    assert "마지막 값" in gw._READ_TOOLS_LOCAL["error"]
     # /tools-map 의 routine_read 도 같은 판정이다
-    overlay({"deny": ["sf:start_view"]}, 4)
+    overlay({"deny": ["sf:start_view"]}, 5)
     t = lambda name, **a: types.Tool(name=name, description="", inputSchema={"type": "object"},  # noqa: E731
                                      **({"annotations": ann(**a)} if a else {}))
     _aggregate_tools(monkeypatch, {"sf": [t("search_voc"), t("start_view", readOnlyHint=True), t("corpus_check"), t("job_status")]})
@@ -13964,3 +13984,596 @@ def test_SRC15_StepForge_MCP_길은_rest_sso_가_있어도_공유_세션_그대�
     assert not asyncio.run(gw._call_tool("onto_link", {"dry_run": True})).isError and sf.calls == ["onto_link"]
     [row] = _rows()
     assert row["mode"] == "service" and row["caller"] == "u@corp.com"
+
+
+# ── GW-05 앱 키 · 환경 · 정본 · 옛 키(HWAXPortal docs/request-1117) ─────────────────────────────────────────────
+def _gw05_kit(monkeypatch):
+    class _S:
+        session = object()
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": _S(), "heax-kooremapper_mcp": _S(), "sibling-copy": _S()})
+    monkeypatch.setattr(gw, "exposed_tools", [_tool("section_pair_view"), _tool("report_summary"), _tool("copy_tool")])
+    monkeypatch.setattr(gw, "route", {"section_pair_view": ("heax-step_forge", "section_pair_view"),
+                                      "report_summary": ("heax-kooremapper_mcp", "report_summary"),
+                                      "copy_tool": ("sibling-copy", "copy_tool")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)          # 위임 앱(kooremapper_mcp)이 정책 미수신으로 닫히지 않게
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+
+
+def _apps_body(args=None):
+    return json.loads(asyncio.run(gw._list_tool_apps(args or {})).content[0].text)
+
+
+def test_GW05_추적_앱_키_표는_주소가_없고_옛_선언_키_둘을_새_허브_앱으로_잇는다():
+    raw = gw.APP_KEYS_PATH.read_text(encoding="utf-8")
+    assert "://" not in raw and not re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", raw), "추적 파일에 주소가 있다"
+    data = json.loads(raw)
+    assert "default_env" not in data and "apps" not in data, "환경 · 정본 여부는 박스의 사실 — 추적 파일에 적지 않는다"
+    got, errs = gw._app_keys_parse(data)
+    assert errs == []
+    assert got["retired"]["dynaforge-prod"]["now"] == "heax-kooremapper_mcp" and got["retired"]["dynaforge-prod"]["prefix"] == "dynaforgeprod_"
+    assert got["retired"]["stepforge-prod"]["now"] == "heax-step_forge" and got["retired"]["stepforge-prod"]["prefix"] == "stepforgeprod_"
+
+
+def test_GW05_list_tool_apps_의_앱마다_env_canonical_aliases_가_찬다(monkeypatch):
+    _gw05_kit(monkeypatch)
+    body = _apps_body()
+    apps = {a["app"]: a for a in body["apps"]}
+    assert set(apps) == {"_gateway", "heax-step_forge", "heax-kooremapper_mcp", "sibling-copy"}
+    assert all(a["env"] == "unknown" for a in apps.values()), "박스가 적지 않으면 dev · prod 어느 쪽으로도 지어내지 않는다(unknown — contracts §5)"
+    assert body["env"]["box"] == "unknown" and body["env"]["source"] == "unset" and "app_keys.local.json" in body["env"]["note"]
+    assert apps["heax-step_forge"]["aliases"] == [{"key": "stepforge-prod", "prefix": "stepforgeprod_"}]
+    assert apps["heax-kooremapper_mcp"]["aliases"] == [{"key": "dynaforge-prod", "prefix": "dynaforgeprod_"}]
+    assert all(a["canonical"] is True for a in apps.values())
+    # 띄운 셸의 GATEWAY_ENV
+    monkeypatch.setattr(gw, "GATEWAY_ENV", "prod")
+    body = _apps_body()
+    assert {a["env"] for a in body["apps"]} == {"prod"} and body["env"] == {"box": "prod", "source": "GATEWAY_ENV"}, "적으면 note 가 없다"
+    # 박스 덧씌우기 — default_env 가 GATEWAY_ENV 보다 먼저, 앱별 값이 그보다 먼저. 바뀐 시각으로 재기동 없이 다시 읽는다
+    gw.APP_KEYS_LOCAL_PATH.write_text(json.dumps({"default_env": "prod", "apps": {"sibling-copy": {"env": "dev", "canonical": False,
+                                                                                                    "note": "시험 사본"}}}), encoding="utf-8")
+    monkeypatch.setattr(gw, "GATEWAY_ENV", "dev")
+    body = _apps_body()
+    apps = {a["app"]: a for a in body["apps"]}
+    assert body["env"] == {"box": "prod", "source": "app_keys.local.json"}, "덧씌우기가 GATEWAY_ENV 보다 먼저"
+    assert apps["heax-step_forge"]["env"] == "prod" and apps["sibling-copy"]["env"] == "dev"
+    assert apps["sibling-copy"]["canonical"] is False and apps["sibling-copy"]["env_note"] == "시험 사본"
+    # 깨진 덧씌우기는 버린다 — 기본값으로 돌고 까닭을 싣는다(env.errors 는 관리자 · 내부 서비스에게만 — 11-17 검토 L7)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [gw.ADMIN_GROUP])
+    gw.APP_KEYS_LOCAL_PATH.write_text("{broken", encoding="utf-8")
+    st = gw.APP_KEYS_LOCAL_PATH.stat()
+    os.utime(gw.APP_KEYS_LOCAL_PATH, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    body = _apps_body()
+    assert body["env"]["box"] == "dev" and body["env"]["source"] == "GATEWAY_ENV" and any("덧씌우기를 버렸다" in e for e in body["env"]["errors"]), body["env"]
+    # 틀린 값 칸은 그 칸만 버린다
+    gw.APP_KEYS_LOCAL_PATH.write_text(json.dumps({"default_env": "staging", "apps": {"heax-step_forge": {"env": "prod"},
+                                                                                     "sibling-copy": {"env": "production"}}}), encoding="utf-8")
+    os.utime(gw.APP_KEYS_LOCAL_PATH, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+    body = _apps_body()
+    apps = {a["app"]: a for a in body["apps"]}
+    assert "default_env" in body["env"]["errors"] and "apps.sibling-copy.env" in body["env"]["errors"], "이름은 dev · prod 둘뿐(D5)"
+    assert apps["heax-step_forge"]["env"] == "prod" and apps["_gateway"]["env"] == "dev" and apps["sibling-copy"]["env"] == "dev"
+    assert {a["env"] for a in body["apps"]} <= {"dev", "prod"}
+
+
+def test_GW05_옛_키가_아직_붙어_있으면_정본이_아니고_새_키를_말한다_시험_사본도_정본이_아니다(monkeypatch, tmp_path):
+    _gw05_kit(monkeypatch)
+    class _S:
+        session = object()
+    monkeypatch.setattr(gw, "backends", {**gw.backends, "stepforge-prod": _S()})
+    monkeypatch.setattr(gw, "route", {**gw.route, "stepforgeprod_old_view": ("stepforge-prod", "old_view")})
+    monkeypatch.setattr(gw, "exposed_tools", [*gw.exposed_tools, _tool("stepforgeprod_old_view")])
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _real_vocab_with_staging(tmp_path, "sibling-copy"))
+    apps = {a["app"]: a for a in _apps_body()["apps"]}
+    assert apps["stepforge-prod"]["canonical"] is False and apps["stepforge-prod"]["replaced_by"] == "heax-step_forge"
+    assert apps["sibling-copy"]["canonical"] is False, "코어 어휘표의 시험 사본"
+    assert apps["heax-step_forge"]["canonical"] is True
+
+
+def test_GW05_옛_키로_앱을_물으면_새_키를_안내하고_도구를_대신_싣지_않는다(monkeypatch):
+    _gw05_kit(monkeypatch)
+    one = _apps_body({"app": "stepforge-prod"})
+    assert one["apps"] == [] and one["error"].startswith("unknown app: stepforge-prod — 옛 키다") and "heax-step_forge" in one["error"]
+    assert one["moved"] == {"old": "stepforge-prod", "now": "heax-step_forge", "prefix": "stepforgeprod_"}
+    assert _apps_body({"app": "nope"})["error"] == "unknown app: nope" and "moved" not in _apps_body({"app": "nope"})
+
+
+def test_GW05_옛_접두_이름으로_부르면_새_이름을_안내하고_대신_부르지_않는다(monkeypatch):
+    b = _CallB(["section_pair_view"])
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": b})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    asyncio.run(gw._aggregate())
+    r = asyncio.run(gw._call_tool("stepforgeprod_section_pair_view", {}))
+    text = r.content[0].text
+    assert r.isError and text.startswith("unknown tool: stepforgeprod_section_pair_view — 옛 키 'stepforge-prod'"), text
+    assert "'heax-step_forge' 의 'section_pair_view'" in text and "대신 부르지 않는다" in text
+    assert b.session.calls == [], "옛 이름을 조용히 새 앱으로 돌렸다"
+    r2 = asyncio.run(gw._call_tool("invoke_tool", {"name": "stepforgeprod_section_pair_view", "arguments": {}}))
+    assert r2.isError and "section_pair_view" in r2.content[0].text and b.session.calls == [], "invoke_tool 도 같다"
+    r3 = asyncio.run(gw._call_tool("dynaforgeprod_report_summary", {}))
+    assert r3.isError and "heax-kooremapper_mcp" in r3.content[0].text and "목록에 없다" in r3.content[0].text, "새 앱에 없으면 찾는 길을 말한다"
+    rows = _rows()
+    assert rows[-1]["error"] == "unknown tool" and rows[-1]["note"] == "retired-key"
+    assert asyncio.run(gw._call_tool("no_such_tool", {})).content[0].text == "unknown tool: no_such_tool", "옛 키가 아니면 지금 그대로"
+
+
+def test_GW05_옛_키나_접두를_담은_질의는_검색_답에_새_키를_싣고_그_밖은_그대로다(monkeypatch):
+    _gw05_kit(monkeypatch)
+    plain = json.loads(asyncio.run(gw._search_tools({"query": "section pair view"}, embed=False, log_query=False)).content[0].text)
+    assert "moved" not in plain
+    got = json.loads(asyncio.run(gw._search_tools({"query": "stepforgeprod_section_pair_view"}, embed=False,
+                                                  log_query=False)).content[0].text)
+    assert got["moved"] == [{"old": "stepforge-prod", "now": "heax-step_forge", "tool": "section_pair_view"}]
+    got = json.loads(asyncio.run(gw._search_tools({"query": "dynaforge-prod 리포트"}, embed=False, log_query=False)).content[0].text)
+    assert got["moved"] == [{"old": "dynaforge-prod", "now": "heax-kooremapper_mcp"}]
+    assert list(got)[:4] == ["query", "match_count", "ranked", "moved"], "이름 순위 뒤 · 전문 앞"
+
+
+# ── GW-02 읽기 전용 허용 목록 — 재기동 없이 · 박스 덧씌우기 · 거절 까닭 · 관리자 보기(HWAXPortal docs/request-1117) ────────────────────────
+def _gw02_kit(monkeypatch, tmp_path, tools=("a_view", "b_view", "c_view", "hinted_view")):
+    _ro_base = tmp_path / "read_tools.json"
+    _ro_base.write_text(json.dumps({"tools": ["sf:a_view"], "deny": [], "override": []}), encoding="utf-8")
+    for k in ("READ_TOOLS", "READ_OVERRIDE", "READ_DENY"):            # 다시 읽기가 모듈 값을 바꾼다 — 시험 뒤 되돌린다
+        monkeypatch.setattr(gw, k, getattr(gw, k))
+    monkeypatch.setattr(gw, "READ_TOOLS_PATH", _ro_base)
+    monkeypatch.setattr(gw, "_READ_BASE", {"mtime": None, "checked": 0.0, "error": None, "loaded_at": None})
+    monkeypatch.setattr(gw, "route", {n: ("sf", n) for n in tools})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "tool_readonly_hint", {("sf", "hinted_view"): True})
+    return _ro_base
+
+
+def _bump(p, obj, n):
+    p.write_text(obj if isinstance(obj, str) else json.dumps(obj), encoding="utf-8")
+    os.utime(p, ns=(n * 1_000_000_000_000_000_000, n * 1_000_000_000_000_000_000))
+    gw._READ_BASE["checked"] = 0.0
+
+
+def test_GW02_read_tools_json_은_바뀐_시각으로_다시_읽고_깨지면_마지막_값으로_돈다(monkeypatch, tmp_path, caplog):
+    base = _gw02_kit(monkeypatch, tmp_path)
+    assert gw._readonly_denial("a_view", {}) == "" and gw._readonly_denial("b_view", {}).startswith("read_only:")
+    _bump(base, {"tools": ["sf:b_view"], "override": ["sf:c_view"], "deny": ["sf:hinted_view"]}, 1)
+    assert gw._readonly_denial("b_view", {}) == "" and gw._readonly_denial("c_view", {}) == "", "재기동 없이 먹는다(override 도 읽기)"
+    assert gw._readonly_denial("a_view", {}).startswith("read_only:"), "뺀 것은 곧바로 닫힌다"
+    assert gw._readonly_denial("hinted_view", {}).startswith("read_only:"), "deny 가 앱 표지보다 먼저다"
+    assert gw.READ_OVERRIDE == {"sf:c_view"} and gw.READ_DENY == {"sf:hinted_view"}
+    # 몇 초에 한 번만 본다 — 바로 뒤의 쓰기는 다음 확인 때 먹는다
+    gw._READ_BASE["checked"] = gw.time.monotonic()
+    base.write_text(json.dumps({"tools": []}), encoding="utf-8")
+    os.utime(base, ns=(2 * 10**18, 2 * 10**18))
+    assert gw._readonly_denial("b_view", {}) == "", "확인 간격 안에서는 다시 보지 않는다"
+    gw._READ_BASE["checked"] = 0.0
+    assert gw._readonly_denial("b_view", {}).startswith("read_only:")
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        _bump(base, "{broken", 3)
+        assert gw._readonly_denial("b_view", {}).startswith("read_only:") and gw.READ_TOOLS == frozenset(), "깨지면 마지막 값 그대로"
+    assert "마지막 값" in gw._readonly_allowlist_view()["base"]["error"]
+    assert any("read_tools.json 을 다시 읽지 못했다" in r.getMessage() for r in caplog.records)
+
+
+def test_GW02_읽기_전용_PAT_도_박스_덧씌우기를_읽고_닫기가_먼저_이긴다(monkeypatch, tmp_path):
+    _gw02_kit(monkeypatch, tmp_path)
+    local = gw.READ_TOOLS_LOCAL_PATH                                  # autouse 가 tmp 로 건 자리
+    assert gw._readonly_denial("b_view", {}).startswith("read_only:")
+    local.write_text(json.dumps({"tools": ["sf:b_view"], "deny": ["sf:a_view"]}), encoding="utf-8")
+    assert gw._readonly_denial("b_view", {}) == "", "덧씌우기의 읽기 목록 — 재기동 없이"
+    why = gw._readonly_denial("a_view", {})
+    assert why.startswith("read_only: 'a_view'") and "deny" in why and "sf:a_view" in why, "덧씌우기의 deny 가 추적 목록보다 먼저다"
+
+
+def test_GW02_읽기_전용_거절은_호출자가_받는_글에_read_only_까닭과_도구_이름을_싣는다(monkeypatch):
+    b = _ro_setup(monkeypatch, {gw.READONLY_HEADER: "1"})
+    r = asyncio.run(gw._call_tool("export_step", {}))
+    text = r.content[0].text
+    assert r.isError and text.startswith("read_only: 'export_step'") and "read-only" in text and "heax-step_forge:export_step" in text, text
+    assert "read_tools.local.json" in text and "재기동 없이" in text, "박스 덧씌우기로 고치는 길을 말한다"
+    for n, a in (("save_conversation", {}), ("rest_call", {"method": "POST"}), ("routine_call", {})):
+        t = gw._readonly_denial(n, a)
+        assert t.startswith("read_only:") and "read-only" in t and n.split("_")[0] in t, (n, t)
+    assert b.session.calls == []
+
+
+def test_GW02_관리자_보기_MCP_는_관리자만_출처_지문_읽은_시각을_준다(monkeypatch, tmp_path):
+    _gw02_kit(monkeypatch, tmp_path)
+    gw.READ_TOOLS_LOCAL_PATH.write_text(json.dumps({"tools": ["sf:b_view", "sf:a_view"], "deny": ["sf:c_view"]}), encoding="utf-8")
+    _set_request_headers(monkeypatch, {gw.GROUPS_HEADER: "feat:chat"})
+    r = asyncio.run(gw._call_tool("gateway_readonly_allowlist", {}))
+    assert r.isError and r.content[0].text.startswith("forbidden: gateway_readonly_allowlist"), r.content[0].text
+    assert "gateway_readonly_allowlist" not in {t.name for t in gw._visible_tools(["feat:chat"])}, "관리자가 아니면 목록 · 검색에 없다"
+    assert "gateway_readonly_allowlist" in {t.name for t in gw._visible_tools([gw.ADMIN_GROUP])}
+    _set_request_headers(monkeypatch, {gw.GROUPS_HEADER: gw.ADMIN_GROUP})
+    out = json.loads(asyncio.run(gw._call_tool("gateway_readonly_allowlist", {})).content[0].text)
+    rows = {e["tool"]: e for e in out["entries"]}
+    assert rows["sf:a_view"]["source"] == ["read_tools.json", "read_tools.local.json"]
+    assert rows["sf:b_view"]["source"] == ["read_tools.local.json"]
+    assert out["deny"] == [{"tool": "sf:c_view", "source": ["read_tools.local.json"]}]
+    assert out["base"]["file"] == "read_tools.json" and out["overlay"]["present"] and out["overlay"]["loaded_at"]
+    assert out["base"]["loaded_at"] and len(out["fingerprint"]) == 12 and out["hinted_read_only"] == 1
+    one = json.loads(asyncio.run(gw._call_tool("gateway_readonly_allowlist", {"q": "b_view"})).content[0].text)
+    assert [e["tool"] for e in one["entries"]] == ["sf:b_view"]
+    _set_request_headers(monkeypatch, {gw.GROUPS_HEADER: gw.ADMIN_GROUP, gw.READONLY_HEADER: "1"})
+    assert not asyncio.run(gw._call_tool("gateway_readonly_allowlist", {})).isError, "보기는 읽기다 — 관리자의 읽기 전용 PAT 도 본다"
+
+
+def _http(monkeypatch, path, method="GET", body=None, auth="Bearer gw-secret", verifier=None, qs=b""):
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    sent = []
+
+    async def send(m):
+        sent.append(m)
+    raw = body if isinstance(body, bytes) else (json.dumps(body, ensure_ascii=False).encode() if body is not None else b"")
+
+    async def receive():
+        return {"type": "http.request", "body": raw, "more_body": False}
+    headers = [(b"authorization", auth.encode())] if auth else []
+    asyncio.run(gw._bearer_gate(None, verifier)({"type": "http", "path": path, "method": method, "query_string": qs,
+                                                 "headers": headers, "client": ("198.51.100.20", 5000)}, receive, send))
+    return sent[0]["status"], json.loads(sent[1]["body"])
+
+
+def test_GW02_REST_GET_PATCH_는_관리자만_덧씌우기를_원자적으로_고치고_재기동_없이_먹고_감사한다(monkeypatch, tmp_path):
+    _gw02_kit(monkeypatch, tmp_path)
+    local = gw.READ_TOOLS_LOCAL_PATH
+    st, view = _http(monkeypatch, "/readonly-allowlist")
+    assert st == 200 and [e["tool"] for e in view["entries"]] == ["sf:a_view"] and not view["overlay"]["present"]
+    st, out = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:b_view"], "deny_add": ["sf:hinted_view"],
+                                                                  "expect": view["fingerprint"]})
+    assert st == 200 and out["ok"] and {e["tool"] for e in out["entries"]} == {"sf:a_view", "sf:b_view"}
+    saved = json.loads(local.read_text(encoding="utf-8"))
+    assert saved["tools"] == ["sf:b_view"] and saved["deny"] == ["sf:hinted_view"] and "_doc" in saved
+    assert not [p for p in local.parent.iterdir() if p.name.endswith(".tmp")], "임시 파일이 남았다"
+    assert gw._readonly_denial("b_view", {}) == "" and gw._readonly_denial("hinted_view", {}).startswith("read_only:"), "재기동 0"
+    st, conflict = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:c_view"], "expect": view["fingerprint"]})
+    assert st == 409 and conflict["fingerprint"] == out["fingerprint"], "옛 지문이면 덮지 않는다"
+    st, out2 = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"remove": ["sf:a_view", "sf:b_view"]})
+    assert st == 200 and out2["not_in_overlay"] == ["sf:a_view"] and "deny_add" in out2["note"], "추적 항목은 덧씌우기로 못 지운다"
+    for bad in ({"add": ["no-colon"]}, {"add": "sf:x"}, {}, {"add": [f"sf:t{i}" for i in range(gw.RO_PATCH_MAX + 1)]}):
+        assert _http(monkeypatch, "/readonly-allowlist", "PATCH", bad)[0] == 400, bad
+    local.write_text("{broken", encoding="utf-8")
+    st, broken = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:c_view"]})
+    assert st == 409 and local.read_text(encoding="utf-8") == "{broken", "깨진 파일은 덮지 않는다"
+    assert _http(monkeypatch, "/readonly-allowlist", "DELETE")[0] == 405
+    assert _http(monkeypatch, "/readonly-allowlist", auth="Bearer wrong")[0] == 401
+    rows = [r for r in _rows() if r["tool"].endswith("/readonly-allowlist")]
+    patched = [r for r in rows if r["tool"] == "PATCH /readonly-allowlist" and r["ok"]]
+    assert len(patched) == 2 and patched[0]["note"] == f"fp {out['fingerprint']} +sf:b_view deny+sf:hinted_view" and patched[0]["caller"] == "gw-token"
+    assert patched[0]["ip"] == "198.51.100.20" and patched[0]["via"] == "gw-token"
+
+
+def test_GW02_REST_는_PAT_면_포털이_지금_관리자라고_답한_사람만_읽기_전용이면_고치지_못한다(monkeypatch, tmp_path):
+    _gw02_kit(monkeypatch, tmp_path)
+    v = _verifier(monkeypatch)
+    admin = {"v": False}
+
+    async def access(email, base, **kw):
+        return {"keys": [], "is_admin": admin["v"]}
+    monkeypatch.setattr(gw, "_portal_access", access)
+    tok = _pat(gw.MCP_AUDIENCE, groups=[gw.ADMIN_GROUP])                     # 토큰에 박힌 관리자 표지는 믿지 않는다
+    st, body = _http(monkeypatch, "/readonly-allowlist", auth=f"Bearer {tok}", verifier=v)
+    assert st == 403 and "관리자" in body["detail"]
+    admin["v"] = True
+    assert _http(monkeypatch, "/readonly-allowlist", auth=f"Bearer {tok}", verifier=v)[0] == 200
+    st, out = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:b_view"]}, auth=f"Bearer {tok}", verifier=v)
+    assert st == 200 and _rows()[-1]["caller"] == "u@corp.com" and _rows()[-1]["via"] == "pat"
+    ro = _pat(gw.MCP_AUDIENCE, scopes=["read"])
+    st, body = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:c_view"]}, auth=f"Bearer {ro}", verifier=v)
+    assert st == 403 and "read-only" in body["detail"]
+    assert _http(monkeypatch, "/readonly-allowlist", auth=f"Bearer {ro}", verifier=v)[0] == 200, "보기는 읽기 전용 PAT 도"
+    expired = _pat(gw.MCP_AUDIENCE, exp_in=-3600)
+    st, body = _http(monkeypatch, "/readonly-allowlist", auth=f"Bearer {expired}", verifier=v)
+    assert st == 401 and body == gw.EXPIRED_BODY
+    panel = _pat(gw.PANEL_AUDIENCE)
+    assert _http(monkeypatch, "/readonly-allowlist", auth=f"Bearer {panel}", verifier=v)[0] == 401, "패널 PAT(다른 청중)는 열지 않는다"
+
+
+# ── GW-01 적재 경로 카탈로그 — 공개만(HWAXPortal docs/request-1117 · 사용자 결정 C3) ─────────────────────────────────────────────
+def _ingest_kit(monkeypatch, routes=None, rest=None):
+    monkeypatch.setattr(gw, "REST", rest if rest is not None else {"app-a": {"base": "http://a.invalid"}, "app-b": {"base": "http://b.invalid/apps/b"}})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    if routes is not None:
+        gw.INGEST_ROUTES_LOCAL_PATH.write_text(json.dumps({"routes": routes}), encoding="utf-8")
+
+
+def _rt(site, path, **kw):
+    return {"site": site, "method": "POST", "path": path, "portal_gate": False, "token": "app_token", "max_bytes": 512 * 1048576, **kw}
+
+
+_ROUTES = {"a-intake": _rt("app-a", "/apps/a_api/api/v1/intake", app="heax-a", token_hint="ak_", max_file_bytes=100, check_path="/api/v1/intake",
+                           declared_by="앱 A 11-20"),
+           "b-intake": _rt("app-b", "/apps/b/api/intake", portal_gate=True, token="portal_pat")}
+
+
+def _rcat(args):
+    return json.loads(asyncio.run(gw._rest_catalog(args)).content[0].text)
+
+
+def test_GW01_추적_선언은_주소가_없고_앱의_공식_답이_오기_전에는_비어_있으며_틀은_어느_앱이든_같다():
+    raw = gw.INGEST_ROUTES_PATH.read_text(encoding="utf-8")
+    assert "://" not in raw and not re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", raw), "추적 파일에 주소가 있다"
+    data = json.loads(raw)
+    assert data["routes"] == {}, "앱이 공식으로 밝힌 것만 — 짐작으로 채우지 않는다(결정 C3)"
+    (tid, tpl), = data["_template"].items()
+    assert "check_base" not in tpl, "점검 주소는 박스 덧씌우기에만"
+    got, why = gw._ingest_route_parse("x-intake", {**tpl, "site": "app-x", "app": "heax-x"})
+    assert got is not None and why == "ok", why
+    assert set(tpl) >= {"site", "method", "path", "portal_gate", "token", "max_bytes"}, "틀이 수용 기준의 칸을 다 보인다"
+
+
+def test_GW01_rest_catalog_part_ingest_는_경로_메서드_자격_상한_로그인_문을_싣고_주소는_싣지_않는다(monkeypatch):
+    _ingest_kit(monkeypatch)
+    out = _rcat({"part": "ingest"})
+    assert out["ingest"] == [] and "짐작으로 채우지 않는다" in out["note"], "선언이 없으면 없다고 말한다"
+    gw.INGEST_ROUTES_LOCAL_PATH.write_text(json.dumps({"routes": _ROUTES}), encoding="utf-8")
+    out = _rcat({"part": "ingest"})
+    rows = {r["id"]: r for r in out["ingest"]}
+    a = rows["a-intake"]
+    assert (a["method"], a["path"], a["token"], a["portal_gate"], a["max_mb"], a["max_file_bytes"]) == (
+        "POST", "/apps/a_api/api/v1/intake", "app_token", False, 512.0, 100)
+    assert a["checkable"] is True and a["last_check"] is None and a["declared_by"] == "앱 A 11-20"
+    assert rows["b-intake"]["portal_gate"] is True and rows["b-intake"]["checkable"] is False
+    assert ".invalid" not in json.dumps(out) and "relay" not in json.dumps(out), "상류 주소 · 중계가 새어 나왔다"
+    assert "받지도 나르지도 않는다" in out["how_to_upload"]
+    assert [r["id"] for r in _rcat({"part": "ingest", "site": "app-b"})["ingest"]] == ["b-intake"]
+    monkeypatch.setattr(gw, "_openapi_of", lambda s: asyncio.sleep(0, result=None))
+    base = {x["site"]: x for x in _rcat({"site": "app-a"})["sites"]}
+    assert base["app-a"]["ingest"] == [{"id": "a-intake", "method": "POST", "path": "/apps/a_api/api/v1/intake", "token": "app_token",
+                                        "max_mb": 512.0}] and "part='ingest'" in base["app-a"]["ingest_hint"]
+    assert "ingest" not in {x["site"]: x for x in _rcat({})["sites"]}.get("app-c", {}), "선언 없는 사이트에는 칸이 없다"
+
+
+def test_GW01_권한이_없으면_경로도_안_보이고_틀린_선언은_까닭과_함께_버리고_깨진_덧씌우기는_기본값으로(monkeypatch):
+    _ingest_kit(monkeypatch, {**_ROUTES,
+                              "bad-path": _rt("app-a", "http://evil.invalid/x"), "bad-token": _rt("app-a", "/x", token="service"),
+                              "bad-gate": {k: v for k, v in _rt("app-a", "/x").items() if k != "portal_gate"},
+                              "_x": _rt("app-a", "/x"), "bad-site": _rt("_uploads", "/x")})
+    out = _rcat({"part": "ingest"})
+    assert "invalid" not in out and "fingerprint" not in out, "버린 선언 · 지문은 관리자 · 공유 비밀에게만(11-17 검토 L7)"
+    monkeypatch.setattr(gw, "_request_groups", lambda: [gw.ADMIN_GROUP])
+    out = _rcat({"part": "ingest"})
+    assert out["invalid"] == {"bad-path": "path", "bad-token": "token", "bad-gate": "portal_gate", "_x": "id · 꼴", "bad-site": "site"}
+    assert len(out["fingerprint"]) == 12
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "POLICY", {"app-a": ["team"]})
+    assert [r["id"] for r in _rcat({"part": "ingest"})["ingest"]] == ["b-intake"], "REST 다리와 같은 규칙"
+    monkeypatch.setattr(gw, "POLICY", {"heax-a": ["team"]})
+    assert [r["id"] for r in _rcat({"part": "ingest"})["ingest"]] == ["b-intake"], "앱 키의 권한도 본다"
+    loc = gw.INGEST_ROUTES_LOCAL_PATH
+    loc.write_text("{broken", encoding="utf-8")
+    st = loc.stat()
+    os.utime(loc, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert "overlay_error" not in _rcat({"part": "ingest"})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [gw.ADMIN_GROUP])
+    out = _rcat({"part": "ingest"})
+    assert "덧씌우기를 버렸다" in out["overlay_error"] and out["ingest"] == []
+
+
+def test_GW01_점검은_check_path_가_있는_선언만_자격_없는_HEAD_한_번이고_시각_코드_뜻을_남긴다(monkeypatch):
+    _ingest_kit(monkeypatch, _ROUTES)
+    seen, mode = [], {"down": False}
+
+    def handler(req):
+        if mode["down"]:
+            raise httpx.ConnectError("down", request=req)
+        seen.append((req.method, str(req.url), req.headers.get("authorization"), req.content))
+        return httpx.Response(405)
+    _mock_http(monkeypatch, handler)
+    out = _rcat({"part": "ingest", "site": "app-a", "probe": True})
+    lc = out["ingest"][0]["last_check"]
+    assert seen == [("HEAD", "http://a.invalid/api/v1/intake", None, b"")], seen
+    assert lc["status"] == 405 and lc["meaning"] == "경로가 있다" and lc["via"] == "probe" and lc["checked_at"] and "_mono" not in lc
+    _rcat({"part": "ingest", "site": "app-a", "probe": True})
+    _rcat({"part": "ingest", "probe": True})
+    _rcat({"part": "ingest", "site": "app-b", "probe": True})
+    assert len(seen) == 1, "간격 안에서는 다시 묻지 않고 · site 없이는 하지 않고 · check_path 없는 선언은 건드리지 않는다"
+    gw._INGEST_CHECK.clear()
+    mode["down"] = True
+    lc = _rcat({"part": "ingest", "site": "app-a", "probe": True})["ingest"][0]["last_check"]
+    assert lc["status"] is None and lc["meaning"] == "닿지 않는다" and lc["error"] == "ConnectError"
+    # 박스 덧씌우기의 점검 주소
+    gw._INGEST_CHECK.clear()
+    mode["down"] = False
+    gw.INGEST_ROUTES_LOCAL_PATH.write_text(json.dumps({"routes": {**_ROUTES, "a-intake": {**_ROUTES["a-intake"],
+                                                                                           "check_base": "http://box.invalid:8700"}}}),
+                                           encoding="utf-8")
+    os.utime(gw.INGEST_ROUTES_LOCAL_PATH, ns=(10**18, 10**18))
+    _rcat({"part": "ingest", "site": "app-a", "probe": True})
+    assert seen[-1][1] == "http://box.invalid:8700/api/v1/intake"
+
+
+def test_GW01_HTTP_GET_ingest_는_PAT_나_공유_비밀로_같은_답을_주고_업로드는_받지_않는다(monkeypatch):
+    _ingest_kit(monkeypatch, _ROUTES)
+    st, body = _http(monkeypatch, "/ingest")
+    assert st == 200 and {r["id"] for r in body["ingest"]} == {"a-intake", "b-intake"}
+    st, body = _http(monkeypatch, "/ingest/app-b")
+    assert st == 200 and [r["id"] for r in body["ingest"]] == ["b-intake"]
+    assert _http(monkeypatch, "/ingest", auth="")[0] == 401
+    v = _verifier(monkeypatch)
+    monkeypatch.setattr(gw, "POLICY", {"app-b": ["team"]})
+    st, body = _http(monkeypatch, "/ingest", auth=f"Bearer {_pat(gw.MCP_AUDIENCE)}", verifier=v)
+    assert st == 200 and [r["id"] for r in body["ingest"]] == ["a-intake"], "PAT 면 그 사람 권한으로 보이는 것만"
+    for m in ("POST", "PUT", "PATCH", "DELETE"):
+        st, body = _http(monkeypatch, "/ingest/app-a/a-intake", m, body=b"file-bytes")
+        assert st == 405 and "업로드를 받지 않는다" in body["detail"], m
+    assert _http(monkeypatch, "/ingest/app-a/a-intake/x")[0] == 404
+
+
+# ── 11-17 검토 — GW-02 고침(M1 · L1 · L3 · L6) ─────────────────────────────────────────────
+def _labelled(monkeypatch, tmp_path):
+    """앱 표지가 다른 도구 넷 — w_view(readOnlyHint=False) · d_view(destructiveHint) · p_view(표지 없음) · t_view(readOnlyHint=False, 추적 목록)."""
+    base = _gw02_kit(monkeypatch, tmp_path, tools=())
+    ann = types.ToolAnnotations
+    tl = {"w_view": ann(readOnlyHint=False), "d_view": ann(destructiveHint=True), "p_view": None, "t_view": ann(readOnlyHint=False),
+          "h_view": ann(readOnlyHint=True, destructiveHint=True)}
+    monkeypatch.setattr(gw, "exposed_tools", [types.Tool(name=n, description="", inputSchema={"type": "object"}, **({"annotations": a} if a else {}))
+                                              for n, a in tl.items()])
+    monkeypatch.setattr(gw, "route", {n: ("sf", n) for n in tl})
+    monkeypatch.setattr(gw, "tool_readonly_hint", {("sf", "h_view"): True})
+    _bump(base, {"tools": ["sf:t_view", "sf:d_view"]}, 1)
+    return base
+
+
+def test_M1_박스_덧씌우기만으로는_앱이_쓰기로_적은_도구를_열지_않고_파괴_표지는_어느_목록이든_막는다(monkeypatch, tmp_path):
+    _labelled(monkeypatch, tmp_path)
+    gw.READ_TOOLS_LOCAL_PATH.write_text(json.dumps({"tools": ["sf:w_view", "sf:p_view", "sf:d_view"]}), encoding="utf-8")
+    why = gw._readonly_denial("w_view", {})
+    assert why.startswith("read_only: 'w_view'") and "readOnlyHint=False" in why and "앱 표지가 이긴다" in why, why
+    assert gw._readonly_denial("p_view", {}) == "", "표지가 없으면 덧씌우기로 연다"
+    assert gw._readonly_denial("t_view", {}) == "", "추적 목록은 지금 그대로(앱의 readOnlyHint=False 보다 먼저)"
+    for n in ("d_view", "h_view"):
+        w = gw._readonly_denial(n, {})
+        assert w.startswith(f"read_only: '{n}'") and "destructiveHint" in w, (n, w)
+    # 루틴 · 패널 판정과 같은 쪽이다
+    for n, want in (("w_view", False), ("p_view", True), ("d_view", False)):
+        t = next(x for x in gw.exposed_tools if x.name == n)
+        assert gw._routine_read(t, "sf", n, by_name=False) is want, n
+
+
+def test_M1_PATCH_는_쓰기_파괴_표지가_달린_항목을_남기되_경고하고_보기는_표지로_막힌_것을_적는다(monkeypatch, tmp_path):
+    _labelled(monkeypatch, tmp_path)
+    st, out = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:w_view", "sf:p_view", "sf:d_view"]})
+    assert st == 200 and "sf:w_view" in json.loads(gw.READ_TOOLS_LOCAL_PATH.read_text(encoding="utf-8"))["tools"], "항목은 남긴다"
+    assert [w.split("'")[1] for w in out["warnings"]] == ["sf:w_view", "sf:d_view"] and "열리지 않는다" in out["warnings"][0]
+    rows = {e["tool"]: e for e in out["entries"]}
+    assert rows["sf:w_view"]["blocked_by_label"] == "readOnlyHint=False" and rows["sf:d_view"]["blocked_by_label"] == "destructiveHint"
+    assert "blocked_by_label" not in rows["sf:t_view"] and "blocked_by_label" not in rows["sf:p_view"], "추적 항목은 지금 그대로 연다"
+    assert "루틴" in out["scope"] and "패널" in out["scope"], "같은 항목이 루틴 단계 · 패널 확인에도 든다고 말한다"
+    assert _http(monkeypatch, "/readonly-allowlist")[1]["scope"] == out["scope"]
+
+
+def test_L1_read_tools_json_의_칸이_목록이_아니면_셋_다_마지막_값을_둔다(monkeypatch, tmp_path, caplog):
+    base = _gw02_kit(monkeypatch, tmp_path)
+    _bump(base, {"tools": ["sf:a_view"], "deny": ["sf:b_view"], "override": ["sf:c_view"]}, 1)
+    assert gw._readonly_denial("a_view", {}) == "" and gw.READ_DENY == {"sf:b_view"}
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        _bump(base, {"tools": ["sf:b_view"], "deny": "sf:b_view"}, 2)
+        gw._readonly_denial("a_view", {})
+    assert gw.READ_DENY == {"sf:b_view"} and gw.READ_TOOLS == {"sf:a_view", "sf:c_view"}, "deny 만 비고 나머지가 바뀌는 반쪽 판이 없다"
+    assert "deny 는 목록이어야 한다" in gw._readonly_allowlist_view()["base"]["error"]
+    _bump(base, {"tools": ["sf:b_view"], "deny": []}, 3)
+    assert gw._readonly_denial("b_view", {}) == "" and gw._readonly_allowlist_view()["base"]["error"] is None
+
+
+def test_L6_공유_비밀_PATCH_감사는_함께_실린_사람을_적고_권한은_주지_않는다(monkeypatch, tmp_path):
+    _gw02_kit(monkeypatch, tmp_path)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    sent = []
+
+    async def send(m):
+        sent.append(m)
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps({"add": ["sf:b_view"]}).encode(), "more_body": False}
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/readonly-allowlist", "method": "PATCH", "query_string": b"",
+                                             "headers": [(b"authorization", b"Bearer gw-secret"), (b"x-hwax-user", b"admin%40corp.com")],
+                                             "client": ("198.51.100.21", 1)}, receive, send))
+    assert sent[0]["status"] == 200
+    row = _rows()[-1]
+    assert row["caller"] == "admin@corp.com" and row["via"] == "gw-token" and "+sf:b_view" in row["note"]
+
+
+def test_L3_관리자도_의미_순위를_받는다_관리자_도구는_색인_밖이라_뒤에_선다(monkeypatch):
+    search = _fused_kit(monkeypatch, _CURVE_SPECS, {"curve_a": 0.9, "plot_b": 0.5})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [gw.ADMIN_GROUP])
+    assert "gateway_readonly_allowlist" in {t.name for t in gw._visible_tools([gw.ADMIN_GROUP])}
+    out = search("곡선")
+    assert out["mode"] == "rrf", out.get("mode_reason")
+    order, why = asyncio.run(gw._tool_embed_order("곡선", gw._visible_tools([gw.ADMIN_GROUP])))
+    assert why == "" and order[-1] is gw.READONLY_ALLOWLIST_TOOL
+
+
+# ── 11-17 검토 — GW-01 고침(L2 · L5 · L7 · L9) ─────────────────────────────────────────────
+# master(38769b7) 의 rest_catalog 도구 설명 sha256 — 검색 순위는 도구 설명을 본다. 적재 경로 설명은 인자(part)에 둔다(L9)
+_REST_CATALOG_DESC_SHA = "19dc88af99729701b5401d0f0f717b98cf32badea728157c9c964a4e38d333cf"
+
+
+def test_L9_rest_catalog_도구_설명은_master_그대로이고_적재_경로_설명은_인자에_있다():
+    import hashlib
+    assert hashlib.sha256(gw.REST_CATALOG_TOOL.description.encode()).hexdigest() == _REST_CATALOG_DESC_SHA, \
+        "도구 설명을 바꾸면 모두의 search_tools 순위가 바뀐다 — 설명은 인자에 둔다"
+    part = gw.REST_CATALOG_TOOL.inputSchema["properties"]["part"]
+    assert part["enum"] == ["paths", "ingest"] and "업로드를 받지 않는다" in part["description"]
+
+
+def test_L5_적재_경로는_다른_호스트로_읽히는_꼴을_받지_않는다():
+    for bad in ("//evil.invalid/x", "/\\evil.invalid/x", "/a\\b", "///x"):
+        assert not gw._ingest_path_ok(bad), bad
+        assert gw._ingest_route_parse("r-1", _rt("app-a", bad))[1] == "path", bad
+    assert gw._ingest_path_ok("/apps/a/api/v1/intake")
+
+
+def test_L2_동시에_온_점검은_HEAD_를_한_번만_보낸다(monkeypatch):
+    _ingest_kit(monkeypatch, _ROUTES)
+    seen = []
+
+    async def slow(req):
+        seen.append(req.method)
+        await asyncio.sleep(0.05)
+        return httpx.Response(405)
+    _mock_http(monkeypatch, slow)
+    r = gw._ingest_conf()["routes"]["a-intake"]
+
+    async def many():
+        return await asyncio.gather(*(gw._ingest_probe(r) for _ in range(25)))
+    got = asyncio.run(many())
+    assert seen == ["HEAD"], f"점검이 {len(seen)}번 나갔다"
+    assert gw._INGEST_CHECK["a-intake"]["status"] == 405 and "in_progress" not in gw._INGEST_CHECK["a-intake"]
+    assert sum(1 for g in got if g.get("in_progress")) == 24, "나머지는 '점검 중' 기록을 받는다"
+
+
+def test_L7_HTTP_카탈로그도_버린_선언_지문은_공유_비밀_관리자에게만(monkeypatch):
+    _ingest_kit(monkeypatch, {**_ROUTES, "bad-path": _rt("app-a", "//evil.invalid/x")})
+    st, body = _http(monkeypatch, "/ingest")
+    assert st == 200 and body["invalid"] == {"bad-path": "path"} and "fingerprint" in body, "공유 비밀은 본다"
+    v = _verifier(monkeypatch)
+    st, body = _http(monkeypatch, "/ingest", auth=f"Bearer {_pat(gw.MCP_AUDIENCE)}", verifier=v)
+    assert st == 200 and "invalid" not in body and "fingerprint" not in body and {r["id"] for r in body["ingest"]} == {"a-intake", "b-intake"}
+
+
+# ── 11-17 검토 — GW-05 고침(L4 · L7) ─────────────────────────────────────────────
+def test_L4_형제_허브는_정본이_아니다(monkeypatch, tmp_path):
+    _gw05_kit(monkeypatch)
+    d = json.loads(_REAL_CORE_VOCAB.read_text(encoding="utf-8"))
+    d.setdefault("apps", {})["sibling-copy"] = {"role": "sibling", "label": "형제 허브"}
+    p = tmp_path / "core_vocab.json"
+    p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", p)
+    apps = {a["app"]: a for a in _apps_body()["apps"]}
+    assert "sibling-copy" in (gw._CORE_VOCAB["data"] or {}).get("siblings", ()), "전제 — 어휘표가 형제로 읽었다"
+    assert apps["sibling-copy"]["canonical"] is False and apps["heax-step_forge"]["canonical"] is True
+
+
+def test_L7_옛_키_안내는_권한_밖_앱_도구_이름을_말하지_않고_env_errors_는_관리자에게만(monkeypatch):
+    b = _CallB(["section_pair_view"])
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": b})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {"heax-step_forge": ["cad-team"]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    asyncio.run(gw._aggregate())
+    text = asyncio.run(gw._call_tool("stepforgeprod_section_pair_view", {})).content[0].text
+    assert text.startswith("unknown tool: stepforgeprod_section_pair_view — 옛 키 'stepforge-prod'") and "권한이 없다" in text
+    assert "heax-step_forge" not in text and "section_pair_view'" not in text, text
+    one = _apps_body({"app": "stepforge-prod"})
+    assert one["moved"] == {"old": "stepforge-prod"} and "heax-step_forge" not in json.dumps(one["error"]) and "권한이 없다" in one["error"]
+    got = json.loads(asyncio.run(gw._search_tools({"query": "stepforgeprod_section_pair_view"}, embed=False, log_query=False)).content[0].text)
+    assert got["moved"] == [{"old": "stepforge-prod", "note": gw._RETIRED_NO_ACCESS}]
+    # 권한이 있으면 종전대로 이름을 말한다
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["cad-team"])
+    assert "'heax-step_forge' 의 'section_pair_view'" in asyncio.run(gw._call_tool("stepforgeprod_section_pair_view", {})).content[0].text
+    # env.errors — 관리자 · 내부 서비스에게만
+    gw.APP_KEYS_LOCAL_PATH.write_text(json.dumps({"apps": {"secret-app": {"env": "production"}}}), encoding="utf-8")
+    assert "errors" not in _apps_body()["env"]
+    monkeypatch.setattr(gw, "_request_groups", lambda: [gw.ADMIN_GROUP])
+    assert _apps_body()["env"]["errors"] == ["apps.secret-app.env"]

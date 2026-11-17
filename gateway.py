@@ -1454,7 +1454,8 @@ async def _aggregate():
         clash = name_counts[t.name] > 1 if key in _CONN_ACTIVE else base_counts[t.name] > 1
         # 그림 도구(로컬)와 같은 이름의 백엔드 도구는 접두를 단다 — 맨 이름이면 tools/list 에 같은 이름이 둘이고 그 이름의 호출은 늘 로컬로 가서
         # 백엔드 도구에 닿지 못했다(반대 검토 7). 그림 저장 · PC 키트가 새로 맡은 이름만이다 — 다른 로컬 이름은 지금 그대로다.
-        clash = clash or (FIG_STORE_ON and t.name in _FIG_NAMES) or t.name == KIT_GET_TOOL.name
+        clash = (clash or (FIG_STORE_ON and t.name in _FIG_NAMES) or t.name == KIT_GET_TOOL.name
+                 or t.name == READONLY_ALLOWLIST_TOOL.name)
         if clash or key in family:
             prefix = key.replace("-", "")  # mx-white-paper -> mxwhitepaper
             exposed_name = f"{prefix}_{t.name}"
@@ -2843,6 +2844,13 @@ REST_CATALOG_TOOL = types.Tool(
             "site": {"type": "string", "description": "특정 사이트만(생략 시 전체 요약)"},
             "q": {"type": "string", "description": "경로·요약에서 찾을 말(예: upload, job, report)"},
             "limit": {"type": "integer", "description": "사이트당 반환할 경로 수(기본 40, 최대 200). 넘으면 truncated 가 말한다"},
+            # 설명은 도구 설명이 아니라 인자에 둔다 — 검색 순위는 도구 설명을 보고 인자는 보지 않는다(모두의 순위가 바이트까지 그대로다, 11-17 검토 L9)
+            "part": {"type": "string", "enum": ["paths", "ingest"],
+                     "description": ("paths(기본 — REST 경로 표) 또는 ingest — 앱이 공식으로 밝힌 파일 적재 경로(바깥 경로 · 메서드 · 받는 자격 종류 · "
+                                     "크기 상한 · 포털 로그인 문 · 마지막 점검). 큰 파일은 MCP 로 나르지 않고 거기 적힌 길로 직접 올린다 — 게이트웨이는 "
+                                     "업로드를 받지 않는다.")},
+            "probe": {"type": "boolean",
+                      "description": "part='ingest' 이고 site 를 줄 때만 — 점검 경로(check_path)가 있는 선언을 자격 없이 HEAD 로 한 번 보고 응답 코드 · 시각을 last_check 에 남긴다(기본 false)."},
         },
     },
 )
@@ -3012,7 +3020,9 @@ async def _tool_index_refresh() -> None:
 
 async def _tool_embed_order(raw_q: str, tools: list[types.Tool]) -> tuple[list[types.Tool] | None, str]:
     """도구를 질의와의 코사인 내림차순(같으면 이름 차례)으로 — (순서, '') 또는 못 하면 (None, 까닭). 값은 버리고 순서만 낸다."""
-    keyed = [(t, _doc_key(_tool_doc(t))) for t in tools]
+    # 관리자 시야에만 있는 도구는 모두의 색인 밖이다 — 그것 때문에 관리자의 의미 순위가 꺼지지 않게 뒤에 둔다(11-17 검토 L3)
+    extra = [t for t in tools if t is READONLY_ALLOWLIST_TOOL]
+    keyed = [(t, _doc_key(_tool_doc(t))) for t in tools if t is not READONLY_ALLOWLIST_TOOL]
     if not keyed or any(k not in _TOOL_VEC for _, k in keyed):
         _tool_index_schedule()
         return None, "도구 색인이 아직 다 차지 않았다(뒤에서 채우는 중)"
@@ -3035,7 +3045,7 @@ async def _tool_embed_order(raw_q: str, tools: list[types.Tool]) -> tuple[list[t
         v, vn = _TOOL_VEC[k]
         sims.append((sum(a * b for a, b in zip(qv, v)) / (qn * vn), t.name, t))
     sims.sort(key=lambda s: (-s[0], s[1]))
-    return [t for _, _, t in sims], ""
+    return [t for _, _, t in sims] + extra, ""
 
 
 async def _tool_rank_fused(raw_q: str, rows: list, tools: list[types.Tool]) -> tuple[list, dict]:
@@ -3736,6 +3746,8 @@ def _tool_is_write(t, original: str, backend: str | None = None) -> bool:
         return False
     if getattr(ann, "destructiveHint", None) is True:
         return True
+    if backend is not None:
+        _read_base_sync()
     if backend is not None and f"{backend}:{original}" in READ_OVERRIDE:
         return False       # 앱이 readOnlyHint=False 를 적었어도 포털이 읽기로 다루는 도구(read_tools.json override — 사용자 결정으로만)
     if getattr(ann, "readOnlyHint", None) is False:
@@ -4075,6 +4087,10 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
         payload.update(mode)        # 어느 순위로 답했나 — rrf, 또는 못 섞었으면 substring 과 그 까닭(mode_reason)
     payload["match_count"] = len(rows)
     payload["ranked"] = [m["tool"] for m in matches]
+    _moved = _retired_in_query(q, groups)
+    if _moved:
+        # 옛 키 · 옛 접두를 담은 질의(GW-05) — 새 키(이름이 보이면 새 도구)를 말한다. 옛 이름은 대신 부르지 않는다
+        payload["moved"] = _moved
     if lookup_tool is not None:
         payload["hint"] = (f"먼저 {ONTO_LOOKUP_TOOL.name} 으로 정본 key 를 얻고 그 답의 next 를 따른다 — 후보(candidates)면 고르지 말고 사람에게 "
                            "묻는다")
@@ -4168,6 +4184,188 @@ async def _needs_connect(keys) -> set[str]:
     return out
 
 
+# ── 앱 키 · 환경 · 정본 · 옛 키(HWAXPortal docs/request-1117 GW-05) ───────────────────────────────────────────────
+# list_tool_apps 의 앱 줄마다 env(dev · prod — 이름은 게이트웨이가 정한다, 사용자 결정 D5 · DynaForge · 리스크 앱도 같은 이름) · canonical · aliases 를 싣는다. 옛 키(은퇴한 선언 백엔드 키 · 그 접두 이름)로 부르거나 찾으면
+# 새 키 · 새 이름을 **안내만** 한다 — 대신 부르지 않는다(옛 이름이 조용히 다른 앱으로 가면 무엇을 불렀는지가 흐려진다).
+#  · 옛 키 표는 추적 app_keys.json 의 retired(주소 없음). 환경 · 정본 여부는 박스의 사실이라 박스 덧씌우기 app_keys.local.json(gitignore — merge patch,
+#    바뀐 시각을 보고 재기동 없이 다시 읽는다)에 default_env · apps.<키>.env · canonical 로 적는다. 게이트웨이를 띄우는 셸의 GATEWAY_ENV 가 그다음이다.
+#    둘 다 없으면 env 는 unknown 이다 — dev 로도 prod 로도 지어내지 않는다(운영 박스가 적지 않은 사이에 운영 앱이 dev 로 보이면 요청이 막으려던 오판이다 —
+#    HWAXPortal docs/request-1117 contracts §5 '모르면 unknown'). 박스가 적지 않았다는 것은 list_tool_apps 의 env.source 'unset' 과 note 가 말한다.
+#  · canonical 은 덧씌우기 값이 먼저고, 없으면 옛 키(아직 붙어 있어도) · 코어 어휘표의 시험 사본(staging) · 형제 허브(sibling — 같은 허브 도구,
+#    담은 데이터가 다르다 · 정본은 하나다)가 거짓, 나머지는 참이다(11-17 검토 L4).
+#  · 옛 키 안내는 부르는 사람이 지금 키의 앱을 쓸 수 있을 때만 그 앱 · 도구 이름을 말한다 — 권한 밖이면 '다른 앱으로 옮겼다 — 권한이 없다' 만(L7).
+APP_KEYS_PATH = Path(__file__).with_name("app_keys.json")
+APP_KEYS_LOCAL_PATH = Path(__file__).with_name("app_keys.local.json")
+APP_ENVS = ("dev", "prod")
+APP_ENV_UNSET = "unknown"                # 박스가 적지 않았을 때의 값 — 어느 쪽으로도 지어내지 않는다(이름 셋째 값, 박스가 적는 값은 APP_ENVS 둘뿐)
+GATEWAY_ENV = (os.environ.get("GATEWAY_ENV") or "").strip().lower()
+_APP_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+_APP_KEYS: dict = {"key": None, "data": None, "error": None, "overlay": None}
+
+
+def _app_keys_parse(d: dict) -> tuple[dict, list[str]]:
+    """app_keys 꼴 → 쓰는 값과 버린 칸의 까닭. 칸 하나가 틀리면 그 칸만 버린다(옛 키 하나 때문에 환경 표 전체를 잃지 않는다)."""
+    if not isinstance(d, dict):
+        raise TypeError("객체여야 한다")
+    errs: list[str] = []
+    retired: dict[str, dict] = {}
+    for old, spec in (d.get("retired") or {}).items():
+        now = (spec or {}).get("now") if isinstance(spec, dict) else None
+        if not (isinstance(old, str) and _APP_KEY_RE.fullmatch(old) and isinstance(now, str) and _APP_KEY_RE.fullmatch(now) and now != old):
+            errs.append(f"retired.{old}")
+            continue
+        prefix = spec.get("prefix") if isinstance(spec.get("prefix"), str) and spec.get("prefix") else old.replace("-", "") + "_"
+        retired[old] = {"now": now, "prefix": prefix, "note": str(spec.get("note") or "")[:300]}
+    default_env = d.get("default_env")
+    if default_env is not None and default_env not in APP_ENVS:
+        errs.append("default_env")
+        default_env = None
+    apps: dict[str, dict] = {}
+    for key, spec in (d.get("apps") or {}).items():
+        if not (isinstance(key, str) and isinstance(spec, dict)):
+            errs.append(f"apps.{key}")
+            continue
+        one = {}
+        if spec.get("env") in APP_ENVS:
+            one["env"] = spec["env"]
+        elif spec.get("env") is not None:
+            errs.append(f"apps.{key}.env")
+        if isinstance(spec.get("canonical"), bool):
+            one["canonical"] = spec["canonical"]
+        elif spec.get("canonical") is not None:
+            errs.append(f"apps.{key}.canonical")
+        if spec.get("note"):
+            one["note"] = str(spec["note"])[:300]
+        apps[key] = one
+    return {"retired": retired, "default_env": default_env, "apps": apps}, errs
+
+
+def _app_keys() -> dict:
+    """지금 쓰는 앱 키 표 — 추적 기본값에 박스 덧씌우기를 얹은 것. 두 파일의 바뀐 시각이 같으면 다시 읽지 않는다(검색 손잡이 _tuning 과 같은 꼴).
+    기본값을 못 읽으면 마지막 값, 그것도 없으면 빈 표다. 덧씌우기가 깨지면 버리고 기본값으로 돈다(까닭은 list_tool_apps 의 env.errors)."""
+    def mt(p: Path):
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return None
+    key = (mt(APP_KEYS_PATH), mt(APP_KEYS_LOCAL_PATH))
+    if key == _APP_KEYS["key"] and _APP_KEYS["data"] is not None:
+        return _APP_KEYS["data"]
+    error, errs = None, []
+    try:
+        base_raw = json.loads(APP_KEYS_PATH.read_text(encoding="utf-8"))
+        data, errs = _app_keys_parse(base_raw)
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        error = f"기본값을 못 읽음({type(exc).__name__})"
+        log.warning("앱 키 표(%s)를 못 읽었다 — 옛 키 안내 없이 돈다: %r", APP_KEYS_PATH, exc)
+        if _APP_KEYS["data"] is not None:
+            _APP_KEYS.update(key=key, error=error)
+            return _APP_KEYS["data"]
+        base_raw, data = {}, {"retired": {}, "default_env": None, "apps": {}}
+    overlay = {"present": key[1] is not None}
+    if key[1] is not None:
+        try:
+            patch = json.loads(APP_KEYS_LOCAL_PATH.read_text(encoding="utf-8"))
+            if not isinstance(patch, dict):
+                raise TypeError("덧씌우기는 객체여야 한다")
+            data, errs = _app_keys_parse(_merge_patch(base_raw, patch))
+            overlay["fingerprint"] = _json_fp(patch)
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            overlay["error"] = f"덧씌우기를 버렸다({type(exc).__name__}: {str(exc)[:120]})"
+            log.warning("앱 키 덧씌우기(%s)를 버리고 기본값으로 돈다: %r", APP_KEYS_LOCAL_PATH, exc)
+    if errs:
+        log.warning("앱 키 표에서 꼴이 틀린 칸을 버렸다: %s", ", ".join(errs[:20]))
+    data = {**data, "errors": errs[:40]}
+    _APP_KEYS.update(key=key, data=data, error=error, overlay=overlay)
+    return data
+
+
+def _box_env() -> tuple[str, str]:
+    """이 박스의 기본 환경과 그 출처 — 덧씌우기 default_env > GATEWAY_ENV > unknown(출처 unset)."""
+    d = _app_keys()
+    if d.get("default_env"):
+        return d["default_env"], "app_keys.local.json"
+    if GATEWAY_ENV in APP_ENVS:
+        return GATEWAY_ENV, "GATEWAY_ENV"
+    return APP_ENV_UNSET, "unset"
+
+
+def _app_env_entry(key: str) -> dict:
+    """앱 줄에 싣는 env · canonical · aliases(+ 옛 키면 replaced_by). env 는 박스가 적은 dev · prod, 적지 않았으면 unknown 이다(늘 찬다)."""
+    d = _app_keys()
+    one = (d.get("apps") or {}).get(key) or {}
+    env = one.get("env") or _box_env()[0]
+    retired = d.get("retired") or {}
+    if "canonical" in one:
+        canonical = one["canonical"]
+    else:
+        cv = _CORE_VOCAB["data"] or {}
+        canonical = key not in retired and key not in (cv.get("staging") or frozenset()) and key not in (cv.get("siblings") or ())
+    out = {"env": env, "canonical": canonical,
+           "aliases": [{"key": old, "prefix": s["prefix"]} for old, s in sorted(retired.items()) if s["now"] == key]}
+    if key in retired:
+        out["replaced_by"] = retired[key]["now"]
+    if one.get("note"):
+        out["env_note"] = one["note"]
+    return out
+
+
+def _retired_key(text: str) -> tuple[str, dict] | None:
+    """앱 키 글이 옛 키인가 — 그대로거나 하이픈을 뺀 꼴(dynaforgeprod)까지. 아니면 None."""
+    t = str(text or "").strip().lower()
+    for old, spec in (_app_keys().get("retired") or {}).items():
+        if t in (old.lower(), old.lower().replace("-", "")):
+            return old, spec
+    return None
+
+
+def _exposed_name(backend: str, original: str) -> str | None:
+    """(백엔드, 원래 이름) 의 지금 노출 이름 — 없으면 None."""
+    return next((n for n, (bk, orig) in route.items() if bk == backend and orig == original), None)
+
+
+_RETIRED_NO_ACCESS = "다른 앱으로 옮겼지만 이 계정은 그 앱을 쓸 권한이 없다 — 포털 '내 권한'(/access)에서 요청한다"
+
+
+def _retired_tool_hint(name: str, groups: list[str] | None = None) -> str | None:
+    """옛 키의 접두 이름(예 stepforgeprod_section_pair_view)이면 새 키 · 새 이름을 말하는 안내 한 줄. 아니면 None. 대신 부르지 않는다.
+    부르는 사람이 지금 키의 앱을 쓸 수 없으면 그 앱 · 도구 이름을 말하지 않는다(L7)."""
+    groups = _request_groups() if groups is None else groups
+    for old, spec in (_app_keys().get("retired") or {}).items():
+        p = spec["prefix"]
+        if p and name.startswith(p) and len(name) > len(p):
+            if not _backend_allowed(spec["now"], groups):
+                return f"옛 키 '{old}' 의 이름이다 — {_RETIRED_NO_ACCESS}"
+            orig = name[len(p):]
+            new = _exposed_name(spec["now"], orig)
+            if new:
+                return (f"옛 키 '{old}' 의 이름이다 — 지금은 앱 '{spec['now']}' 의 '{new}' 로 부른다(게이트웨이는 옛 이름을 대신 부르지 않는다)")
+            return (f"옛 키 '{old}' 의 이름이다 — 지금 그 도구는 앱 '{spec['now']}' 에 있어야 하는데 '{orig}' 가 지금 목록에 없다. "
+                    f"search_tools 로 찾거나 list_tool_apps(app='{spec['now']}') 로 본다")
+    return None
+
+
+def _retired_in_query(q: str, groups: list[str] | None = None) -> list[dict]:
+    """검색 질의가 옛 키 · 옛 접두를 담았으면 새 키(와 이름이 있으면 새 도구)를 말하는 줄. 없으면 []. 지금 키의 앱을 쓸 수 없는 사람에게는 옮겼다는
+    것만 말한다(L7)."""
+    groups = _request_groups() if groups is None else groups
+    q = str(q or "").lower()
+    out = []
+    for old, spec in sorted((_app_keys().get("retired") or {}).items()):
+        p = spec["prefix"].lower()
+        if old.lower() in q or old.lower().replace("-", "") in q or (p and p in q):
+            if not _backend_allowed(spec["now"], groups):
+                out.append({"old": old, "note": _RETIRED_NO_ACCESS})
+                continue
+            row = {"old": old, "now": spec["now"]}
+            m = re.search(re.escape(p) + r"([a-z0-9_]+)", q) if p else None
+            if m:
+                new = _exposed_name(spec["now"], m.group(1))
+                row["tool"] = new or None
+            out.append(row)
+    return out
+
+
 async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     groups = _request_groups()
     _core_vocab()                                    # 앱 역할(role)을 지금 어휘표로 — 덧씌우기를 고쳤으면 다시 읽는다
@@ -4229,6 +4427,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             "status": "ok" if (accessible and reachable) else
                       ("no_access" if not accessible else "backend_down"),
         }
+        # 환경 · 정본 · 옛 키(GW-05) — 앱마다 env 가 dev · prod 로 찬다(박스가 app_keys.local.json · GATEWAY_ENV 로 적는다 — 없으면 unknown)
+        entry.update(_app_env_entry(key))
         role = None if local else _app_role(key)
         if role:
             # 어휘표의 앱 역할(E2-1 · C-B) — 정본 · 형제(같은 허브 도구, 담은 데이터가 다르다) · 비코어(코어 객체가 없다 — note 는 그 앱이 갖는 것)
@@ -4272,12 +4472,32 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         # 이 연결의 개인 보기(E-4) — tools/list 에 실은 수 · 보기로 뺀 수(목록 밖도 search_tools → invoke_tool 로 닿는다)
         "view": _view_info(groups),
     }
+    # 이 박스의 기본 환경과 출처(GW-05) — 앱 줄의 env 는 이것이거나 박스 덧씌우기의 앱별 값이다
+    _env, _src = _box_env()
+    payload["env"] = {"box": _env, "source": _src}
+    if _src == "unset":
+        payload["env"]["note"] = (f"이 박스는 환경을 적지 않아 {APP_ENV_UNSET} 로 적었다 — 운영자가 게이트웨이 app_keys.local.json 에 "
+                                  "default_env(dev · prod)를 적거나 게이트웨이를 GATEWAY_ENV 와 함께 띄운다")
+    _ak = _app_keys()
+    # 덧씌우기에서 버린 칸(앱 키가 든다)은 관리자 · 내부 서비스에게만(L7)
+    if (ADMIN_GROUP in groups or SERVICE_GROUP in groups) and (_ak.get("errors") or (_APP_KEYS.get("overlay") or {}).get("error")):
+        payload["env"]["errors"] = [*(_ak.get("errors") or []), *([_APP_KEYS["overlay"]["error"]] if (_APP_KEYS.get("overlay") or {}).get("error") else [])]
     if want_app and not apps:
+        _moved = _retired_key(want_app) if not denied else None
         if denied:
             d0 = denied_apps[0]
             payload["error"] = (f"not_ready: {want_app} — {d0['how']}" if d0["reason"] == "policy_not_ready"
                                 else f"no_access: {want_app} — 이 계정에는 권한이 없는 앱이다. {d0['how']}")
             payload["denied"] = d0
+        elif _moved and not _backend_allowed(_moved[1]["now"], groups):
+            # 옛 키인데 지금 키의 앱을 쓸 수 없다 — 그 앱 이름을 말하지 않는다(L7)
+            payload["error"] = f"unknown app: {want_app} — 옛 키다. {_RETIRED_NO_ACCESS}"
+            payload["moved"] = {"old": _moved[0]}
+        elif _moved:
+            # 옛 키(GW-05) — 새 키를 안내만 한다(그 앱의 도구를 대신 싣지 않는다)
+            payload["error"] = (f"unknown app: {want_app} — 옛 키다. 지금은 '{_moved[1]['now']}' 다 — list_tool_apps(app='{_moved[1]['now']}') 로 "
+                                "다시 본다")
+            payload["moved"] = {"old": _moved[0], "now": _moved[1]["now"], "prefix": _moved[1]["prefix"]}
         else:
             payload["error"] = f"unknown app: {want_app}"
     return types.CallToolResult(
@@ -4879,9 +5099,213 @@ def _openapi_rows(doc: dict) -> list[dict]:
     return rows
 
 
+# ── 적재 경로 카탈로그 — 공개만(HWAXPortal docs/request-1117 GW-01 · 사용자 결정 C3) ─────────────────────────────────────────
+# 앱이 공식으로 밝힌 파일 적재 경로(바깥 경로 · 메서드 · 받는 자격 종류 · 크기 상한 · 포털 로그인 문을 지나나)를 한 자리에 **싣기만** 한다. 게이트웨이는
+# 업로드를 받지도 나르지도 계산하지도 않는다(결정 C3 — 중계는 짓지 않는다). 11-12 에 포털 토큰이 앱 반입 경로에서 401 이었고 무엇을 들고 어디로 가야
+# 하는지 적힌 곳이 없었다 — 그 답은 앱이 낸다. 앱이 답을 내기 전에는 짐작으로 채우지 않는다(추적 파일의 routes 는 비어 있다).
+#  · 선언은 추적 ingest_routes.json(주소 없음 — 경로 · 꼴만, 어느 앱이든 같은 틀) + 박스 덧씌우기 ingest_routes.local.json(gitignore, merge patch,
+#    바뀐 시각으로 다시 읽음). 박스만 아는 점검 주소(check_base)는 덧씌우기에만 적는다.
+#  · 보기 — rest_catalog(part='ingest') · GET /ingest[/<site>](PAT 또는 공유 비밀). 점검(probe — 자격 없는 HEAD 의 응답 코드 · 시각)을 선언에 check_path 가
+#    있는 경로에만 하고 last_check 에 싣는다.
+INGEST_ROUTES_PATH = Path(__file__).with_name("ingest_routes.json")
+INGEST_ROUTES_LOCAL_PATH = Path(__file__).with_name("ingest_routes.local.json")
+INGEST_TOKENS = ("portal_pat", "app_token", "sso")
+INGEST_PROBE_MIN_S = 30.0                # 같은 경로를 이보다 자주 점검하지 않는다(답은 마지막 것을 준다)
+INGEST_PROBE_TIMEOUT_S = 10.0
+_INGEST_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,60}$")
+_INGEST_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+_INGEST: dict = {"key": None, "data": None, "error": None, "overlay": None}
+_INGEST_CHECK: dict[str, dict] = {}      # 경로 id → {checked_at, status, meaning, via, error?}
+
+
+def _ingest_path_ok(v) -> bool:
+    """오리진 위의 경로 꼴인가 — '/' 로 시작하고(스킴 · 호스트 없음 — '//호스트' · 역슬래시는 브라우저 · 클라이언트가 다른 호스트로 읽는다, 11-17 검토
+    L5) 쿼리 · 조각 · 빈칸 · '..' 가 없다."""
+    return (isinstance(v, str) and v.startswith("/") and not v.startswith("//") and "\\" not in v and len(v) <= 300 and "://" not in v
+            and not any(c in v for c in "?#") and not re.search(r"\s|\.\.", v))
+
+
+def _ingest_route_parse(rid: str, r) -> tuple[dict | None, str]:
+    """선언 하나 → (쓰는 꼴, 'ok') 또는 (None, 까닭). 틀린 칸이 있으면 그 경로를 통째로 버린다(반쪽 선언을 싣지 않는다).
+    꼴(어느 앱이든 같다) — site · app · method · path · portal_gate · token · max_bytes 는 앱이 밝힌 값이고, 나머지는 덧붙임이다."""
+    if not _INGEST_ID_RE.fullmatch(str(rid)) or not isinstance(r, dict):
+        return None, "id · 꼴"
+    if not (isinstance(r.get("site"), str) and _INGEST_KEY_RE.fullmatch(r["site"])):
+        return None, "site"
+    if r.get("app") is not None and not (isinstance(r["app"], str) and _INGEST_KEY_RE.fullmatch(r["app"])):
+        return None, "app"
+    method = str(r.get("method") or "").upper()
+    if method not in ("POST", "PUT"):
+        return None, "method"
+    if not _ingest_path_ok(r.get("path")):
+        return None, "path"
+    if not isinstance(r.get("portal_gate"), bool):
+        return None, "portal_gate"
+    if r.get("token") not in INGEST_TOKENS:
+        return None, "token"
+    for k in ("max_bytes", "max_file_bytes"):
+        v = r.get(k)
+        if (k == "max_bytes" or v is not None) and (isinstance(v, bool) or not isinstance(v, int) or v <= 0):
+            return None, k
+    if r.get("check_path") is not None and not _ingest_path_ok(r.get("check_path")):
+        return None, "check_path"
+    if r.get("check_base") is not None and not _conn_url_ok(r.get("check_base")):
+        return None, "check_base"
+    out = {"id": rid, "site": r["site"], "app": r.get("app"), "method": method, "path": r["path"], "portal_gate": r["portal_gate"],
+           "token": r["token"], "max_bytes": r["max_bytes"], "max_file_bytes": r.get("max_file_bytes"),
+           "check_path": r.get("check_path"), "check_base": r.get("check_base")}
+    for k in ("label", "token_hint", "token_note", "content_type", "fields", "source", "declared_by"):
+        v = r.get(k)
+        if v is not None and not isinstance(v, str):
+            return None, k
+        out[k] = (v or "")[:600]
+    return out, "ok"
+
+
+def _ingest_conf() -> dict:
+    """지금 싣는 적재 경로 선언 — {routes, invalid, fingerprint}. 추적 기본값에 박스 덧씌우기를 얹는다. 두 파일의 바뀐 시각이 같으면 다시 읽지 않는다.
+    기본값을 못 읽으면 마지막 값(없으면 빈 표), 덧씌우기가 깨지면 버리고 기본값으로 돈다."""
+    key = (_stat_ns(INGEST_ROUTES_PATH), _stat_ns(INGEST_ROUTES_LOCAL_PATH))
+    if key == _INGEST["key"] and _INGEST["data"] is not None:
+        return _INGEST["data"]
+    error = None
+    try:
+        base_raw = json.loads(INGEST_ROUTES_PATH.read_text(encoding="utf-8"))
+        if not isinstance(base_raw, dict):
+            raise TypeError("객체여야 한다")
+    except (OSError, ValueError, TypeError) as exc:
+        error = f"기본값을 못 읽음({type(exc).__name__})"
+        log.warning("적재 경로 선언(%s)을 못 읽었다: %r", INGEST_ROUTES_PATH, exc)
+        if _INGEST["data"] is not None:
+            _INGEST.update(key=key, error=error)
+            return _INGEST["data"]
+        base_raw = {}
+    eff, overlay = base_raw, {"present": key[1] is not None}
+    if key[1] is not None:
+        try:
+            patch = json.loads(INGEST_ROUTES_LOCAL_PATH.read_text(encoding="utf-8"))
+            if not isinstance(patch, dict):
+                raise TypeError("덧씌우기는 객체여야 한다")
+            eff = _merge_patch(base_raw, patch)
+            overlay["fingerprint"] = _json_fp(patch)
+        except (OSError, ValueError, TypeError) as exc:
+            overlay["error"] = f"덧씌우기를 버렸다({type(exc).__name__}: {str(exc)[:120]})"
+            log.warning("적재 경로 덧씌우기(%s)를 버리고 기본값으로 돈다: %r", INGEST_ROUTES_LOCAL_PATH, exc)
+    routes, invalid = {}, {}
+    for rid, r in ((eff.get("routes") or {}).items() if isinstance(eff.get("routes"), dict) else ()):
+        got, why = _ingest_route_parse(str(rid), r)
+        if got is None:
+            invalid[str(rid)] = why
+        else:
+            routes[str(rid)] = got
+    if invalid:
+        log.warning("적재 경로 선언에서 꼴이 틀린 경로를 버렸다: %s", ", ".join(f"{k}({v})" for k, v in sorted(invalid.items())))
+    # 덧씌우기가 정한 점검 주소는 내부 목적지다 — 다른 내부 주소처럼 사내 프록시를 거치지 않게 NO_PROXY 에 더한다(REST 사이트 주소는 기동 때 이미 더했다)
+    _bypass_proxy_for([r["check_base"] for r in routes.values() if r.get("check_base")])
+    data = {"routes": routes, "invalid": invalid, "fingerprint": _json_fp({k: v for k, v in eff.items() if k == "routes"})}
+    _INGEST.update(key=key, data=data, error=error, overlay=overlay)
+    return data
+
+
+def _ingest_check_url(r: dict) -> str | None:
+    """점검할 주소 — 박스 덧씌우기 check_base > REST 사이트 주소(rest.<site>.base) 뒤에 check_path. check_path 가 없으면 점검하지 않는다(None)."""
+    base = r.get("check_base") or (REST.get(r["site"]) or {}).get("base")
+    return (str(base).rstrip("/") + r["check_path"]) if base and r.get("check_path") else None
+
+
+def _ingest_entry(r: dict) -> dict:
+    """카탈로그 한 줄 — 주소는 싣지 않는다(바깥 경로 · 꼴 · 자격 종류 · 상한 · 로그인 문 · 마지막 점검)."""
+    out = {k: r[k] for k in ("id", "site", "app", "label", "method", "path", "portal_gate", "token", "token_hint", "token_note",
+                             "content_type", "fields", "max_bytes") if r.get(k) not in (None, "")}
+    out["max_mb"] = round(r["max_bytes"] / 1048576, 1)
+    for k in ("max_file_bytes", "source", "declared_by"):
+        if r.get(k):
+            out[k] = r[k]
+    out["checkable"] = _ingest_check_url(r) is not None
+    last = _INGEST_CHECK.get(r["id"])
+    out["last_check"] = {k: v for k, v in last.items() if not k.startswith("_")} if last else None
+    return out
+
+
+def _ingest_meaning(status: int | None) -> str:
+    if status is None:
+        return "닿지 않는다"
+    if status in (401, 403):
+        return "문이 자격을 요구한다(경로는 그 뒤에 있다 — 자격 없는 점검이라 정상이다)"
+    if status == 404:
+        return "경로가 없다 — 선언(check_path)이나 사이트 주소를 본다"
+    if status == 405 or 200 <= status < 400:
+        return "경로가 있다"
+    return "상류 오류" if status >= 500 else "그 밖의 답"
+
+
+def _ingest_record(rid: str, status: int | None, error: str | None = None) -> dict:
+    rec = {"checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status": status, "meaning": _ingest_meaning(status),
+           "via": "probe", "_mono": time.monotonic()}
+    if error:
+        rec["error"] = _clip(error, 160)
+    _INGEST_CHECK[rid] = rec
+    return rec
+
+
+async def _ingest_probe(r: dict) -> dict | None:
+    """그 경로를 자격 없이 HEAD 로 한 번 본다(본문 없음 · 자격 없음 — 아무것도 올리지 않는다) — 응답 코드 · 시각을 남긴다. INGEST_PROBE_MIN_S 안에 다시
+    부르면 마지막 것을 준다. check_path 가 없으면 하지 않는다."""
+    url = _ingest_check_url(r)
+    if url is None:
+        return None
+    last = _INGEST_CHECK.get(r["id"])
+    if last and time.monotonic() - last.get("_mono", 0) < INGEST_PROBE_MIN_S:
+        return last
+    # 기다리기 전에 '점검 중' 을 먼저 적는다 — 동시에 온 점검들이 저마다 HEAD 를 보내지 않게(11-17 검토 L2 — 25건이 25번 보냈다)
+    _INGEST_CHECK[r["id"]] = {**(last or {"checked_at": None, "status": None, "meaning": "점검 중"}), "via": "probe", "in_progress": True,
+                              "_mono": time.monotonic()}
+    try:
+        async with httpx.AsyncClient(timeout=INGEST_PROBE_TIMEOUT_S, follow_redirects=False) as cli:
+            resp = await cli.head(url)
+        return _ingest_record(r["id"], resp.status_code)
+    except Exception as exc:  # noqa: BLE001 — 점검 실패도 기록이다
+        return _ingest_record(r["id"], None, type(exc).__name__)
+
+
+def _ingest_visible(r: dict, groups: list[str]) -> bool:
+    """이 사람이 볼 수 있는 경로인가 — REST 다리와 같은 규칙(사이트), 앱 키가 있으면 그 앱도."""
+    return _backend_allowed(r["site"], groups) and (not r.get("app") or _backend_allowed(r["app"], groups))
+
+
+async def _ingest_catalog(groups: list[str], site: str = "", probe: bool = False) -> dict:
+    """rest_catalog(part='ingest') · GET /ingest[/<site>] 의 답. probe 는 site 를 줄 때만(그 사이트의 경로를 자격 없이 HEAD 로 본다).
+    버린 선언(invalid — 박스 덧씌우기의 id · 까닭) · 선언 전체의 지문 · 덧씌우기 오류는 관리자 · 공유 비밀(내부 서비스)에게만 싣는다 — 권한 밖 경로의
+    존재를 알리지 않는다(11-17 검토 L7)."""
+    conf = _ingest_conf()
+    privileged = ADMIN_GROUP in groups or SERVICE_GROUP in groups
+    rows = [r for r in conf["routes"].values() if _ingest_visible(r, groups) and (not site or r["site"] == site)]
+    if probe and site:
+        for r in rows:
+            await _ingest_probe(r)
+    out = {"ingest": [_ingest_entry(r) for r in sorted(rows, key=lambda r: (r["site"], r["id"]))],
+           "how_to_upload": ("앱이 밝힌 path 로 직접 올린다 — token 이 말하는 자격(portal_pat 포털 PAT · app_token 그 앱이 낸 토큰 · sso 사람별 위임)을 싣고, "
+                             "portal_gate 가 참이면 포털 로그인 문을 지나는 자격이어야 한다. 크기는 max_bytes 안. 게이트웨이는 업로드를 받지도 나르지도 "
+                             "않는다(MCP 로도 파일 본문을 나르지 않는다).")}
+    if privileged:
+        out["fingerprint"] = conf["fingerprint"]
+    if not conf["routes"]:
+        out["note"] = "앱이 공식으로 밝힌 적재 경로 선언이 아직 없다 — 짐작으로 채우지 않는다. 앱의 업로드 안내 도구(예 upload_instructions)를 본다"
+    elif site and not rows:
+        out["note"] = f"사이트 '{site}' 에 내 권한으로 보이는 적재 경로 선언이 없다"
+    if privileged and conf["invalid"]:
+        out["invalid"] = conf["invalid"]
+    if privileged and (_INGEST.get("overlay") or {}).get("error"):
+        out["overlay_error"] = _INGEST["overlay"]["error"]
+    return out
+
+
 async def _rest_catalog(args: dict) -> types.CallToolResult:
     groups = _request_groups()
     want = str(args.get("site") or "").strip()
+    if str(args.get("part") or "").strip() == "ingest":
+        # 적재 경로(GW-01) — REST 사이트 표와 따로 선언된다(사이트 키는 같다). 권한은 REST 다리와 같은 규칙이다
+        return _rest_text(await _ingest_catalog(groups, want, probe=args.get("probe") is True))
     q = str(args.get("q") or "").strip().lower()
     try:
         limit = max(1, min(200, int(args.get("limit") or 40)))
@@ -4910,6 +5334,12 @@ async def _rest_catalog(args: dict) -> types.CallToolResult:
             # 단언 쓰기(HWAXPortal docs/core-link §5) — 이 경로의 POST 만 부르는 사람(또는 서비스 작업) 명의로 간다. 그 밖의 쓰기는 405 다
             info["write_paths"] = {"method": "POST", "paths": list(conf["write_paths"])}
             info["readonly"] = False
+        _ing = [r for r in _ingest_conf()["routes"].values() if r["site"] == s and _ingest_visible(r, groups)]
+        if _ing:
+            # 적재 경로(GW-01) — 한 줄씩만. 로그인 문 · 자격 설명 · 마지막 점검은 part='ingest' 가 준다
+            info["ingest"] = [{"id": r["id"], "method": r["method"], "path": r["path"], "token": r["token"],
+                               "max_mb": round(r["max_bytes"] / 1048576, 1)} for r in sorted(_ing, key=lambda r: r["id"])]
+            info["ingest_hint"] = "로그인 문 · 자격 설명 · 마지막 점검은 rest_catalog(site=…, part='ingest')"
         doc = await _openapi_of(s)
         if doc is None:
             info["paths"] = None
@@ -6922,15 +7352,16 @@ _RT_DELIB_START_KEYS = ("question", "job", "rounds", "modifiers", "evidence", "p
                         "stop_after_round", "advanced")
 _RT_DELIB_ADV_DROP = frozenset(("tools", "apps", "save_report", "wiki"))
 # 박스의 읽기 목록 덧씌우기(gitignore) — read_tools.json 과 같은 꼴 {"tools": [...], "deny": [...]}('백엔드키:원래 이름'). 바뀐 시각이 다르면
-# 재기동 없이 다시 읽고, 못 읽으면 통째로 버린다(빈 목록 — deny 도 빠진다, 경고는 남긴다). 루틴 단계 판정만 본다(읽기 전용 PAT 의 허용 목록은
-# read_tools.json 그대로다).
+# 재기동 없이 다시 읽고, 못 읽거나 꼴이 틀리면 마지막으로 읽은 {tools, deny} 를 그대로 둔다(경고 · 관리자 보기의 error — 깨진 파일로 deny 가 빠져
+# 열리는 쪽으로 가지 않는다, 11-17 검토 L1). 파일을 지우면 빈 목록이다. 루틴 단계 판정과 읽기 전용 PAT 의 허용 목록이 함께
+# 본다(HWAXPortal docs/request-1117 GW-02 · R-7 — 같은 박스 관리자가 쓰는 파일이라 신뢰가 같다. 읽기 전용 PAT 에서도 deny 가 먼저다).
 READ_TOOLS_LOCAL_PATH = Path(__file__).with_name("read_tools.local.json")
 _READ_TOOLS_LOCAL: dict = {"mtime": None, "tools": frozenset(), "deny": frozenset()}
 
 
 def _load_read_deny() -> frozenset:
     """read_tools.json 의 deny — 루틴 단계에서 닫는 '백엔드키:원래 이름'(R3 리뷰 2차 #0). 칸이 없으면 빈 목록, 못 읽거나 목록이 아니면 빈 목록에
-    경고 한 줄. 읽기 전용 PAT 의 허용 목록(READ_TOOLS)과는 무관하다."""
+    경고 한 줄. 루틴 단계와 읽기 전용 PAT 이 함께 맨 먼저 본다(11-17 부터 읽기 전용 PAT 도 — HWAXPortal docs/request-1117 R-7)."""
     try:
         with open(Path(__file__).with_name("read_tools.json"), encoding="utf-8") as f:
             raw = json.load(f).get("deny") or []
@@ -6963,39 +7394,47 @@ READ_OVERRIDE = _load_read_override()
 
 
 # 닫기 목록 — 박스가 이름 꼴 · 앱 표지로 열린 쓰기를 코드 고침 없이 닫는다. _routine_read 가 다른 어느 판정보다(앱의 readOnlyHint=True
-# 보다도) 먼저 본다. 루틴 단계만이다 — 읽기 전용 PAT 판정(_readonly_denial)은 보지 않는다.
+# 보다도) 먼저 본다. 읽기 전용 PAT 판정(_readonly_denial)도 맨 먼저 본다(11-17 부터 — HWAXPortal docs/request-1117 R-7).
 READ_DENY = _load_read_deny()
 
 
 def _read_tools_local() -> dict:
-    """박스 덧씌우기(read_tools.local.json)의 {tools, deny} — 바뀐 시각이 다르면 다시 읽는다. 못 읽거나 꼴이 틀리면 둘 다 빈 목록이다."""
+    """박스 덧씌우기(read_tools.local.json)의 {tools, deny} — 바뀐 시각이 다르면 다시 읽는다. 못 읽거나 꼴이 틀리면 마지막으로 읽은 값을 그대로 두고
+    error 에 까닭을 싣는다(처음부터 깨져 있으면 빈 목록이다). 파일이 없으면 빈 목록이다."""
     try:
         mt = READ_TOOLS_LOCAL_PATH.stat().st_mtime_ns
     except OSError:
         mt = None
     if mt != _READ_TOOLS_LOCAL["mtime"]:
-        tools, deny = frozenset(), frozenset()
-        if mt is not None:
-            try:
-                data = json.loads(READ_TOOLS_LOCAL_PATH.read_text(encoding="utf-8"))
-                raw, raw_deny = data.get("tools") or [], data.get("deny") or []
-                if not isinstance(raw, list) or not isinstance(raw_deny, list):
-                    raise TypeError("tools · deny 는 목록이어야 한다")
-                tools, deny = frozenset(str(x) for x in raw if str(x)), frozenset(str(x) for x in raw_deny if str(x))
-            except (OSError, ValueError, TypeError, AttributeError) as exc:
-                log.warning("읽기 목록 덧씌우기(%s)를 못 읽어 버린다 — 루틴 단계는 read_tools.json · readOnlyHint · 이름 꼴로만 연다"
-                            "(덧씌우기의 deny 도 빠진다): %r", READ_TOOLS_LOCAL_PATH, exc)
-        _READ_TOOLS_LOCAL.update(mtime=mt, tools=tools, deny=deny)
+        if mt is None:
+            _READ_TOOLS_LOCAL.update(mtime=None, tools=frozenset(), deny=frozenset(), error=None, loaded_at=None)
+            return _READ_TOOLS_LOCAL
+        try:
+            data = json.loads(READ_TOOLS_LOCAL_PATH.read_text(encoding="utf-8"))
+            raw, raw_deny = data.get("tools") or [], data.get("deny") or []
+            if not isinstance(raw, list) or not isinstance(raw_deny, list):
+                raise TypeError("tools · deny 는 목록이어야 한다")
+            tools, deny = frozenset(str(x) for x in raw if str(x)), frozenset(str(x) for x in raw_deny if str(x))
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            # 마지막으로 읽은 값을 그대로 둔다 — 같은 시각이면 다시 읽지 않게 시각만 적는다(고쳐 쓰면 다시 읽는다)
+            _READ_TOOLS_LOCAL.update(mtime=mt, error=f"덧씌우기를 읽지 못해 마지막 값으로 돈다({type(exc).__name__}: {str(exc)[:120]})")
+            log.warning("읽기 목록 덧씌우기(%s)를 못 읽었다 — 마지막으로 읽은 tools %d · deny %d 그대로 돈다(deny 를 놓지 않는다): %r",
+                        READ_TOOLS_LOCAL_PATH, len(_READ_TOOLS_LOCAL.get("tools") or ()), len(_READ_TOOLS_LOCAL.get("deny") or ()), exc)
+            return _READ_TOOLS_LOCAL
+        _READ_TOOLS_LOCAL.update(mtime=mt, tools=tools, deny=deny, error=None,
+                                 loaded_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     return _READ_TOOLS_LOCAL
 
 
 def _routine_read_tools() -> frozenset:
-    """루틴 단계의 읽기 목록 — read_tools.json(READ_TOOLS) ∪ 박스 덧씌우기(read_tools.local.json)."""
+    """루틴 단계 · 읽기 전용 PAT 의 읽기 목록 — read_tools.json(READ_TOOLS) ∪ 박스 덧씌우기(read_tools.local.json). 둘 다 바뀐 시각으로 다시 읽는다."""
+    _read_base_sync()
     return READ_TOOLS | _read_tools_local()["tools"]
 
 
 def _routine_read_deny() -> frozenset:
-    """루틴 단계의 닫기 목록 — read_tools.json 의 deny(READ_DENY) ∪ 박스 덧씌우기의 deny."""
+    """닫기 목록 — read_tools.json 의 deny(READ_DENY) ∪ 박스 덧씌우기의 deny. 루틴 단계와 읽기 전용 PAT 이 맨 먼저 본다(GW-02 · R-7)."""
+    _read_base_sync()
     return READ_DENY | _read_tools_local()["deny"]
 
 
@@ -7381,8 +7820,10 @@ def _visible_tools(groups: list[str]) -> list[types.Tool]:
     # 근거로 썼다(HWAXPortal docs/request-1029 R-6 · 결정 D-2). 숨김만이다 — 이름을 콕 집어 부르면(invoke_tool · 노출 이름) 그대로 닿는다.
     # StepForge · DynaForge 의 *-prod 는 운영 앱이라 10-31 OB-04 에 기본 표에서 뺐다 — 다른 시험 사본은 박스 덧씌우기로 둔다.
     hidden = muted | ((_CORE_VOCAB["data"] or {}).get("staging") or frozenset())
+    # 관리자 전용 도구(읽기 전용 허용 목록 보기 — GW-02)는 관리자 시야에만 둔다 — 모두의 목록 · 검색 순위에 못 쓰는 도구를 늘어놓지 않는다(부르면 거절된다)
     return [t for t in exposed_tools
-            if _backend_allowed(route[t.name][0], groups) and route[t.name][0] not in hidden] + _local_tools()
+            if _backend_allowed(route[t.name][0], groups) and route[t.name][0] not in hidden] + _local_tools() + (
+        [READONLY_ALLOWLIST_TOOL] if ADMIN_GROUP in groups else [])
 
 
 # 가벼운 보기의 두 도구(E-4 · L-A) — 찾고 부른다. 앱 목록 · 패널 도구 · 그 밖은 invoke_tool 로 닿는다(파괴 · 제어 도구 막이는 그대로다).
@@ -7406,7 +7847,7 @@ def _listed_tools(groups: list[str]) -> list[types.Tool]:
         return list(_VIEW_LIGHT_TOOLS)
     d = _CORE_VOCAB["data"] or {}
     canon, sib, reads = d.get("canonical"), d.get("siblings") or frozenset(), d.get("core_reads") or frozenset()
-    want, local = set(areas), {id(t) for t in _local_tools()}
+    want, local = set(areas), {id(t) for t in _local_tools()} | {id(READONLY_ALLOWLIST_TOOL)}
     out = []
     for t in vis:
         if id(t) in local:
@@ -7809,34 +8250,349 @@ def _load_read_tools() -> frozenset:
 READ_TOOLS = _load_read_tools() | READ_OVERRIDE      # 덧씌우기(override)도 읽기 전용 PAT 이 부른다(위 READ_OVERRIDE)
 
 
+# read_tools.json 을 바뀐 시각으로 다시 읽는다(HWAXPortal docs/request-1117 GW-02 · R-7 — 종전엔 기동 때 한 번만 읽어 목록을 고치면 재기동이 필요했다).
+# 다시 읽으면 READ_TOOLS · READ_OVERRIDE · READ_DENY 를 한꺼번에 바꾼다. 파일이 JSON 으로 안 읽히거나 칸 하나라도 목록이 아니면 셋 다 마지막 값을
+# 그대로 둔다(경고 · 관리자 보기의 error — deny 하나만 비고 나머지가 바뀌는 반쪽 판을 만들지 않는다, 11-17 검토 L1). 판정마다 stat 하지 않게
+# READ_BASE_RECHECK_S 초에 한 번만 본다.
+READ_TOOLS_PATH = Path(__file__).with_name("read_tools.json")
+READ_BASE_RECHECK_S = 1.0
+
+
+def _stat_ns(p: Path) -> int | None:
+    try:
+        return p.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+_READ_BASE: dict = {"mtime": _stat_ns(READ_TOOLS_PATH), "checked": 0.0, "error": None,
+                    "loaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
+def _read_base_sync() -> None:
+    """read_tools.json 이 바뀌었으면 READ_TOOLS · READ_OVERRIDE · READ_DENY 를 다시 읽는다(READ_BASE_RECHECK_S 초에 한 번 본다)."""
+    global READ_TOOLS, READ_OVERRIDE, READ_DENY
+    now = time.monotonic()
+    if now - _READ_BASE["checked"] < READ_BASE_RECHECK_S:
+        return
+    _READ_BASE["checked"] = now
+    mt = _stat_ns(READ_TOOLS_PATH)
+    if mt == _READ_BASE["mtime"]:
+        return
+    try:
+        data = json.loads(READ_TOOLS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise TypeError("객체여야 한다")
+
+        def lst(k: str) -> frozenset:
+            raw = data.get(k) or []
+            if not isinstance(raw, list):
+                raise TypeError(f"{k} 는 목록이어야 한다")
+            return frozenset(str(x) for x in raw if str(x))
+        tools, ov, deny = lst("tools"), lst("override"), lst("deny")
+    except (OSError, ValueError, TypeError) as exc:
+        _READ_BASE.update(mtime=mt, error=f"다시 읽지 못해 마지막 값으로 돈다({type(exc).__name__}: {str(exc)[:120]})")
+        log.warning("read_tools.json 을 다시 읽지 못했다 — 마지막으로 읽은 목록(%d개 · deny %d)으로 돈다: %r", len(READ_TOOLS), len(READ_DENY), exc)
+        return
+    READ_OVERRIDE, READ_TOOLS, READ_DENY = ov, tools | ov, deny
+    _READ_BASE.update(mtime=mt, error=None, loaded_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    log.info("read_tools.json 을 다시 읽었다 — 읽기 목록 %d · override %d · deny %d(재기동 없음)", len(tools), len(ov), len(deny))
+
+
+def _tool_by_route(backend: str, original: str):
+    """(백엔드, 원래 이름) 의 노출 도구 — 앱 표지(annotations)를 읽는다. 없으면 None."""
+    return next((t for t in exposed_tools if route.get(t.name) == (backend, original)), None)
+
+
+def _label_block(backend: str, original: str) -> str | None:
+    """앱 표지가 읽기를 막나 — 'destructiveHint' · 'readOnlyHint=False' 또는 None(관리자 보기 · PATCH 경고가 쓴다)."""
+    ann = getattr(_tool_by_route(backend, original), "annotations", None)
+    if getattr(ann, "destructiveHint", None) is True:
+        return "destructiveHint"
+    return "readOnlyHint=False" if getattr(ann, "readOnlyHint", None) is False else None
+
+
+# 읽기 전용 거절 글의 까닭 표지 — 부른 앱이 이 낱말로 '읽기 전용이라 막혔다' 를 가른다(GW-02). 앞머리 `read_only:` 는 그대로다(리스크 앱이 그것으로 판정한다).
+_RO_WHY = "읽기 전용 토큰(read-only — scopes 에 read 만)"
+
+
 def _readonly_denial(name: str, arguments: dict) -> str:
-    """읽기 전용 토큰이 이 호출을 할 수 없으면 그 까닭(호출자에게 그대로 보인다), 할 수 있으면 ''. invoke_tool 은 안쪽 이름으로 바꾼 뒤에 본다."""
+    """읽기 전용 토큰이 이 호출을 할 수 없으면 그 까닭(호출자에게 그대로 보인다 — 앞머리 read_only: · 까닭 read-only · 도구 이름), 할 수 있으면 ''.
+    invoke_tool 은 안쪽 이름으로 바꾼 뒤에 본다. 백엔드 도구는 ① 닫기 목록(deny — read_tools.json ∪ 박스 덧씌우기) ② 앱의 destructiveHint=True 가
+    먼저 막고, ③ 추적 읽기 목록(read_tools.json 의 tools · override — 앱의 readOnlyHint=False 보다 먼저, 지금 그대로) ④ 박스 덧씌우기의 tools(앱이
+    readOnlyHint=False 를 적지 않았을 때만 — 루틴 · 패널 판정과 같이 앱 표지가 이긴다, 11-17 검토 M1) ⑤ 앱의 readOnlyHint 면 연다(GW-02 · R-7)."""
     if name in _LOCAL_READ:
         return ""
     if name == REST_CALL_TOOL.name:
         m = (str((arguments or {}).get("method") or "GET").strip() or "GET").upper()
-        return "" if m in ("GET", "HEAD") else f"read_only: rest_call {m[:10]} — 읽기 전용 토큰(scopes 에 read 만)은 GET · HEAD 만 부른다."
+        return "" if m in ("GET", "HEAD") else f"read_only: rest_call {m[:10]} — {_RO_WHY}은 GET · HEAD 만 부른다."
     if name == SAVE_CONV_TOOL.name:
-        return "read_only: save_conversation — 읽기 전용 토큰(scopes 에 read 만)은 대화를 저장할 수 없다."
+        return f"read_only: save_conversation — {_RO_WHY}은 대화를 저장할 수 없다."
     if name in _ROUTINE_NAMES:
         # 루틴 도구는 경로(route)에 없는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸린다 — 실행 · 원장 쓰기는 여기서 막는다(목록 · 계획은 _LOCAL_READ)
-        return f"read_only: {name} — 읽기 전용 토큰(scopes 에 read 만)은 루틴을 돌리지 못한다(원장에 쓴다). routine_list · routine_get 만 된다."
+        return f"read_only: {name} — {_RO_WHY}은 루틴을 돌리지 못한다(원장에 쓴다). routine_list · routine_get 만 된다."
     if FIG_STORE_ON and name in _FIG_NAMES:
         # 그림 도구 — 받기 · 목록은 읽기다. 보고서 · 문서 쓰기는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸리므로 여기서 막는다. 끄면 이 이름들은 그림
         # 도구가 아니다 — _LOCAL_READ 에 두면 끈 박스에서 같은 이름의 백엔드 쓰기 도구가 읽기 전용 PAT 로 열렸다(반대 검토 6)
         if name in _FIG_READ_NAMES:
             return ""
         if name == FIG_DOC_TOOL.name:
-            return "read_only: figure_to_doc — 읽기 전용 토큰(scopes 에 read 만)은 MX 백서 문서에 그림을 넣지 못한다. figure_get · figure_list 만 된다."
-        return "read_only: figure_to_report — 읽기 전용 토큰(scopes 에 read 만)은 보고서에 그림을 넣지 못한다. figure_get · figure_list 만 된다."
+            return f"read_only: figure_to_doc — {_RO_WHY}은 MX 백서 문서에 그림을 넣지 못한다. figure_get · figure_list 만 된다."
+        return f"read_only: figure_to_report — {_RO_WHY}은 보고서에 그림을 넣지 못한다. figure_get · figure_list 만 된다."
     resolved = route.get(name) or alias_route.get(name)
     if resolved is None:
         return ""      # 아래 'unknown tool' 로 끝난다 — 없는 도구를 읽기 전용 까닭으로 가리지 않는다
     key, orig = resolved
-    if f"{key}:{orig}" in READ_TOOLS or tool_readonly_hint.get((key, orig)):
+    k = f"{key}:{orig}"
+    if k in _routine_read_deny():
+        return (f"read_only: '{name}' — {_RO_WHY}이 부를 수 없다 — 이 박스가 읽기 목록의 닫기(deny)에 '{k}' 를 적었다(게이트웨이 "
+                "read_tools.json · read_tools.local.json).")
+    ann = getattr(_tool_by_route(key, orig), "annotations", None)
+    if getattr(ann, "destructiveHint", None) is True:
+        return f"read_only: '{name}' — {_RO_WHY}은 부를 수 없다 — 앱이 이 도구에 destructiveHint(되돌리기 어려운 쓰기)를 달았다."
+    if k in READ_TOOLS:
         return ""
-    return (f"read_only: '{name}' — 읽기 전용 토큰(scopes 에 read 만)은 조회 도구만 부른다. 이 도구가 조회라면 운영자가 게이트웨이 "
-            f"read_tools.json 에 '{key}:{orig}' 를 더하거나, 앱이 그 도구에 readOnlyHint 를 단다.")
+    if k in _read_tools_local()["tools"]:
+        if getattr(ann, "readOnlyHint", None) is False:
+            return (f"read_only: '{name}' — {_RO_WHY}은 부를 수 없다 — 박스 덧씌우기 read_tools.local.json 에 '{k}' 가 있지만 앱이 이 도구에 "
+                    "readOnlyHint=False(쓰기)를 달았다. 앱 표지가 이긴다 — 앱이 표지를 고치거나, 사용자 결정으로 추적 read_tools.json 의 override 에 둔다.")
+        return ""
+    if tool_readonly_hint.get((key, orig)):
+        return ""
+    return (f"read_only: '{name}' — {_RO_WHY}은 조회 도구만 부른다. 이 도구가 조회라면 운영자가 게이트웨이 "
+            f"read_tools.json(또는 박스 덧씌우기 read_tools.local.json — 재기동 없이 먹는다)에 '{k}' 를 더하거나, 앱이 그 도구에 readOnlyHint 를 단다.")
+
+
+# ── 읽기 전용 허용 목록 관리자 보기 · 고치기(HWAXPortal docs/request-1117 GW-02) ─────────────────────────────────────────
+# 보기는 MCP gateway_readonly_allowlist(관리자 — 포털이 지금 관리자라고 답한 사람) · REST GET /readonly-allowlist, 고치기는 REST PATCH 뿐이다(박스 덧씌우기
+# read_tools.local.json 을 통째로 새로 써서 바꾼다 — 같은 폴더의 임시 파일 → os.replace). 추적 read_tools.json 은 git 으로만 바꾼다. 재기동 없이 먹는다.
+# REST 자격은 게이트웨이 공유 비밀(포털 관리자 화면이 부른다) 또는 관리자 PAT(MCP 청중)이다. 고치기는 감사 한 줄이다.
+READONLY_ALLOWLIST_TOOL = types.Tool(
+    name="gateway_readonly_allowlist",
+    description=("관리자만 — 읽기 전용 포털 PAT(scopes 에 read 만)가 부를 수 있는 백엔드 도구 목록을 본다. 항목마다 출처(read_tools.json · 그 override · "
+                 "박스 덧씌우기 read_tools.local.json)와 닫기(deny) 여부, 두 파일의 지문 · 읽은 시각 · 오류를 준다. 앱이 readOnlyHint 를 단 도구는 목록 "
+                 "없이도 열린다(수만 준다). 고치기는 관리자 REST(PATCH /mcp-gw/readonly-allowlist)이고 재기동 없이 먹는다."),
+    inputSchema={"type": "object", "properties": {
+        "q": {"type": "string", "description": "이 글이 든 항목만 싣는다(예: heax-step_forge). 비우면 전부다."}}},
+    annotations=types.ToolAnnotations(readOnlyHint=True))
+_RO_ENTRY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}:[A-Za-z0-9_.:-]{1,160}$")
+RO_PATCH_MAX = 200                       # 한 번에 바꾸는 항목 수 상한
+
+
+def _readonly_allowlist_view(q: str = "") -> dict:
+    """읽기 전용 PAT 의 지금 허용 목록 — 항목 · 출처 · 닫힘 · 지문 · 읽은 시각. q 를 주면 그 글이 든 항목만."""
+    _read_base_sync()
+    loc = _read_tools_local()
+    ltools, ldeny = loc["tools"], loc["deny"]
+    deny = READ_DENY | ldeny
+    rows = []
+    for k in sorted(READ_TOOLS | ltools):
+        src = ([("read_tools.json override" if k in READ_OVERRIDE else "read_tools.json")] if k in READ_TOOLS else []) + (
+            ["read_tools.local.json"] if k in ltools else [])
+        row = {"tool": k, "source": src, **({"denied": True} if k in deny else {})}
+        # 앱 표지가 막으면 적는다 — destructiveHint 는 어느 출처든, readOnlyHint=False 는 박스 덧씌우기에만 있는 항목만(추적 항목은 지금 그대로 연다)
+        bk, _sep, orig = k.partition(":")
+        lb = _label_block(bk, orig)
+        if lb == "destructiveHint" or (lb and k not in READ_TOOLS):
+            row["blocked_by_label"] = lb
+        rows.append(row)
+    drows = [{"tool": k, "source": (["read_tools.json"] if k in READ_DENY else []) + (["read_tools.local.json"] if k in ldeny else [])}
+             for k in sorted(deny)]
+    q = str(q or "").strip().lower()
+    if q:
+        rows, drows = [r for r in rows if q in r["tool"].lower()], [r for r in drows if q in r["tool"].lower()]
+    base_fp = _json_fp({"tools": sorted(READ_TOOLS), "override": sorted(READ_OVERRIDE), "deny": sorted(READ_DENY)})
+    loc_fp = _json_fp({"tools": sorted(ltools), "deny": sorted(ldeny)})
+    return {
+        "fingerprint": _json_fp({"base": base_fp, "overlay": loc_fp}),
+        "base": {"file": "read_tools.json", "fingerprint": base_fp, "loaded_at": _READ_BASE.get("loaded_at"),
+                 "error": _READ_BASE.get("error"), "tools": len(READ_TOOLS), "override": len(READ_OVERRIDE), "deny": len(READ_DENY)},
+        "overlay": {"file": "read_tools.local.json", "present": loc.get("mtime") is not None, "fingerprint": loc_fp,
+                    "loaded_at": loc.get("loaded_at"), "error": loc.get("error"), "tools": len(ltools), "deny": len(ldeny)},
+        "entries": rows, "deny": drows,
+        "hinted_read_only": sum(1 for v in tool_readonly_hint.values() if v),
+        "rule": ("닫기(deny)가 맨 먼저다 — 거기 있으면 읽기 목록 · 앱 표지와 무관하게 막는다. 앱의 destructiveHint 도 막는다. 그다음 추적 읽기 목록"
+                 "(read_tools.json · override) · 박스 덧씌우기(앱이 readOnlyHint=False 를 적지 않았을 때만) · 앱의 readOnlyHint 면 연다. 두 파일은 바뀐 "
+                 "시각으로 다시 읽는다(재기동 없음) — 못 읽으면 마지막 값 그대로다."),
+        "scope": ("이 목록은 읽기 전용 PAT 만이 아니다 — 같은 항목이 분석 루틴 단계의 읽기 판정(routine_call)에도 열리고, MCP Apps 패널의 첫 쓰기 확인도 "
+                  "읽기로 보아 묻지 않는다. 더하면 세 곳에 함께 열린다 — 읽기를 확인한 것만 더한다."),
+    }
+
+
+async def _readonly_allowlist_tool(arguments: dict) -> types.CallToolResult:
+    """MCP gateway_readonly_allowlist — 관리자만(포털이 지금 관리자라고 답한 사람). 감사 한 줄."""
+    t0 = time.monotonic()
+    if ADMIN_GROUP not in _request_groups():
+        _audit(READONLY_ALLOWLIST_TOOL.name, "_gateway", False, "forbidden: not-admin", 0, mode="refused")
+        return types.CallToolResult(content=[types.TextContent(type="text", text=(
+            f"forbidden: {READONLY_ALLOWLIST_TOOL.name} — 포털 관리자만 본다(이 계정은 포털 관리자가 아니다)"))], isError=True)
+    out = _readonly_allowlist_view(str((arguments or {}).get("q") or ""))
+    _audit(READONLY_ALLOWLIST_TOOL.name, "_gateway", True, None, round((time.monotonic() - t0) * 1000), note=out["fingerprint"])
+    return _rt_json(out)
+
+
+def _readonly_overlay_patch(body: dict) -> tuple[int, dict]:
+    """박스 덧씌우기 read_tools.local.json 을 고친다 — add · remove(읽기 목록) · deny_add · deny_remove(닫기 목록), expect(지문 — 다르면 409).
+    파일이 깨져 있으면 덮지 않고 409 다(손으로 고친 것을 날리지 않는다). 다른 칸(_doc 등)은 그대로 둔다. → (HTTP 상태, 답)."""
+    def entries(k: str) -> list[str]:
+        v = body.get(k) or []
+        if not isinstance(v, list) or len(v) > RO_PATCH_MAX or not all(isinstance(x, str) and _RO_ENTRY_RE.fullmatch(x) for x in v):
+            raise ValueError(f"{k} 는 '백엔드키:원래 이름' 목록이다({RO_PATCH_MAX}개까지)")
+        return list(dict.fromkeys(v))
+    add, rem, dadd, drem = (entries(k) for k in ("add", "remove", "deny_add", "deny_remove"))
+    if not (add or rem or dadd or drem):
+        raise ValueError("바꿀 것이 없다 — add · remove · deny_add · deny_remove 가운데 하나를 준다")
+    cur = _readonly_allowlist_view()
+    if body.get("expect") is not None and body.get("expect") != cur["fingerprint"]:
+        return 409, {"error": "conflict", "detail": "그 사이 목록이 바뀌었다 — 다시 읽고(GET) 지문(expect)을 새로 준다", "fingerprint": cur["fingerprint"]}
+    path = READ_TOOLS_LOCAL_PATH
+    raw: dict = {}
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or not isinstance(raw.get("tools", []), list) or not isinstance(raw.get("deny", []), list):
+                raise TypeError("tools · deny 는 목록이어야 한다")
+        except (OSError, ValueError, TypeError) as exc:
+            return 409, {"error": "overlay broken", "detail": f"박스 덧씌우기가 깨져 있다 — 덮지 않는다. 운영자가 손으로 고친 뒤 다시({type(exc).__name__})"}
+    tools, deny = [str(x) for x in raw.get("tools") or []], [str(x) for x in raw.get("deny") or []]
+    not_in = sorted({x for x in rem if x not in tools} | {x for x in drem if x not in deny})
+    raw["tools"] = sorted((set(tools) | set(add)) - set(rem))
+    raw["deny"] = sorted((set(deny) | set(dadd)) - set(drem))
+    raw.setdefault("_doc", "박스 덧씌우기 — read_tools.json 과 같은 꼴(tools · deny). 관리자 PATCH /readonly-allowlist 가 고친다(HWAXPortal docs/request-1117 GW-02).")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    _READ_TOOLS_LOCAL["mtime"] = "patched"            # 같은 나노초 안의 두 번째 쓰기도 다시 읽게 한다
+    out = {"ok": True, "changed": {"add": add, "remove": rem, "deny_add": dadd, "deny_remove": drem}, **_readonly_allowlist_view()}
+    warn = []
+    for x in add:
+        bk, _sep, orig = x.partition(":")
+        lb = _label_block(bk, orig)
+        if lb:
+            warn.append(f"'{x}' — 앱이 {lb} 를 달았다. 항목은 남겼지만 그 표지가 있는 동안 읽기 전용 PAT · 루틴 단계 · 패널 확인에서 열리지 않는다")
+    if warn:
+        out["warnings"] = warn
+    if not_in:
+        out["not_in_overlay"] = not_in
+        out["note"] = ("덧씌우기에 없는 항목은 지울 수 없다 — 추적 read_tools.json 의 항목은 git 으로 고치거나, 박스에서 닫으려면 deny_add 로 닫는다")
+    return 200, out
+
+
+async def _http_caller(scope, pat_verifier, gw_auth: str) -> dict:
+    """게이트웨이 HTTP 창구의 자격 — 공유 비밀(kind gw-token) 또는 포털 PAT(MCP 청중 · 패널 · 서비스 PAT 아님, kind pat). Authorization 이 두 번이면
+    없는 것으로 본다(/mcp 와 같은 자세). PAT 의 그룹은 포털의 **지금** 값이다(관리자 표지도 — _rest_groups). 실패면 kind None 과 reason."""
+    auths = [v.decode("latin-1") for k, v in (scope.get("headers") or []) if k.lower() == b"authorization"]
+    auth = auths[0] if len(auths) == 1 else ""
+    if auth and _secret_eq(auth, gw_auth):
+        return {"kind": "gw-token", "email": "", "groups": [SERVICE_GROUP]}
+    token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+    if not token:
+        return {"kind": None, "reason": "duplicate-authorization" if len(auths) > 1 else "no-bearer"}
+    if pat_verifier is None:
+        return {"kind": None, "reason": "unverified-token"}
+    try:
+        claims = await pat_verifier.verify(token, [MCP_AUDIENCE])
+    except PatExpired:
+        return {"kind": None, "reason": "expired", "expired": True}
+    if claims is None or _panel_scope(claims)[0] or _service_scope(claims)[0]:
+        return {"kind": None, "reason": "unverified-token"}
+    email = str(claims.get("email") or "").strip().lower()
+    pat_groups = [str(g) for g in (claims.get("groups") or []) if str(g) != SERVICE_GROUP]
+    return {"kind": "pat", "email": email, "groups": await _rest_groups(pat_groups, email), "claims": claims, "token": token,
+            "read_only": is_read_only(claims)}
+
+
+async def _http_reply(send, status: int, obj: dict, extra=()) -> None:
+    await send({"type": "http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json"), (b"cache-control", b"no-store"), *extra]})
+    await send({"type": "http.response.body", "body": json.dumps(obj, ensure_ascii=False).encode()})
+
+
+async def _ingest_http(scope, receive, send, pat_verifier, gw_auth: str) -> None:
+    """/ingest 창구(GW-01) — GET /ingest · GET /ingest/<site>[?probe=1](적재 경로 카탈로그 — rest_catalog(part='ingest') 와 같은 답). 자격은 포털 PAT
+    (MCP 청중 — 그 사람 권한으로 보이는 경로만) 또는 게이트웨이 공유 비밀(전부). GET 만이다 — 게이트웨이는 업로드를 받지 않는다(결정 C3)."""
+    path = scope.get("path") or ""
+    parts = [p for p in path[len("/ingest"):].split("/") if p]
+    method = scope.get("method")
+    ip = (scope.get("client") or (None,))[0]
+    who = await _http_caller(scope, pat_verifier, gw_auth)
+    tool = f"{method if method in ('GET', 'POST', 'PUT') else 'OTHER'} /ingest" + (f"/{_clip(parts[0], 40)}" if parts else "")
+    if who["kind"] is None:
+        _audit(tool, "_gateway", False, f"unauthorized: {who['reason']}", 0, ip=ip)
+        await _http_reply(send, 401, EXPIRED_BODY if who.get("expired") else {"error": "unauthorized"})
+        return
+    if method == "GET" and len(parts) <= 1:
+        qs = parse_qs((scope.get("query_string") or b"").decode("utf-8"))
+        site = parts[0] if parts else ""
+        probe = (qs.get("probe") or [""])[0] in ("1", "true")
+        await _http_reply(send, 200, await _ingest_catalog(who["groups"], site, probe=probe and bool(site)))
+        return
+    if method != "GET":
+        await _http_reply(send, 405, {"error": "method not allowed",
+                                      "detail": "게이트웨이는 업로드를 받지 않는다 — 앱이 밝힌 path 로 직접 올린다(GET /mcp-gw/ingest 로 본다)"},
+                          [(b"allow", b"GET")])
+        return
+    await _http_reply(send, 404, {"error": "not found"})
+
+
+async def _ro_allowlist_http(scope, receive, send, pat_verifier, gw_auth: str) -> None:
+    """GET · PATCH /readonly-allowlist — 공유 비밀 또는 관리자 PAT. PATCH 는 박스 덧씌우기를 고치고 감사 한 줄을 남긴다."""
+    t0 = time.monotonic()
+    method = scope.get("method")
+    ip = (scope.get("client") or (None,))[0]
+    who = await _http_caller(scope, pat_verifier, gw_auth)
+    tool = f"{method if method in ('GET', 'PATCH') else 'OTHER'} /readonly-allowlist"
+    if who["kind"] is None:
+        _audit(tool, "_gateway", False, f"unauthorized: {who['reason']}", 0, ip=ip)
+        await _http_reply(send, 401, EXPIRED_BODY if who.get("expired") else {"error": "unauthorized"})
+        return
+    caller, via = (who["email"] or None, "pat") if who["kind"] == "pat" else ("gw-token", "gw-token")
+    if who["kind"] == "gw-token":
+        # 공유 비밀(포털 관리자 화면)이 실어 보낸 사람 — 감사에만 적는다(권한을 주지 않는다)
+        _hu = next((v.decode("latin-1") for k_, v in (scope.get("headers") or []) if k_.lower() == USER_HEADER.encode()), "")
+        try:
+            _hu = unquote(_hu).strip().lower()
+        except Exception:  # noqa: BLE001
+            _hu = ""
+        if _hu and _CONN_EMAIL_RE.fullmatch(_hu):
+            caller = _hu
+    if who["kind"] == "pat" and (ADMIN_GROUP not in who["groups"] or who.get("read_only") and method == "PATCH"):
+        why = "read-only" if ADMIN_GROUP in who["groups"] else "not-admin"
+        _audit(tool, "_gateway", False, f"forbidden: {why}", 0, caller=caller, via=via, ip=ip, mode="refused")
+        await _http_reply(send, 403, {"error": "forbidden", "detail": "포털 관리자만 본다 · 고친다" if why == "not-admin" else
+                                      "읽기 전용 토큰(read-only)으로는 고치지 못한다"})
+        return
+    try:
+        if method == "GET":
+            qs = parse_qs((scope.get("query_string") or b"").decode("utf-8"))
+            out = _readonly_allowlist_view((qs.get("q") or [""])[0])
+            _audit(tool, "_gateway", True, None, round((time.monotonic() - t0) * 1000), caller=caller, via=via, ip=ip)
+            await _http_reply(send, 200, out)
+        elif method == "PATCH":
+            status, out = _readonly_overlay_patch(await _read_json_body(receive))
+            ch = out.get("changed") or {}
+            # 무엇을 바꿨나 — 항목 이름째(감사 note 는 120자에서 잘린다 — 지문으로 그 판을 다시 찾는다)
+            _ents = " ".join([f"+{x}" for x in ch.get("add") or ()] + [f"-{x}" for x in ch.get("remove") or ()] +
+                             [f"deny+{x}" for x in ch.get("deny_add") or ()] + [f"deny-{x}" for x in ch.get("deny_remove") or ()])
+            _audit(tool, "_gateway", status == 200, None if status == 200 else out.get("error"), round((time.monotonic() - t0) * 1000),
+                   caller=caller, via=via, ip=ip, note=f"fp {out.get('fingerprint')} {_ents}" if status == 200 else None)
+            await _http_reply(send, status, out)
+        else:
+            _audit(tool, "_gateway", False, "method not allowed", 0, caller=caller, via=via, ip=ip)
+            await _http_reply(send, 405, {"error": "method not allowed"}, [(b"allow", b"GET, PATCH")])
+    except ValueError as exc:
+        _audit(tool, "_gateway", False, f"bad request: {str(exc)[:120]}", 0, caller=caller, via=via, ip=ip)
+        await _http_reply(send, 400, {"error": str(exc)[:300]})
+    except Exception as exc:  # noqa: BLE001 — 창구의 실패가 게이트웨이를 죽이면 안 된다
+        log.warning("/readonly-allowlist 실패: %r", exc)
+        _audit(tool, "_gateway", False, _clip(exc, 200), 0, caller=caller, via=via, ip=ip)
+        await _http_reply(send, 500, {"error": _clip(exc, 200)})
 
 
 # ── 사용자별 백엔드 자격증명 ────────────────────────────────────────────────
@@ -8780,7 +9536,8 @@ _LOCAL_READ = frozenset({SEARCH_CONV_TOOL.name, LIST_APPS_TOOL.name, SEARCH_TOOL
                          ROUTINE_LIST_TOOL.name, ROUTINE_GET_TOOL.name,   # 루틴 실행 · 원장 쓰기는 읽기 전용 PAT 밖
                          *_INSIGHT_NAMES,                                  # 과제 인사이트는 읽기 둘뿐이다
                          KIT_GET_TOOL.name,                                # PC 키트 받기 — 파일을 내줄 뿐이다
-                         ONTO_LOOKUP_TOOL.name})                           # 온톨로지 조회 — 안쪽 허브 호출은 그 이름으로 다시 판정된다
+                         ONTO_LOOKUP_TOOL.name,                            # 온톨로지 조회 — 안쪽 허브 호출은 그 이름으로 다시 판정된다
+                         READONLY_ALLOWLIST_TOOL.name})                    # 읽기 전용 허용 목록 보기(관리자) — 고치기는 REST PATCH 뿐이다
 _ROUTINE_NAMES = frozenset(t.name for t in ROUTINE_TOOLS)
 
 
@@ -8900,6 +9657,8 @@ async def _call_tool_body(name: str, arguments: dict):
         return await _fig_dispatch(name, arguments or {})
     if name == KIT_GET_TOOL.name:
         return await _kit_dispatch(arguments or {})
+    if name == READONLY_ALLOWLIST_TOOL.name:
+        return await _readonly_allowlist_tool(arguments or {})
 
     if name == REST_CATALOG_TOOL.name:
         return await _rest_catalog(arguments or {})
@@ -8908,10 +9667,12 @@ async def _call_tool_body(name: str, arguments: dict):
     # `route` 를 **먼저** 본다 — bare 이름의 뜻은 그대로다. 없을 때만 호출 전용 별칭.
     resolved = route.get(name) or alias_route.get(name)
     if resolved is None:
+        # 옛 키의 접두 이름이면 새 키 · 새 이름을 안내한다 — 대신 부르지 않는다(GW-05)
+        _moved = _retired_tool_hint(name)
         _audit(name, None, False, "unknown tool", 0,
-               caller=_request_user() or None, corr=_request_corr())
+               caller=_request_user() or None, corr=_request_corr(), note="retired-key" if _moved else None)
         return types.CallToolResult(
-            content=[types.TextContent(type="text", text=f"unknown tool: {name}")],
+            content=[types.TextContent(type="text", text=f"unknown tool: {name}" + (f" — {_moved}" if _moved else ""))],
             isError=True,
         )
     backend_key, original = resolved
@@ -9268,7 +10029,7 @@ def _bearer_gate(app, pat_verifier=None):
             # search_tools·invoke_tool 도 게이트웨이 로컬이다 — 빠뜨리면 /tools-map 의 _gateway
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
-                        VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL, ONTO_LOOKUP_TOOL):
+                        VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL, ONTO_LOOKUP_TOOL, READONLY_ALLOWLIST_TOOL):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서
@@ -9455,6 +10216,14 @@ def _bearer_gate(app, pat_verifier=None):
             await send({"type": "http.response.start", "status": _status,
                         "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": _body})
+            return
+        if scope.get("path") == "/ingest" or scope.get("path", "").startswith("/ingest/"):
+            # 적재 경로 카탈로그(GW-01 — 공개만) — 포털 PAT 또는 공유 비밀로 스스로 인증한다(_ingest_http)
+            await _ingest_http(scope, receive, send, pat_verifier, expected)
+            return
+        if scope.get("path") == "/readonly-allowlist":
+            # 읽기 전용 허용 목록 보기 · 고치기(GW-02) — 공유 비밀 또는 관리자 PAT 로 스스로 인증한다(_ro_allowlist_http)
+            await _ro_allowlist_http(scope, receive, send, pat_verifier, expected)
             return
         if FIG_STORE_ON and scope.get("path", "").startswith("/fig/"):
             # 그림 받기 — 주인의 PAT 또는 서명한 표로 스스로 인증한다(_fig_download). 끄면 이 길이 없다(지금처럼 아래 인증으로 간다).

@@ -20,7 +20,7 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
 ## 읽기 전용 포털 PAT — 조회만(HWAXPortal docs/followups-1017 결정 5)
 
 포털 PAT 의 `scopes` 가 `read` 만이면(**`read` 가 있고 `write` 가 없을 때** — 챗 · 절차 PAT 의 `["chat"]` 은 해당 없음, 칸이 없는 옛 PAT 은
-포털 기본 읽기 · 쓰기) 다음만 부른다. 막으면 `read_only: …` 로 까닭과 여는 법을 답하고 감사 원장에 `read-only` 를 남긴다.
+포털 기본 읽기 · 쓰기) 다음만 부른다. 막으면 `read_only: …` 로 까닭(`read-only`) · 도구 이름과 여는 법을 답하고 감사 원장에 `read-only` 를 남긴다.
 
 - 백엔드 도구 — **`read_tools.json`(추적)의 `백엔드키:원래 이름`**(별칭 · 접두 노출 이름도 원래 이름으로 푼다) 또는 **앱이 그 도구에 단
   `readOnlyHint`**(재집계마다 다시 읽는다). 처음 목록은 리스크 앱이 읽기 토큰으로 부르는 26종(10-18 대조). 이 목록은 분석 루틴 단계의 읽기
@@ -31,12 +31,43 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
   빠졌다, `heax-step_forge:upload_instructions` · `heax-kooremapper_mcp:report_upload_instructions` — 안내 글만 준다, `reportarchive:preview_publish` — 게시
   미리보기, 게시하지 않고 확인 토큰은 서명뿐이라 저장이 없다). 11-09 에 쓰기 낱말(`_WRITE_NAME`)에 `link` · `edit` · `sync` 를 더하며
   둘을 더했다 — 그 낱말로 막히게 된 `ste:get_sync_settings`(설정 조회)와 쓰지 않는 미리 보기 `heax-kooremapper_mcp:plan_task_links`
-  (HWAXPortal docs/core-link CK-5). 같은 파일의 `deny` 는 루틴 단계만 닫는다 — 읽기 전용 PAT 판정은 보지 않는다.
+  (HWAXPortal docs/core-link CK-5). 같은 파일의 `deny` 와 박스 덧씌우기 `read_tools.local.json` 의 `deny` 가 맨 먼저다 — 거기 있으면 읽기 목록 · 앱 표지와
+  무관하게 막는다(11-17 부터 읽기 전용 PAT 도 — HWAXPortal docs/request-1117 R-7, 종전은 루틴 단계만).
+- **재기동 없이**(GW-02) — `read_tools.json` 도 바뀐 시각으로 다시 읽는다(1초에 한 번 본다 · JSON 이 깨지거나 칸 하나라도 목록이 아니면 셋 다 마지막
+  값 · 경고). 읽기 전용 PAT 도 박스 덧씌우기 `read_tools.local.json` 의 `tools` 를 읽는다(같은 박스 관리자가 쓰는 파일이라 신뢰가 같다). 차례는 ① 닫기
+  목록 ② 앱의 `destructiveHint` ③ 추적 `tools` · `override`(지금 그대로 — 앱의 `readOnlyHint=False` 보다 먼저) ④ 박스 덧씌우기 `tools`(앱이
+  `readOnlyHint=False` 를 적지 않았을 때만 — 루틴 · 패널 판정과 같이 앱 표지가 이긴다) ⑤ 앱의 `readOnlyHint`. 거절 글은 `read_only: '<도구>' — 읽기 전용 토큰
+  (read-only — …)` 꼴로 부른 앱에 그대로 간다(앞머리 `read_only:` 는 그대로 — 리스크 앱이 그것으로 판정한다).
+- **관리자 보기 · 고치기** — MCP `gateway_readonly_allowlist`(포털이 지금 관리자라고 답한 사람만 · tools/list 도 관리자에게만 — 항목마다 출처 ·
+  닫힘 · 앱 표지가 막는 항목(`blocked_by_label`), 두 파일의 지문 · 읽은 시각 · 오류, 그리고 같은 항목이 루틴 단계 · MCP Apps 패널의 첫 쓰기 확인에도 든다는
+  `scope`). REST `GET /readonly-allowlist[?q=]`(밖에서는 `/mcp-gw/readonly-allowlist`)와 `PATCH /readonly-allowlist`
+  — 자격은 게이트웨이 공유 비밀(포털 관리자 화면) 또는 관리자 PAT(MCP 청중, 읽기 전용 PAT 은 보기만). PATCH 본문은
+  `{"add": [...], "remove": [...], "deny_add": [...], "deny_remove": [...], "expect": "<지문>"}`(항목은 `백엔드키:원래 이름`, 한 번에 200개까지) — 박스
+  덧씌우기를 같은 폴더 임시 파일 → `os.replace` 로 통째로 새로 쓰고(다른 칸은 그대로), `expect` 가 지금 지문과 다르면 409, 파일이 깨져 있으면 덮지 않고
+  409 다. 추적 `read_tools.json` 의 항목은 지우지 못한다(git 으로 — 박스에서 닫으려면 `deny_add`). 더한 항목에 앱이 쓰기 · 파괴 표지를 달았으면 항목은
+  남기고 `warnings` 에 그 이름과 '표지가 있는 동안 열리지 않는다' 를 싣는다. 고치기마다 감사 한 줄(`PATCH /readonly-allowlist`, note `fp <지문> +항목 -항목
+  deny+항목 …` — 120자에서 잘린다, 공유 비밀 호출이면 `caller` 는 함께 실린 `x-hwax-user` — 감사에만 쓰고 권한은 주지 않는다).
 - 게이트웨이 자체 도구 — 조회(search_tools · list_tool_apps · rest_catalog · search_conversations · browse_experts · use_experts ·
   verify_answer)는 열고 `save_conversation` 은 막는다. `rest_call` 과 REST 다리(`/api/<site>/`)는 GET · HEAD 만. `invoke_tool` 은 안쪽 도구로 본다.
 - 표지 `x-hwax-readonly` 는 PAT 분기에서만 싣고 클라이언트 사본은 두 분기(GW_TOKEN · PAT) 모두 버린다.
 - 판정 밖 — 읽기 PAT 로 포털 `/agent/chat` · 카드 대조를 부르면 포털이 챗 PAT 를 새로 찍어 심의(RA 초안 저장)가 돈다. 리스크 앱 패널의
   길이라 그대로 둔다(결정 FU-D17).
+
+## 앱 키 · 환경 · 정본 · 옛 키 — `list_tool_apps`(HWAXPortal docs/request-1117 GW-05)
+
+- 앱 줄마다 `env`(**`dev` · `prod` 둘뿐** — 이름은 게이트웨이가 정한다, 사용자 결정 D5 · DynaForge · 리스크 앱도 같은 이름) · `canonical` · `aliases`
+  (`[{key, prefix}]` — 이 앱으로 옮겨 온 옛 키), 옛 키 앱이 아직 붙어 있으면 `replaced_by`. 맨 위 `env` 는 박스 값과 출처(`app_keys.local.json` ·
+  `GATEWAY_ENV` · `unset`)다.
+- 환경 — 박스 덧씌우기 `app_keys.local.json`(gitignore, merge patch, 바뀐 시각으로 다시 읽음)의 `apps.<키>.env` > `default_env` > 띄운 셸의 `GATEWAY_ENV` >
+  `unknown`(출처 `unset` 과 고칠 곳을 note 로 — dev 로도 prod 로도 지어내지 않는다). 운영 박스(cae00)는 `{"default_env": "prod"}` 를, dev 박스는
+  `{"default_env": "dev"}` 를 적는다. 다른 이름(staging · production …)은 받지 않고 `env.errors` 에 칸 이름을 싣는다(`env.errors` 는 관리자 · 내부
+  서비스에게만 — 박스의 앱 키가 든다).
+- 정본 — 덧씌우기 `apps.<키>.canonical`, 없으면 옛 키 · 코어 어휘표의 시험 사본(staging 역할) · 형제 허브(sibling 역할)가 거짓, 나머지는 참.
+- 옛 키 표 — 추적 `app_keys.json` 의 `retired`(`dynaforge-prod` → `heax-kooremapper_mcp` · 접두 `dynaforgeprod_`, `stepforge-prod` → `heax-step_forge` ·
+  접두 `stepforgeprod_`). 옛 접두 이름을 부르면(직접 · `invoke_tool`) `unknown tool: … — 옛 키 '…' 의 이름이다 — 지금은 앱 '…' 의 '…' 로 부른다`(감사
+  note `retired-key`), `list_tool_apps(app=옛 키)` 는 `moved`, 옛 키 · 접두를 담은 `search_tools` 질의는 답에 `moved` 를 싣는다. **대신 부르지 않는다.**
+  부르는 사람이 지금 키의 앱을 쓸 권한이 없으면 그 앱 · 도구 이름을 말하지 않고 '다른 앱으로 옮겼다 — 권한이 없다' 만 말한다.
+  그 밖의 답은 바이트까지 그대로다.
 
 ## 서비스 PAT — 박스 작업의 신원(HWAXPortal docs/core-link SRC-13 · 계약 design §3)
 
@@ -324,6 +355,13 @@ python3 tool_usage_report.py --days 60 --out unused.md
 - 게이트웨이 자체 도구(`_gateway`)는 감사에 다 남지 않아 세지 않는다. 도구가 생긴 날은 모른다 — 최근에 붙은 앱은 안 불린 것이 당연할 수 있다.
 - 보고서에는 도구 이름과 수만 있다(부른 사람 · 주소는 없다). 감사 경로는 게이트웨이와 같은 규칙이다(`GATEWAY_AUDIT`, 없으면 이 리포의 `audit.jsonl`).
 
+## 도구 등록 점검표 — 문서 + 읽기만 하는 훑기(HWAXPortal docs/request-1117 GW-04)
+
+배치 원칙(데이터를 가진 플랫폼이 함수를 갖는다 · 포털 · 게이트웨이는 노출 · 연결만 · 보고만 하는 함수는 주인 플랫폼으로)과 점검 항목은
+`docs/tool-registration-checklist.md`, 훑기는 `tool_registration_scan.py`(`/tools-map` 또는 저장한 파일 · 선택으로 설명 스냅숏 → 앱마다 도구 · 데이터
+주인 추정 · 보고만 의심 · 까닭, 끝에 질의 점검 D1 — 낙하 · 부분 충격 해석 결과는 DynaForge 만, Report Archive 의 분석 실행 도구 넷은 그 질의에서 1위가
+아니어야 한다). 관리자 도구 · 저장 없음(사용자 결정) — 아무것도 쓰지 않는다. 기본 검색 순위는 이 일로 바꾸지 않는다(박스 덧씌우기 제안은 그 문서).
+
 ## search_tools 의미 순위 — 선택, 기본 꺼짐
 
 `search_tools` 의 부분문자열 순위에 AIDataHub 임베딩 순위를 RRF(k=60)로 **더한다**(갈아 끼우지 않는다 — 한국어 업무어는 부분문자열이 이기는 사례가 있다). 켤지는 평가 결과를 보고 정한다 — 평가셋·러너·숫자는 `tool_search_eval/README.md`.
@@ -373,9 +411,10 @@ python3 tool_usage_report.py --days 60 --out unused.md
   `deliberate_cancel` 을 부르고 포털의 까닭 뒤에 ` — 막 시작한 심의(<job_id>)는 접었다`(못 접으면 `…접지 못했다(<까닭>)`)를 붙인다.
 - 읽기 목록 덧씌우기 `read_tools.local.json`(gitignore) — `read_tools.json` 과 같은 꼴(`{"tools": ["백엔드키:원래 이름", …], "deny": [...]}`)로, 이름 꼴로는
   막히는 조회 도구를 박스에서 커밋 없이 열고(`tools`) 이름 꼴 · 앱 표지로 열린 쓰기를 코드 고침 없이 닫는다(`deny` — 앱의 `readOnlyHint=True` 보다 먼저,
-  R3 리뷰 2차 #0). 리포에 둘 것은 `read_tools.json` 에(위 읽기 전용 PAT 절 — 그 파일의 `deny` 도 루틴만 닫는다). 바뀐 시각이 다르면 재기동 없이 다시
-  읽고, 못 읽거나 꼴이 틀리면 통째로 버린다(빈 목록 — `deny` 도 빠진다, 경고 한 줄).
-  루틴 단계 판정만 본다(읽기 전용 PAT 의 허용 목록은 `read_tools.json` 그대로다). update-all §1 의 stash 는 받기 전의 `.gitignore` 로 돌므로 **이 판을 받은
+  R3 리뷰 2차 #0). 리포에 둘 것은 `read_tools.json` 에(위 읽기 전용 PAT 절). 바뀐 시각이 다르면 재기동 없이 다시
+  읽고, 못 읽거나 꼴이 틀리면 마지막으로 읽은 `tools` · `deny` 를 그대로 둔다(경고 한 줄 · 관리자 보기의 `overlay.error` — 깨진 파일로 `deny` 가 빠지지
+  않는다). 파일을 지우면 빈 목록이다.
+  11-17 부터 읽기 전용 PAT 의 허용 목록도 이 파일을 읽는다(위 읽기 전용 PAT 절 — GW-02). update-all §1 의 stash 는 받기 전의 `.gitignore` 로 돌므로 **이 판을 받은
   뒤에 만든다**.
 - `routine_report_submit` — 끝난 실행에 다시 내면 포털이 저장본을 돌려준다(`ask` 의 `upload=true` 다시 내기, R3-D12). 저장본에 이미 만든 RA 초안의
   `ra_report_id` 가 있으면 초안을 또 만들지 않고 그 id 를 `ra_note` 와 함께 돌려준다(원장 `/ra` 에도 다시 적지 않는다). 앞 올리기가 실패한 저장본은 다시 올린다.
@@ -408,6 +447,28 @@ python3 tool_usage_report.py --days 60 --out unused.md
 - `save_conversation` 은 `subject`(받는 칸 넷 — `sp_task` · `round` · `text` · `artifacts`, JSON 20,000자까지)와 `chair_template`(`[a-z0-9-]` 40자)을
   꼴만 보고 포털 `ConvCreate` 에 넘긴다. 틀리면 그 칸만 버리고 대화는 저장한 뒤 답의 `subject_dropped` 로 말한다. 포털이 들인 결과(`insight` — id ·
   상태 또는 건너뛴 까닭)를 답에 옮긴다. 확인(SP key 다시 풀기)은 포털이 저장한 뒤 에이전트 서버로 한다.
+
+## 적재 경로 카탈로그 — 공개만(HWAXPortal docs/request-1117 GW-01 · 사용자 결정 C3)
+
+큰 파일은 MCP 로 나르지 않는다. 앱이 공식으로 밝힌 **어디로 · 무슨 자격으로 · 얼마까지** 올리는지를 한 자리에 싣는다 — 11-12 에 포털 토큰이 앱 반입
+경로에서 401 이었고 허브 경로는 로그인 문에서 401 이었다(무엇을 들고 가야 하는지 적힌 곳이 없었다). **게이트웨이는 업로드를 받지도 나르지도 계산하지도
+않는다**(결정 C3 — 중계는 짓지 않는다). 사람 · 스크립트는 실린 `path` 로 직접 올린다.
+
+- 선언 — 추적 `ingest_routes.json`(**주소 없음** — 경로 · 꼴만, 어느 앱이든 같은 틀 `_template`) + 박스 덧씌우기 `ingest_routes.local.json`(gitignore, JSON
+  merge patch, 바뀐 시각으로 다시 읽음 · 깨지면 버리고 기본값). **추적 `routes` 는 앱의 공식 답이 온 것만 담는다 — 지금은 비어 있다**(짐작으로 채우지
+  않는다). 반드시 칸 — `site`(REST 사이트 키 — 묶음 · 권한) · `method`(POST · PUT) · `path`(포털 오리진 위의 바깥 경로) · `portal_gate`(포털 로그인 문을
+  지나나) · `token`(받는 자격 종류 — `portal_pat` · `app_token` · `sso`) · `max_bytes`(요청 하나 상한). 덧붙임 — `app` · `label` · `token_hint` · `token_note` ·
+  `content_type` · `fields` · `max_file_bytes` · `source` · `declared_by` · `check_path`(점검 경로 — REST 사이트 주소 뒤) · `check_base`(점검 주소 — 박스
+  덧씌우기에만). 경로는 `/` 로 시작하는 오리진 위의 경로만이다(`//호스트` · 역슬래시 · 쿼리 · `..` 는 받지 않는다). 틀린 칸이 있는 경로는 통째로 버리고
+  `invalid` 에 까닭을 싣는다 — `invalid` · 선언 전체의 `fingerprint` · 덧씌우기 오류는 관리자 · 공유 비밀에게만 보인다.
+- 보기 — MCP `rest_catalog(part='ingest'[, site=…][, probe=true])` · HTTP `GET /ingest[/<site>][?probe=1]`(밖에서는 `/mcp-gw/ingest…` — 포털 PAT 면 그
+  사람 권한으로 보이는 것만, 공유 비밀이면 전부). 권한은 REST 다리와 같은 규칙(사이트 · 있으면 앱 키). 기본 `rest_catalog` 표에도 선언이 있는 사이트마다
+  `ingest` 한 줄씩이 붙는다. 주소는 싣지 않는다. 적재 경로 설명은 `rest_catalog` 의 도구 설명이 아니라 `part` 인자에 있다 — 도구 설명을 바꾸면 모두의
+  `search_tools` 순위가 바뀐다(시험이 도구 설명을 master 와 sha256 으로 맞댄다). `/ingest` 는 GET 만이다 — 다른 메서드는 405(`업로드를 받지 않는다`).
+- 점검(`probe`) — site 를 줄 때만, `check_path` 가 있는 선언을 **자격 없이 · 본문 없이** HEAD 로 한 번 본다(30초 안에 다시 부르면 마지막 것). 405 · 2xx ·
+  3xx 는 '경로가 있다', 401 · 403 은 '문이 자격을 요구한다', 404 는 '경로가 없다', 닿지 않으면 `status: null`. 보내기 전에 '점검 중'(`in_progress`)을 먼저
+  적어 동시에 온 점검이 HEAD 를 하나만 보낸다. `last_check`(시각 · 코드 · 뜻)는 게이트웨이
+  메모리에만 있다(재기동하면 비운다).
 
 ## 그림 저장 — 도구 결과의 그림을 받고 보고서에 넣는다(사용자 보고 11-02)
 

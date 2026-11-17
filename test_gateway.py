@@ -8587,7 +8587,11 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     # 11-02 PC 키트에서 'docx' · '변환기' · '표 칸'(띄어 쓴 열쇠) → kit_get 을 넣었다(변환기를 찾게 — 일부러 바꾼 기본값, HWAXPortal docs/report-figures RF-23)
     # 같은 날 figure_to_doc 이 '문서에' · '백서' 를 새로 넣었다(79)
     # 11-03 StepForge F1 이 '짝 단면' · '단면 비교'(띄어 쓴 열쇠) → section_pair_view 를 새로 넣었다(81)
-    assert len(d["synonyms"]) == 81 and d["synonyms"]["요약"] == ("digest", "summary")
+    # 11-17 cae00 요청 OL-5(사용자 결정 — 기본값으로 옮김)가 '온톨로지' · 'ontology' 를 새로 넣었다(83 — 박스 덧씌우기에서 잰 그대로, HWAXPortal
+    # docs/ontology-first OF-42)
+    assert len(d["synonyms"]) == 83 and d["synonyms"]["요약"] == ("digest", "summary")
+    assert d["synonyms"]["온톨로지"] == ("ontology", "onto_", "object_resolve", "graph_neighbors", "objects_summary", "코어 정본")
+    assert d["synonyms"]["ontology"] == ("object_resolve", "graph_neighbors", "objects_summary", "코어 정본")
     assert d["synonyms"]["docx"] == d["synonyms"]["변환기"] == d["synonyms"]["표 칸"] == ("kit_get",)
     assert d["synonyms"]["그림"] == ("plot", "render", "figure") and d["synonyms"]["이미지"] == ("figure", "image")
     assert d["synonyms"]["문서에"] == ("document", "figure_to_doc") and d["synonyms"]["백서"] == ("document", "mxwp", "figure_to_doc")

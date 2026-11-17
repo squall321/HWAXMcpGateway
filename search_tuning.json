@@ -636,6 +636,28 @@
    ],
    "owner": null,
    "source_fix": null
+  },
+  "온톨로지": {
+   "to": [
+    "ontology",
+    "onto_",
+    "object_resolve",
+    "graph_neighbors",
+    "objects_summary",
+    "코어 정본"
+   ],
+   "owner": null,
+   "source_fix": null
+  },
+  "ontology": {
+   "to": [
+    "object_resolve",
+    "graph_neighbors",
+    "objects_summary",
+    "코어 정본"
+   ],
+   "owner": null,
+   "source_fix": null
   }
  },
  "quality": {

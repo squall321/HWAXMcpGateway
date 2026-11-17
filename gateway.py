@@ -4087,7 +4087,7 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
         payload.update(mode)        # 어느 순위로 답했나 — rrf, 또는 못 섞었으면 substring 과 그 까닭(mode_reason)
     payload["match_count"] = len(rows)
     payload["ranked"] = [m["tool"] for m in matches]
-    _moved = _retired_in_query(q)
+    _moved = _retired_in_query(q, groups)
     if _moved:
         # 옛 키 · 옛 접두를 담은 질의(GW-05) — 새 키(이름이 보이면 새 도구)를 말한다. 옛 이름은 대신 부르지 않는다
         payload["moved"] = _moved
@@ -4191,7 +4191,9 @@ async def _needs_connect(keys) -> set[str]:
 #    바뀐 시각을 보고 재기동 없이 다시 읽는다)에 default_env · apps.<키>.env · canonical 로 적는다. 게이트웨이를 띄우는 셸의 GATEWAY_ENV 가 그다음이다.
 #    둘 다 없으면 env 는 unknown 이다 — dev 로도 prod 로도 지어내지 않는다(운영 박스가 적지 않은 사이에 운영 앱이 dev 로 보이면 요청이 막으려던 오판이다 —
 #    HWAXPortal docs/request-1117 contracts §5 '모르면 unknown'). 박스가 적지 않았다는 것은 list_tool_apps 의 env.source 'unset' 과 note 가 말한다.
-#  · canonical 은 덧씌우기 값이 먼저고, 없으면 옛 키(아직 붙어 있어도) · 코어 어휘표의 시험 사본(staging)이 거짓, 나머지는 참이다.
+#  · canonical 은 덧씌우기 값이 먼저고, 없으면 옛 키(아직 붙어 있어도) · 코어 어휘표의 시험 사본(staging) · 형제 허브(sibling — 같은 허브 도구,
+#    담은 데이터가 다르다 · 정본은 하나다)가 거짓, 나머지는 참이다(11-17 검토 L4).
+#  · 옛 키 안내는 부르는 사람이 지금 키의 앱을 쓸 수 있을 때만 그 앱 · 도구 이름을 말한다 — 권한 밖이면 '다른 앱으로 옮겼다 — 권한이 없다' 만(L7).
 APP_KEYS_PATH = Path(__file__).with_name("app_keys.json")
 APP_KEYS_LOCAL_PATH = Path(__file__).with_name("app_keys.local.json")
 APP_ENVS = ("dev", "prod")
@@ -4289,7 +4291,7 @@ def _box_env() -> tuple[str, str]:
 
 
 def _app_env_entry(key: str) -> dict:
-    """앱 줄에 싣는 env · canonical · aliases(+ 옛 키면 replaced_by). 앱마다 env 가 늘 dev · prod 가운데 하나로 찬다."""
+    """앱 줄에 싣는 env · canonical · aliases(+ 옛 키면 replaced_by). env 는 박스가 적은 dev · prod, 적지 않았으면 unknown 이다(늘 찬다)."""
     d = _app_keys()
     one = (d.get("apps") or {}).get(key) or {}
     env = one.get("env") or _box_env()[0]
@@ -4297,7 +4299,8 @@ def _app_env_entry(key: str) -> dict:
     if "canonical" in one:
         canonical = one["canonical"]
     else:
-        canonical = key not in retired and key not in ((_CORE_VOCAB["data"] or {}).get("staging") or frozenset())
+        cv = _CORE_VOCAB["data"] or {}
+        canonical = key not in retired and key not in (cv.get("staging") or frozenset()) and key not in (cv.get("siblings") or ())
     out = {"env": env, "canonical": canonical,
            "aliases": [{"key": old, "prefix": s["prefix"]} for old, s in sorted(retired.items()) if s["now"] == key]}
     if key in retired:
@@ -4321,11 +4324,18 @@ def _exposed_name(backend: str, original: str) -> str | None:
     return next((n for n, (bk, orig) in route.items() if bk == backend and orig == original), None)
 
 
-def _retired_tool_hint(name: str) -> str | None:
-    """옛 키의 접두 이름(예 stepforgeprod_section_pair_view)이면 새 키 · 새 이름을 말하는 안내 한 줄. 아니면 None. 대신 부르지 않는다."""
+_RETIRED_NO_ACCESS = "다른 앱으로 옮겼지만 이 계정은 그 앱을 쓸 권한이 없다 — 포털 '내 권한'(/access)에서 요청한다"
+
+
+def _retired_tool_hint(name: str, groups: list[str] | None = None) -> str | None:
+    """옛 키의 접두 이름(예 stepforgeprod_section_pair_view)이면 새 키 · 새 이름을 말하는 안내 한 줄. 아니면 None. 대신 부르지 않는다.
+    부르는 사람이 지금 키의 앱을 쓸 수 없으면 그 앱 · 도구 이름을 말하지 않는다(L7)."""
+    groups = _request_groups() if groups is None else groups
     for old, spec in (_app_keys().get("retired") or {}).items():
         p = spec["prefix"]
         if p and name.startswith(p) and len(name) > len(p):
+            if not _backend_allowed(spec["now"], groups):
+                return f"옛 키 '{old}' 의 이름이다 — {_RETIRED_NO_ACCESS}"
             orig = name[len(p):]
             new = _exposed_name(spec["now"], orig)
             if new:
@@ -4335,13 +4345,18 @@ def _retired_tool_hint(name: str) -> str | None:
     return None
 
 
-def _retired_in_query(q: str) -> list[dict]:
-    """검색 질의가 옛 키 · 옛 접두를 담았으면 새 키(와 이름이 있으면 새 도구)를 말하는 줄. 없으면 []."""
+def _retired_in_query(q: str, groups: list[str] | None = None) -> list[dict]:
+    """검색 질의가 옛 키 · 옛 접두를 담았으면 새 키(와 이름이 있으면 새 도구)를 말하는 줄. 없으면 []. 지금 키의 앱을 쓸 수 없는 사람에게는 옮겼다는
+    것만 말한다(L7)."""
+    groups = _request_groups() if groups is None else groups
     q = str(q or "").lower()
     out = []
     for old, spec in sorted((_app_keys().get("retired") or {}).items()):
         p = spec["prefix"].lower()
         if old.lower() in q or old.lower().replace("-", "") in q or (p and p in q):
+            if not _backend_allowed(spec["now"], groups):
+                out.append({"old": old, "note": _RETIRED_NO_ACCESS})
+                continue
             row = {"old": old, "now": spec["now"]}
             m = re.search(re.escape(p) + r"([a-z0-9_]+)", q) if p else None
             if m:
@@ -4464,7 +4479,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         payload["env"]["note"] = (f"이 박스는 환경을 적지 않아 {APP_ENV_UNSET} 로 적었다 — 운영자가 게이트웨이 app_keys.local.json 에 "
                                   "default_env(dev · prod)를 적거나 게이트웨이를 GATEWAY_ENV 와 함께 띄운다")
     _ak = _app_keys()
-    if _ak.get("errors") or (_APP_KEYS.get("overlay") or {}).get("error"):
+    # 덧씌우기에서 버린 칸(앱 키가 든다)은 관리자 · 내부 서비스에게만(L7)
+    if (ADMIN_GROUP in groups or SERVICE_GROUP in groups) and (_ak.get("errors") or (_APP_KEYS.get("overlay") or {}).get("error")):
         payload["env"]["errors"] = [*(_ak.get("errors") or []), *([_APP_KEYS["overlay"]["error"]] if (_APP_KEYS.get("overlay") or {}).get("error") else [])]
     if want_app and not apps:
         _moved = _retired_key(want_app) if not denied else None
@@ -4473,6 +4489,10 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             payload["error"] = (f"not_ready: {want_app} — {d0['how']}" if d0["reason"] == "policy_not_ready"
                                 else f"no_access: {want_app} — 이 계정에는 권한이 없는 앱이다. {d0['how']}")
             payload["denied"] = d0
+        elif _moved and not _backend_allowed(_moved[1]["now"], groups):
+            # 옛 키인데 지금 키의 앱을 쓸 수 없다 — 그 앱 이름을 말하지 않는다(L7)
+            payload["error"] = f"unknown app: {want_app} — 옛 키다. {_RETIRED_NO_ACCESS}"
+            payload["moved"] = {"old": _moved[0]}
         elif _moved:
             # 옛 키(GW-05) — 새 키를 안내만 한다(그 앱의 도구를 대신 싣지 않는다)
             payload["error"] = (f"unknown app: {want_app} — 옛 키다. 지금은 '{_moved[1]['now']}' 다 — list_tool_apps(app='{_moved[1]['now']}') 로 "

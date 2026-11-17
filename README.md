@@ -59,12 +59,14 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
   (`[{key, prefix}]` — 이 앱으로 옮겨 온 옛 키), 옛 키 앱이 아직 붙어 있으면 `replaced_by`. 맨 위 `env` 는 박스 값과 출처(`app_keys.local.json` ·
   `GATEWAY_ENV` · `unset`)다.
 - 환경 — 박스 덧씌우기 `app_keys.local.json`(gitignore, merge patch, 바뀐 시각으로 다시 읽음)의 `apps.<키>.env` > `default_env` > 띄운 셸의 `GATEWAY_ENV` >
-  `dev`(출처 `unset` 과 고칠 곳을 note 로 — 운영이라고 지어내지 않는다). 운영 박스(cae00)는 `{"default_env": "prod"}` 를 적는다. 다른 이름(staging ·
-  production …)은 받지 않고 `env.errors` 에 칸 이름을 싣는다.
-- 정본 — 덧씌우기 `apps.<키>.canonical`, 없으면 옛 키 · 코어 어휘표의 시험 사본(staging 역할)이 거짓, 나머지는 참.
+  `unknown`(출처 `unset` 과 고칠 곳을 note 로 — dev 로도 prod 로도 지어내지 않는다). 운영 박스(cae00)는 `{"default_env": "prod"}` 를, dev 박스는
+  `{"default_env": "dev"}` 를 적는다. 다른 이름(staging · production …)은 받지 않고 `env.errors` 에 칸 이름을 싣는다(`env.errors` 는 관리자 · 내부
+  서비스에게만 — 박스의 앱 키가 든다).
+- 정본 — 덧씌우기 `apps.<키>.canonical`, 없으면 옛 키 · 코어 어휘표의 시험 사본(staging 역할) · 형제 허브(sibling 역할)가 거짓, 나머지는 참.
 - 옛 키 표 — 추적 `app_keys.json` 의 `retired`(`dynaforge-prod` → `heax-kooremapper_mcp` · 접두 `dynaforgeprod_`, `stepforge-prod` → `heax-step_forge` ·
   접두 `stepforgeprod_`). 옛 접두 이름을 부르면(직접 · `invoke_tool`) `unknown tool: … — 옛 키 '…' 의 이름이다 — 지금은 앱 '…' 의 '…' 로 부른다`(감사
   note `retired-key`), `list_tool_apps(app=옛 키)` 는 `moved`, 옛 키 · 접두를 담은 `search_tools` 질의는 답에 `moved` 를 싣는다. **대신 부르지 않는다.**
+  부르는 사람이 지금 키의 앱을 쓸 권한이 없으면 그 앱 · 도구 이름을 말하지 않고 '다른 앱으로 옮겼다 — 권한이 없다' 만 말한다.
   그 밖의 답은 바이트까지 그대로다.
 
 ## 서비스 PAT — 박스 작업의 신원(HWAXPortal docs/core-link SRC-13 · 계약 design §3)

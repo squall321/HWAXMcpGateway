@@ -14040,7 +14040,8 @@ def test_GW05_list_tool_apps_의_앱마다_env_canonical_aliases_가_찬다(monk
     assert body["env"] == {"box": "prod", "source": "app_keys.local.json"}, "덧씌우기가 GATEWAY_ENV 보다 먼저"
     assert apps["heax-step_forge"]["env"] == "prod" and apps["sibling-copy"]["env"] == "dev"
     assert apps["sibling-copy"]["canonical"] is False and apps["sibling-copy"]["env_note"] == "시험 사본"
-    # 깨진 덧씌우기는 버린다 — 기본값으로 돌고 까닭을 싣는다
+    # 깨진 덧씌우기는 버린다 — 기본값으로 돌고 까닭을 싣는다(env.errors 는 관리자 · 내부 서비스에게만 — 11-17 검토 L7)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [gw.ADMIN_GROUP])
     gw.APP_KEYS_LOCAL_PATH.write_text("{broken", encoding="utf-8")
     st = gw.APP_KEYS_LOCAL_PATH.stat()
     os.utime(gw.APP_KEYS_LOCAL_PATH, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
@@ -14535,3 +14536,44 @@ def test_L7_HTTP_카탈로그도_버린_선언_지문은_공유_비밀_관리자
     v = _verifier(monkeypatch)
     st, body = _http(monkeypatch, "/ingest", auth=f"Bearer {_pat(gw.MCP_AUDIENCE)}", verifier=v)
     assert st == 200 and "invalid" not in body and "fingerprint" not in body and {r["id"] for r in body["ingest"]} == {"a-intake", "b-intake"}
+
+
+# ── 11-17 검토 — GW-05 고침(L4 · L7) ─────────────────────────────────────────────
+def test_L4_형제_허브는_정본이_아니다(monkeypatch, tmp_path):
+    _gw05_kit(monkeypatch)
+    d = json.loads(_REAL_CORE_VOCAB.read_text(encoding="utf-8"))
+    d.setdefault("apps", {})["sibling-copy"] = {"role": "sibling", "label": "형제 허브"}
+    p = tmp_path / "core_vocab.json"
+    p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(gw, "CORE_VOCAB_PATH", p)
+    apps = {a["app"]: a for a in _apps_body()["apps"]}
+    assert "sibling-copy" in (gw._CORE_VOCAB["data"] or {}).get("siblings", ()), "전제 — 어휘표가 형제로 읽었다"
+    assert apps["sibling-copy"]["canonical"] is False and apps["heax-step_forge"]["canonical"] is True
+
+
+def test_L7_옛_키_안내는_권한_밖_앱_도구_이름을_말하지_않고_env_errors_는_관리자에게만(monkeypatch):
+    b = _CallB(["section_pair_view"])
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": b})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "POLICY", {"heax-step_forge": ["cad-team"]})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    asyncio.run(gw._aggregate())
+    text = asyncio.run(gw._call_tool("stepforgeprod_section_pair_view", {})).content[0].text
+    assert text.startswith("unknown tool: stepforgeprod_section_pair_view — 옛 키 'stepforge-prod'") and "권한이 없다" in text
+    assert "heax-step_forge" not in text and "section_pair_view'" not in text, text
+    one = _apps_body({"app": "stepforge-prod"})
+    assert one["moved"] == {"old": "stepforge-prod"} and "heax-step_forge" not in json.dumps(one["error"]) and "권한이 없다" in one["error"]
+    got = json.loads(asyncio.run(gw._search_tools({"query": "stepforgeprod_section_pair_view"}, embed=False, log_query=False)).content[0].text)
+    assert got["moved"] == [{"old": "stepforge-prod", "note": gw._RETIRED_NO_ACCESS}]
+    # 권한이 있으면 종전대로 이름을 말한다
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["cad-team"])
+    assert "'heax-step_forge' 의 'section_pair_view'" in asyncio.run(gw._call_tool("stepforgeprod_section_pair_view", {})).content[0].text
+    # env.errors — 관리자 · 내부 서비스에게만
+    gw.APP_KEYS_LOCAL_PATH.write_text(json.dumps({"apps": {"secret-app": {"env": "production"}}}), encoding="utf-8")
+    assert "errors" not in _apps_body()["env"]
+    monkeypatch.setattr(gw, "_request_groups", lambda: [gw.ADMIN_GROUP])
+    assert _apps_body()["env"]["errors"] == ["apps.secret-app.env"]

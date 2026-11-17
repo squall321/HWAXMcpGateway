@@ -420,6 +420,25 @@ python3 tool_usage_report.py --days 60 --out unused.md
   꼴만 보고 포털 `ConvCreate` 에 넘긴다. 틀리면 그 칸만 버리고 대화는 저장한 뒤 답의 `subject_dropped` 로 말한다. 포털이 들인 결과(`insight` — id ·
   상태 또는 건너뛴 까닭)를 답에 옮긴다. 확인(SP key 다시 풀기)은 포털이 저장한 뒤 에이전트 서버로 한다.
 
+## 적재 경로 카탈로그 — 공개만(HWAXPortal docs/request-1117 GW-01 · 사용자 결정 C3)
+
+큰 파일은 MCP 로 나르지 않는다. 앱이 공식으로 밝힌 **어디로 · 무슨 자격으로 · 얼마까지** 올리는지를 한 자리에 싣는다 — 11-12 에 포털 토큰이 앱 반입
+경로에서 401 이었고 허브 경로는 로그인 문에서 401 이었다(무엇을 들고 가야 하는지 적힌 곳이 없었다). **게이트웨이는 업로드를 받지도 나르지도 계산하지도
+않는다**(결정 C3 — 중계는 짓지 않는다). 사람 · 스크립트는 실린 `path` 로 직접 올린다.
+
+- 선언 — 추적 `ingest_routes.json`(**주소 없음** — 경로 · 꼴만, 어느 앱이든 같은 틀 `_template`) + 박스 덧씌우기 `ingest_routes.local.json`(gitignore, JSON
+  merge patch, 바뀐 시각으로 다시 읽음 · 깨지면 버리고 기본값). **추적 `routes` 는 앱의 공식 답이 온 것만 담는다 — 지금은 비어 있다**(짐작으로 채우지
+  않는다). 반드시 칸 — `site`(REST 사이트 키 — 묶음 · 권한) · `method`(POST · PUT) · `path`(포털 오리진 위의 바깥 경로) · `portal_gate`(포털 로그인 문을
+  지나나) · `token`(받는 자격 종류 — `portal_pat` · `app_token` · `sso`) · `max_bytes`(요청 하나 상한). 덧붙임 — `app` · `label` · `token_hint` · `token_note` ·
+  `content_type` · `fields` · `max_file_bytes` · `source` · `declared_by` · `check_path`(점검 경로 — REST 사이트 주소 뒤) · `check_base`(점검 주소 — 박스
+  덧씌우기에만). 틀린 칸이 있는 경로는 통째로 버리고 `invalid` 에 까닭을 싣는다.
+- 보기 — MCP `rest_catalog(part='ingest'[, site=…][, probe=true])` · HTTP `GET /ingest[/<site>][?probe=1]`(밖에서는 `/mcp-gw/ingest…` — 포털 PAT 면 그
+  사람 권한으로 보이는 것만, 공유 비밀이면 전부). 권한은 REST 다리와 같은 규칙(사이트 · 있으면 앱 키). 기본 `rest_catalog` 표에도 선언이 있는 사이트마다
+  `ingest` 한 줄씩이 붙는다. 주소는 싣지 않는다. `/ingest` 는 GET 만이다 — 다른 메서드는 405(`업로드를 받지 않는다`).
+- 점검(`probe`) — site 를 줄 때만, `check_path` 가 있는 선언을 **자격 없이 · 본문 없이** HEAD 로 한 번 본다(30초 안에 다시 부르면 마지막 것). 405 · 2xx ·
+  3xx 는 '경로가 있다', 401 · 403 은 '문이 자격을 요구한다', 404 는 '경로가 없다', 닿지 않으면 `status: null`. `last_check`(시각 · 코드 · 뜻)는 게이트웨이
+  메모리에만 있다(재기동하면 비운다).
+
 ## 그림 저장 — 도구 결과의 그림을 받고 보고서에 넣는다(사용자 보고 11-02)
 
 StepForge · DynaForge 의 그림(`ImageContent`)은 결과 안에만 있었다. 게이트웨이는 성공한 백엔드 결과(캐시 적중 포함)의 그림 블록마다 파일 하나와

@@ -50,6 +50,10 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "APP_KEYS_LOCAL_PATH", tmp_path / "app_keys.local.json")
     monkeypatch.setattr(gw, "_APP_KEYS", {"key": None, "data": None, "error": None, "overlay": None})
     monkeypatch.setattr(gw, "GATEWAY_ENV", "")
+    # 적재 경로 선언의 박스 덧씌우기 · 점검 기록도 같다 — 박스에 ingest_routes.local.json 이 있으면 중계 시험이 그 박스 상류 · 준비 폴더로 돈다(GW-01)
+    monkeypatch.setattr(gw, "INGEST_ROUTES_LOCAL_PATH", tmp_path / "ingest_routes.local.json")
+    monkeypatch.setattr(gw, "_INGEST", {"key": None, "data": None, "error": None, "overlay": None})
+    monkeypatch.setattr(gw, "_INGEST_CHECK", {})
 
 
 @pytest.fixture(autouse=True)
@@ -14253,3 +14257,130 @@ def test_GW02_REST_는_PAT_면_포털이_지금_관리자라고_답한_사람만
     assert st == 401 and body == gw.EXPIRED_BODY
     panel = _pat(gw.PANEL_AUDIENCE)
     assert _http(monkeypatch, "/readonly-allowlist", auth=f"Bearer {panel}", verifier=v)[0] == 401, "패널 PAT(다른 청중)는 열지 않는다"
+
+
+# ── GW-01 적재 경로 카탈로그 — 공개만(HWAXPortal docs/request-1117 · 사용자 결정 C3) ─────────────────────────────────────────────
+def _ingest_kit(monkeypatch, routes=None, rest=None):
+    monkeypatch.setattr(gw, "REST", rest if rest is not None else {"app-a": {"base": "http://a.invalid"}, "app-b": {"base": "http://b.invalid/apps/b"}})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    if routes is not None:
+        gw.INGEST_ROUTES_LOCAL_PATH.write_text(json.dumps({"routes": routes}), encoding="utf-8")
+
+
+def _rt(site, path, **kw):
+    return {"site": site, "method": "POST", "path": path, "portal_gate": False, "token": "app_token", "max_bytes": 512 * 1048576, **kw}
+
+
+_ROUTES = {"a-intake": _rt("app-a", "/apps/a_api/api/v1/intake", app="heax-a", token_hint="ak_", max_file_bytes=100, check_path="/api/v1/intake",
+                           declared_by="앱 A 11-20"),
+           "b-intake": _rt("app-b", "/apps/b/api/intake", portal_gate=True, token="portal_pat")}
+
+
+def _rcat(args):
+    return json.loads(asyncio.run(gw._rest_catalog(args)).content[0].text)
+
+
+def test_GW01_추적_선언은_주소가_없고_앱의_공식_답이_오기_전에는_비어_있으며_틀은_어느_앱이든_같다():
+    raw = gw.INGEST_ROUTES_PATH.read_text(encoding="utf-8")
+    assert "://" not in raw and not re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", raw), "추적 파일에 주소가 있다"
+    data = json.loads(raw)
+    assert data["routes"] == {}, "앱이 공식으로 밝힌 것만 — 짐작으로 채우지 않는다(결정 C3)"
+    (tid, tpl), = data["_template"].items()
+    assert "check_base" not in tpl, "점검 주소는 박스 덧씌우기에만"
+    got, why = gw._ingest_route_parse("x-intake", {**tpl, "site": "app-x", "app": "heax-x"})
+    assert got is not None and why == "ok", why
+    assert set(tpl) >= {"site", "method", "path", "portal_gate", "token", "max_bytes"}, "틀이 수용 기준의 칸을 다 보인다"
+
+
+def test_GW01_rest_catalog_part_ingest_는_경로_메서드_자격_상한_로그인_문을_싣고_주소는_싣지_않는다(monkeypatch):
+    _ingest_kit(monkeypatch)
+    out = _rcat({"part": "ingest"})
+    assert out["ingest"] == [] and "짐작으로 채우지 않는다" in out["note"], "선언이 없으면 없다고 말한다"
+    gw.INGEST_ROUTES_LOCAL_PATH.write_text(json.dumps({"routes": _ROUTES}), encoding="utf-8")
+    out = _rcat({"part": "ingest"})
+    rows = {r["id"]: r for r in out["ingest"]}
+    a = rows["a-intake"]
+    assert (a["method"], a["path"], a["token"], a["portal_gate"], a["max_mb"], a["max_file_bytes"]) == (
+        "POST", "/apps/a_api/api/v1/intake", "app_token", False, 512.0, 100)
+    assert a["checkable"] is True and a["last_check"] is None and a["declared_by"] == "앱 A 11-20"
+    assert rows["b-intake"]["portal_gate"] is True and rows["b-intake"]["checkable"] is False
+    assert ".invalid" not in json.dumps(out) and "relay" not in json.dumps(out), "상류 주소 · 중계가 새어 나왔다"
+    assert "받지도 나르지도 않는다" in out["how_to_upload"]
+    assert [r["id"] for r in _rcat({"part": "ingest", "site": "app-b"})["ingest"]] == ["b-intake"]
+    monkeypatch.setattr(gw, "_openapi_of", lambda s: asyncio.sleep(0, result=None))
+    base = {x["site"]: x for x in _rcat({"site": "app-a"})["sites"]}
+    assert base["app-a"]["ingest"] == [{"id": "a-intake", "method": "POST", "path": "/apps/a_api/api/v1/intake", "token": "app_token",
+                                        "max_mb": 512.0}] and "part='ingest'" in base["app-a"]["ingest_hint"]
+    assert "ingest" not in {x["site"]: x for x in _rcat({})["sites"]}.get("app-c", {}), "선언 없는 사이트에는 칸이 없다"
+
+
+def test_GW01_권한이_없으면_경로도_안_보이고_틀린_선언은_까닭과_함께_버리고_깨진_덧씌우기는_기본값으로(monkeypatch):
+    _ingest_kit(monkeypatch, {**_ROUTES,
+                              "bad-path": _rt("app-a", "http://evil.invalid/x"), "bad-token": _rt("app-a", "/x", token="service"),
+                              "bad-gate": {k: v for k, v in _rt("app-a", "/x").items() if k != "portal_gate"},
+                              "_x": _rt("app-a", "/x"), "bad-site": _rt("_uploads", "/x")})
+    out = _rcat({"part": "ingest"})
+    assert out["invalid"] == {"bad-path": "path", "bad-token": "token", "bad-gate": "portal_gate", "_x": "id · 꼴", "bad-site": "site"}
+    monkeypatch.setattr(gw, "POLICY", {"app-a": ["team"]})
+    assert [r["id"] for r in _rcat({"part": "ingest"})["ingest"]] == ["b-intake"], "REST 다리와 같은 규칙"
+    monkeypatch.setattr(gw, "POLICY", {"heax-a": ["team"]})
+    assert [r["id"] for r in _rcat({"part": "ingest"})["ingest"]] == ["b-intake"], "앱 키의 권한도 본다"
+    loc = gw.INGEST_ROUTES_LOCAL_PATH
+    loc.write_text("{broken", encoding="utf-8")
+    st = loc.stat()
+    os.utime(loc, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    out = _rcat({"part": "ingest"})
+    assert "덧씌우기를 버렸다" in out["overlay_error"] and out["ingest"] == []
+
+
+def test_GW01_점검은_check_path_가_있는_선언만_자격_없는_HEAD_한_번이고_시각_코드_뜻을_남긴다(monkeypatch):
+    _ingest_kit(monkeypatch, _ROUTES)
+    seen, mode = [], {"down": False}
+
+    def handler(req):
+        if mode["down"]:
+            raise httpx.ConnectError("down", request=req)
+        seen.append((req.method, str(req.url), req.headers.get("authorization"), req.content))
+        return httpx.Response(405)
+    _mock_http(monkeypatch, handler)
+    out = _rcat({"part": "ingest", "site": "app-a", "probe": True})
+    lc = out["ingest"][0]["last_check"]
+    assert seen == [("HEAD", "http://a.invalid/api/v1/intake", None, b"")], seen
+    assert lc["status"] == 405 and lc["meaning"] == "경로가 있다" and lc["via"] == "probe" and lc["checked_at"] and "_mono" not in lc
+    _rcat({"part": "ingest", "site": "app-a", "probe": True})
+    _rcat({"part": "ingest", "probe": True})
+    _rcat({"part": "ingest", "site": "app-b", "probe": True})
+    assert len(seen) == 1, "간격 안에서는 다시 묻지 않고 · site 없이는 하지 않고 · check_path 없는 선언은 건드리지 않는다"
+    gw._INGEST_CHECK.clear()
+    mode["down"] = True
+    lc = _rcat({"part": "ingest", "site": "app-a", "probe": True})["ingest"][0]["last_check"]
+    assert lc["status"] is None and lc["meaning"] == "닿지 않는다" and lc["error"] == "ConnectError"
+    # 박스 덧씌우기의 점검 주소
+    gw._INGEST_CHECK.clear()
+    mode["down"] = False
+    gw.INGEST_ROUTES_LOCAL_PATH.write_text(json.dumps({"routes": {**_ROUTES, "a-intake": {**_ROUTES["a-intake"],
+                                                                                           "check_base": "http://box.invalid:8700"}}}),
+                                           encoding="utf-8")
+    os.utime(gw.INGEST_ROUTES_LOCAL_PATH, ns=(10**18, 10**18))
+    _rcat({"part": "ingest", "site": "app-a", "probe": True})
+    assert seen[-1][1] == "http://box.invalid:8700/api/v1/intake"
+
+
+def test_GW01_HTTP_GET_ingest_는_PAT_나_공유_비밀로_같은_답을_주고_업로드는_받지_않는다(monkeypatch):
+    _ingest_kit(monkeypatch, _ROUTES)
+    st, body = _http(monkeypatch, "/ingest")
+    assert st == 200 and {r["id"] for r in body["ingest"]} == {"a-intake", "b-intake"}
+    st, body = _http(monkeypatch, "/ingest/app-b")
+    assert st == 200 and [r["id"] for r in body["ingest"]] == ["b-intake"]
+    assert _http(monkeypatch, "/ingest", auth="")[0] == 401
+    v = _verifier(monkeypatch)
+    monkeypatch.setattr(gw, "POLICY", {"app-b": ["team"]})
+    st, body = _http(monkeypatch, "/ingest", auth=f"Bearer {_pat(gw.MCP_AUDIENCE)}", verifier=v)
+    assert st == 200 and [r["id"] for r in body["ingest"]] == ["a-intake"], "PAT 면 그 사람 권한으로 보이는 것만"
+    for m in ("POST", "PUT", "PATCH", "DELETE"):
+        st, body = _http(monkeypatch, "/ingest/app-a/a-intake", m, body=b"file-bytes")
+        assert st == 405 and "업로드를 받지 않는다" in body["detail"], m
+    assert _http(monkeypatch, "/ingest/app-a/a-intake/x")[0] == 404

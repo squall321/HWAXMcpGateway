@@ -2837,13 +2837,17 @@ LIST_APPS_TOOL = types.Tool(
 # 그래서 **둘만** 둔다: 무엇이 있는지 묻는 것과, 하나를 부르는 것.
 REST_CATALOG_TOOL = types.Tool(
     name="rest_catalog",
-    description='⚠ **먼저 전용 도구를 찾아라** — `list_tool_apps` / `search_tools` 로 그 일을 하는 도구가 있는지 \n보고, 있으면 그걸 써라. 이 도구는 **전용 도구로 안 되는 것**(웹 화면에서만 되던 조작)을 위한 우회로다.\n\n하위 사이트가 여는 REST API 목록을 돌려준다. 사이트별로 base 경로와, 그 사이트가 OpenAPI 를 \n내면 **경로·메서드·요약과 인자(params)·본문(body) 스키마**까지 준다. 내 포털 권한으로 **쓸 수 있는 사이트만** 보인다.\n\nsite 를 주면 그 사이트만 상세히. q 를 주면 경로·요약에 그 말이 든 것만 추린다\n(경로가 많은 사이트는 q 없이 부르면 요약만 준다).',
+    description='⚠ **먼저 전용 도구를 찾아라** — `list_tool_apps` / `search_tools` 로 그 일을 하는 도구가 있는지 \n보고, 있으면 그걸 써라. 이 도구는 **전용 도구로 안 되는 것**(웹 화면에서만 되던 조작)을 위한 우회로다.\n\n하위 사이트가 여는 REST API 목록을 돌려준다. 사이트별로 base 경로와, 그 사이트가 OpenAPI 를 \n내면 **경로·메서드·요약과 인자(params)·본문(body) 스키마**까지 준다. 내 포털 권한으로 **쓸 수 있는 사이트만** 보인다.\n\nsite 를 주면 그 사이트만 상세히. q 를 주면 경로·요약에 그 말이 든 것만 추린다\n(경로가 많은 사이트는 q 없이 부르면 요약만 준다).\n\npart=\'ingest\' 면 앱이 밝힌 **파일 적재 경로**(바깥 경로 · 메서드 · 받는 자격 종류 · 크기 상한 · 포털 로그인 문 · 마지막 점검)를 준다 — 큰 파일은 MCP 로 나르지 않고 거기 적힌 길로 직접 올린다(게이트웨이는 업로드를 받지 않는다).',
     inputSchema={
         "type": "object",
         "properties": {
             "site": {"type": "string", "description": "특정 사이트만(생략 시 전체 요약)"},
             "q": {"type": "string", "description": "경로·요약에서 찾을 말(예: upload, job, report)"},
             "limit": {"type": "integer", "description": "사이트당 반환할 경로 수(기본 40, 최대 200). 넘으면 truncated 가 말한다"},
+            "part": {"type": "string", "enum": ["paths", "ingest"],
+                     "description": "paths(기본 — REST 경로 표) 또는 ingest(앱이 밝힌 파일 적재 경로 · 받는 자격 종류 · 크기 상한 · 포털 로그인 문)."},
+            "probe": {"type": "boolean",
+                      "description": "part='ingest' 이고 site 를 줄 때만 — 점검 경로(check_path)가 있는 선언을 자격 없이 HEAD 로 한 번 보고 응답 코드 · 시각을 last_check 에 남긴다(기본 false)."},
         },
     },
 )
@@ -5068,9 +5072,204 @@ def _openapi_rows(doc: dict) -> list[dict]:
     return rows
 
 
+# ── 적재 경로 카탈로그 — 공개만(HWAXPortal docs/request-1117 GW-01 · 사용자 결정 C3) ─────────────────────────────────────────
+# 앱이 공식으로 밝힌 파일 적재 경로(바깥 경로 · 메서드 · 받는 자격 종류 · 크기 상한 · 포털 로그인 문을 지나나)를 한 자리에 **싣기만** 한다. 게이트웨이는
+# 업로드를 받지도 나르지도 계산하지도 않는다(결정 C3 — 중계는 짓지 않는다). 11-12 에 포털 토큰이 앱 반입 경로에서 401 이었고 무엇을 들고 어디로 가야
+# 하는지 적힌 곳이 없었다 — 그 답은 앱이 낸다. 앱이 답을 내기 전에는 짐작으로 채우지 않는다(추적 파일의 routes 는 비어 있다).
+#  · 선언은 추적 ingest_routes.json(주소 없음 — 경로 · 꼴만, 어느 앱이든 같은 틀) + 박스 덧씌우기 ingest_routes.local.json(gitignore, merge patch,
+#    바뀐 시각으로 다시 읽음). 박스만 아는 점검 주소(check_base)는 덧씌우기에만 적는다.
+#  · 보기 — rest_catalog(part='ingest') · GET /ingest[/<site>](PAT 또는 공유 비밀). 점검(probe — 자격 없는 HEAD 의 응답 코드 · 시각)을 선언에 check_path 가
+#    있는 경로에만 하고 last_check 에 싣는다.
+INGEST_ROUTES_PATH = Path(__file__).with_name("ingest_routes.json")
+INGEST_ROUTES_LOCAL_PATH = Path(__file__).with_name("ingest_routes.local.json")
+INGEST_TOKENS = ("portal_pat", "app_token", "sso")
+INGEST_PROBE_MIN_S = 30.0                # 같은 경로를 이보다 자주 점검하지 않는다(답은 마지막 것을 준다)
+INGEST_PROBE_TIMEOUT_S = 10.0
+_INGEST_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,60}$")
+_INGEST_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+_INGEST: dict = {"key": None, "data": None, "error": None, "overlay": None}
+_INGEST_CHECK: dict[str, dict] = {}      # 경로 id → {checked_at, status, meaning, via, error?}
+
+
+def _ingest_path_ok(v) -> bool:
+    return (isinstance(v, str) and v.startswith("/") and len(v) <= 300 and "://" not in v and not any(c in v for c in "?#")
+            and not re.search(r"\s|\.\.", v))
+
+
+def _ingest_route_parse(rid: str, r) -> tuple[dict | None, str]:
+    """선언 하나 → (쓰는 꼴, 'ok') 또는 (None, 까닭). 틀린 칸이 있으면 그 경로를 통째로 버린다(반쪽 선언을 싣지 않는다).
+    꼴(어느 앱이든 같다) — site · app · method · path · portal_gate · token · max_bytes 는 앱이 밝힌 값이고, 나머지는 덧붙임이다."""
+    if not _INGEST_ID_RE.fullmatch(str(rid)) or not isinstance(r, dict):
+        return None, "id · 꼴"
+    if not (isinstance(r.get("site"), str) and _INGEST_KEY_RE.fullmatch(r["site"])):
+        return None, "site"
+    if r.get("app") is not None and not (isinstance(r["app"], str) and _INGEST_KEY_RE.fullmatch(r["app"])):
+        return None, "app"
+    method = str(r.get("method") or "").upper()
+    if method not in ("POST", "PUT"):
+        return None, "method"
+    if not _ingest_path_ok(r.get("path")):
+        return None, "path"
+    if not isinstance(r.get("portal_gate"), bool):
+        return None, "portal_gate"
+    if r.get("token") not in INGEST_TOKENS:
+        return None, "token"
+    for k in ("max_bytes", "max_file_bytes"):
+        v = r.get(k)
+        if (k == "max_bytes" or v is not None) and (isinstance(v, bool) or not isinstance(v, int) or v <= 0):
+            return None, k
+    if r.get("check_path") is not None and not _ingest_path_ok(r.get("check_path")):
+        return None, "check_path"
+    if r.get("check_base") is not None and not _conn_url_ok(r.get("check_base")):
+        return None, "check_base"
+    out = {"id": rid, "site": r["site"], "app": r.get("app"), "method": method, "path": r["path"], "portal_gate": r["portal_gate"],
+           "token": r["token"], "max_bytes": r["max_bytes"], "max_file_bytes": r.get("max_file_bytes"),
+           "check_path": r.get("check_path"), "check_base": r.get("check_base")}
+    for k in ("label", "token_hint", "token_note", "content_type", "fields", "source", "declared_by"):
+        v = r.get(k)
+        if v is not None and not isinstance(v, str):
+            return None, k
+        out[k] = (v or "")[:600]
+    return out, "ok"
+
+
+def _ingest_conf() -> dict:
+    """지금 싣는 적재 경로 선언 — {routes, invalid, fingerprint}. 추적 기본값에 박스 덧씌우기를 얹는다. 두 파일의 바뀐 시각이 같으면 다시 읽지 않는다.
+    기본값을 못 읽으면 마지막 값(없으면 빈 표), 덧씌우기가 깨지면 버리고 기본값으로 돈다."""
+    key = (_stat_ns(INGEST_ROUTES_PATH), _stat_ns(INGEST_ROUTES_LOCAL_PATH))
+    if key == _INGEST["key"] and _INGEST["data"] is not None:
+        return _INGEST["data"]
+    error = None
+    try:
+        base_raw = json.loads(INGEST_ROUTES_PATH.read_text(encoding="utf-8"))
+        if not isinstance(base_raw, dict):
+            raise TypeError("객체여야 한다")
+    except (OSError, ValueError, TypeError) as exc:
+        error = f"기본값을 못 읽음({type(exc).__name__})"
+        log.warning("적재 경로 선언(%s)을 못 읽었다: %r", INGEST_ROUTES_PATH, exc)
+        if _INGEST["data"] is not None:
+            _INGEST.update(key=key, error=error)
+            return _INGEST["data"]
+        base_raw = {}
+    eff, overlay = base_raw, {"present": key[1] is not None}
+    if key[1] is not None:
+        try:
+            patch = json.loads(INGEST_ROUTES_LOCAL_PATH.read_text(encoding="utf-8"))
+            if not isinstance(patch, dict):
+                raise TypeError("덧씌우기는 객체여야 한다")
+            eff = _merge_patch(base_raw, patch)
+            overlay["fingerprint"] = _json_fp(patch)
+        except (OSError, ValueError, TypeError) as exc:
+            overlay["error"] = f"덧씌우기를 버렸다({type(exc).__name__}: {str(exc)[:120]})"
+            log.warning("적재 경로 덧씌우기(%s)를 버리고 기본값으로 돈다: %r", INGEST_ROUTES_LOCAL_PATH, exc)
+    routes, invalid = {}, {}
+    for rid, r in ((eff.get("routes") or {}).items() if isinstance(eff.get("routes"), dict) else ()):
+        got, why = _ingest_route_parse(str(rid), r)
+        if got is None:
+            invalid[str(rid)] = why
+        else:
+            routes[str(rid)] = got
+    if invalid:
+        log.warning("적재 경로 선언에서 꼴이 틀린 경로를 버렸다: %s", ", ".join(f"{k}({v})" for k, v in sorted(invalid.items())))
+    # 덧씌우기가 정한 점검 주소는 내부 목적지다 — 다른 내부 주소처럼 사내 프록시를 거치지 않게 NO_PROXY 에 더한다(REST 사이트 주소는 기동 때 이미 더했다)
+    _bypass_proxy_for([r["check_base"] for r in routes.values() if r.get("check_base")])
+    data = {"routes": routes, "invalid": invalid, "fingerprint": _json_fp({k: v for k, v in eff.items() if k == "routes"})}
+    _INGEST.update(key=key, data=data, error=error, overlay=overlay)
+    return data
+
+
+def _ingest_check_url(r: dict) -> str | None:
+    """점검할 주소 — 박스 덧씌우기 check_base > REST 사이트 주소(rest.<site>.base) 뒤에 check_path. check_path 가 없으면 점검하지 않는다(None)."""
+    base = r.get("check_base") or (REST.get(r["site"]) or {}).get("base")
+    return (str(base).rstrip("/") + r["check_path"]) if base and r.get("check_path") else None
+
+
+def _ingest_entry(r: dict) -> dict:
+    """카탈로그 한 줄 — 주소는 싣지 않는다(바깥 경로 · 꼴 · 자격 종류 · 상한 · 로그인 문 · 마지막 점검)."""
+    out = {k: r[k] for k in ("id", "site", "app", "label", "method", "path", "portal_gate", "token", "token_hint", "token_note",
+                             "content_type", "fields", "max_bytes") if r.get(k) not in (None, "")}
+    out["max_mb"] = round(r["max_bytes"] / 1048576, 1)
+    for k in ("max_file_bytes", "source", "declared_by"):
+        if r.get(k):
+            out[k] = r[k]
+    out["checkable"] = _ingest_check_url(r) is not None
+    last = _INGEST_CHECK.get(r["id"])
+    out["last_check"] = {k: v for k, v in last.items() if not k.startswith("_")} if last else None
+    return out
+
+
+def _ingest_meaning(status: int | None) -> str:
+    if status is None:
+        return "닿지 않는다"
+    if status in (401, 403):
+        return "문이 자격을 요구한다(경로는 그 뒤에 있다 — 자격 없는 점검이라 정상이다)"
+    if status == 404:
+        return "경로가 없다 — 선언(check_path)이나 사이트 주소를 본다"
+    if status == 405 or 200 <= status < 400:
+        return "경로가 있다"
+    return "상류 오류" if status >= 500 else "그 밖의 답"
+
+
+def _ingest_record(rid: str, status: int | None, error: str | None = None) -> dict:
+    rec = {"checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status": status, "meaning": _ingest_meaning(status),
+           "via": "probe", "_mono": time.monotonic()}
+    if error:
+        rec["error"] = _clip(error, 160)
+    _INGEST_CHECK[rid] = rec
+    return rec
+
+
+async def _ingest_probe(r: dict) -> dict | None:
+    """그 경로를 자격 없이 HEAD 로 한 번 본다(본문 없음 · 자격 없음 — 아무것도 올리지 않는다) — 응답 코드 · 시각을 남긴다. INGEST_PROBE_MIN_S 안에 다시
+    부르면 마지막 것을 준다. check_path 가 없으면 하지 않는다."""
+    url = _ingest_check_url(r)
+    if url is None:
+        return None
+    last = _INGEST_CHECK.get(r["id"])
+    if last and time.monotonic() - last.get("_mono", 0) < INGEST_PROBE_MIN_S:
+        return last
+    try:
+        async with httpx.AsyncClient(timeout=INGEST_PROBE_TIMEOUT_S, follow_redirects=False) as cli:
+            resp = await cli.head(url)
+        return _ingest_record(r["id"], resp.status_code)
+    except Exception as exc:  # noqa: BLE001 — 점검 실패도 기록이다
+        return _ingest_record(r["id"], None, type(exc).__name__)
+
+
+def _ingest_visible(r: dict, groups: list[str]) -> bool:
+    """이 사람이 볼 수 있는 경로인가 — REST 다리와 같은 규칙(사이트), 앱 키가 있으면 그 앱도."""
+    return _backend_allowed(r["site"], groups) and (not r.get("app") or _backend_allowed(r["app"], groups))
+
+
+async def _ingest_catalog(groups: list[str], site: str = "", probe: bool = False) -> dict:
+    """rest_catalog(part='ingest') · GET /ingest[/<site>] 의 답. probe 는 site 를 줄 때만(그 사이트의 경로를 자격 없이 HEAD 로 본다)."""
+    conf = _ingest_conf()
+    rows = [r for r in conf["routes"].values() if _ingest_visible(r, groups) and (not site or r["site"] == site)]
+    if probe and site:
+        for r in rows:
+            await _ingest_probe(r)
+    out = {"ingest": [_ingest_entry(r) for r in sorted(rows, key=lambda r: (r["site"], r["id"]))],
+           "how_to_upload": ("앱이 밝힌 path 로 직접 올린다 — token 이 말하는 자격(portal_pat 포털 PAT · app_token 그 앱이 낸 토큰 · sso 사람별 위임)을 싣고, "
+                             "portal_gate 가 참이면 포털 로그인 문을 지나는 자격이어야 한다. 크기는 max_bytes 안. 게이트웨이는 업로드를 받지도 나르지도 "
+                             "않는다(MCP 로도 파일 본문을 나르지 않는다)."),
+           "fingerprint": conf["fingerprint"]}
+    if not conf["routes"]:
+        out["note"] = "앱이 공식으로 밝힌 적재 경로 선언이 아직 없다 — 짐작으로 채우지 않는다. 앱의 업로드 안내 도구(예 upload_instructions)를 본다"
+    elif site and not rows:
+        out["note"] = f"사이트 '{site}' 에 내 권한으로 보이는 적재 경로 선언이 없다"
+    if conf["invalid"]:
+        out["invalid"] = conf["invalid"]
+    if (_INGEST.get("overlay") or {}).get("error"):
+        out["overlay_error"] = _INGEST["overlay"]["error"]
+    return out
+
+
 async def _rest_catalog(args: dict) -> types.CallToolResult:
     groups = _request_groups()
     want = str(args.get("site") or "").strip()
+    if str(args.get("part") or "").strip() == "ingest":
+        # 적재 경로(GW-01) — REST 사이트 표와 따로 선언된다(사이트 키는 같다). 권한은 REST 다리와 같은 규칙이다
+        return _rest_text(await _ingest_catalog(groups, want, probe=args.get("probe") is True))
     q = str(args.get("q") or "").strip().lower()
     try:
         limit = max(1, min(200, int(args.get("limit") or 40)))
@@ -5099,6 +5298,12 @@ async def _rest_catalog(args: dict) -> types.CallToolResult:
             # 단언 쓰기(HWAXPortal docs/core-link §5) — 이 경로의 POST 만 부르는 사람(또는 서비스 작업) 명의로 간다. 그 밖의 쓰기는 405 다
             info["write_paths"] = {"method": "POST", "paths": list(conf["write_paths"])}
             info["readonly"] = False
+        _ing = [r for r in _ingest_conf()["routes"].values() if r["site"] == s and _ingest_visible(r, groups)]
+        if _ing:
+            # 적재 경로(GW-01) — 한 줄씩만. 로그인 문 · 자격 설명 · 마지막 점검은 part='ingest' 가 준다
+            info["ingest"] = [{"id": r["id"], "method": r["method"], "path": r["path"], "token": r["token"],
+                               "max_mb": round(r["max_bytes"] / 1048576, 1)} for r in sorted(_ing, key=lambda r: r["id"])]
+            info["ingest_hint"] = "로그인 문 · 자격 설명 · 마지막 점검은 rest_catalog(site=…, part='ingest')"
         doc = await _openapi_of(s)
         if doc is None:
             info["paths"] = None
@@ -8227,6 +8432,33 @@ async def _http_reply(send, status: int, obj: dict, extra=()) -> None:
     await send({"type": "http.response.body", "body": json.dumps(obj, ensure_ascii=False).encode()})
 
 
+async def _ingest_http(scope, receive, send, pat_verifier, gw_auth: str) -> None:
+    """/ingest 창구(GW-01) — GET /ingest · GET /ingest/<site>[?probe=1](적재 경로 카탈로그 — rest_catalog(part='ingest') 와 같은 답). 자격은 포털 PAT
+    (MCP 청중 — 그 사람 권한으로 보이는 경로만) 또는 게이트웨이 공유 비밀(전부). GET 만이다 — 게이트웨이는 업로드를 받지 않는다(결정 C3)."""
+    path = scope.get("path") or ""
+    parts = [p for p in path[len("/ingest"):].split("/") if p]
+    method = scope.get("method")
+    ip = (scope.get("client") or (None,))[0]
+    who = await _http_caller(scope, pat_verifier, gw_auth)
+    tool = f"{method if method in ('GET', 'POST', 'PUT') else 'OTHER'} /ingest" + (f"/{_clip(parts[0], 40)}" if parts else "")
+    if who["kind"] is None:
+        _audit(tool, "_gateway", False, f"unauthorized: {who['reason']}", 0, ip=ip)
+        await _http_reply(send, 401, EXPIRED_BODY if who.get("expired") else {"error": "unauthorized"})
+        return
+    if method == "GET" and len(parts) <= 1:
+        qs = parse_qs((scope.get("query_string") or b"").decode("utf-8"))
+        site = parts[0] if parts else ""
+        probe = (qs.get("probe") or [""])[0] in ("1", "true")
+        await _http_reply(send, 200, await _ingest_catalog(who["groups"], site, probe=probe and bool(site)))
+        return
+    if method != "GET":
+        await _http_reply(send, 405, {"error": "method not allowed",
+                                      "detail": "게이트웨이는 업로드를 받지 않는다 — 앱이 밝힌 path 로 직접 올린다(GET /mcp-gw/ingest 로 본다)"},
+                          [(b"allow", b"GET")])
+        return
+    await _http_reply(send, 404, {"error": "not found"})
+
+
 async def _ro_allowlist_http(scope, receive, send, pat_verifier, gw_auth: str) -> None:
     """GET · PATCH /readonly-allowlist — 공유 비밀 또는 관리자 PAT. PATCH 는 박스 덧씌우기를 고치고 감사 한 줄을 남긴다."""
     t0 = time.monotonic()
@@ -9892,6 +10124,10 @@ def _bearer_gate(app, pat_verifier=None):
             await send({"type": "http.response.start", "status": _status,
                         "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": _body})
+            return
+        if scope.get("path") == "/ingest" or scope.get("path", "").startswith("/ingest/"):
+            # 적재 경로 카탈로그(GW-01 — 공개만) — 포털 PAT 또는 공유 비밀로 스스로 인증한다(_ingest_http)
+            await _ingest_http(scope, receive, send, pat_verifier, expected)
             return
         if scope.get("path") == "/readonly-allowlist":
             # 읽기 전용 허용 목록 보기 · 고치기(GW-02) — 공유 비밀 또는 관리자 PAT 로 스스로 인증한다(_ro_allowlist_http)

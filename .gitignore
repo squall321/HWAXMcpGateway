@@ -31,3 +31,6 @@ service_tools.local.json
 # 앱 키 표의 박스 덧씌우기(HWAXPortal docs/request-1117 GW-05) — 환경(default_env · apps.<키>.env) · 정본 여부는 박스의 사실이다. 무시 목록에 없으면
 # deploy-all · update-all 의 git stash -u 가 치운다
 app_keys.local.json
+# 적재 경로 선언의 박스 덧씌우기(HWAXPortal docs/request-1117 GW-01 — 공개만) — 점검 주소(check_base) · 박스에서만 쓰는 경로는 박스의 사실이다.
+# 무시 목록에 없으면 deploy-all · update-all 의 git stash -u 가 치운다
+ingest_routes.local.json

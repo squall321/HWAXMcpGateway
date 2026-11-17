@@ -14335,7 +14335,12 @@ def test_GW01_권한이_없으면_경로도_안_보이고_틀린_선언은_까�
                               "bad-gate": {k: v for k, v in _rt("app-a", "/x").items() if k != "portal_gate"},
                               "_x": _rt("app-a", "/x"), "bad-site": _rt("_uploads", "/x")})
     out = _rcat({"part": "ingest"})
+    assert "invalid" not in out and "fingerprint" not in out, "버린 선언 · 지문은 관리자 · 공유 비밀에게만(11-17 검토 L7)"
+    monkeypatch.setattr(gw, "_request_groups", lambda: [gw.ADMIN_GROUP])
+    out = _rcat({"part": "ingest"})
     assert out["invalid"] == {"bad-path": "path", "bad-token": "token", "bad-gate": "portal_gate", "_x": "id · 꼴", "bad-site": "site"}
+    assert len(out["fingerprint"]) == 12
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
     monkeypatch.setattr(gw, "POLICY", {"app-a": ["team"]})
     assert [r["id"] for r in _rcat({"part": "ingest"})["ingest"]] == ["b-intake"], "REST 다리와 같은 규칙"
     monkeypatch.setattr(gw, "POLICY", {"heax-a": ["team"]})
@@ -14344,6 +14349,8 @@ def test_GW01_권한이_없으면_경로도_안_보이고_틀린_선언은_까�
     loc.write_text("{broken", encoding="utf-8")
     st = loc.stat()
     os.utime(loc, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert "overlay_error" not in _rcat({"part": "ingest"})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [gw.ADMIN_GROUP])
     out = _rcat({"part": "ingest"})
     assert "덧씌우기를 버렸다" in out["overlay_error"] and out["ingest"] == []
 
@@ -14480,3 +14487,51 @@ def test_L3_관리자도_의미_순위를_받는다_관리자_도구는_색인_�
     assert out["mode"] == "rrf", out.get("mode_reason")
     order, why = asyncio.run(gw._tool_embed_order("곡선", gw._visible_tools([gw.ADMIN_GROUP])))
     assert why == "" and order[-1] is gw.READONLY_ALLOWLIST_TOOL
+
+
+# ── 11-17 검토 — GW-01 고침(L2 · L5 · L7 · L9) ─────────────────────────────────────────────
+# master(38769b7) 의 rest_catalog 도구 설명 sha256 — 검색 순위는 도구 설명을 본다. 적재 경로 설명은 인자(part)에 둔다(L9)
+_REST_CATALOG_DESC_SHA = "19dc88af99729701b5401d0f0f717b98cf32badea728157c9c964a4e38d333cf"
+
+
+def test_L9_rest_catalog_도구_설명은_master_그대로이고_적재_경로_설명은_인자에_있다():
+    import hashlib
+    assert hashlib.sha256(gw.REST_CATALOG_TOOL.description.encode()).hexdigest() == _REST_CATALOG_DESC_SHA, \
+        "도구 설명을 바꾸면 모두의 search_tools 순위가 바뀐다 — 설명은 인자에 둔다"
+    part = gw.REST_CATALOG_TOOL.inputSchema["properties"]["part"]
+    assert part["enum"] == ["paths", "ingest"] and "업로드를 받지 않는다" in part["description"]
+
+
+def test_L5_적재_경로는_다른_호스트로_읽히는_꼴을_받지_않는다():
+    for bad in ("//evil.invalid/x", "/\\evil.invalid/x", "/a\\b", "///x"):
+        assert not gw._ingest_path_ok(bad), bad
+        assert gw._ingest_route_parse("r-1", _rt("app-a", bad))[1] == "path", bad
+    assert gw._ingest_path_ok("/apps/a/api/v1/intake")
+
+
+def test_L2_동시에_온_점검은_HEAD_를_한_번만_보낸다(monkeypatch):
+    _ingest_kit(monkeypatch, _ROUTES)
+    seen = []
+
+    async def slow(req):
+        seen.append(req.method)
+        await asyncio.sleep(0.05)
+        return httpx.Response(405)
+    _mock_http(monkeypatch, slow)
+    r = gw._ingest_conf()["routes"]["a-intake"]
+
+    async def many():
+        return await asyncio.gather(*(gw._ingest_probe(r) for _ in range(25)))
+    got = asyncio.run(many())
+    assert seen == ["HEAD"], f"점검이 {len(seen)}번 나갔다"
+    assert gw._INGEST_CHECK["a-intake"]["status"] == 405 and "in_progress" not in gw._INGEST_CHECK["a-intake"]
+    assert sum(1 for g in got if g.get("in_progress")) == 24, "나머지는 '점검 중' 기록을 받는다"
+
+
+def test_L7_HTTP_카탈로그도_버린_선언_지문은_공유_비밀_관리자에게만(monkeypatch):
+    _ingest_kit(monkeypatch, {**_ROUTES, "bad-path": _rt("app-a", "//evil.invalid/x")})
+    st, body = _http(monkeypatch, "/ingest")
+    assert st == 200 and body["invalid"] == {"bad-path": "path"} and "fingerprint" in body, "공유 비밀은 본다"
+    v = _verifier(monkeypatch)
+    st, body = _http(monkeypatch, "/ingest", auth=f"Bearer {_pat(gw.MCP_AUDIENCE)}", verifier=v)
+    assert st == 200 and "invalid" not in body and "fingerprint" not in body and {r["id"] for r in body["ingest"]} == {"a-intake", "b-intake"}

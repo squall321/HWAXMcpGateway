@@ -457,12 +457,15 @@ python3 tool_usage_report.py --days 60 --out unused.md
   않는다). 반드시 칸 — `site`(REST 사이트 키 — 묶음 · 권한) · `method`(POST · PUT) · `path`(포털 오리진 위의 바깥 경로) · `portal_gate`(포털 로그인 문을
   지나나) · `token`(받는 자격 종류 — `portal_pat` · `app_token` · `sso`) · `max_bytes`(요청 하나 상한). 덧붙임 — `app` · `label` · `token_hint` · `token_note` ·
   `content_type` · `fields` · `max_file_bytes` · `source` · `declared_by` · `check_path`(점검 경로 — REST 사이트 주소 뒤) · `check_base`(점검 주소 — 박스
-  덧씌우기에만). 틀린 칸이 있는 경로는 통째로 버리고 `invalid` 에 까닭을 싣는다.
+  덧씌우기에만). 경로는 `/` 로 시작하는 오리진 위의 경로만이다(`//호스트` · 역슬래시 · 쿼리 · `..` 는 받지 않는다). 틀린 칸이 있는 경로는 통째로 버리고
+  `invalid` 에 까닭을 싣는다 — `invalid` · 선언 전체의 `fingerprint` · 덧씌우기 오류는 관리자 · 공유 비밀에게만 보인다.
 - 보기 — MCP `rest_catalog(part='ingest'[, site=…][, probe=true])` · HTTP `GET /ingest[/<site>][?probe=1]`(밖에서는 `/mcp-gw/ingest…` — 포털 PAT 면 그
   사람 권한으로 보이는 것만, 공유 비밀이면 전부). 권한은 REST 다리와 같은 규칙(사이트 · 있으면 앱 키). 기본 `rest_catalog` 표에도 선언이 있는 사이트마다
-  `ingest` 한 줄씩이 붙는다. 주소는 싣지 않는다. `/ingest` 는 GET 만이다 — 다른 메서드는 405(`업로드를 받지 않는다`).
+  `ingest` 한 줄씩이 붙는다. 주소는 싣지 않는다. 적재 경로 설명은 `rest_catalog` 의 도구 설명이 아니라 `part` 인자에 있다 — 도구 설명을 바꾸면 모두의
+  `search_tools` 순위가 바뀐다(시험이 도구 설명을 master 와 sha256 으로 맞댄다). `/ingest` 는 GET 만이다 — 다른 메서드는 405(`업로드를 받지 않는다`).
 - 점검(`probe`) — site 를 줄 때만, `check_path` 가 있는 선언을 **자격 없이 · 본문 없이** HEAD 로 한 번 본다(30초 안에 다시 부르면 마지막 것). 405 · 2xx ·
-  3xx 는 '경로가 있다', 401 · 403 은 '문이 자격을 요구한다', 404 는 '경로가 없다', 닿지 않으면 `status: null`. `last_check`(시각 · 코드 · 뜻)는 게이트웨이
+  3xx 는 '경로가 있다', 401 · 403 은 '문이 자격을 요구한다', 404 는 '경로가 없다', 닿지 않으면 `status: null`. 보내기 전에 '점검 중'(`in_progress`)을 먼저
+  적어 동시에 온 점검이 HEAD 를 하나만 보낸다. `last_check`(시각 · 코드 · 뜻)는 게이트웨이
   메모리에만 있다(재기동하면 비운다).
 
 ## 그림 저장 — 도구 결과의 그림을 받고 보고서에 넣는다(사용자 보고 11-02)

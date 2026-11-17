@@ -2837,15 +2837,18 @@ LIST_APPS_TOOL = types.Tool(
 # 그래서 **둘만** 둔다: 무엇이 있는지 묻는 것과, 하나를 부르는 것.
 REST_CATALOG_TOOL = types.Tool(
     name="rest_catalog",
-    description='⚠ **먼저 전용 도구를 찾아라** — `list_tool_apps` / `search_tools` 로 그 일을 하는 도구가 있는지 \n보고, 있으면 그걸 써라. 이 도구는 **전용 도구로 안 되는 것**(웹 화면에서만 되던 조작)을 위한 우회로다.\n\n하위 사이트가 여는 REST API 목록을 돌려준다. 사이트별로 base 경로와, 그 사이트가 OpenAPI 를 \n내면 **경로·메서드·요약과 인자(params)·본문(body) 스키마**까지 준다. 내 포털 권한으로 **쓸 수 있는 사이트만** 보인다.\n\nsite 를 주면 그 사이트만 상세히. q 를 주면 경로·요약에 그 말이 든 것만 추린다\n(경로가 많은 사이트는 q 없이 부르면 요약만 준다).\n\npart=\'ingest\' 면 앱이 밝힌 **파일 적재 경로**(바깥 경로 · 메서드 · 받는 자격 종류 · 크기 상한 · 포털 로그인 문 · 마지막 점검)를 준다 — 큰 파일은 MCP 로 나르지 않고 거기 적힌 길로 직접 올린다(게이트웨이는 업로드를 받지 않는다).',
+    description='⚠ **먼저 전용 도구를 찾아라** — `list_tool_apps` / `search_tools` 로 그 일을 하는 도구가 있는지 \n보고, 있으면 그걸 써라. 이 도구는 **전용 도구로 안 되는 것**(웹 화면에서만 되던 조작)을 위한 우회로다.\n\n하위 사이트가 여는 REST API 목록을 돌려준다. 사이트별로 base 경로와, 그 사이트가 OpenAPI 를 \n내면 **경로·메서드·요약과 인자(params)·본문(body) 스키마**까지 준다. 내 포털 권한으로 **쓸 수 있는 사이트만** 보인다.\n\nsite 를 주면 그 사이트만 상세히. q 를 주면 경로·요약에 그 말이 든 것만 추린다\n(경로가 많은 사이트는 q 없이 부르면 요약만 준다).',
     inputSchema={
         "type": "object",
         "properties": {
             "site": {"type": "string", "description": "특정 사이트만(생략 시 전체 요약)"},
             "q": {"type": "string", "description": "경로·요약에서 찾을 말(예: upload, job, report)"},
             "limit": {"type": "integer", "description": "사이트당 반환할 경로 수(기본 40, 최대 200). 넘으면 truncated 가 말한다"},
+            # 설명은 도구 설명이 아니라 인자에 둔다 — 검색 순위는 도구 설명을 보고 인자는 보지 않는다(모두의 순위가 바이트까지 그대로다, 11-17 검토 L9)
             "part": {"type": "string", "enum": ["paths", "ingest"],
-                     "description": "paths(기본 — REST 경로 표) 또는 ingest(앱이 밝힌 파일 적재 경로 · 받는 자격 종류 · 크기 상한 · 포털 로그인 문)."},
+                     "description": ("paths(기본 — REST 경로 표) 또는 ingest — 앱이 공식으로 밝힌 파일 적재 경로(바깥 경로 · 메서드 · 받는 자격 종류 · "
+                                     "크기 상한 · 포털 로그인 문 · 마지막 점검). 큰 파일은 MCP 로 나르지 않고 거기 적힌 길로 직접 올린다 — 게이트웨이는 "
+                                     "업로드를 받지 않는다.")},
             "probe": {"type": "boolean",
                       "description": "part='ingest' 이고 site 를 줄 때만 — 점검 경로(check_path)가 있는 선언을 자격 없이 HEAD 로 한 번 보고 응답 코드 · 시각을 last_check 에 남긴다(기본 false)."},
         },
@@ -5096,8 +5099,10 @@ _INGEST_CHECK: dict[str, dict] = {}      # 경로 id → {checked_at, status, me
 
 
 def _ingest_path_ok(v) -> bool:
-    return (isinstance(v, str) and v.startswith("/") and len(v) <= 300 and "://" not in v and not any(c in v for c in "?#")
-            and not re.search(r"\s|\.\.", v))
+    """오리진 위의 경로 꼴인가 — '/' 로 시작하고(스킴 · 호스트 없음 — '//호스트' · 역슬래시는 브라우저 · 클라이언트가 다른 호스트로 읽는다, 11-17 검토
+    L5) 쿼리 · 조각 · 빈칸 · '..' 가 없다."""
+    return (isinstance(v, str) and v.startswith("/") and not v.startswith("//") and "\\" not in v and len(v) <= 300 and "://" not in v
+            and not any(c in v for c in "?#") and not re.search(r"\s|\.\.", v))
 
 
 def _ingest_route_parse(rid: str, r) -> tuple[dict | None, str]:
@@ -5232,6 +5237,9 @@ async def _ingest_probe(r: dict) -> dict | None:
     last = _INGEST_CHECK.get(r["id"])
     if last and time.monotonic() - last.get("_mono", 0) < INGEST_PROBE_MIN_S:
         return last
+    # 기다리기 전에 '점검 중' 을 먼저 적는다 — 동시에 온 점검들이 저마다 HEAD 를 보내지 않게(11-17 검토 L2 — 25건이 25번 보냈다)
+    _INGEST_CHECK[r["id"]] = {**(last or {"checked_at": None, "status": None, "meaning": "점검 중"}), "via": "probe", "in_progress": True,
+                              "_mono": time.monotonic()}
     try:
         async with httpx.AsyncClient(timeout=INGEST_PROBE_TIMEOUT_S, follow_redirects=False) as cli:
             resp = await cli.head(url)
@@ -5246,8 +5254,11 @@ def _ingest_visible(r: dict, groups: list[str]) -> bool:
 
 
 async def _ingest_catalog(groups: list[str], site: str = "", probe: bool = False) -> dict:
-    """rest_catalog(part='ingest') · GET /ingest[/<site>] 의 답. probe 는 site 를 줄 때만(그 사이트의 경로를 자격 없이 HEAD 로 본다)."""
+    """rest_catalog(part='ingest') · GET /ingest[/<site>] 의 답. probe 는 site 를 줄 때만(그 사이트의 경로를 자격 없이 HEAD 로 본다).
+    버린 선언(invalid — 박스 덧씌우기의 id · 까닭) · 선언 전체의 지문 · 덧씌우기 오류는 관리자 · 공유 비밀(내부 서비스)에게만 싣는다 — 권한 밖 경로의
+    존재를 알리지 않는다(11-17 검토 L7)."""
     conf = _ingest_conf()
+    privileged = ADMIN_GROUP in groups or SERVICE_GROUP in groups
     rows = [r for r in conf["routes"].values() if _ingest_visible(r, groups) and (not site or r["site"] == site)]
     if probe and site:
         for r in rows:
@@ -5255,15 +5266,16 @@ async def _ingest_catalog(groups: list[str], site: str = "", probe: bool = False
     out = {"ingest": [_ingest_entry(r) for r in sorted(rows, key=lambda r: (r["site"], r["id"]))],
            "how_to_upload": ("앱이 밝힌 path 로 직접 올린다 — token 이 말하는 자격(portal_pat 포털 PAT · app_token 그 앱이 낸 토큰 · sso 사람별 위임)을 싣고, "
                              "portal_gate 가 참이면 포털 로그인 문을 지나는 자격이어야 한다. 크기는 max_bytes 안. 게이트웨이는 업로드를 받지도 나르지도 "
-                             "않는다(MCP 로도 파일 본문을 나르지 않는다)."),
-           "fingerprint": conf["fingerprint"]}
+                             "않는다(MCP 로도 파일 본문을 나르지 않는다).")}
+    if privileged:
+        out["fingerprint"] = conf["fingerprint"]
     if not conf["routes"]:
         out["note"] = "앱이 공식으로 밝힌 적재 경로 선언이 아직 없다 — 짐작으로 채우지 않는다. 앱의 업로드 안내 도구(예 upload_instructions)를 본다"
     elif site and not rows:
         out["note"] = f"사이트 '{site}' 에 내 권한으로 보이는 적재 경로 선언이 없다"
-    if conf["invalid"]:
+    if privileged and conf["invalid"]:
         out["invalid"] = conf["invalid"]
-    if (_INGEST.get("overlay") or {}).get("error"):
+    if privileged and (_INGEST.get("overlay") or {}).get("error"):
         out["overlay_error"] = _INGEST["overlay"]["error"]
     return out
 

@@ -20,5 +20,23 @@
    "check_path": "/api/<적재-경로>"
   }
  },
- "routes": {}
+ "routes": {
+  "dynaforge-report-intake": {
+   "site": "dyna-forge",
+   "app": "heax-kooremapper_mcp",
+   "label": "해석 리포트 하나 한 번에 반입(세션 만들기 · 지정 + K파일 + 리포트 + scenario) — 압축 512 MB · 풀어 2,048 MB, 묶음 적재 없음(같은 리포트를 다시 올리면 하나 더 생긴다)",
+   "method": "POST",
+   "path": "/apps/kooremapper_api/api/v1/reports/intake",
+   "portal_gate": false,
+   "token": "app_token",
+   "token_hint": "kr_",
+   "token_note": "그 DynaForge 인스턴스가 낸 kr_ PAT 를 Authorization: Bearer 로 — 포털 토큰은 받지 않는다(dev 에서 받은 kr_ 는 운영에서 401). 401 의 detail 로 가린다: '인증 토큰이 필요합니다.' = 머리가 API 에 안 닿음 · '…취소·만료되었습니다.' = 이 서버가 낸 kr_ 아님 · detail 없는 401 = 앞에서 막힘",
+   "content_type": "multipart/form-data",
+   "fields": "file(리포트 HTML(.gz) 또는 묶음 .zip · .tar(.gz)) · kfile? · scenario? · session_id? · session_name? · kind? · label? · project? · dev_rev? · variation? · doe? · focus?",
+   "max_file_bytes": 536870912,
+   "max_bytes": 536870912,
+   "source": "DynaForge system_capabilities.intake(코드 c37bd03 — modules/system/routes.py) · reports/intake 라우트",
+   "declared_by": "DynaForge(kooremapper-4a) · 2026-11-17 결정 D4 공식 답"
+  }
+ }
 }

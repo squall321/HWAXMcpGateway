@@ -14274,6 +14274,11 @@ def test_GW02_REST_는_PAT_면_포털이_지금_관리자라고_답한_사람만
 
 # ── GW-01 적재 경로 카탈로그 — 공개만(HWAXPortal docs/request-1117 · 사용자 결정 C3) ─────────────────────────────────────────────
 def _ingest_kit(monkeypatch, routes=None, rest=None):
+    # 추적 선언(앱의 공식 답 — 11-17 DynaForge 부터)에 기대지 않는다 — 틀은 같고 routes 를 비운 사본을 본다(autouse 가 tmp 로 건 덧씌우기 곁)
+    base = json.loads(gw.INGEST_ROUTES_PATH.read_text(encoding="utf-8"))
+    empty = gw.INGEST_ROUTES_LOCAL_PATH.with_name("ingest_routes.base-test.json")
+    empty.write_text(json.dumps({**base, "routes": {}}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(gw, "INGEST_ROUTES_PATH", empty)
     monkeypatch.setattr(gw, "REST", rest if rest is not None else {"app-a": {"base": "http://a.invalid"}, "app-b": {"base": "http://b.invalid/apps/b"}})
     monkeypatch.setattr(gw, "POLICY", {})
     monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
@@ -14300,7 +14305,17 @@ def test_GW01_추적_선언은_주소가_없고_앱의_공식_답이_오기_전�
     raw = gw.INGEST_ROUTES_PATH.read_text(encoding="utf-8")
     assert "://" not in raw and not re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", raw), "추적 파일에 주소가 있다"
     data = json.loads(raw)
-    assert data["routes"] == {}, "앱이 공식으로 밝힌 것만 — 짐작으로 채우지 않는다(결정 C3)"
+    # 앱이 공식으로 밝힌 것만 — 짐작으로 채우지 않는다(결정 C3 · D4). 11-17 DynaForge 가 system_capabilities.intake 로 공식 답을 냈다(코드 c37bd03).
+    assert set(data["routes"]) <= {"dynaforge-report-intake"}, sorted(data["routes"])
+    for rid, rt in data["routes"].items():
+        assert rt.get("source") and rt.get("declared_by"), (rid, "출처 · 밝힌 이가 없는 경로는 싣지 않는다")
+        assert gw._ingest_route_parse(rid, rt)[1] == "ok", rid
+    dyn = data["routes"].get("dynaforge-report-intake")
+    src = gw.Path(gw.__file__).resolve().parent.parent / "KooRemapper" / "platform" / "backend" / "app" / "modules" / "system" / "routes.py"
+    if dyn and src.exists():
+        body = src.read_text(encoding="utf-8")
+        assert '"path": "/api/v1/reports/intake"' in body and dyn["path"].endswith("/api/v1/reports/intake"), "DynaForge 의 선언과 경로가 다르다"
+        assert '"portal_auth_required": False' in body and dyn["portal_gate"] is False and dyn["token"] == "app_token"
     (tid, tpl), = data["_template"].items()
     assert "check_base" not in tpl, "점검 주소는 박스 덧씌우기에만"
     got, why = gw._ingest_route_parse("x-intake", {**tpl, "site": "app-x", "app": "heax-x"})

@@ -14014,35 +14014,39 @@ def test_GW05_list_tool_apps_의_앱마다_env_canonical_aliases_가_찬다(monk
     body = _apps_body()
     apps = {a["app"]: a for a in body["apps"]}
     assert set(apps) == {"_gateway", "heax-step_forge", "heax-kooremapper_mcp", "sibling-copy"}
-    assert all(a["env"] == "unknown" for a in apps.values()), "박스가 적지 않으면 지어내지 않는다(unknown)"
-    assert body["env"]["box"] == "unknown" and body["env"]["source"] == "unset" and "app_keys.local.json" in body["env"]["note"]
+    assert all(a["env"] == "dev" for a in apps.values()), "박스가 적지 않으면 운영이라고 지어내지 않는다(dev)"
+    assert body["env"]["box"] == "dev" and body["env"]["source"] == "unset" and "app_keys.local.json" in body["env"]["note"]
     assert apps["heax-step_forge"]["aliases"] == [{"key": "stepforge-prod", "prefix": "stepforgeprod_"}]
     assert apps["heax-kooremapper_mcp"]["aliases"] == [{"key": "dynaforge-prod", "prefix": "dynaforgeprod_"}]
     assert all(a["canonical"] is True for a in apps.values())
     # 띄운 셸의 GATEWAY_ENV
     monkeypatch.setattr(gw, "GATEWAY_ENV", "prod")
     body = _apps_body()
-    assert {a["env"] for a in body["apps"]} == {"prod"} and body["env"] == {"box": "prod", "source": "GATEWAY_ENV"}
+    assert {a["env"] for a in body["apps"]} == {"prod"} and body["env"] == {"box": "prod", "source": "GATEWAY_ENV"}, "적으면 note 가 없다"
     # 박스 덧씌우기 — default_env 가 GATEWAY_ENV 보다 먼저, 앱별 값이 그보다 먼저. 바뀐 시각으로 재기동 없이 다시 읽는다
-    gw.APP_KEYS_LOCAL_PATH.write_text(json.dumps({"default_env": "dev", "apps": {"sibling-copy": {"env": "staging", "canonical": False,
-                                                                                                   "note": "시험 사본"}}}), encoding="utf-8")
+    gw.APP_KEYS_LOCAL_PATH.write_text(json.dumps({"default_env": "prod", "apps": {"sibling-copy": {"env": "dev", "canonical": False,
+                                                                                                    "note": "시험 사본"}}}), encoding="utf-8")
+    monkeypatch.setattr(gw, "GATEWAY_ENV", "dev")
     body = _apps_body()
     apps = {a["app"]: a for a in body["apps"]}
-    assert body["env"] == {"box": "dev", "source": "app_keys.local.json"}
-    assert apps["heax-step_forge"]["env"] == "dev" and apps["sibling-copy"]["env"] == "staging"
+    assert body["env"] == {"box": "prod", "source": "app_keys.local.json"}, "덧씌우기가 GATEWAY_ENV 보다 먼저"
+    assert apps["heax-step_forge"]["env"] == "prod" and apps["sibling-copy"]["env"] == "dev"
     assert apps["sibling-copy"]["canonical"] is False and apps["sibling-copy"]["env_note"] == "시험 사본"
     # 깨진 덧씌우기는 버린다 — 기본값으로 돌고 까닭을 싣는다
     gw.APP_KEYS_LOCAL_PATH.write_text("{broken", encoding="utf-8")
     st = gw.APP_KEYS_LOCAL_PATH.stat()
     os.utime(gw.APP_KEYS_LOCAL_PATH, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
     body = _apps_body()
-    assert body["env"]["box"] == "prod" and any("덧씌우기를 버렸다" in e for e in body["env"]["errors"]), body["env"]
+    assert body["env"]["box"] == "dev" and body["env"]["source"] == "GATEWAY_ENV" and any("덧씌우기를 버렸다" in e for e in body["env"]["errors"]), body["env"]
     # 틀린 값 칸은 그 칸만 버린다
-    gw.APP_KEYS_LOCAL_PATH.write_text(json.dumps({"default_env": "production", "apps": {"heax-step_forge": {"env": "dev"}}}), encoding="utf-8")
+    gw.APP_KEYS_LOCAL_PATH.write_text(json.dumps({"default_env": "staging", "apps": {"heax-step_forge": {"env": "prod"},
+                                                                                     "sibling-copy": {"env": "production"}}}), encoding="utf-8")
     os.utime(gw.APP_KEYS_LOCAL_PATH, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
     body = _apps_body()
     apps = {a["app"]: a for a in body["apps"]}
-    assert "default_env" in body["env"]["errors"] and apps["heax-step_forge"]["env"] == "dev" and apps["_gateway"]["env"] == "prod"
+    assert "default_env" in body["env"]["errors"] and "apps.sibling-copy.env" in body["env"]["errors"], "이름은 dev · prod 둘뿐(D5)"
+    assert apps["heax-step_forge"]["env"] == "prod" and apps["_gateway"]["env"] == "dev" and apps["sibling-copy"]["env"] == "dev"
+    assert {a["env"] for a in body["apps"]} <= {"dev", "prod"}
 
 
 def test_GW05_옛_키가_아직_붙어_있으면_정본이_아니고_새_키를_말한다_시험_사본도_정본이_아니다(monkeypatch, tmp_path):

@@ -4180,15 +4180,16 @@ async def _needs_connect(keys) -> set[str]:
 
 
 # ── 앱 키 · 환경 · 정본 · 옛 키(HWAXPortal docs/request-1117 GW-05) ───────────────────────────────────────────────
-# list_tool_apps 의 앱 줄마다 env(dev · staging · prod) · canonical · aliases 를 싣는다. 옛 키(은퇴한 선언 백엔드 키 · 그 접두 이름)로 부르거나 찾으면
+# list_tool_apps 의 앱 줄마다 env(dev · prod — 이름은 게이트웨이가 정한다, 사용자 결정 D5 · DynaForge · 리스크 앱도 같은 이름) · canonical · aliases 를 싣는다. 옛 키(은퇴한 선언 백엔드 키 · 그 접두 이름)로 부르거나 찾으면
 # 새 키 · 새 이름을 **안내만** 한다 — 대신 부르지 않는다(옛 이름이 조용히 다른 앱으로 가면 무엇을 불렀는지가 흐려진다).
 #  · 옛 키 표는 추적 app_keys.json 의 retired(주소 없음). 환경 · 정본 여부는 박스의 사실이라 박스 덧씌우기 app_keys.local.json(gitignore — merge patch,
 #    바뀐 시각을 보고 재기동 없이 다시 읽는다)에 default_env · apps.<키>.env · canonical 로 적는다. 게이트웨이를 띄우는 셸의 GATEWAY_ENV 가 그다음이다.
-#    둘 다 없으면 env 는 unknown 이다 — 지어내지 않는다(그 박스가 값을 적어야 수용 기준 '모든 앱에 env' 가 선다).
+#    둘 다 없으면 env 는 dev 로 찬다 — 운영이라고 지어내지 않는 쪽이다(박스가 적지 않았다는 것은 list_tool_apps 의 env.source 'unset' 과 note 가 말한다).
 #  · canonical 은 덧씌우기 값이 먼저고, 없으면 옛 키(아직 붙어 있어도) · 코어 어휘표의 시험 사본(staging)이 거짓, 나머지는 참이다.
 APP_KEYS_PATH = Path(__file__).with_name("app_keys.json")
 APP_KEYS_LOCAL_PATH = Path(__file__).with_name("app_keys.local.json")
-APP_ENVS = ("dev", "staging", "prod")
+APP_ENVS = ("dev", "prod")
+APP_ENV_UNSET = "dev"                    # 박스가 적지 않았을 때의 값 — 운영(prod)이라고 지어내지 않는다
 GATEWAY_ENV = (os.environ.get("GATEWAY_ENV") or "").strip().lower()
 _APP_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _APP_KEYS: dict = {"key": None, "data": None, "error": None, "overlay": None}
@@ -4272,17 +4273,17 @@ def _app_keys() -> dict:
 
 
 def _box_env() -> tuple[str, str]:
-    """이 박스의 기본 환경과 그 출처 — 덧씌우기 default_env > GATEWAY_ENV > unknown(unset)."""
+    """이 박스의 기본 환경과 그 출처 — 덧씌우기 default_env > GATEWAY_ENV > dev(출처 unset)."""
     d = _app_keys()
     if d.get("default_env"):
         return d["default_env"], "app_keys.local.json"
     if GATEWAY_ENV in APP_ENVS:
         return GATEWAY_ENV, "GATEWAY_ENV"
-    return "unknown", "unset"
+    return APP_ENV_UNSET, "unset"
 
 
 def _app_env_entry(key: str) -> dict:
-    """앱 줄에 싣는 env · canonical · aliases(+ 옛 키면 replaced_by). 앱마다 env 가 늘 찬다(모르면 unknown)."""
+    """앱 줄에 싣는 env · canonical · aliases(+ 옛 키면 replaced_by). 앱마다 env 가 늘 dev · prod 가운데 하나로 찬다."""
     d = _app_keys()
     one = (d.get("apps") or {}).get(key) or {}
     env = one.get("env") or _box_env()[0]
@@ -4405,7 +4406,7 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             "status": "ok" if (accessible and reachable) else
                       ("no_access" if not accessible else "backend_down"),
         }
-        # 환경 · 정본 · 옛 키(GW-05) — 앱마다 env 가 늘 찬다(모르면 unknown — 박스가 app_keys.local.json · GATEWAY_ENV 로 적는다)
+        # 환경 · 정본 · 옛 키(GW-05) — 앱마다 env 가 dev · prod 로 늘 찬다(박스가 app_keys.local.json · GATEWAY_ENV 로 적는다 — 없으면 dev)
         entry.update(_app_env_entry(key))
         role = None if local else _app_role(key)
         if role:
@@ -4453,9 +4454,9 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     # 이 박스의 기본 환경과 출처(GW-05) — 앱 줄의 env 는 이것이거나 박스 덧씌우기의 앱별 값이다
     _env, _src = _box_env()
     payload["env"] = {"box": _env, "source": _src}
-    if _env == "unknown":
-        payload["env"]["note"] = ("이 박스는 환경을 적지 않았다 — 운영자가 게이트웨이 app_keys.local.json 에 default_env(dev · staging · prod)를 적거나 "
-                                  "게이트웨이를 GATEWAY_ENV 와 함께 띄운다")
+    if _src == "unset":
+        payload["env"]["note"] = (f"이 박스는 환경을 적지 않아 {APP_ENV_UNSET} 로 적었다 — 운영 박스면 운영자가 게이트웨이 app_keys.local.json 에 "
+                                  "default_env(dev · prod)를 적거나 게이트웨이를 GATEWAY_ENV 와 함께 띄운다")
     _ak = _app_keys()
     if _ak.get("errors") or (_APP_KEYS.get("overlay") or {}).get("error"):
         payload["env"]["errors"] = [*(_ak.get("errors") or []), *([_APP_KEYS["overlay"]["error"]] if (_APP_KEYS.get("overlay") or {}).get("error") else [])]

@@ -1,5 +1,5 @@
 {
- "_doc": "앱 키 · 환경 · 정본 · 옛 키(HWAXPortal docs/request-1117 GW-05). retired 는 은퇴한 앱 키 → 지금 키(now)와 옛 노출 이름의 접두(prefix, 없으면 옛 키에서 하이픈을 뺀 것 + '_')다. 옛 키나 접두 이름으로 부르거나(unknown tool 답) 찾거나(search_tools 의 moved) 앱을 물으면(list_tool_apps 의 moved) 게이트웨이가 새 키 · 새 이름을 안내한다 — 대신 부르지 않는다. 환경(dev · staging · prod)과 정본 여부는 박스의 사실이라 이 파일에 적지 않는다 — 박스는 같은 자리의 app_keys.local.json(gitignore)에 JSON merge patch 로 default_env 와 apps.<앱 키>.env · canonical · note 를 적는다(바뀐 시각을 보고 재기동 없이 다시 읽는다). 게이트웨이를 띄우는 셸의 GATEWAY_ENV 가 그다음이고, 둘 다 없으면 env 는 unknown 이다(지어내지 않는다). 주소 · 토큰은 적지 않는다.",
+ "_doc": "앱 키 · 환경 · 정본 · 옛 키(HWAXPortal docs/request-1117 GW-05). retired 는 은퇴한 앱 키 → 지금 키(now)와 옛 노출 이름의 접두(prefix, 없으면 옛 키에서 하이픈을 뺀 것 + '_')다. 옛 키나 접두 이름으로 부르거나(unknown tool 답) 찾거나(search_tools 의 moved) 앱을 물으면(list_tool_apps 의 moved) 게이트웨이가 새 키 · 새 이름을 안내한다 — 대신 부르지 않는다. 환경(dev · prod — 이름은 게이트웨이가 정한다, 사용자 결정 D5)과 정본 여부는 박스의 사실이라 이 파일에 적지 않는다 — 박스는 같은 자리의 app_keys.local.json(gitignore)에 JSON merge patch 로 default_env 와 apps.<앱 키>.env · canonical · note 를 적는다(바뀐 시각을 보고 재기동 없이 다시 읽는다). 게이트웨이를 띄우는 셸의 GATEWAY_ENV 가 그다음이고, 둘 다 없으면 env 는 dev 다(운영이라고 지어내지 않는다 — list_tool_apps 의 env.source 가 unset 이라고 말한다). 주소 · 토큰은 적지 않는다.",
  "retired": {
   "dynaforge-prod": {
    "now": "heax-kooremapper_mcp",

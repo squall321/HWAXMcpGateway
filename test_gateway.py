@@ -10576,7 +10576,8 @@ def test_루틴_읽기_판정은_앱_표지가_먼저이고_읽기_목록이_다
 
 def test_박스_읽기_목록_덧씌우기는_바뀐_시각을_보고_재기동_없이_연다(monkeypatch, caplog):
     """이름 꼴로는 막히는 조회 도구(risk_next_step)를 박스가 커밋 없이 연다 — read_tools.local.json(gitignore, read_tools.json 과 같은 꼴).
-    바뀐 시각이 다르면 다시 읽고(재기동 없음), 깨진 파일은 버려 닫힌 쪽으로 돈다(경고 한 줄), 지우면 다시 막힌다."""
+    바뀐 시각이 다르면 다시 읽고(재기동 없음), 깨진 파일은 마지막으로 읽은 값 그대로 돈다(경고 한 줄 — deny 를 놓지 않게, 11-17 검토 L1), 지우면 다시
+    막힌다."""
     monkeypatch.setattr(gw, "READ_TOOLS", frozenset())
     seen, inner = _rt_platform_kit(monkeypatch, {"heax-hwax_risk": ["risk_next_step"]})
     local = gw.READ_TOOLS_LOCAL_PATH                                  # autouse 가 tmp 로 건 자리
@@ -10591,14 +10592,17 @@ def test_박스_읽기_목록_덧씌우기는_바뀐_시각을_보고_재기동_
     local.write_text('{"tools": "heax-hwax_risk:risk_next_step"}', encoding="utf-8")   # 꼴이 틀렸다(목록이 아니다)
     os.utime(local, ns=(2_000_000_000_000_000_000, 2_000_000_000_000_000_000))
     with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
-        assert call() == refused, "깨진 덧씌우기는 버린다(닫힌 쪽)"
+        assert call() != refused, "깨진 덧씌우기는 마지막 값 그대로다"
     assert any("read_tools.local.json" in r.getMessage() for r in caplog.records), caplog.text
-    local.write_text(json.dumps({"tools": ["heax-hwax_risk:risk_next_step"]}), encoding="utf-8")
+    local.write_text(json.dumps({"tools": []}), encoding="utf-8")
     os.utime(local, ns=(3_000_000_000_000_000_000, 3_000_000_000_000_000_000))
+    assert call() == refused, "고쳐 쓰면 그 값이다"
+    local.write_text(json.dumps({"tools": ["heax-hwax_risk:risk_next_step"]}), encoding="utf-8")
+    os.utime(local, ns=(4_000_000_000_000_000_000, 4_000_000_000_000_000_000))
     assert call() != refused
     local.unlink()
     assert call() == refused, "지우면 다시 막힌다"
-    assert [i[0] for i in inner] == ["risk_next_step", "risk_next_step"]
+    assert [i[0] for i in inner] == ["risk_next_step"] * 3
 
 
 def test_이름_꼴로_막히던_조회_넷은_추적_읽기_목록으로_루틴_단계와_읽기_전용_PAT_에_열린다(monkeypatch):
@@ -10979,13 +10983,17 @@ def test_닫기_목록은_표지_읽기_목록_이름_꼴보다_먼저_닫고_�
     for n in ("start_view", "corpus_check"):
         assert not call(n)[0].isError, ("덧씌우기에서 빼면 재기동 없이 다시 열린다", n)
     assert call("search_voc")[1] == _RT_DENIED_MSG.format("sf:search_voc"), "추적 deny 는 그대로다"
-    overlay({"tools": ["sf:risk_next_step"], "deny": "sf:job_status"}, 3)          # 꼴이 틀렸다(목록이 아니다)
+    overlay({"tools": ["sf:risk_next_step"], "deny": ["sf:job_status"]}, 3)
+    assert call("job_status")[1] == _RT_DENIED_MSG.format("sf:job_status")
+    overlay({"tools": ["sf:risk_next_step"], "deny": "sf:job_status"}, 4)          # 꼴이 틀렸다(목록이 아니다)
     with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
-        assert not call("job_status")[0].isError, "깨진 덧씌우기는 통째로 버린다 — deny 도 빠진다"
-        assert call("risk_next_step")[1] == _RT_NOT_READ_MSG.format("sf:risk_next_step"), "tools 도 빠진다"
+        # 11-17 검토 L1 — 깨진 덧씌우기는 마지막으로 읽은 tools · deny 를 그대로 둔다(종전 '통째로 버린다 — deny 도 빠진다' 는 열리는 쪽이었다)
+        assert call("job_status")[1] == _RT_DENIED_MSG.format("sf:job_status"), "깨져도 deny 를 놓지 않는다"
+        assert not call("risk_next_step")[0].isError, "tools 도 마지막 값 그대로"
     assert any("read_tools.local.json" in r.getMessage() and "deny" in r.getMessage() for r in caplog.records), caplog.text
+    assert "마지막 값" in gw._READ_TOOLS_LOCAL["error"]
     # /tools-map 의 routine_read 도 같은 판정이다
-    overlay({"deny": ["sf:start_view"]}, 4)
+    overlay({"deny": ["sf:start_view"]}, 5)
     t = lambda name, **a: types.Tool(name=name, description="", inputSchema={"type": "object"},  # noqa: E731
                                      **({"annotations": ann(**a)} if a else {}))
     _aggregate_tools(monkeypatch, {"sf": [t("search_voc"), t("start_view", readOnlyHint=True), t("corpus_check"), t("job_status")]})
@@ -14233,7 +14241,7 @@ def test_GW02_REST_GET_PATCH_는_관리자만_덧씌우기를_원자적으로_�
     assert _http(monkeypatch, "/readonly-allowlist", auth="Bearer wrong")[0] == 401
     rows = [r for r in _rows() if r["tool"].endswith("/readonly-allowlist")]
     patched = [r for r in rows if r["tool"] == "PATCH /readonly-allowlist" and r["ok"]]
-    assert len(patched) == 2 and patched[0]["note"].startswith("+1 -0 deny+1 deny-0") and patched[0]["caller"] == "gw-token"
+    assert len(patched) == 2 and patched[0]["note"] == f"fp {out['fingerprint']} +sf:b_view deny+sf:hinted_view" and patched[0]["caller"] == "gw-token"
     assert patched[0]["ip"] == "198.51.100.20" and patched[0]["via"] == "gw-token"
 
 
@@ -14388,3 +14396,87 @@ def test_GW01_HTTP_GET_ingest_는_PAT_나_공유_비밀로_같은_답을_주고_
         st, body = _http(monkeypatch, "/ingest/app-a/a-intake", m, body=b"file-bytes")
         assert st == 405 and "업로드를 받지 않는다" in body["detail"], m
     assert _http(monkeypatch, "/ingest/app-a/a-intake/x")[0] == 404
+
+
+# ── 11-17 검토 — GW-02 고침(M1 · L1 · L3 · L6) ─────────────────────────────────────────────
+def _labelled(monkeypatch, tmp_path):
+    """앱 표지가 다른 도구 넷 — w_view(readOnlyHint=False) · d_view(destructiveHint) · p_view(표지 없음) · t_view(readOnlyHint=False, 추적 목록)."""
+    base = _gw02_kit(monkeypatch, tmp_path, tools=())
+    ann = types.ToolAnnotations
+    tl = {"w_view": ann(readOnlyHint=False), "d_view": ann(destructiveHint=True), "p_view": None, "t_view": ann(readOnlyHint=False),
+          "h_view": ann(readOnlyHint=True, destructiveHint=True)}
+    monkeypatch.setattr(gw, "exposed_tools", [types.Tool(name=n, description="", inputSchema={"type": "object"}, **({"annotations": a} if a else {}))
+                                              for n, a in tl.items()])
+    monkeypatch.setattr(gw, "route", {n: ("sf", n) for n in tl})
+    monkeypatch.setattr(gw, "tool_readonly_hint", {("sf", "h_view"): True})
+    _bump(base, {"tools": ["sf:t_view", "sf:d_view"]}, 1)
+    return base
+
+
+def test_M1_박스_덧씌우기만으로는_앱이_쓰기로_적은_도구를_열지_않고_파괴_표지는_어느_목록이든_막는다(monkeypatch, tmp_path):
+    _labelled(monkeypatch, tmp_path)
+    gw.READ_TOOLS_LOCAL_PATH.write_text(json.dumps({"tools": ["sf:w_view", "sf:p_view", "sf:d_view"]}), encoding="utf-8")
+    why = gw._readonly_denial("w_view", {})
+    assert why.startswith("read_only: 'w_view'") and "readOnlyHint=False" in why and "앱 표지가 이긴다" in why, why
+    assert gw._readonly_denial("p_view", {}) == "", "표지가 없으면 덧씌우기로 연다"
+    assert gw._readonly_denial("t_view", {}) == "", "추적 목록은 지금 그대로(앱의 readOnlyHint=False 보다 먼저)"
+    for n in ("d_view", "h_view"):
+        w = gw._readonly_denial(n, {})
+        assert w.startswith(f"read_only: '{n}'") and "destructiveHint" in w, (n, w)
+    # 루틴 · 패널 판정과 같은 쪽이다
+    for n, want in (("w_view", False), ("p_view", True), ("d_view", False)):
+        t = next(x for x in gw.exposed_tools if x.name == n)
+        assert gw._routine_read(t, "sf", n, by_name=False) is want, n
+
+
+def test_M1_PATCH_는_쓰기_파괴_표지가_달린_항목을_남기되_경고하고_보기는_표지로_막힌_것을_적는다(monkeypatch, tmp_path):
+    _labelled(monkeypatch, tmp_path)
+    st, out = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:w_view", "sf:p_view", "sf:d_view"]})
+    assert st == 200 and "sf:w_view" in json.loads(gw.READ_TOOLS_LOCAL_PATH.read_text(encoding="utf-8"))["tools"], "항목은 남긴다"
+    assert [w.split("'")[1] for w in out["warnings"]] == ["sf:w_view", "sf:d_view"] and "열리지 않는다" in out["warnings"][0]
+    rows = {e["tool"]: e for e in out["entries"]}
+    assert rows["sf:w_view"]["blocked_by_label"] == "readOnlyHint=False" and rows["sf:d_view"]["blocked_by_label"] == "destructiveHint"
+    assert "blocked_by_label" not in rows["sf:t_view"] and "blocked_by_label" not in rows["sf:p_view"], "추적 항목은 지금 그대로 연다"
+    assert "루틴" in out["scope"] and "패널" in out["scope"], "같은 항목이 루틴 단계 · 패널 확인에도 든다고 말한다"
+    assert _http(monkeypatch, "/readonly-allowlist")[1]["scope"] == out["scope"]
+
+
+def test_L1_read_tools_json_의_칸이_목록이_아니면_셋_다_마지막_값을_둔다(monkeypatch, tmp_path, caplog):
+    base = _gw02_kit(monkeypatch, tmp_path)
+    _bump(base, {"tools": ["sf:a_view"], "deny": ["sf:b_view"], "override": ["sf:c_view"]}, 1)
+    assert gw._readonly_denial("a_view", {}) == "" and gw.READ_DENY == {"sf:b_view"}
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        _bump(base, {"tools": ["sf:b_view"], "deny": "sf:b_view"}, 2)
+        gw._readonly_denial("a_view", {})
+    assert gw.READ_DENY == {"sf:b_view"} and gw.READ_TOOLS == {"sf:a_view", "sf:c_view"}, "deny 만 비고 나머지가 바뀌는 반쪽 판이 없다"
+    assert "deny 는 목록이어야 한다" in gw._readonly_allowlist_view()["base"]["error"]
+    _bump(base, {"tools": ["sf:b_view"], "deny": []}, 3)
+    assert gw._readonly_denial("b_view", {}) == "" and gw._readonly_allowlist_view()["base"]["error"] is None
+
+
+def test_L6_공유_비밀_PATCH_감사는_함께_실린_사람을_적고_권한은_주지_않는다(monkeypatch, tmp_path):
+    _gw02_kit(monkeypatch, tmp_path)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    sent = []
+
+    async def send(m):
+        sent.append(m)
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps({"add": ["sf:b_view"]}).encode(), "more_body": False}
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/readonly-allowlist", "method": "PATCH", "query_string": b"",
+                                             "headers": [(b"authorization", b"Bearer gw-secret"), (b"x-hwax-user", b"admin%40corp.com")],
+                                             "client": ("198.51.100.21", 1)}, receive, send))
+    assert sent[0]["status"] == 200
+    row = _rows()[-1]
+    assert row["caller"] == "admin@corp.com" and row["via"] == "gw-token" and "+sf:b_view" in row["note"]
+
+
+def test_L3_관리자도_의미_순위를_받는다_관리자_도구는_색인_밖이라_뒤에_선다(monkeypatch):
+    search = _fused_kit(monkeypatch, _CURVE_SPECS, {"curve_a": 0.9, "plot_b": 0.5})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [gw.ADMIN_GROUP])
+    assert "gateway_readonly_allowlist" in {t.name for t in gw._visible_tools([gw.ADMIN_GROUP])}
+    out = search("곡선")
+    assert out["mode"] == "rrf", out.get("mode_reason")
+    order, why = asyncio.run(gw._tool_embed_order("곡선", gw._visible_tools([gw.ADMIN_GROUP])))
+    assert why == "" and order[-1] is gw.READONLY_ALLOWLIST_TOOL

@@ -33,16 +33,20 @@ HWAX 페더레이션의 **중앙 MCP 게이트웨이**. 채팅 에이전트(HWAX
   둘을 더했다 — 그 낱말로 막히게 된 `ste:get_sync_settings`(설정 조회)와 쓰지 않는 미리 보기 `heax-kooremapper_mcp:plan_task_links`
   (HWAXPortal docs/core-link CK-5). 같은 파일의 `deny` 와 박스 덧씌우기 `read_tools.local.json` 의 `deny` 가 맨 먼저다 — 거기 있으면 읽기 목록 · 앱 표지와
   무관하게 막는다(11-17 부터 읽기 전용 PAT 도 — HWAXPortal docs/request-1117 R-7, 종전은 루틴 단계만).
-- **재기동 없이**(GW-02) — `read_tools.json` 도 바뀐 시각으로 다시 읽는다(1초에 한 번 본다 · JSON 이 깨지면 마지막 값 · 경고). 읽기 전용 PAT 도 박스
-  덧씌우기 `read_tools.local.json` 의 `tools` 를 읽는다(같은 박스 관리자가 쓰는 파일이라 신뢰가 같다). 거절 글은 `read_only: '<도구>' — 읽기 전용 토큰
+- **재기동 없이**(GW-02) — `read_tools.json` 도 바뀐 시각으로 다시 읽는다(1초에 한 번 본다 · JSON 이 깨지거나 칸 하나라도 목록이 아니면 셋 다 마지막
+  값 · 경고). 읽기 전용 PAT 도 박스 덧씌우기 `read_tools.local.json` 의 `tools` 를 읽는다(같은 박스 관리자가 쓰는 파일이라 신뢰가 같다). 차례는 ① 닫기
+  목록 ② 앱의 `destructiveHint` ③ 추적 `tools` · `override`(지금 그대로 — 앱의 `readOnlyHint=False` 보다 먼저) ④ 박스 덧씌우기 `tools`(앱이
+  `readOnlyHint=False` 를 적지 않았을 때만 — 루틴 · 패널 판정과 같이 앱 표지가 이긴다) ⑤ 앱의 `readOnlyHint`. 거절 글은 `read_only: '<도구>' — 읽기 전용 토큰
   (read-only — …)` 꼴로 부른 앱에 그대로 간다(앞머리 `read_only:` 는 그대로 — 리스크 앱이 그것으로 판정한다).
 - **관리자 보기 · 고치기** — MCP `gateway_readonly_allowlist`(포털이 지금 관리자라고 답한 사람만 · tools/list 도 관리자에게만 — 항목마다 출처 ·
-  닫힘, 두 파일의 지문 · 읽은 시각 · 오류). REST `GET /readonly-allowlist[?q=]`(밖에서는 `/mcp-gw/readonly-allowlist`)와 `PATCH /readonly-allowlist`
+  닫힘 · 앱 표지가 막는 항목(`blocked_by_label`), 두 파일의 지문 · 읽은 시각 · 오류, 그리고 같은 항목이 루틴 단계 · MCP Apps 패널의 첫 쓰기 확인에도 든다는
+  `scope`). REST `GET /readonly-allowlist[?q=]`(밖에서는 `/mcp-gw/readonly-allowlist`)와 `PATCH /readonly-allowlist`
   — 자격은 게이트웨이 공유 비밀(포털 관리자 화면) 또는 관리자 PAT(MCP 청중, 읽기 전용 PAT 은 보기만). PATCH 본문은
   `{"add": [...], "remove": [...], "deny_add": [...], "deny_remove": [...], "expect": "<지문>"}`(항목은 `백엔드키:원래 이름`, 한 번에 200개까지) — 박스
   덧씌우기를 같은 폴더 임시 파일 → `os.replace` 로 통째로 새로 쓰고(다른 칸은 그대로), `expect` 가 지금 지문과 다르면 409, 파일이 깨져 있으면 덮지 않고
-  409 다. 추적 `read_tools.json` 의 항목은 지우지 못한다(git 으로 — 박스에서 닫으려면 `deny_add`). 고치기마다 감사 한 줄(`PATCH /readonly-allowlist`,
-  note `+N -M deny+N deny-M fp <지문>`).
+  409 다. 추적 `read_tools.json` 의 항목은 지우지 못한다(git 으로 — 박스에서 닫으려면 `deny_add`). 더한 항목에 앱이 쓰기 · 파괴 표지를 달았으면 항목은
+  남기고 `warnings` 에 그 이름과 '표지가 있는 동안 열리지 않는다' 를 싣는다. 고치기마다 감사 한 줄(`PATCH /readonly-allowlist`, note `fp <지문> +항목 -항목
+  deny+항목 …` — 120자에서 잘린다, 공유 비밀 호출이면 `caller` 는 함께 실린 `x-hwax-user` — 감사에만 쓰고 권한은 주지 않는다).
 - 게이트웨이 자체 도구 — 조회(search_tools · list_tool_apps · rest_catalog · search_conversations · browse_experts · use_experts ·
   verify_answer)는 열고 `save_conversation` 은 막는다. `rest_call` 과 REST 다리(`/api/<site>/`)는 GET · HEAD 만. `invoke_tool` 은 안쪽 도구로 본다.
 - 표지 `x-hwax-readonly` 는 PAT 분기에서만 싣고 클라이언트 사본은 두 분기(GW_TOKEN · PAT) 모두 버린다.
@@ -406,7 +410,8 @@ python3 tool_usage_report.py --days 60 --out unused.md
 - 읽기 목록 덧씌우기 `read_tools.local.json`(gitignore) — `read_tools.json` 과 같은 꼴(`{"tools": ["백엔드키:원래 이름", …], "deny": [...]}`)로, 이름 꼴로는
   막히는 조회 도구를 박스에서 커밋 없이 열고(`tools`) 이름 꼴 · 앱 표지로 열린 쓰기를 코드 고침 없이 닫는다(`deny` — 앱의 `readOnlyHint=True` 보다 먼저,
   R3 리뷰 2차 #0). 리포에 둘 것은 `read_tools.json` 에(위 읽기 전용 PAT 절). 바뀐 시각이 다르면 재기동 없이 다시
-  읽고, 못 읽거나 꼴이 틀리면 통째로 버린다(빈 목록 — `deny` 도 빠진다, 경고 한 줄).
+  읽고, 못 읽거나 꼴이 틀리면 마지막으로 읽은 `tools` · `deny` 를 그대로 둔다(경고 한 줄 · 관리자 보기의 `overlay.error` — 깨진 파일로 `deny` 가 빠지지
+  않는다). 파일을 지우면 빈 목록이다.
   11-17 부터 읽기 전용 PAT 의 허용 목록도 이 파일을 읽는다(위 읽기 전용 PAT 절 — GW-02). update-all §1 의 stash 는 받기 전의 `.gitignore` 로 돌므로 **이 판을 받은
   뒤에 만든다**.
 - `routine_report_submit` — 끝난 실행에 다시 내면 포털이 저장본을 돌려준다(`ask` 의 `upload=true` 다시 내기, R3-D12). 저장본에 이미 만든 RA 초안의

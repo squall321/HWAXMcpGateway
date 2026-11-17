@@ -14594,13 +14594,20 @@ def test_L7_옛_키_안내는_권한_밖_앱_도구_이름을_말하지_않고_e
     assert _apps_body()["env"]["errors"] == ["apps.secret-app.env"]
 
 
-def test_쓰기_동사_subscribe_recheck_는_표지가_없어도_루틴_읽기로_열리지_않는다():
+def test_쓰기_동사_subscribe_recheck_는_표지가_없어도_루틴_읽기로_열리지_않는다(monkeypatch):
     """StepForge job_subscribe(웹훅 등록) · interference_recheck(잡을 건다) — 이름 규칙이 마지막 갈래인 루틴 읽기 판정이 표지 없는 둘을 읽기로 열지 않는다
-    (HWAXPortal docs/request-1117, StepForge 11-17 갈래 D-706). 순위의 쓰기 감점도 같은 판정을 쓴다."""
+    (HWAXPortal docs/request-1117, StepForge 11-17 갈래 D-706). 순위의 쓰기 감점도 같은 판정을 쓴다. interference_recheck 는 장부를 안 바꾸는 측정이라
+    read_tools.json override 로 읽기다(사용자 결정 11-17 R-14) — 덧씌우기를 비우면 이름 규칙대로 닫힌다."""
     for n in ("job_subscribe", "interference_recheck"):
         t = types.Tool(name=n, description="x", inputSchema={"type": "object", "properties": {}})
         assert gw._WRITE_NAME.search(n), n
-        assert gw._routine_read(t, "heax-step_forge", n) is False, n
+    sub = types.Tool(name="job_subscribe", description="x", inputSchema={"type": "object", "properties": {}})
+    rec = types.Tool(name="interference_recheck", description="x", inputSchema={"type": "object", "properties": {}})
+    assert gw._routine_read(sub, "heax-step_forge", "job_subscribe") is False, "웹훅을 바깥으로 보낸다 — 덧씌우기에 없다"
+    assert "heax-step_forge:interference_recheck" in gw.READ_OVERRIDE and gw._routine_read(rec, "heax-step_forge", "interference_recheck")
+    monkeypatch.setattr(gw, "READ_OVERRIDE", frozenset())
+    monkeypatch.setattr(gw, "READ_TOOLS", gw.READ_TOOLS - {"heax-step_forge:interference_recheck"})   # 읽기 목록은 덧씌우기를 합친 값이다
+    assert gw._routine_read(rec, "heax-step_forge", "interference_recheck") is False, "덧씌우기가 없으면 이름 규칙(recheck)이 닫는다"
     assert not gw._WRITE_NAME.search("subscription_status") and not gw._WRITE_NAME.search("rechecked_list"), "낱말 단위로만"
 
 

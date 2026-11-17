@@ -6262,7 +6262,8 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
         "(ontology-first F0)은 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
-    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 22, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1
+    # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 관리자 읽기 목록 보기 1(GW-02 — tools/list 는 관리자에게만)
+    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 23, "reportarchive": 2}
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
     assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
@@ -10938,11 +10939,11 @@ def test_동사로도_쓰이는_fetch_resolve_trace_는_조회_낱말이_아니�
 _RT_DENIED_MSG = "ROUTINE_ERROR: 단계 안에서는 읽기로 확인된 도구만 부른다(v1) — '{}' 는 이 박스가 닫았다(read_tools.json · read_tools.local.json 의 deny)"
 
 
-def test_닫기_목록은_표지_읽기_목록_이름_꼴보다_먼저_닫고_루틴_단계에만_든다(monkeypatch, tmp_path, caplog, _fresh_scores):
+def test_닫기_목록은_표지_읽기_목록_이름_꼴보다_먼저_닫고_루틴_단계와_읽기_전용_PAT_에_든다(monkeypatch, tmp_path, caplog, _fresh_scores):
     """R3 리뷰 2차 #0 — 박스가 이름 꼴 · 앱 표지 · 읽기 목록으로 열린 쓰기를 코드 고침 없이 닫는다. read_tools.json 과 박스 덧씌우기
     read_tools.local.json 의 deny 를 _routine_read 가 맨 먼저 본다(앱의 readOnlyHint=True 보다도). routine_call 은 '이 박스가 닫았다' 로 거절하고
     (읽기 목록에 더하라는 안내는 틀린 길이다) 안쪽 도구도 원장도 건드리지 않는다. /tools-map 의 routine_read 에서도 빠진다. 덧씌우기는 바뀐 시각을
-    보고 재기동 없이 다시 읽고, 깨지면 통째로 버린다(deny 도 빠진다 — 경고 한 줄). 루틴만이다 — 읽기 전용 PAT 의 허용 목록은 그대로 연다."""
+    보고 재기동 없이 다시 읽고, 깨지면 통째로 버린다(deny 도 빠진다 — 경고 한 줄). 11-17 부터 읽기 전용 PAT 도 같은 닫기 목록을 먼저 본다(R-7 · GW-02)."""
     ann = types.ToolAnnotations
     local = gw.READ_TOOLS_LOCAL_PATH                                  # autouse 가 tmp 로 건 자리
 
@@ -10966,7 +10967,10 @@ def test_닫기_목록은_표지_읽기_목록_이름_꼴보다_먼저_닫고_�
         res, text = call(n)
         assert not res.isError and inner[-1][0] == n, (n, text)
     monkeypatch.setattr(gw, "tool_readonly_hint", {})
-    assert gw._readonly_denial("corpus_check", {}) == "", "읽기 전용 PAT 는 deny 를 보지 않는다(허용 목록 그대로)"
+    # 11-17 사용자 결정 R-7(HWAXPortal docs/request-1117 GW-02) — 읽기 전용 PAT 도 박스 덧씌우기를 읽고 닫기 목록이 먼저 이긴다(종전 '읽기 전용 PAT 는
+    # deny 를 보지 않는다' 를 뒤집음)
+    why = gw._readonly_denial("corpus_check", {})
+    assert why.startswith("read_only: 'corpus_check'") and "read-only" in why and "deny" in why and "sf:corpus_check" in why, why
     overlay({"tools": ["sf:risk_next_step"]}, 2)
     for n in ("start_view", "corpus_check"):
         assert not call(n)[0].isError, ("덧씌우기에서 빼면 재기동 없이 다시 열린다", n)
@@ -14092,3 +14096,160 @@ def test_GW05_옛_키나_접두를_담은_질의는_검색_답에_새_키를_싣
     got = json.loads(asyncio.run(gw._search_tools({"query": "dynaforge-prod 리포트"}, embed=False, log_query=False)).content[0].text)
     assert got["moved"] == [{"old": "dynaforge-prod", "now": "heax-kooremapper_mcp"}]
     assert list(got)[:4] == ["query", "match_count", "ranked", "moved"], "이름 순위 뒤 · 전문 앞"
+
+
+# ── GW-02 읽기 전용 허용 목록 — 재기동 없이 · 박스 덧씌우기 · 거절 까닭 · 관리자 보기(HWAXPortal docs/request-1117) ────────────────────────
+def _gw02_kit(monkeypatch, tmp_path, tools=("a_view", "b_view", "c_view", "hinted_view")):
+    _ro_base = tmp_path / "read_tools.json"
+    _ro_base.write_text(json.dumps({"tools": ["sf:a_view"], "deny": [], "override": []}), encoding="utf-8")
+    for k in ("READ_TOOLS", "READ_OVERRIDE", "READ_DENY"):            # 다시 읽기가 모듈 값을 바꾼다 — 시험 뒤 되돌린다
+        monkeypatch.setattr(gw, k, getattr(gw, k))
+    monkeypatch.setattr(gw, "READ_TOOLS_PATH", _ro_base)
+    monkeypatch.setattr(gw, "_READ_BASE", {"mtime": None, "checked": 0.0, "error": None, "loaded_at": None})
+    monkeypatch.setattr(gw, "route", {n: ("sf", n) for n in tools})
+    monkeypatch.setattr(gw, "alias_route", {})
+    monkeypatch.setattr(gw, "tool_readonly_hint", {("sf", "hinted_view"): True})
+    return _ro_base
+
+
+def _bump(p, obj, n):
+    p.write_text(obj if isinstance(obj, str) else json.dumps(obj), encoding="utf-8")
+    os.utime(p, ns=(n * 1_000_000_000_000_000_000, n * 1_000_000_000_000_000_000))
+    gw._READ_BASE["checked"] = 0.0
+
+
+def test_GW02_read_tools_json_은_바뀐_시각으로_다시_읽고_깨지면_마지막_값으로_돈다(monkeypatch, tmp_path, caplog):
+    base = _gw02_kit(monkeypatch, tmp_path)
+    assert gw._readonly_denial("a_view", {}) == "" and gw._readonly_denial("b_view", {}).startswith("read_only:")
+    _bump(base, {"tools": ["sf:b_view"], "override": ["sf:c_view"], "deny": ["sf:hinted_view"]}, 1)
+    assert gw._readonly_denial("b_view", {}) == "" and gw._readonly_denial("c_view", {}) == "", "재기동 없이 먹는다(override 도 읽기)"
+    assert gw._readonly_denial("a_view", {}).startswith("read_only:"), "뺀 것은 곧바로 닫힌다"
+    assert gw._readonly_denial("hinted_view", {}).startswith("read_only:"), "deny 가 앱 표지보다 먼저다"
+    assert gw.READ_OVERRIDE == {"sf:c_view"} and gw.READ_DENY == {"sf:hinted_view"}
+    # 몇 초에 한 번만 본다 — 바로 뒤의 쓰기는 다음 확인 때 먹는다
+    gw._READ_BASE["checked"] = gw.time.monotonic()
+    base.write_text(json.dumps({"tools": []}), encoding="utf-8")
+    os.utime(base, ns=(2 * 10**18, 2 * 10**18))
+    assert gw._readonly_denial("b_view", {}) == "", "확인 간격 안에서는 다시 보지 않는다"
+    gw._READ_BASE["checked"] = 0.0
+    assert gw._readonly_denial("b_view", {}).startswith("read_only:")
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        _bump(base, "{broken", 3)
+        assert gw._readonly_denial("b_view", {}).startswith("read_only:") and gw.READ_TOOLS == frozenset(), "깨지면 마지막 값 그대로"
+    assert "마지막 값" in gw._readonly_allowlist_view()["base"]["error"]
+    assert any("read_tools.json 을 다시 읽지 못했다" in r.getMessage() for r in caplog.records)
+
+
+def test_GW02_읽기_전용_PAT_도_박스_덧씌우기를_읽고_닫기가_먼저_이긴다(monkeypatch, tmp_path):
+    _gw02_kit(monkeypatch, tmp_path)
+    local = gw.READ_TOOLS_LOCAL_PATH                                  # autouse 가 tmp 로 건 자리
+    assert gw._readonly_denial("b_view", {}).startswith("read_only:")
+    local.write_text(json.dumps({"tools": ["sf:b_view"], "deny": ["sf:a_view"]}), encoding="utf-8")
+    assert gw._readonly_denial("b_view", {}) == "", "덧씌우기의 읽기 목록 — 재기동 없이"
+    why = gw._readonly_denial("a_view", {})
+    assert why.startswith("read_only: 'a_view'") and "deny" in why and "sf:a_view" in why, "덧씌우기의 deny 가 추적 목록보다 먼저다"
+
+
+def test_GW02_읽기_전용_거절은_호출자가_받는_글에_read_only_까닭과_도구_이름을_싣는다(monkeypatch):
+    b = _ro_setup(monkeypatch, {gw.READONLY_HEADER: "1"})
+    r = asyncio.run(gw._call_tool("export_step", {}))
+    text = r.content[0].text
+    assert r.isError and text.startswith("read_only: 'export_step'") and "read-only" in text and "heax-step_forge:export_step" in text, text
+    assert "read_tools.local.json" in text and "재기동 없이" in text, "박스 덧씌우기로 고치는 길을 말한다"
+    for n, a in (("save_conversation", {}), ("rest_call", {"method": "POST"}), ("routine_call", {})):
+        t = gw._readonly_denial(n, a)
+        assert t.startswith("read_only:") and "read-only" in t and n.split("_")[0] in t, (n, t)
+    assert b.session.calls == []
+
+
+def test_GW02_관리자_보기_MCP_는_관리자만_출처_지문_읽은_시각을_준다(monkeypatch, tmp_path):
+    _gw02_kit(monkeypatch, tmp_path)
+    gw.READ_TOOLS_LOCAL_PATH.write_text(json.dumps({"tools": ["sf:b_view", "sf:a_view"], "deny": ["sf:c_view"]}), encoding="utf-8")
+    _set_request_headers(monkeypatch, {gw.GROUPS_HEADER: "feat:chat"})
+    r = asyncio.run(gw._call_tool("gateway_readonly_allowlist", {}))
+    assert r.isError and r.content[0].text.startswith("forbidden: gateway_readonly_allowlist"), r.content[0].text
+    assert "gateway_readonly_allowlist" not in {t.name for t in gw._visible_tools(["feat:chat"])}, "관리자가 아니면 목록 · 검색에 없다"
+    assert "gateway_readonly_allowlist" in {t.name for t in gw._visible_tools([gw.ADMIN_GROUP])}
+    _set_request_headers(monkeypatch, {gw.GROUPS_HEADER: gw.ADMIN_GROUP})
+    out = json.loads(asyncio.run(gw._call_tool("gateway_readonly_allowlist", {})).content[0].text)
+    rows = {e["tool"]: e for e in out["entries"]}
+    assert rows["sf:a_view"]["source"] == ["read_tools.json", "read_tools.local.json"]
+    assert rows["sf:b_view"]["source"] == ["read_tools.local.json"]
+    assert out["deny"] == [{"tool": "sf:c_view", "source": ["read_tools.local.json"]}]
+    assert out["base"]["file"] == "read_tools.json" and out["overlay"]["present"] and out["overlay"]["loaded_at"]
+    assert out["base"]["loaded_at"] and len(out["fingerprint"]) == 12 and out["hinted_read_only"] == 1
+    one = json.loads(asyncio.run(gw._call_tool("gateway_readonly_allowlist", {"q": "b_view"})).content[0].text)
+    assert [e["tool"] for e in one["entries"]] == ["sf:b_view"]
+    _set_request_headers(monkeypatch, {gw.GROUPS_HEADER: gw.ADMIN_GROUP, gw.READONLY_HEADER: "1"})
+    assert not asyncio.run(gw._call_tool("gateway_readonly_allowlist", {})).isError, "보기는 읽기다 — 관리자의 읽기 전용 PAT 도 본다"
+
+
+def _http(monkeypatch, path, method="GET", body=None, auth="Bearer gw-secret", verifier=None, qs=b""):
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    sent = []
+
+    async def send(m):
+        sent.append(m)
+    raw = body if isinstance(body, bytes) else (json.dumps(body, ensure_ascii=False).encode() if body is not None else b"")
+
+    async def receive():
+        return {"type": "http.request", "body": raw, "more_body": False}
+    headers = [(b"authorization", auth.encode())] if auth else []
+    asyncio.run(gw._bearer_gate(None, verifier)({"type": "http", "path": path, "method": method, "query_string": qs,
+                                                 "headers": headers, "client": ("198.51.100.20", 5000)}, receive, send))
+    return sent[0]["status"], json.loads(sent[1]["body"])
+
+
+def test_GW02_REST_GET_PATCH_는_관리자만_덧씌우기를_원자적으로_고치고_재기동_없이_먹고_감사한다(monkeypatch, tmp_path):
+    _gw02_kit(monkeypatch, tmp_path)
+    local = gw.READ_TOOLS_LOCAL_PATH
+    st, view = _http(monkeypatch, "/readonly-allowlist")
+    assert st == 200 and [e["tool"] for e in view["entries"]] == ["sf:a_view"] and not view["overlay"]["present"]
+    st, out = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:b_view"], "deny_add": ["sf:hinted_view"],
+                                                                  "expect": view["fingerprint"]})
+    assert st == 200 and out["ok"] and {e["tool"] for e in out["entries"]} == {"sf:a_view", "sf:b_view"}
+    saved = json.loads(local.read_text(encoding="utf-8"))
+    assert saved["tools"] == ["sf:b_view"] and saved["deny"] == ["sf:hinted_view"] and "_doc" in saved
+    assert not [p for p in local.parent.iterdir() if p.name.endswith(".tmp")], "임시 파일이 남았다"
+    assert gw._readonly_denial("b_view", {}) == "" and gw._readonly_denial("hinted_view", {}).startswith("read_only:"), "재기동 0"
+    st, conflict = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:c_view"], "expect": view["fingerprint"]})
+    assert st == 409 and conflict["fingerprint"] == out["fingerprint"], "옛 지문이면 덮지 않는다"
+    st, out2 = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"remove": ["sf:a_view", "sf:b_view"]})
+    assert st == 200 and out2["not_in_overlay"] == ["sf:a_view"] and "deny_add" in out2["note"], "추적 항목은 덧씌우기로 못 지운다"
+    for bad in ({"add": ["no-colon"]}, {"add": "sf:x"}, {}, {"add": [f"sf:t{i}" for i in range(gw.RO_PATCH_MAX + 1)]}):
+        assert _http(monkeypatch, "/readonly-allowlist", "PATCH", bad)[0] == 400, bad
+    local.write_text("{broken", encoding="utf-8")
+    st, broken = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:c_view"]})
+    assert st == 409 and local.read_text(encoding="utf-8") == "{broken", "깨진 파일은 덮지 않는다"
+    assert _http(monkeypatch, "/readonly-allowlist", "DELETE")[0] == 405
+    assert _http(monkeypatch, "/readonly-allowlist", auth="Bearer wrong")[0] == 401
+    rows = [r for r in _rows() if r["tool"].endswith("/readonly-allowlist")]
+    patched = [r for r in rows if r["tool"] == "PATCH /readonly-allowlist" and r["ok"]]
+    assert len(patched) == 2 and patched[0]["note"].startswith("+1 -0 deny+1 deny-0") and patched[0]["caller"] == "gw-token"
+    assert patched[0]["ip"] == "198.51.100.20" and patched[0]["via"] == "gw-token"
+
+
+def test_GW02_REST_는_PAT_면_포털이_지금_관리자라고_답한_사람만_읽기_전용이면_고치지_못한다(monkeypatch, tmp_path):
+    _gw02_kit(monkeypatch, tmp_path)
+    v = _verifier(monkeypatch)
+    admin = {"v": False}
+
+    async def access(email, base, **kw):
+        return {"keys": [], "is_admin": admin["v"]}
+    monkeypatch.setattr(gw, "_portal_access", access)
+    tok = _pat(gw.MCP_AUDIENCE, groups=[gw.ADMIN_GROUP])                     # 토큰에 박힌 관리자 표지는 믿지 않는다
+    st, body = _http(monkeypatch, "/readonly-allowlist", auth=f"Bearer {tok}", verifier=v)
+    assert st == 403 and "관리자" in body["detail"]
+    admin["v"] = True
+    assert _http(monkeypatch, "/readonly-allowlist", auth=f"Bearer {tok}", verifier=v)[0] == 200
+    st, out = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:b_view"]}, auth=f"Bearer {tok}", verifier=v)
+    assert st == 200 and _rows()[-1]["caller"] == "u@corp.com" and _rows()[-1]["via"] == "pat"
+    ro = _pat(gw.MCP_AUDIENCE, scopes=["read"])
+    st, body = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:c_view"]}, auth=f"Bearer {ro}", verifier=v)
+    assert st == 403 and "read-only" in body["detail"]
+    assert _http(monkeypatch, "/readonly-allowlist", auth=f"Bearer {ro}", verifier=v)[0] == 200, "보기는 읽기 전용 PAT 도"
+    expired = _pat(gw.MCP_AUDIENCE, exp_in=-3600)
+    st, body = _http(monkeypatch, "/readonly-allowlist", auth=f"Bearer {expired}", verifier=v)
+    assert st == 401 and body == gw.EXPIRED_BODY
+    panel = _pat(gw.PANEL_AUDIENCE)
+    assert _http(monkeypatch, "/readonly-allowlist", auth=f"Bearer {panel}", verifier=v)[0] == 401, "패널 PAT(다른 청중)는 열지 않는다"

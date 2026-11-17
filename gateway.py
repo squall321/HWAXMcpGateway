@@ -3386,10 +3386,12 @@ SEARCH_TOOLS_TOOL = types.Tool(
 # repin — SP 0.4.72 lineage_repin(계보 다시 고정 — 되돌릴 길이 없는 사람 판단, SP 의 관리자 전용 목록 밖)이 쓰기로 읽히게(11-03).
 # link · edit · sync — unlink 는 있는데 짝이 없었다(10-28 부터, 일부러 뺀 기록 없음). StepForge onto_link · SP link_sp_core · sync_sp_core 같은
 # 쓰기를 운영자 동기화의 '목록 밖 쓰기' 가 짚게 한다(HWAXPortal docs/core-link CK-5). 새로 걸리는 읽기(ste get_sync_settings)는 읽기 목록에 있다.
+# subscribe · recheck — StepForge 의 job_subscribe(웹훅 등록 — 바깥으로 보낸다) · interference_recheck(잡을 스스로 건다, 11-17 갈래 D-706). 이름 규칙이
+# 마지막 갈래인 루틴 읽기 판정(_routine_read)이 표지 없는 이 둘을 읽기로 열지 않게(11-17 카탈로그에 이 낱말이 든 도구가 없어 지금 순위는 그대로다).
 _WRITE_NAME = re.compile(r"(?:^|_)(create|update|delete|remove|set|save|register|upload|submit|run|rerun|start|import|ingest|apply|add|"
                          r"patch|publish|cancel|stop|train|activate|recompute|rename|confirm|unlink|link|bind|move|insert|propose|deprecate|"
                          r"fileback|decide|ack|attach|intake|record|forget|draft|send|purge|restore|trash|reload|reset|continue|upsert|merge|repin|"
-                         r"replace|overwrite|write|edit|sync)(?:_|$)")
+                         r"replace|overwrite|write|edit|sync|subscribe|recheck)(?:_|$)")
 _READ_NAME_HINT = re.compile(r"(instructions|guide|advice|preview|estimate|status|history|_log$|_state$)")
 # 같은 도구 사본의 정본 고르기 — 점수가 같으면 라벨에 시험 · 사본 표지가 없는 앱을 앞에 둔다(종전엔 이름순이라 사본 허브가 앞이었다).
 _COPY_LABEL = re.compile(r"[(\[](?:시험|사본|테스트|test|copy|staging|dev)[)\]]", re.I)

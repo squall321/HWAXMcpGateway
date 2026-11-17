@@ -14577,3 +14577,13 @@ def test_L7_옛_키_안내는_권한_밖_앱_도구_이름을_말하지_않고_e
     assert "errors" not in _apps_body()["env"]
     monkeypatch.setattr(gw, "_request_groups", lambda: [gw.ADMIN_GROUP])
     assert _apps_body()["env"]["errors"] == ["apps.secret-app.env"]
+
+
+def test_쓰기_동사_subscribe_recheck_는_표지가_없어도_루틴_읽기로_열리지_않는다():
+    """StepForge job_subscribe(웹훅 등록) · interference_recheck(잡을 건다) — 이름 규칙이 마지막 갈래인 루틴 읽기 판정이 표지 없는 둘을 읽기로 열지 않는다
+    (HWAXPortal docs/request-1117, StepForge 11-17 갈래 D-706). 순위의 쓰기 감점도 같은 판정을 쓴다."""
+    for n in ("job_subscribe", "interference_recheck"):
+        t = types.Tool(name=n, description="x", inputSchema={"type": "object", "properties": {}})
+        assert gw._WRITE_NAME.search(n), n
+        assert gw._routine_read(t, "heax-step_forge", n) is False, n
+    assert not gw._WRITE_NAME.search("subscription_status") and not gw._WRITE_NAME.search("rechecked_list"), "낱말 단위로만"

@@ -117,7 +117,7 @@ def test_visible_tools(monkeypatch):
                               gw.SEARCH_TOOLS_TOOL, gw.INVOKE_TOOL,
                               gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL,
                               gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL, *gw.ROUTINE_TOOLS, *gw.INSIGHT_TOOLS,
-                              *gw.FIGURE_TOOLS, gw.KIT_GET_TOOL)}
+                              *gw.FIGURE_TOOLS, gw.KIT_GET_TOOL, gw.ONTO_LOOKUP_TOOL)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -6258,7 +6258,7 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
         "(ontology-first F0)은 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
-    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 21, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1
+    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 22, "reportarchive": 2}   # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
     assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
@@ -6325,7 +6325,7 @@ def test_기준_미만으로_처음_붙는_앱만_한_번_경고하고_막지_�
 def test_게이트웨이_로컬_도구는_제_앱으로_센다(monkeypatch, _fresh_scores):
     """로컬 도구는 route 에 없다 — `_gateway` 앱으로 세고, tools/list 가 붙이는 것과 같은 목록이다(REST 다리는 사이트가 있을
     때만). 목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
-    for rest, n_local in (({}, 21), ({"s": {"base": "http://x"}}, 23)):      # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1(+ REST 다리 둘)
+    for rest, n_local in (({}, 22), ({"s": {"base": "http://x"}}, 24)):      # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1(+ REST 다리 둘)
         monkeypatch.setattr(gw, "REST", rest)
         _aggregate_tools(monkeypatch, {"sf": [_stool("sf_q", {"q": None})]})
         row = {r["app"]: r for r in gw._ARG_SCORE["apps"]}["_gateway"]
@@ -6563,7 +6563,18 @@ def _search_tools_master():
     """원문을 게이트웨이 모듈의 이름공간에서 정의한다 — monkeypatch 한 카탈로그·요청 문맥을 지금 코드와 똑같이 본다."""
     ns: dict = {}
     exec(compile(_SEARCH_TOOLS_MASTER, "master:_search_tools", "exec"), gw.__dict__, ns)
-    return ns["_search_tools"]
+    fn = ns["_search_tools"]
+
+    async def run(*a, **kw):
+        # 기준본은 ontology_lookup 이 없던 때의 코드다 — 지금 코드는 손잡이(onto_lookup_first)를 끄면 그 도구를 순위 줄에 넣지 않으므로, 기준본도 그
+        # 도구를 빼고 돌아야 같은 것을 견준다(HWAXPortal docs/ontology-first OF-36). 앉혀 둔 _local_tools(시험이 바꿨을 수도)를 감싸고 되돌린다.
+        real = gw._local_tools
+        gw._local_tools = lambda: [t for t in real() if t.name != gw.ONTO_LOOKUP_TOOL.name]
+        try:
+            return await fn(*a, **kw)
+        finally:
+            gw._local_tools = real
+    return run
 
 
 _SEARCH_SPECS = [
@@ -6939,6 +6950,9 @@ def _role_catalog(monkeypatch, *, hub_tools=_CORE_HUB_TOOLS, hubs=_CORE_HUBS, ot
                                                 **{k: {"label": lab, "description": ""} for k, (lab, _t) in other.items()}})
     monkeypatch.setattr(gw, "POLICY", {})
     monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    # 정책을 받은 것으로 — 아니면 박스 gateway_config.json 의 사람별 위임 백엔드(dev 는 DynaForge)가 policy_not_ready 로 숨어 시험이 박스마다
+    # 달라졌다(11-17 — onto_first 시험이 dev 에서만 붉었다, HWAXPortal docs/ontology-first OF-40)
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
     _no_embed(monkeypatch)
 
 
@@ -7462,6 +7476,238 @@ def test_onto_first_검색_평가가_켠_판을_잰다(monkeypatch, tmp_path):
     v = gw._eval_variants()
     assert v["+onto_first"]["switches"]["onto_first"] is True and "-onto_first" not in v
     assert v["+noncore_demote"]["switches"]["onto_first"] is False, "다른 판에서는 그대로 끔"
+
+
+# ── 온톨로지 조회 ontology_lookup(HWAXPortal docs/ontology-first PLAN §12 · 요청 OL-1 ~ OL-3, 11-16 cae00) ─────────────────────────────────────
+# 정본 object_resolve 로 풀어 판정을 그대로 넘기고, exact 면 코어 어휘표 ontology.lookup 으로 앱마다 다음 호출을 채운다. 허브 호출은 _call_tool_body 로
+# 간다(가짜 허브는 그 자리만 바꾼다). search_tools 손잡이 onto_lookup_first 는 기본 끔이고, 끄면 순위 · 글이 그 도구가 없던 때와 바이트까지 같다.
+_OL_OTHER = {**_ONTO_OTHER,
+             "heax-kooremapper_mcp": ("DynaForge", [("ontology_object", "받은 객체 하나 — 칸 · 상태 · 선."),
+                                                    ("list_tasks", "해석 과제 목록 — 과제명 · 과제코드 · 별칭으로 찾는다.")]),
+             "reportarchive": ("Report Archive", [("search_objects", "보고서 객체를 찾는다.")])}
+_OL_LOOKUP = {"failuretrace": {"tool": "object_resolve", "args": {"type_slug": "{type_slug}", "name": "{key}"}},
+              "heax-kooremapper_mcp": {"tool": "ontology_object", "args": {"type_slug": "{type_slug}", "key": "{key}"}},
+              "heax-step_forge": {"tool": "onto_search", "args": {"q": "{key}", "type_slug": "{type_slug}", "resolve": True},
+                                  "types": ["plm_task"]},
+              "reportarchive": {"tool": "search_objects", "args": {"q": "{name}"}}}
+
+
+def _ol_kit(monkeypatch, tmp_path, answers, *, lookup=_OL_LOOKUP):
+    """실제 어휘표 + 합성 카탈로그 + 가짜 정본 — answers(노출 이름, 인자) → 정본 답(사전 · 예외 글은 오류 답). 부른 것을 calls 에 적는다."""
+    _role_kit(monkeypatch, other=_OL_OTHER)
+    _vocab_overlay(monkeypatch, tmp_path, {"ontology": {"lookup": lookup}})
+    calls = []
+
+    async def fake(name, args):
+        calls.append((name, args))
+        got = answers(name, args)
+        if isinstance(got, str):
+            return types.CallToolResult(content=[types.TextContent(type="text", text=got)], isError=True)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(got, ensure_ascii=False))])
+    monkeypatch.setattr(gw, "_call_tool_body", fake)
+    return lambda a: json.loads(asyncio.run(gw._onto_lookup(a)).content[0].text), calls
+
+
+_OL_OBJ = {"id": "u-1", "key": "TASK-A", "label": "과제 A", "status": "active", "matched_by": "key", "type_slug": "plm_task"}
+
+
+def test_OL1_도구는_읽기로_실리고_엔진_좌석_자유_조회에_걸리지_않는다():
+    t = next(x for x in gw._local_tools() if x.name == "ontology_lookup")
+    assert t.annotations.readOnlyHint is True and "ontology_lookup" in gw._LOCAL_READ
+    assert gw._routine_read(t, "_gateway", t.name) is True
+    for w in ("온톨로지", "ontology", "조회", "검색", "정본"):
+        assert w in t.description, w
+    import ast
+    src = gw.Path(gw.__file__).resolve().parent.parent / "HWAXAgentServer" / "deliberation.py"
+    if not src.exists():
+        pytest.skip("형제 HWAXAgentServer 리포가 없다")
+    allow = next(ast.literal_eval(n.value) for n in ast.parse(src.read_text(encoding="utf-8")).body
+                 if isinstance(n, ast.Assign) and any(getattr(x, "id", "") == "_FREE_ALLOW" for x in n.targets))
+    assert not t.name.startswith(tuple(allow)), "리스크 심사 · 심의 좌석 자유 조회에 새로 열리면 안 된다(D-18)"
+
+
+def test_OL1_lookup_줄은_줄마다_거르고_예외를_내지_않는다():
+    good = {"failuretrace": {"tool": "object_resolve", "args": {"type_slug": "{type_slug}", "name": "{key}"}, "_doc": "설명"},
+            "heax-step_forge": {"tool": "onto_search", "args": {"q": "{key}"}, "types": ["plm_task"]}}
+    bad = {"Bad Key": {"tool": "x", "args": {"a": 1}}, "a1": {"tool": "x y", "args": {"a": 1}}, "a2": {"tool": "x", "args": {}},
+           "a3": {"tool": "x", "args": {"a": 1}, "types": []}, "a4": {"tool": "x", "args": {"a": 1}, "weight": 2}, "a5": "x",
+           "a6": {"tool": "x", "args": [1]}, "a7": {"tool": "x", "args": {"a": 1}, "types": ["Plm Task"]}}
+    rows = gw._onto_lookup_rows({"ontology": {"lookup": {**good, **bad}}})
+    assert [r[0] for r in rows] == ["failuretrace", "heax-step_forge"] and rows[1][3] == ("plm_task",) and rows[0][3] is None
+    for junk in (None, [], "x", {"lookup": []}, {"lookup": None}, {"apps": {}}):
+        assert gw._onto_lookup_rows({"ontology": junk}) == (), junk
+    assert gw._onto_facts({}) == (60, 4000) and gw._onto_facts({"ontology": {"facts": {"limit": 30, "chars": 5000}}}) == (30, 5000)
+    assert gw._onto_facts({"ontology": {"facts": {"limit": True, "chars": 10}}}) == (60, 4000)
+
+
+def test_OL1_타입은_어휘표로_고르고_이름은_타입_낱말만_뺀다():
+    vt = {"PLM 과제": "plm_task", "개발모델": "plm_model", "고장모드": "failure_mode", "관리 기준": "criterion"}
+    assert gw._onto_pick("고장모드 솔더 크랙", "", vt) == (["failure_mode"], "솔더 크랙")
+    assert gw._onto_pick("PLM 과제 TASK-A", "", vt) == (["plm_task"], "TASK-A")
+    assert gw._onto_pick("과제 TASK-A", "", vt) == (["plm_task"], "TASK-A"), "여러 낱말 이름의 끝 낱말"
+    assert gw._onto_pick("개발모델 M1 의 관리 기준 조회", "", vt) == (["plm_model", "criterion"], "M1 의"), "질의 차례 · 조사는 떼지 않는다(OF-38)"
+    assert gw._onto_pick("온톨로지 검색 솔더", "", vt) == ([], "솔더")
+    assert gw._onto_pick("솔더 크랙", "고장모드", vt) == (["failure_mode"], "솔더 크랙")
+    assert gw._onto_pick("솔더 크랙", "failure_mode", vt) == (["failure_mode"], "솔더 크랙")
+    assert gw._onto_pick("x", "test_item", vt) == (["test_item"], "x"), "slug 꼴이면 어휘표에 없어도 허브가 판정한다"
+    with pytest.raises(ValueError):
+        gw._onto_pick("x", "없는 타입", vt)
+
+
+def test_OL1_exact_면_개체와_next_를_주고_정본_판정을_그대로_넘긴다(monkeypatch, tmp_path):
+    lookup, calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: {"match": "exact", "object": _OL_OBJ, "candidates": []})
+    out = lookup({"query": "TASK-A", "type": "PLM 과제"})
+    assert calls == [(gw._rt_exposed("rootdesigndatahub", "object_resolve"), {"type_slug": "plm_task", "name": "TASK-A"})]
+    assert out["match"] == "exact" and out["object"] == {"type_slug": "plm_task", "key": "TASK-A", "name": "과제 A", "object_id": "u-1",
+                                                          "matched_by": "key"}
+    nxt = {x["app"]: x for x in out["next"]}
+    assert list(nxt) == ["failuretrace", "caegroupdatahub", "heax-kooremapper_mcp", "heax-step_forge", "reportarchive"], \
+        "허브 가족 먼저(어휘표 차례 — 실제 표의 caegroupdatahub 줄이 덧씌우기와 합쳐진다) — 그다음 표 차례"
+    assert nxt["failuretrace"] == {"tool": gw._rt_exposed("failuretrace", "object_resolve"), "app": "failuretrace",
+                                   "args": {"type_slug": "plm_task", "name": "TASK-A"}, "role": "sibling"}
+    assert nxt["heax-step_forge"]["args"] == {"q": "TASK-A", "type_slug": "plm_task", "resolve": True}
+    assert nxt["reportarchive"]["role"] == "noncore" and nxt["reportarchive"]["args"] == {"q": "과제 A"}
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: {"match": "exact", "object": {**_OL_OBJ, "type_slug": a["type_slug"]}})
+    out = lookup({"query": "솔더 크랙", "type": "고장모드"})
+    assert out["object"]["type_slug"] == "failure_mode" and "heax-step_forge" not in {x["app"] for x in out["next"]}, "types 가 받지 않는 타입은 싣지 않는다"
+    assert lookup({"query": "TASK-A", "type": "PLM 과제", "apps": ["heax-kooremapper_mcp"]})["next"][0]["app"] == "heax-kooremapper_mcp"
+
+
+def test_OL1_후보는_고르지_않고_none_은_시도한_타입을_말한다(monkeypatch, tmp_path):
+    cand = [{**_OL_OBJ, "id": "u-1"}, {**_OL_OBJ, "id": "u-2", "key": "TASK-AB", "matched_by": "contains"}]
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: {"match": "candidates", "object": None, "candidates": cand})
+    out = lookup({"query": "TASK", "type": "plm_task"})
+    assert out["match"] == "candidates" and out["ask_user"] is True and len(out["candidates"]) == 2 and "next" not in out
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: {"match": "none", "object": None, "candidates": []})
+    out = lookup({"query": "개발모델 M1 고장모드 X"})
+    assert out["match"] == "none" and out["tried"] == ["plm_model", "failure_mode"] and "next" not in out
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: (
+        {"match": "exact", "object": _OL_OBJ} if a["type_slug"] == "plm_task" else {"match": "exact", "object": {**_OL_OBJ, "id": "u-9"}}))
+    out = lookup({"query": "PLM 과제 개발모델 TASK-A"})
+    assert out["match"] == "candidates" and {c["object_id"] for c in out["candidates"]} == {"u-1", "u-9"}, "두 타입이 다 exact 면 고르지 않는다"
+
+
+def test_OL1_정본에_닿지_못하면_none_이_아니라_refused_다(monkeypatch, tmp_path):
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: "forbidden: 권한 없음")
+    out = lookup({"query": "TASK-A", "type": "plm_task"})
+    assert out["match"] == "refused" and "권한" in out["why"] and "next" not in out
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: (
+        {"match": "exact", "object": _OL_OBJ} if a["type_slug"] == "plm_task" else "unreachable"))
+    out = lookup({"query": "PLM 과제 개발모델 TASK-A"})
+    assert out["match"] == "exact" and out["incomplete"] is True and out["refused_types"][0]["type_slug"] == "plm_model", "OF-39"
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: (
+        {"match": "none"} if a["type_slug"] == "plm_task" else "unreachable"))
+    assert lookup({"query": "PLM 과제 개발모델 X"})["match"] == "refused", "성공한 것이 none 뿐이면 '없다' 로 말하지 않는다"
+    lookup, calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: {"match": "exact", "object": _OL_OBJ})
+    out = lookup({"query": "고장모드"})
+    assert out["match"] == "refused" and calls == [], "이름이 남지 않으면 허브를 부르지 않는다"
+
+
+def test_OL1_읽기_전용_토큰의_허브_거절은_refused_로_넘긴다(monkeypatch, tmp_path):
+    """가짜 허브 없이 실제 _call_tool_body 의 읽기 전용 관문을 지난다 — 정본 object_resolve 는 읽기 목록 · 표지에 없어 거절되고, 그 거절이 refused 다."""
+    _role_kit(monkeypatch, other=_OL_OTHER)
+    _vocab_overlay(monkeypatch, tmp_path, {"ontology": {"lookup": _OL_LOOKUP}})
+    monkeypatch.setattr(gw, "_request_readonly", lambda: True)
+    out = json.loads(asyncio.run(gw._call_tool_body("ontology_lookup", {"query": "TASK-A", "type": "plm_task"})).content[0].text)
+    assert out["match"] == "refused" and "read_only" in out["why"], out
+
+
+def test_OL1_next_에서_보이지_않는_앱과_꺼_둔_앱이_빠진다(monkeypatch, tmp_path):
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: {"match": "exact", "object": _OL_OBJ})
+    monkeypatch.setattr(gw, "POLICY", {"heax-kooremapper_mcp": ["dyna-only"]})
+    monkeypatch.setattr(gw, "_request_muted", lambda: {"reportarchive"})
+    apps = [x["app"] for x in lookup({"query": "TASK-A", "type": "plm_task"})["next"]]
+    assert apps == ["failuretrace", "caegroupdatahub", "heax-step_forge"], apps
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: {"match": "exact", "object": {**_OL_OBJ, "key": None}})
+    out = lookup({"query": "과제 A", "type": "plm_task"})
+    assert [x["app"] for x in out["next"]] == ["reportarchive"] and {s["app"] for s in out["skipped"]} == {
+        "failuretrace", "caegroupdatahub", "heax-kooremapper_mcp", "heax-step_forge"}, "key 없는 개체는 '{key}' 틀을 부르지 않는다"
+
+
+def test_OL1_neighbors_는_facts_범위로_접는다(monkeypatch, tmp_path):
+    nb = {"nodes": [{"id": "u-1", "type_slug": "plm_task", "label": "과제 A"},
+                    {"id": "n-1", "type_slug": "failure_mode", "key": "FM-1", "label": "크랙"},
+                    {"id": "n-2", "type_slug": "plm_task", "key": "TASK-B", "label": "앞 과제"},
+                    {"id": "n-3", "type_slug": "test_item", "key": "TI-1", "label": "낙하"}],
+          "edges": [{"src": "u-1", "dst": "n-1", "relation": "has_failure"}, {"src": "n-2", "dst": "u-1", "relation": "precedes"},
+                    {"src": "n-1", "dst": "n-3", "relation": "detected_by"}], "truncated": False}
+    lookup, calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: nb if "graph_neighbors" in n else {"match": "exact", "object": _OL_OBJ})
+    out = lookup({"query": "TASK-A", "type": "plm_task", "neighbors": True})
+    assert calls[-1][1]["object_id"] == "u-1" and calls[-1][1]["depth"] == 1 and "plm_task" not in calls[-1][1]["types"]
+    assert [r["object_id"] for r in out["neighbors"]["rows"]] == ["n-1"] and out["neighbors"]["rows"][0]["rel"] == "→ has_failure", \
+        "닻에 바로 이은 노드만 · 닻 타입의 다른 노드는 아니다"
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: [] if "graph_neighbors" in n else {"match": "exact", "object": _OL_OBJ})
+    assert "error" in lookup({"query": "TASK-A", "type": "plm_task", "neighbors": True})["neighbors"]
+
+
+def test_OL1_타입을_모르면_정본_검색을_후보로_준다(monkeypatch, tmp_path):
+    spec = {**{k: [types.Tool(name=n, description=d, inputSchema={"type": "object", "properties": {}}) for n, d in
+                   (*_CORE_HUB_TOOLS, ("search", "이름 · 식별자 · 별칭으로 전부 찾는다."))] for k, _l in _CORE_HUBS}}
+    _role_kit(monkeypatch, other=_OL_OTHER)
+    _aggregate_tools(monkeypatch, {**spec, **{k: [types.Tool(name=n, description=d, inputSchema={"type": "object", "properties": {}})
+                                                 for n, d in ts] for k, (_l, ts) in _OL_OTHER.items()}})
+    body = {"q": "솔더", "total": 1, "types": [{"slug": "failure_mode", "count": 1}],
+            "items": [{"id": "n-1", "type_slug": "failure_mode", "label": "솔더 크랙", "key": "FM-1", "matched": "label"}]}
+
+    async def fake(name, args):
+        assert name == gw._rt_exposed("rootdesigndatahub", "search") and args["q"] == "솔더"
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(body, ensure_ascii=False))])
+    monkeypatch.setattr(gw, "_call_tool_body", fake)
+    out = json.loads(asyncio.run(gw._onto_lookup({"query": "솔더"})).content[0].text)
+    assert out["match"] == "candidates" and out["via"] == "search" and out["ask_user"] is True, "한 줄이어도 검색은 판정이 아니다"
+    assert out["candidates"][0]["key"] == "FM-1" and out["types"] == [{"type_slug": "failure_mode", "count": 1}]
+
+
+# OL-2 — search_tools
+_OL_QS = ("온톨로지 조회", "온톨로지 검색", "ontology lookup", "고장모드 목록", "StepForge 온톨로지 검색", "파트 이름 찾기", "DynaForge 해석 리포트 과제 이름")
+
+
+def test_OL2_끄면_순위와_글이_도구가_없던_때와_바이트까지_같다(monkeypatch, tmp_path):
+    search = _role_kit(monkeypatch, other=_OL_OTHER)
+    assert gw._tuning()["switches"]["onto_lookup_first"] is False and gw._tuning()["weights"]["onto_object"] == 4
+    now = {q: search(q, 20, raw=True) for q in _OL_QS}
+    real = gw._local_tools
+    monkeypatch.setattr(gw, "_local_tools", lambda: [t for t in real() if t.name != "ontology_lookup"])
+    assert {q: search(q, 20, raw=True) for q in _OL_QS} == now
+
+
+def test_OL2_켜면_온톨로지_코어_질의에서_1위이고_앱을_부르면_그_앱_몫이다(monkeypatch, tmp_path):
+    search = _role_kit(monkeypatch, other=_OL_OTHER)
+    off = {q: search(q, 20) for q in _OL_QS}
+    _tune(monkeypatch, tmp_path, {"switches": {"onto_lookup_first": True}})
+    for q in ("온톨로지 조회", "온톨로지 검색", "ontology lookup", "고장모드 목록"):
+        on = search(q, 20)
+        assert on["ranked"][0] == "ontology_lookup" and "ontology_lookup" in on["hint"], (q, on["ranked"][:3])
+        assert on["ranked"][1:] == [n for n in off[q]["ranked"] if n != "ontology_lookup"][:19], "그 하나만 앞에 선다"
+    on = search("StepForge 온톨로지 검색", 20)
+    assert on["ranked"][0] != "ontology_lookup" and "hint" not in on, "앱 이름을 부른 질의는 그 앱의 입구 몫(onto_first)이다"
+    assert search("파트 이름 찾기", 20) == off["파트 이름 찾기"], "온톨로지 · 코어 질의가 아니면 켜도 그대로"
+    on = search("DynaForge 해석 리포트 과제 이름", 20)
+    assert on["ranked"][0] != "ontology_lookup" and "hint" not in on, "코어 낱말이 들어도 앱을 불렀으면 1위로 세우지 않는다"
+    search("고장모드 목록", 20)
+    rec = [r for r in gw._qlog_read() if r.get("q") == "고장모드 목록"][-1]
+    assert "onto_lookup_first" in (rec.get("via") or {}).get("_gateway:ontology_lookup", ()), rec
+    assert "_gateway:ontology_lookup" in rec.get("boost_only", ()), "손잡이가 세운 줄 — 질의 낱말 덕이 아니다"
+    assert search("ontology_lookup", 1, fn=lambda a: gw._search_tools({**a, "detail": True}))["ranked"] == ["ontology_lookup"]
+
+
+def test_OL2_object_인자는_그_타입을_받는_앱의_맞은_줄만_올린다(monkeypatch, tmp_path):
+    search = _role_kit(monkeypatch, other=_OL_OTHER)
+    _vocab_overlay(monkeypatch, tmp_path, {"ontology": {"lookup": _OL_LOOKUP}})
+    q = "과제 이름 찾기"
+    base = search(q, 20)
+    with_obj = json.loads(asyncio.run(gw._search_tools({"query": q, "limit": 20, "object": "failure_mode:FM-1"})).content[0].text)
+    up = [n for n in with_obj["ranked"] if gw.route.get(n, ("",))[0] in ("heax-kooremapper_mcp", "rootdesigndatahub", "failuretrace")]
+    assert up and all(with_obj["ranked"].index(n) <= base["ranked"].index(n) for n in up if n in base["ranked"]), (base["ranked"], with_obj["ranked"])
+    assert with_obj["match_count"] == base["match_count"], "맞지 않은 도구를 새로 끌어오지 않는다(점수가 있던 줄에만 더한다)"
+    bad = json.loads(asyncio.run(gw._search_tools({"query": q, "limit": 20, "object": "틀린 꼴"})).content[0].text)
+    assert bad["ranked"] == base["ranked"] and "object_ignored" in bad
+
+
+def test_OL2_검색_평가가_켠_판을_잰다():
+    v = gw._eval_variants()
+    assert v["+onto_lookup_first"]["switches"]["onto_lookup_first"] is True and "-onto_lookup_first" not in v
+    assert v["+onto_first"]["switches"]["onto_lookup_first"] is False
 
 
 # ── 개인 Claude 보기(HWAXPortal docs/request-1029 E-4 · design-e2-e4.md 2.4 — 사용자 결정 10-31, 권장안 그대로) ───────────────────────────────
@@ -8330,12 +8576,13 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     assert d["delib_ask"] == ('심의', '토의', '회의')
     assert d["quality_words"] == ('불량', '시장', '원인', '대책', '사례') and d["quality_areas"] == ("quality", "voc")
     assert d["write_intent"] == ('등록', '생성', '만들', '추가', '수정', '고치', '고쳐', '바꾸', '바꿔', '변경', '삭제', '지우', '지워', '저장', '올리', '올려', '업로드', '반입', '가져오', '실행', '돌리', '돌려', '제출', '시작', '걸어', '적용', '반영', '보내', '발행', '게시', '취소', '중지', '멈추', '멈춰', '학습', '이어서', '다시 돌', '채워', '채우', '넣어', '넣고', '남기', '남겨', '붙여', '붙이', '기각', '승인', '심의', '토의', '심사', '회의', 'create', 'add ', 'update', 'edit', 'modify', 'delete', 'remove', 'save', 'register', 'upload', 'import', 'run ', 'execute', 'submit', 'start', 'launch', 'apply', 'publish', 'send', 'cancel', 'stop', 'train', 'rename')
-    # noncore(0.5) · noncore_demote(끔)는 10-31 E2-5 가, onto(4) · onto_first(끔)는 11-02 온톨로지 먼저(HWAXPortal docs/ontology-first)가 더한 새
-    # 손잡이다 — 끈 채로 들어와 순위는 그대로다(옮긴 값이 아니다)
+    # noncore(0.5) · noncore_demote(끔)는 10-31 E2-5 가, onto(4) · onto_first(끔)는 11-02 온톨로지 먼저(HWAXPortal docs/ontology-first)가, onto_object(4) ·
+    # onto_lookup_first(끔)는 11-17 온톨로지 조회(같은 폴더 PLAN §12)가 더한 새 손잡이다 — 끈 채로(onto_object 는 인자가 있을 때만) 들어와 순위는 그대로다
     assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2, "noncore": 0.5,
-                            "onto": 4}
-    assert all(v for k, v in d["switches"].items() if k not in gw._TUNING_OPT_IN) and gw._TUNING_OPT_IN == ("noncore_demote", "onto_first")
+                            "onto": 4, "onto_object": 4}
+    assert all(v for k, v in d["switches"].items() if k not in gw._TUNING_OPT_IN) and gw._TUNING_OPT_IN == ("noncore_demote", "onto_first", "onto_lookup_first")
     assert d["switches"]["noncore_demote"] is False and d["switches"]["onto_first"] is False
+    assert d["switches"]["onto_lookup_first"] is False and d["weights"]["onto_object"] == d["weights"]["onto"]
     # 11-02 그림 저장에서 '그림' 에 figure 를 더하고 '이미지' 를 새로 넣었다(그림 도구를 찾게 — 일부러 바꾼 기본값)
     # 11-02 PC 키트에서 'docx' · '변환기' · '표 칸'(띄어 쓴 열쇠) → kit_get 을 넣었다(변환기를 찾게 — 일부러 바꾼 기본값, HWAXPortal docs/report-figures RF-23)
     # 같은 날 figure_to_doc 이 '문서에' · '백서' 를 새로 넣었다(79)
@@ -9717,7 +9964,7 @@ def test_E9_평가는_떠_있는_카탈로그로_판마다_재고_기록을_남�
     assert body["pairs"]["box"] == 1 and body["pairs"]["doc"] == 1
     # 켜진 묶음은 하나씩 끈 판(-), 꺼진 손잡이(기본 끔인 noncore_demote — E2-5 · onto_first — 온톨로지 먼저)는 하나씩 켠 판(+)
     assert set(body["variants"]) == {"effective", "base", "off", *[f"-{k}" for k in gw._TUNING_SWITCHES if k not in gw._TUNING_OPT_IN],
-                                     "+noncore_demote", "+onto_first"}
+                                     "+noncore_demote", "+onto_first", "+onto_lookup_first"}
     assert body["variants"]["effective"]["전체"]["n"] == 2 and body["variants"]["effective"]["box"]["hit@5"] == 1.0
     assert body["fingerprint"] == gw._tuning()["fingerprint"]
     assert not [r for r in gw._qlog_read() if "q" in r], "평가 질의는 실사용 질의 기록에 섞이지 않는다"

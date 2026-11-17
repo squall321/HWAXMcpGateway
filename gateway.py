@@ -3353,6 +3353,8 @@ SEARCH_TOOLS_TOOL = types.Tool(
             "detail": {"type": "boolean", "description": "true 면 설명 전문과 인자 스키마 전부를 싣는다(기본 false — 한 줄 요약과 "
                                                          "필수 인자의 스키마 · 선택 인자 이름만). 한 도구만 필요하면 query 에 그 도구 이름 · "
                                                          "limit=1. 전문이 상한을 넘으면 상위부터 싣고 나머지는 요약이다(detail_capped 가 말한다)"},
+            "object": {"type": "string", "description": "온톨로지 개체 \"type_slug:key\"(ontology_lookup 의 object) — 주면 그 개체를 받는 앱과 정본 허브의 "
+                                                         "도구 가운데 질의에 맞은 것을 위로 올린다. 꼴이 틀리면 무시하고 object_ignored 로 말한다"},
         },
         "required": ["query"],
     },
@@ -3389,15 +3391,18 @@ _COPY_LABEL = re.compile(r"[(\[](?:시험|사본|테스트|test|copy|staging|dev
 # 그것도 없으면 손 동의어 없는 _TUNING_FALLBACK 으로 돈다. 고리는 cae00 에서 닫힌다 — 거기서 고치고 그 자리에서 잰다(C-31).
 SEARCH_TUNING_PATH = Path(__file__).with_name("search_tuning.json")
 SEARCH_TUNING_LOCAL_PATH = Path(__file__).with_name("search_tuning.local.json")
-_TUNING_SWITCHES = ("synonyms", "core_vocab", "delib_narrow", "quality", "write_penalty", "copy_fold", "noncore_demote", "onto_first")
+_TUNING_SWITCHES = ("synonyms", "core_vocab", "delib_narrow", "quality", "write_penalty", "copy_fold", "noncore_demote", "onto_first",
+                    "onto_lookup_first")
 # 기본이 끔인 손잡이 — 칸이 없으면(덧씌우기가 null 로 지웠거나 기본값 파일을 못 읽었다) 끔으로 읽는다. 나머지는 칸이 없으면 켬이다.
 # noncore_demote(E2-5) 는 cae00 검색 평가(+noncore_demote 판)를 본 뒤 박스 덧씌우기로 켠다(결정 Q-1).
 # onto_first(HWAXPortal docs/ontology-first OF-7 · M3) — 질의가 앱 이름을 부른 줄에서 그 앱의 온톨로지 입구(코어 어휘표 ontology 의 entry)에 가중치 onto 를
 # 더한다. 코어 질문(어휘표 검색 낱말이 든 질의)에는 걸지 않는다 — 코어는 정본이 먼저다. cae00 검색 평가(+onto_first 판)를 본 뒤 박스 덧씌우기로 켠다.
-_TUNING_OPT_IN = ("noncore_demote", "onto_first")
-_TUNING_WEIGHTS = ("name", "desc_cap", "app", "coverage", "write_penalty", "quality_per_word", "noncore", "onto")
+# onto_lookup_first(PLAN §12 · OF-36) — 온톨로지 · 코어 질의에서 질의가 앱 이름을 부르지 않았으면 ontology_lookup 을 1위에 세우고 hint 를 싣는다. 켜기는
+# cae00 검색 평가(+onto_lookup_first 판)를 본 뒤 박스 덧씌우기로. weights.onto_object 는 search_tools 의 object 인자가 있을 때만 쓴다(OF-37).
+_TUNING_OPT_IN = ("noncore_demote", "onto_first", "onto_lookup_first")
+_TUNING_WEIGHTS = ("name", "desc_cap", "app", "coverage", "write_penalty", "quality_per_word", "noncore", "onto", "onto_object")
 _TUNING_FALLBACK = {"weights": {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2,
-                                "noncore": 0.5, "onto": 4}}
+                                "noncore": 0.5, "onto": 4, "onto_object": 4}}
 _TUNING: dict = {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None}
 
 
@@ -3548,7 +3553,10 @@ def _core_vocab_parse(d: dict) -> dict:
             "noncore_names": {k: frozenset(_label_names(str(apps[k].get("label") or "")) | {k.lower()})
                               for k, r in role.items() if r == "noncore"},
             "sib_tags": {k: s for k in siblings if (s := str(apps[k].get("tagline") or "").strip())},
-            "core_reads": frozenset(t for _f, _p, tools in syn for t in tools)}
+            "core_reads": frozenset(t for _f, _p, tools in syn for t in tools),
+            # ontology_lookup 만 읽는 셋(PLAN §12) — 타입 이름 → slug · 앱별 다음 호출(ontology.lookup) · 이웃 접기 범위(ontology.facts). 검색 순위는 읽지 않는다
+            "types": {str(k): str(v) for k, v in (d.get("types") or {}).items()} if isinstance(d.get("types"), dict) else {},
+            "onto_lookup": _onto_lookup_rows(d), "onto_facts": _onto_facts(d)}
 
 
 def _onto_entries(d: dict, family) -> frozenset:
@@ -3842,6 +3850,17 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     # 넣지 않는다(귀속 · boost_only 판정은 그대로). 끄면 순위가 바이트까지 같다(E-7).
     onto = (vocab.get("onto_entries") or frozenset()) if (sw.get("onto_first") and vocab
                                                         and not any(f in q_flat for f, _p, _t in vocab["syn"])) else frozenset()
+    # 온톨로지 조회 먼저(PLAN §12 · OF-36 — 손잡이 onto_lookup_first, 기본 끔). 끄면 ontology_lookup 은 순위 줄에 들지 않는다 — 순위 · 글이 그 도구가
+    # 없던 때와 바이트까지 같다(E-7). 켜면 '온톨로지' · 'ontology' · 코어 낱말이 든 질의에서만 줄에 들고, 질의가 앱 이름을 부르지 않았을 때(아래
+    # named_apps) 1위다. 그 밖의 질의는 켜도 줄에 들지 않는다 — 설명의 '이름 · 코드' 가 아무 질의에나 맞아 다른 줄을 밀지 않게.
+    lookup_on = bool(sw.get("onto_lookup_first"))
+    lookup_q = lookup_on and ("온톨로지" in q or "ontology" in q or bool(vocab and any(f in q_flat for f, _p, _t in vocab["syn"])))
+    # object 인자(OF-37) — "type_slug:key" 의 타입을 받는 앱(어휘표 ontology.lookup — types 가 없으면 어느 타입이든)과 허브 가족의, 질의에 맞은 줄에
+    # weights.onto_object 를 더한다. 인자가 없으면 아무것도 바뀌지 않는다.
+    obj_raw = (arguments or {}).get("object")
+    obj_m = re.fullmatch(r"([a-z0-9_]{1,80}):(\S.{0,300})", obj_raw.strip()) if isinstance(obj_raw, str) and obj_raw.strip() else None
+    obj_apps = (frozenset(app for app, _t, _a, typs in (vocab or {}).get("onto_lookup") or () if not typs or obj_m.group(1) in typs)
+                | frozenset((vocab or {}).get("family") or ())) if obj_m else frozenset()
     w_name, w_app, cap, w_cov = wt["name"], wt["app"], wt["desc_cap"], wt["coverage"]
     groups = _request_groups() if groups is None else groups
     visible = _visible_tools(groups)
@@ -3851,6 +3870,8 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     rows = []
     named_apps: set[str] = set()          # 질의가 이름을 부른 앱 — 사본 무리에서 그 앱 줄을 올린다
     for t in visible:
+        if t.name == ONTO_LOOKUP_TOOL.name and not lookup_q:
+            continue                       # 온톨로지 · 코어 질의가 아니면 켠 박스에서도 줄에 들지 않는다 — 그 밖의 질의는 켬 · 끔이 같다
         name = t.name.lower()
         app, original = route.get(t.name, ("_gateway", t.name))[:2]
         desc = (_core_untagged(app, t.description or "") if app in sib_lines else (t.description or "")).lower()
@@ -3892,6 +3913,9 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
             if row_named and (app, original) in onto:
                 score += wt["onto"]                                  # 질의가 부른 앱의 온톨로지 입구(onto_first — 위 onto 주석)
                 via.add("onto_first")
+            if app in obj_apps:
+                score += wt["onto_object"]                           # object 인자의 개체를 받는 앱(OF-37 — 위 obj_apps 주석)
+                via.add("object")
             # 커버리지 승수 — 질의어를 더 많이 맞힌 도구가 개별 단어 빈도보다 앞선다.
             final = score * (1 + w_cov * covered / max(1, len(terms)))
             base_final = base * (1 + w_cov * base_cov / max(1, len(terms))) if base > 0 else 0
@@ -3966,6 +3990,14 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     # 덧씌운 박스) 줄을 만든다. 첫 줄은 상한(SEARCH_DETAIL_MAX_CHARS)에 걸리지 않으므로 search_tools(query=<이름>, detail=true, limit=1) 은 늘 그 도구의
     # 전문을 준다 — detail_capped 가 가리키는 호출이다. 순위로는 보장되지 않았다(10-16 스냅샷 446개 중 10개가 1위가 아니었다 — 이름이 더 긴 형제
     # 도구 · 동의어 갈래가 앞서거나 사본으로 접혔다). detail 이 없으면 순위 그대로다.
+    # 온톨로지 조회 먼저(OF-36) — 켠 손잡이 · 온톨로지 · 코어 질의 · 질의가 앱 이름을 부르지 않았을 때만이다(부르면 그 앱의 입구 몫 — onto_first).
+    # 이름 그대로(아래 exact)가 그 뒤에 서므로 도구 이름을 콕 집은 detail 질의는 그 도구가 첫 줄이다.
+    lookup_first = lookup_q and not (named_apps - {"_gateway"})
+    lookup_tool = next((t for t in visible if t.name == ONTO_LOOKUP_TOOL.name), None) if lookup_first else None
+    if lookup_tool is not None:
+        lrow = next((r for r in rows if r[4] is lookup_tool), None) or (
+            0, lookup_tool.name, "_gateway", (lookup_tool.description or "").strip(), lookup_tool, False, lookup_tool.name, 0, 0, ())
+        rows = [lrow] + [r for r in rows if r[4] is not lookup_tool]
     exact = next((t for t in visible if t.name.lower() == q), None) if detail else None
     if exact is not None:
         row = next((r for r in rows if r[4] is exact), None) or next((r for r in scored if r[4] is exact), None)
@@ -4028,6 +4060,8 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     # 귀속 — 보정 뺀 점수로 줄을 세워, 보여 준 결과 가운데 보정 덕에만 든 것(boost_only — 보정을 빼면 0점이거나 limit 밖)을 가린다(E-9 ①)
     base_order = {r[1]: i for i, r in enumerate(sorted(rows, key=lambda r: (-r[8], r[7], r[1])), 1)}
     attrib = {r[1]: (r[9], r[8] <= 0 or base_order[r[1]] > limit) for r in rows[:limit]}
+    if lookup_tool is not None and lookup_tool.name in attrib:
+        attrib[lookup_tool.name] = (("onto_lookup_first",), True)      # 손잡이가 세운 줄 — 질의 낱말이 아니라 보정 덕이다
     if exact is not None:
         # 이름 그대로 세운 줄은 보정 덕이 아니다 — 질의 기록의 boost_only 를 플랫폼 피드백 보고서가 '보정 덕에만 찾아진 질의' 로 센다
         attrib[exact.name] = (("exact",), False)
@@ -4041,6 +4075,11 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
         payload.update(mode)        # 어느 순위로 답했나 — rrf, 또는 못 섞었으면 substring 과 그 까닭(mode_reason)
     payload["match_count"] = len(rows)
     payload["ranked"] = [m["tool"] for m in matches]
+    if lookup_tool is not None:
+        payload["hint"] = (f"먼저 {ONTO_LOOKUP_TOOL.name} 으로 정본 key 를 얻고 그 답의 next 를 따른다 — 후보(candidates)면 고르지 말고 사람에게 "
+                           "묻는다")
+    if isinstance(obj_raw, str) and obj_raw.strip() and obj_m is None:
+        payload["object_ignored"] = "object 는 \"type_slug:key\" 꼴이다(ontology_lookup 의 object) — 이번 순위에는 쓰지 않았다"
     if len(rows) > limit:
         # 순위 목록이라 건수는 둔다 — 다만 더 맞은 도구가 있다는 것을 match_count 숫자로만 두지 않는다.
         payload["truncated"] = (f"{len(rows)}건 중 상위 {limit}건만 보였다 — limit 를 올리거나(최대 20) 질의를 좁혀라. "
@@ -5369,6 +5408,284 @@ async def _insight_dispatch(name: str, arguments: dict) -> types.CallToolResult:
     except _InsightError as exc:
         _audit(name, "portal", False, str(exc), round((time.monotonic() - t0) * 1000))
         return types.CallToolResult(content=[types.TextContent(type="text", text=f"INSIGHT_ERROR: {exc}")], isError=True)
+
+
+# ── 온톨로지 조회(HWAXPortal docs/ontology-first PLAN §12 · 요청 OL-1, 11-16 cae00) ──────────────────────────────────────────────────
+# 개인 Claude 가 온톨로지 도구를 앱마다 이름만 보고 고르던 것을 한 입구로 — 정본 허브 object_resolve 로 먼저 풀고(판정 그대로 · 후보는 묻는다), 그 key 로
+# 각 앱에서 부를 다음 호출(코어 어휘표 ontology.lookup)을 채워 준다. 허브 호출은 _call_tool_body 로 간다 — 신원 · 그룹 · 패널 · 서비스 · 읽기 전용 ·
+# 감사가 일반 호출과 같다(새 신원 경로 · 토큰 없음). 타입 고르기는 어휘표 types 로 코드가 한다(LLM 없음 — 허브 objects_resolve_many 는 한 타입의 여러
+# 이름이라 여러 타입을 한 번에 못 푼다, OF-33). 이름이 ontology_ 로 시작해 엔진의 좌석 자유 조회 접두에 걸리지 않는다(리스크 좌석 D-18).
+ONTO_LOOKUP_TOOL = types.Tool(
+    name="ontology_lookup",
+    description=(
+        "온톨로지 조회 — 이름 · 코드 · 별칭을 사내 코어 정본 개체(PLM 과제 · 개발모델 · 프로젝트 · 고장모드 · 시험항목 · 가상검증 · 관리 기준 · 물성)로 "
+        "풀고, 그 개체로 각 앱에서 부를 도구와 인자를 준다 — ontology 검색 · 정본 조회의 입구. 판정은 정본 허브의 것을 그대로 준다: exact 면 object"
+        "(type_slug · key · name · object_id)와 next(앱마다 key 를 채운 다음 호출 — 그대로 부른다), candidates 면 후보를 사람에게 보이고 어느 것인지 "
+        "묻는다(ask_user — 고르지 않는다), none 이면 없다(tried 의 타입 — 짐작하지 않는다), refused 면 정본에 닿지 못했거나 권한이 없다('없다' 가 아니다). "
+        "query 에는 이름 · 코드만, 타입은 type 으로 따로 준다."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "풀 이름 · 코드 · 별칭(예: 고장모드 이름, 과제코드, 모델코드). 타입 낱말은 빼고 type 으로 주는 것이 낫다"},
+            "type": {"type": "string", "description": "코어 타입 — slug(plm_task · plm_model · failure_mode · test_item …) 또는 한국어 이름(고장모드 · 시험항목 …). "
+                                                      "비우면 query 의 타입 낱말로 셋까지 고르고, 하나도 없으면 정본 검색 결과를 후보로 준다"},
+            "apps": {"type": "array", "items": {"type": "string"}, "description": "next 를 이 앱(게이트웨이 앱 키 — list_tool_apps 의 key)으로만 좁힌다. 비우면 보이는 앱 전부"},
+            "neighbors": {"type": "boolean", "description": "true 면 exact 일 때 정본에서 한 걸음 이웃(이어진 코어 개체와 관계)을 줄여 싣는다(기본 false)"},
+            "limit": {"type": "integer", "description": "candidates · 검색 후보로 보일 수(기본 5, 최대 20)"},
+        },
+        "required": ["query"],
+    },
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+_ONTO_STOP = frozenset(("온톨로지", "ontology", "조회", "검색", "찾기", "찾아줘", "lookup", "정본", "코어"))
+_ONTO_SLOT = re.compile(r"\{(type_slug|key|name|object_id)\}")
+ONTO_LOOKUP_MAX_TYPES = 3
+
+
+def _onto_lookup_rows(d: dict) -> tuple:
+    """어휘표 ontology.lookup → ((백엔드 키, 원래 이름, args 틀, 받는 타입 또는 None), …) — 어휘표 차례(PLAN §12 · OF-32). ontology_lookup 만 읽는다(검색
+    순위 · 웹 챗은 읽지 않는다 — 에이전트 서버는 ontology 에서 apps 만 읽는다). 줄마다 거르고 예외를 내지 않는다(_onto_entries 와 같은 까닭 — 덧씌우기
+    전체를 잃지 않게). 받는 칸 tool · args · types(고를 칸 — 없으면 어느 타입이든, OF-35) · _doc."""
+    onto = d.get("ontology")
+    rows = onto.get("lookup") if isinstance(onto, dict) else None
+    out = []
+    for key, row in (rows.items() if isinstance(rows, dict) else ()):
+        if not (isinstance(key, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,79}", key) and isinstance(row, dict)):
+            continue
+        if any(k not in ("tool", "args", "types", "_doc") for k in row):
+            continue
+        tool, args, typs = row.get("tool"), row.get("args"), row.get("types")
+        if not (isinstance(tool, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,120}", tool)
+                and isinstance(args, dict) and args and all(isinstance(k, str) and k for k in args)):
+            continue
+        if typs is not None and not (isinstance(typs, list) and typs
+                                     and all(isinstance(t, str) and re.fullmatch(r"[a-z0-9_]{1,80}", t) for t in typs)):
+            continue
+        out.append((key, tool, args, tuple(typs) if typs else None))
+    return tuple(out)
+
+
+def _onto_facts(d: dict) -> tuple[int, int]:
+    """이웃 접기의 (limit, chars) — 어휘표 ontology.facts(심의 미리보기와 같은 범위). 없거나 틀리면 60 · 4000."""
+    f = (d.get("ontology") or {}).get("facts") if isinstance(d.get("ontology"), dict) else None
+    lim, ch = (f or {}).get("limit"), (f or {}).get("chars")
+    ok = lambda v, lo, hi: isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi  # noqa: E731
+    return (lim if ok(lim, 1, 200) else 60), (ch if ok(ch, 1000, 20000) else 4000)
+
+
+def _onto_pick(query: str, type_arg: str, vocab_types: dict) -> tuple[list[str], str]:
+    """(고른 타입 slug — 질의에 나온 차례 · 셋까지, 풀 이름). 낱말 단위로 맞춘다 — 타입 이름(띄어 쓴 꼴은 잇단 낱말 · 붙여 쓴 꼴) · slug · 여러 낱말
+    이름의 끝 낱말('PLM 과제' → '과제'). 이름은 고른 타입의 낱말과 _ONTO_STOP 만 뺀다 — 조사를 떼지 않는다(조사처럼 끝나는 key 가 잘린다, OF-38).
+    type 을 주면 그 타입 하나다(slug · 한국어 이름 — 모르는 이름은 ValueError, slug 꼴이면 허브가 판정한다)."""
+    toks = query.split()
+    low = [t.lower() for t in toks]
+    forms = []                                     # (낱말 목록, slug) — 긴 꼴부터 맞춘다
+    for name, slug in vocab_types.items():
+        parts = [p.lower() for p in str(name).split()]
+        forms += [(parts, slug), ([re.sub(r"\s+", "", str(name)).lower()], slug), ([str(slug).lower()], slug)]
+        if len(parts) > 1 and len(parts[-1]) >= 2:
+            forms.append(([parts[-1]], slug))
+    forms.sort(key=lambda f: -len(f[0]))
+    if type_arg:
+        t = type_arg.strip()
+        flat = re.sub(r"\s+", "", t).lower()
+        slug = next((s for n, s in vocab_types.items() if re.sub(r"\s+", "", str(n)).lower() == flat or str(s) == t), None)
+        if slug is None and re.fullmatch(r"[a-z0-9_]{1,80}", t):
+            slug = t
+        if slug is None:
+            raise ValueError(f"type '{t[:40]}' 를 모른다 — slug 나 코어 어휘표의 타입 이름(" + " · ".join(map(str, vocab_types)) + ")을 준다")
+        chosen, sforms = [slug], [f for f in forms if f[1] == slug]
+    else:
+        chosen, sforms = [], forms
+    drop, found = set(), []
+    for parts, slug in sforms:
+        n = len(parts)
+        for i in range(len(low) - n + 1):
+            if low[i:i + n] == parts and not (set(range(i, i + n)) & drop):
+                drop.update(range(i, i + n))
+                found.append((i, slug))
+    if not type_arg:
+        for _i, slug in sorted(found):
+            if slug not in chosen:
+                chosen.append(slug)
+        chosen = chosen[:ONTO_LOOKUP_MAX_TYPES]
+    name = " ".join(t for i, t in enumerate(toks) if i not in drop and low[i] not in _ONTO_STOP).strip()
+    return chosen, name
+
+
+def _onto_json(res):
+    """허브 답 → (사전, 거절 까닭). 오류 · 봉투 실패면 (None, 까닭), JSON 객체가 아니면 (None, '꼴이 다르다')."""
+    text = _rt_text(res)
+    if getattr(res, "isError", False) or _envelope_reason(res):
+        return None, (_envelope_reason(res) or text or "오류")[:300]
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        return None, f"정본 답이 JSON 이 아니다 — {text[:120]}"
+    return (obj, None) if isinstance(obj, dict) else (None, "정본 답이 객체가 아니다")
+
+
+def _onto_hit(h: dict, type_slug: str = "") -> dict:
+    return {"type_slug": str(h.get("type_slug") or type_slug), "key": h.get("key") if isinstance(h.get("key"), str) and h.get("key") else None,
+            "name": str(h.get("label") or "")[:200], "object_id": str(h.get("id") or ""),
+            **({"matched_by": str(h.get("matched_by") or h.get("matched"))} if (h.get("matched_by") or h.get("matched")) else {})}
+
+
+def _onto_fill(v, obj: dict):
+    """args 틀 한 칸 — 칸 전체가 '{slot}' 이면 그 값(글이 아닐 수도), 글 속이면 바꿔 끼운다, 그 밖은 그대로."""
+    if not isinstance(v, str):
+        return v
+    m = _ONTO_SLOT.fullmatch(v)
+    return obj.get(m.group(1)) if m else _ONTO_SLOT.sub(lambda mm: str(obj.get(mm.group(1)) or ""), v)
+
+
+def _onto_next(obj: dict, rows: tuple, want_apps: set, vocab: dict) -> tuple[list, list]:
+    """exact 개체로 앱마다 부를 다음 호출 — (next, skipped). 호출자에게 보이고(권한 · 숨김 · 시험 사본 아님) 이 박스에 그 도구가 있는 앱만이다 — 보이지
+    않는 앱은 이름조차 싣지 않는다. 차례는 허브 가족(정본 → 형제, 어휘표 차례) → 그 밖(표 차례). 비코어는 role 을 단다. 칸이 비는 틀(key 없는 개체에
+    '{key}')은 부르지 않고 skipped 에 까닭을 단다."""
+    groups, hidden = _request_groups(), _request_muted() | (vocab.get("staging") or frozenset())
+    fam = list(vocab.get("family") or ())
+    order = sorted(range(len(rows)), key=lambda i: (fam.index(rows[i][0]) if rows[i][0] in fam else len(fam), i))
+    nxt, skipped = [], []
+    for i in order:
+        app, tool, args, typs = rows[i]
+        if (want_apps and app not in want_apps) or (typs and obj["type_slug"] not in typs):
+            continue
+        if app in hidden or not _backend_allowed(app, groups):
+            continue
+        exposed = _rt_exposed(app, tool)
+        if exposed is None:
+            continue
+        need = {m.group(1) for v in args.values() if isinstance(v, str) for m in _ONTO_SLOT.finditer(v)}
+        empty = sorted(s for s in need if not obj.get(s))
+        if empty:
+            skipped.append({"app": app, "tool": exposed, "why": f"개체에 {' · '.join(empty)} 가 없다"})
+            continue
+        line = {"tool": exposed, "app": app, "args": {k: _onto_fill(v, obj) for k, v in args.items()}}
+        role = _app_role(app)
+        if role and role[0] != "canonical":
+            line["role"] = role[0]
+        nxt.append(line)
+    return nxt, skipped
+
+
+def _onto_fold_neighbors(body, focus_id: str, allowed: set, chars: int) -> dict:
+    """graph_neighbors 답(SP NeighborhoodOut) → 닻과 바로 이어진 노드만 '타입 · key · 이름 · 관계' 로 줄여 chars 안에서 끊는다(포털 onto_preview 의
+    neighbor_rows 와 같은 줄이기 — 고를 행이 아니라 읽을 줄이다). 꼴이 다르면 error — 빈 줄로 두면 '이웃이 없다' 로 읽힌다."""
+    if not isinstance(body, dict) or not isinstance(body.get("nodes"), list) or not isinstance(body.get("edges"), list):
+        return {"error": "graph_neighbors 답이 nodes · edges 목록이 아니다"}
+    rel: dict = {}
+    for e in (e for e in body["edges"] if isinstance(e, dict)):
+        src, dst, slug = str(e.get("src") or ""), str(e.get("dst") or ""), str(e.get("relation") or "")[:60]
+        if src == focus_id and dst != focus_id:
+            rel.setdefault(dst, []).append(f"→ {slug}")
+        elif dst == focus_id and src != focus_id:
+            rel.setdefault(src, []).append(f"← {slug}")
+    rows, used = [], 0
+    nodes = [n for n in body["nodes"] if isinstance(n, dict) and str(n.get("id") or "") in rel
+             and (not allowed or str(n.get("type_slug") or "") in allowed)]
+    for n in nodes:
+        r = {**_onto_hit(n), "rel": " / ".join(rel[str(n.get("id"))])[:200]}
+        size = len(json.dumps(r, ensure_ascii=False))
+        if used + size > chars and rows:
+            break
+        rows.append(r)
+        used += size
+    return {"rows": rows, "total": len(nodes), "shown": len(rows), "hub_truncated": body.get("truncated") is True}
+
+
+async def _onto_lookup(a: dict) -> types.CallToolResult:
+    """ontology_lookup 의 몸 — PLAN §12 · OF-33 ~ OF-39. 답은 촘촘한 JSON 한 블록이다(오류도 match: refused 로 — 모델이 한 꼴만 읽게)."""
+    t0 = time.monotonic()
+    query = str(a.get("query") or "").strip()
+    try:
+        limit = max(1, min(20, int(a.get("limit") or 5)))
+    except (TypeError, ValueError):
+        limit = 5
+    want = {str(x) for x in (a.get("apps") or []) if isinstance(x, str)} if isinstance(a.get("apps"), list) else set()
+    vocab = _core_vocab()
+    out: dict = {"query": query}
+
+    def done(match: str, ok: bool = True, **kw) -> types.CallToolResult:
+        out.update(match=match, **kw)
+        _audit(ONTO_LOOKUP_TOOL.name, "_gateway", ok, None if ok else str(kw.get("why") or match)[:200],
+               round((time.monotonic() - t0) * 1000), note=match)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(out, ensure_ascii=False, separators=(",", ":")))])
+
+    if len(query) < 1:
+        return done("refused", ok=False, why="query 에 풀 이름 · 코드를 준다")
+    if not vocab:
+        return done("refused", ok=False, why="코어 어휘표(HWAXPortal backend/config/core_vocab.json)를 읽지 못해 정본 허브를 모른다")
+    canon = vocab["canonical"]
+    resolve_name = _rt_exposed(canon, "object_resolve")
+    if resolve_name is None:
+        return done("refused", ok=False, why=f"정본 허브({canon})가 이 게이트웨이에 붙어 있지 않다")
+    try:
+        chosen, name = _onto_pick(query, str(a.get("type") or "").strip(), vocab.get("types") or {})
+    except ValueError as exc:
+        return done("refused", ok=False, why=str(exc))
+    if not name:
+        return done("refused", ok=False, why="질의에서 타입 낱말을 빼니 풀 이름이 남지 않았다 — query 에 이름 · 코드를 준다(타입은 type 으로)",
+                    tried=chosen)
+    out["name"] = name
+    if not chosen:
+        # 타입을 모른다 — 정본 search 는 '어디 있나' 다(판정이 아니다). 한 줄만 걸려도 후보로 준다(OF-33)
+        search_name = _rt_exposed(canon, "search")
+        if search_name is None:
+            return done("refused", ok=False, why="타입을 고르지 못했고 정본 search 도 없다 — type 을 준다")
+        body, why = _onto_json(await _call_tool_body(search_name, {"q": name, "limit": limit}))
+        if body is None:
+            return done("refused", ok=False, why=why, via="search")
+        items = [x for x in body.get("items") or [] if isinstance(x, dict)]
+        if not items:
+            return done("none", via="search", tried=[], hint="정본 검색에도 없다 — 짐작하지 말고 사람에게 묻는다(오타 · 아직 없는 것)")
+        types_n = [{"type_slug": str(t.get("slug") or t.get("type_slug") or ""), "count": t.get("count")}
+                   for t in body.get("types") or [] if isinstance(t, dict)]
+        return done("candidates", via="search", ask_user=True, candidates=[_onto_hit(x) for x in items[:limit]], types=types_n,
+                    hint="타입을 몰라 정본 검색 결과다(판정이 아니다) — 사람에게 어느 것인지 묻거나 type 을 주고 다시 부른다")
+    results = await asyncio.gather(*(_call_tool_body(resolve_name, {"type_slug": t, "name": name}) for t in chosen))
+    exact, cands, refused, tried = [], [], [], []
+    for t, res in zip(chosen, results):
+        body, why = _onto_json(res)
+        if body is None:
+            refused.append({"type_slug": t, "why": why})
+            continue
+        m = body.get("match")
+        tried.append(t)
+        if m == "exact" and isinstance(body.get("object"), dict) and body["object"].get("id"):
+            exact.append(_onto_hit(body["object"], t))
+        elif m == "candidates":
+            cands += [_onto_hit(h, t) for h in body.get("candidates") or [] if isinstance(h, dict)]
+        elif m != "none":
+            refused.append({"type_slug": t, "why": f"정본 답의 판정이 꼴 밖이다({str(m)[:40]})"})
+            tried.pop()
+    extra = {"refused_types": refused, "incomplete": True} if refused else {}
+    if len(exact) == 1 and not cands:
+        obj = exact[0]
+        nxt, skipped = _onto_next(obj, vocab.get("onto_lookup") or (), want, vocab)
+        kw = {"object": obj, "next": nxt, **({"skipped": skipped} if skipped else {}), **extra}
+        if a.get("neighbors") is True:
+            nb_name = _rt_exposed(canon, "graph_neighbors")
+            lim, chars = vocab.get("onto_facts") or (60, 4000)
+            allowed = {s for s in (vocab.get("types") or {}).values() if s != obj["type_slug"]}
+            if nb_name is None:
+                kw["neighbors"] = {"error": "정본 graph_neighbors 가 없다"}
+            else:
+                args = {"object_id": obj["object_id"], "depth": 1, "limit": lim, **({"types": sorted(allowed)} if allowed else {})}
+                body, why = _onto_json(await _call_tool_body(nb_name, args))
+                kw["neighbors"] = {"error": why} if body is None else _onto_fold_neighbors(body, obj["object_id"], allowed, chars)
+        if not nxt:
+            kw["hint"] = "이 개체로 부를 다른 앱 도구가 보이지 않는다 — 정본의 object_get · graph_neighbors 를 object_id 로 부른다"
+        return done("exact", **kw)
+    if exact or cands:
+        allc = exact + cands
+        return done("candidates", ask_user=True, candidates=allc[:limit], total=len(allc), **extra,
+                    hint="여럿과 맞는다 — 고르지 말고 후보를 사람에게 보이고 어느 것인지 묻는다")
+    if refused and not exact and not cands:
+        return done("refused", ok=False, why=" · ".join(f"{r['type_slug']}: {r['why']}" for r in refused)[:600], refused_types=refused,
+                    tried=tried, hint="정본에 닿지 못했거나 권한이 없다 — '없다' 가 아니다")
+    return done("none", tried=tried, hint="정본에 그런 이름이 없다 — 짐작하지 말고 사람에게 묻는다(오타 · 아직 없는 것 · 다른 타입)")
 
 
 # ── 그림 저장 — 도구 결과의 그림을 파일로 두고, 받고, 보고서에 넣는다(사용자 보고 11-02) ─────────────────────────────────────────────
@@ -7048,7 +7365,8 @@ def _local_tools() -> list[types.Tool]:
     목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
-             BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL]
+             BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL,
+             ONTO_LOOKUP_TOOL]
     # REST 다리는 **등록된 사이트가 있을 때만** 낸다 — 쓸 수 없는 도구를 목록에 두면
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
@@ -8461,7 +8779,8 @@ _LOCAL_READ = frozenset({SEARCH_CONV_TOOL.name, LIST_APPS_TOOL.name, SEARCH_TOOL
                          USE_EXPERTS_TOOL.name, VERIFY_TOOL.name, REST_CATALOG_TOOL.name,
                          ROUTINE_LIST_TOOL.name, ROUTINE_GET_TOOL.name,   # 루틴 실행 · 원장 쓰기는 읽기 전용 PAT 밖
                          *_INSIGHT_NAMES,                                  # 과제 인사이트는 읽기 둘뿐이다
-                         KIT_GET_TOOL.name})                               # PC 키트 받기 — 파일을 내줄 뿐이다
+                         KIT_GET_TOOL.name,                                # PC 키트 받기 — 파일을 내줄 뿐이다
+                         ONTO_LOOKUP_TOOL.name})                           # 온톨로지 조회 — 안쪽 허브 호출은 그 이름으로 다시 판정된다
 _ROUTINE_NAMES = frozenset(t.name for t in ROUTINE_TOOLS)
 
 
@@ -8575,6 +8894,8 @@ async def _call_tool_body(name: str, arguments: dict):
         return await _routine_dispatch(name, arguments or {})
     if name in _INSIGHT_NAMES:
         return await _insight_dispatch(name, arguments or {})
+    if name == ONTO_LOOKUP_TOOL.name:
+        return await _onto_lookup(arguments or {})
     if FIG_STORE_ON and name in _FIG_NAMES:
         return await _fig_dispatch(name, arguments or {})
     if name == KIT_GET_TOOL.name:
@@ -8947,7 +9268,7 @@ def _bearer_gate(app, pat_verifier=None):
             # search_tools·invoke_tool 도 게이트웨이 로컬이다 — 빠뜨리면 /tools-map 의 _gateway
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
-                        VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL):
+                        VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL, ONTO_LOOKUP_TOOL):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서

@@ -126,7 +126,7 @@ def test_visible_tools(monkeypatch):
                               gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL,
                               gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL, *gw.ROUTINE_TOOLS, *gw.INSIGHT_TOOLS,
                               *gw.FIGURE_TOOLS, gw.KIT_GET_TOOL, gw.ONTO_LOOKUP_TOOL, gw.ARTIFACT_TO_STE_TOOL,
-                              gw.GAS_TRANSPORT_TOOL)}
+                              gw.GAS_TRANSPORT_TOOL, gw.RELIAB_TOOL)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -6268,8 +6268,8 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
     # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 관리자 읽기 목록 보기 1(GW-02 — tools/list 는 관리자에게만)
-    # + 가스 투과 물성 1(PT-R1) — ste 업로드 옮기기(P-1)는 rest.ste 가 있을 때만이라 여기(REST 없음)엔 없다
-    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 24, "reportarchive": 2}
+    # + 가스 투과 물성 1(PT-R1) + 신뢰성 시험 조건 1(PT-R2) — ste 업로드 옮기기(P-1)는 rest.ste 가 있을 때만이라 여기(REST 없음)엔 없다
+    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 25, "reportarchive": 2}
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
     assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
@@ -6336,8 +6336,8 @@ def test_기준_미만으로_처음_붙는_앱만_한_번_경고하고_막지_�
 def test_게이트웨이_로컬_도구는_제_앱으로_센다(monkeypatch, _fresh_scores):
     """로컬 도구는 route 에 없다 — `_gateway` 앱으로 세고, tools/list 가 붙이는 것과 같은 목록이다(REST 다리는 사이트가 있을
     때만). 목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
-    # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 가스 투과 물성 1(+ REST 다리 둘, rest.ste 면 ste 업로드 옮기기 하나 더)
-    for rest, n_local in (({}, 23), ({"s": {"base": "http://x"}}, 25), ({"ste": {"base": "http://x", "per_user": "ste"}}, 26)):
+    # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 가스 투과 물성 1 + 신뢰성 시험 조건 1(+ REST 다리 둘, rest.ste 면 ste 업로드 옮기기 하나 더)
+    for rest, n_local in (({}, 24), ({"s": {"base": "http://x"}}, 26), ({"ste": {"base": "http://x", "per_user": "ste"}}, 27)):
         monkeypatch.setattr(gw, "REST", rest)
         _aggregate_tools(monkeypatch, {"sf": [_stool("sf_q", {"q": None})]})
         row = {r["app"]: r for r in gw._ARG_SCORE["apps"]}["_gateway"]
@@ -14918,3 +14918,93 @@ def test_PTR1_읽기_도구이고_심의_좌석_자유_조회에_새로_열리�
     allow = next(ast.literal_eval(n.value) for n in ast.parse(src.read_text(encoding="utf-8")).body
                  if isinstance(n, ast.Assign) and any(getattr(x, "id", "") == "_FREE_ALLOW" for x in n.targets))
     assert not t.name.startswith(tuple(allow)), "리스크 심사 · 심의 좌석 자유 조회에 새로 열리면 안 된다(D-18)"
+
+
+# ── 신뢰성 시험 조건 reliability_test_conditions(HWAXPortal docs/ste-stepforge-1117 PT-R2 · P-2) ───────────────────────────────────────────
+# 가짜 TestScope 는 그쪽 꼴이다 — 시험 값 행(AttributeValueOut)에는 definition_id 만, 정의(AttributeDefinitionOut)에 condition_key_id, 조건 축
+# (ConditionKeyOut)에 key. 목록 도구는 _listed 로 {definitions | conditions, count} 에 싸인다. 미등록이면 게이트웨이 거절 글(/tokens?tab=connect).
+def _rv(defn, *, num=None, lo=None, hi=None, unit="degC", step=None, label=None, status="standard", current=True, set_label=None):
+    return {"definition_id": defn, "label": label or defn, "kind": "condition", "set_label": set_label, "step_order": step,
+            "step_label": (f"단계 {step}" if step else None), "is_current": current, "status": status, "unit": unit,
+            "num_value": num, "num_min": lo, "num_max": hi, "text_value": None, "bool_value": None, "note": None,
+            "display": f"{num if num is not None else f'{lo} ~ {hi}'} {unit}"}
+
+
+_RT_DEFS = {"definitions": [{"id": "d-t", "key": "temp_x", "label": "시험 온도", "kind": "condition", "unit": "degC", "condition_key_id": "c-t"},
+                            {"id": "d-h", "key": "rh_x", "label": "습도", "kind": "condition", "unit": "%", "condition_key_id": "c-h"},
+                            {"id": "d-d", "key": "dur_x", "label": "시간", "kind": "condition", "unit": "h", "condition_key_id": "c-d"},
+                            {"id": "d-n", "key": "note_x", "label": "판정", "kind": "text", "unit": "", "condition_key_id": None}], "count": 4}
+_RT_CONDS = {"conditions": [{"id": "c-t", "key": "temperature", "label": "시험 온도", "unit": "degC"},
+                            {"id": "c-h", "key": "humidity", "label": "습도", "unit": "%"},
+                            {"id": "c-d", "key": "duration", "label": "시간", "unit": "h"}], "count": 3}
+
+
+def _rel_kit(monkeypatch, attrs, *, refuse=False):
+    monkeypatch.setattr(gw, "route", {n: ("testscope", n) for n in ("get_reliability_test", "list_attribute_definitions", "list_conditions")})
+    calls = []
+
+    async def body(name, args):
+        calls.append((name, dict(args)))
+        if refuse:
+            return types.CallToolResult(content=[types.TextContent(type="text", text=(
+                "testscope: a@x.com — TestScope 토큰이 포털에 등록되어 있지 않습니다. 포털 '개인 토큰 › 외부 연결'(/tokens?tab=connect)에서 "
+                "TestScope 토큰(tsc_pat_…)을 등록한 뒤 다시 시도하세요."))], isError=True)
+        out = {"get_reliability_test": {"id": args.get("test_id"), "name": "고온고습", "purpose": "신뢰성", "division_code": "MX",
+                                        "division_name": "사업부", "status": "confirmed", "attributes": attrs},
+               "list_attribute_definitions": _RT_DEFS, "list_conditions": _RT_CONDS}[name]
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(out, ensure_ascii=False))])
+    monkeypatch.setattr(gw, "_call_tool_body", body)
+    return (lambda **a: (lambda r: (json.loads(r.content[0].text), r.isError))(asyncio.run(gw._reliab_conditions(a)))), calls
+
+
+def test_PTR2_단계마다_온도_습도_기간을_해석_단위로(monkeypatch):
+    attrs = [_rv("d-t", num=85), _rv("d-h", num=85, unit="%"), _rv("d-d", num=1000, unit="h"),
+             _rv("d-t", lo=-40, hi=125, step=1, set_label="열충격"), _rv("d-d", num=1800, unit="s", step=1, set_label="열충격"),
+             _rv("d-t", num=358.15, unit="K", step=2, set_label="열충격"),
+             _rv("d-t", num=60, current=False), _rv("d-h", num=90, unit="%", status="draft"),
+             _rv("d-n", unit="", label="판정"), _rv("d-d", num=3, unit="주")]
+    run, calls = _rel_kit(monkeypatch, attrs)
+    out, err = run(test_id="rt-1")
+    assert err is False and out["test"]["name"] == "고온고습" and {n for n, _a in calls} == {
+        "get_reliability_test", "list_attribute_definitions", "list_conditions"}
+    assert calls[1][1] == {"target": "reliability_test"}
+    plain, s1, s2 = out["steps"]
+    assert [x["value"] for x in plain["temperature_C"]] == [85], "지난 판(is_current false) 값은 뺀다"
+    assert [x.get("value") for x in plain["rh_pct"]] == [85, 90] and plain["rh_pct"][1]["draft"] is True, "초안은 싣되 표시한다"
+    assert plain["duration_h"][0]["value"] == 1000
+    assert s1["set_label"] == "열충격" and s1["temperature_C"] == [{"min": -40.0, "max": 125.0, "display": "-40 ~ 125 degC"}]
+    assert s1["duration_h"][0]["value"] == 0.5, "초는 시간으로"
+    assert s2["temperature_C"][0]["value"] == 85.0, "K 는 °C 로"
+    assert out["lux"] is None and "조도" in out["lux_why"]
+    labels = {o["label"]: o for o in out["other_attributes"]}
+    assert "판정" in labels and labels["d-d"]["condition"] == "duration" and labels["d-d"]["unit"] == "주", "모르는 단위는 바꾸지 않고 그대로 보인다"
+
+
+def test_PTR2_토큰이_없으면_등록_안내와_사람에게_묻기(monkeypatch):
+    run, _c = _rel_kit(monkeypatch, [], refuse=True)
+    out, err = run(test_id="rt-1")
+    assert err is True and out["needs_connect"] is True and "/tokens?tab=connect" in out["connect_note"]
+    assert "공용 조건표는 없다" in out["ask_user"], "대신 쓸 값을 지어내지 않는다"
+
+
+def test_PTR2_인자_와_TestScope_부재(monkeypatch):
+    run, calls = _rel_kit(monkeypatch, [])
+    for bad in ("", "a/b", "x" * 65):
+        out, err = run(test_id=bad)
+        assert err is True and "test_id" in out["error"]
+    assert calls == []
+    monkeypatch.setattr(gw, "route", {})
+    out, err = run(test_id="rt-1")
+    assert err is True and "TestScope" in out["error"]
+
+
+def test_PTR2_읽기_도구이고_심의_좌석_자유_조회에_새로_열리지_않는다():
+    t = next(x for x in gw._local_tools() if x.name == "reliability_test_conditions")
+    assert t.annotations.readOnlyHint is True and t.name in gw._LOCAL_READ
+    import ast
+    src = gw.Path(gw.__file__).resolve().parent.parent / "HWAXAgentServer" / "deliberation.py"
+    if not src.exists():
+        pytest.skip("형제 HWAXAgentServer 리포가 없다")
+    allow = next(ast.literal_eval(n.value) for n in ast.parse(src.read_text(encoding="utf-8")).body
+                 if isinstance(n, ast.Assign) and any(getattr(x, "id", "") == "_FREE_ALLOW" for x in n.targets))
+    assert not t.name.startswith(tuple(allow))

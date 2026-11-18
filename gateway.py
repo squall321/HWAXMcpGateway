@@ -6496,6 +6496,120 @@ async def _gas_transport(a: dict) -> types.CallToolResult:
                 note="값마다 conditions.grade_scope 의 시료 · 쓰임 경고를 읽고 쓴다 — alternatives 는 같은 재료의 다른 후보다(평균 내지 않는다)")
 
 
+# ── 신뢰성 시험 조건 → 해석 환경 값(HWAXPortal docs/ste-stepforge-1117 PT-R2 · P-2) ───────────────────────────────────────────────────
+# TestScope 신뢰성 시험에는 온도 · 습도 · 기간 전용 칸이 없다 — 속성 값(attributes[])에 있고 값 행에는 키가 없다. 그래서 세 번 부른다:
+# get_reliability_test(값 — definition_id) · list_attribute_definitions(target=reliability_test — 정의 → condition_key_id) · list_conditions(조건 키 →
+# temperature · humidity · duration · cycles). 모두 부르는 사람의 TestScope 토큰으로 간다(등록하지 않았으면 게이트웨이가 거절 글을 준다 — 그 글을
+# 알아보고 등록 안내로 답한다). 조도(lux)는 TestScope 조건 어휘에 없어 늘 비운다. 공용 조건표는 정의된 것이 없어 대신 줄 값을 만들지 않는다.
+#  · 단위는 아는 것만 바꾼다(°C · K / % / h · min · s · d / 회) — 모르는 단위의 값은 other_attributes 로 옮겨 그대로 보인다.
+#  · 초안(status draft) 값은 싣되 draft 로 표시한다(TestScope 가 비교 · 집계에 쓰지 말라는 값이다). 지난 판 값(is_current false)은 뺀다.
+RELIAB_SOURCE = "testscope"
+_RELIAB_AXES = {"temperature": "temperature_C", "humidity": "rh_pct", "duration": "duration_h", "cycles": "cycles"}
+RELIAB_TOOL = types.Tool(
+    name="reliability_test_conditions",
+    description=(
+        "신뢰성 시험 하나의 조건을 해석 환경 값으로 — TestScope 시험 id 로 단계(step)마다 temperature_C · rh_pct · duration_h · cycles 를 준다(값 하나 "
+        "또는 min · max, 원문 표시 display 와 초안 표시 draft 를 함께). 조건 축에 안 이어진 속성(다른 칸)은 other_attributes 로 그대로 보인다. "
+        "조도(lux)는 TestScope 조건에 없어 늘 null 이다. TestScope 토큰을 등록하지 않았으면 needs_connect 와 등록 안내를 준다 — 그때는 사람에게 "
+        "조건을 직접 묻는다(대신 쓸 공용 조건표는 없다). 시험 id 는 TestScope list_reliability_tests 의 id."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {"test_id": {"type": "string", "description": "TestScope 신뢰성 시험 id(list_reliability_tests · get_reliability_test 의 id)"}},
+        "required": ["test_id"],
+    },
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+
+
+def _reliab_conv(axis: str, unit: str | None, v: float) -> float | None:
+    """조건 축의 값 하나를 해석 단위로 — 모르는 단위면 None(바꾸지 않는다)."""
+    u = str(unit or "").strip().lower().replace(" ", "")
+    if axis == "temperature":
+        return v if u in ("degc", "°c", "℃", "c") else (round(v - 273.15, 6) if u == "k" else None)
+    if axis == "humidity":
+        return v if u in ("%", "%rh", "％", "rh", "pct") else None
+    if axis == "duration":
+        mult = {"h": 1, "hr": 1, "hour": 1, "hours": 1, "시간": 1, "min": 1 / 60, "분": 1 / 60, "s": 1 / 3600, "sec": 1 / 3600, "초": 1 / 3600,
+                "d": 24, "day": 24, "days": 24, "일": 24}.get(u)
+        return None if mult is None else round(v * mult, 6)
+    if axis == "cycles":
+        return v if u in ("", "회", "cycle", "cycles", "cyc", "times", "ea") else None
+    return None
+
+
+async def _reliab_conditions(a: dict) -> types.CallToolResult:
+    t0 = time.monotonic()
+    caller = _request_user()
+    test_id = str(a.get("test_id") or "").strip()
+
+    def done(ok: bool, **kw) -> types.CallToolResult:
+        _audit(RELIAB_TOOL.name, "_gateway", ok, None if ok else str(kw.get("error") or "")[:200],
+               round((time.monotonic() - t0) * 1000), caller=caller or None, note=test_id[:40] or None)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps({"ok": ok, **kw}, ensure_ascii=False))],
+                                    isError=not ok)
+
+    if not re.fullmatch(r"[0-9A-Za-z_-]{1,64}", test_id):
+        return done(False, error="test_id 는 TestScope 신뢰성 시험 id 다(list_reliability_tests 의 id)")
+    names = {k: _rt_exposed(RELIAB_SOURCE, k) for k in ("get_reliability_test", "list_attribute_definitions", "list_conditions")}
+    if None in names.values():
+        return done(False, error="TestScope 가 이 게이트웨이에 붙어 있지 않다",
+                    detail=f"{RELIAB_SOURCE} 의 {' · '.join(k for k, v in names.items() if v is None)} 가 목록에 없다")
+    got = await asyncio.gather(_call_tool_body(names["get_reliability_test"], {"test_id": test_id}),
+                               _call_tool_body(names["list_attribute_definitions"], {"target": "reliability_test"}),
+                               _call_tool_body(names["list_conditions"], {}))
+    bodies = []
+    for what, res in zip(("시험", "속성 정의", "조건 축"), got):
+        text = _rt_text(res)
+        if "/tokens?tab=connect" in text:
+            return done(False, needs_connect=True, error="TestScope 토큰이 등록되지 않았다",
+                        connect_note="포털 '개인 토큰 › 외부 연결'(/tokens?tab=connect)에서 TestScope 토큰을 등록한 뒤 다시 부른다",
+                        ask_user="등록하기 전에는 사람에게 시험 조건(온도 · 습도 · 기간 · 조도)을 직접 묻는다 — 대신 쓸 공용 조건표는 없다")
+        try:
+            body = json.loads(text)
+        except ValueError:
+            body = None
+        if getattr(res, "isError", False) or not isinstance(body, dict) or body.get("error"):
+            err = body.get("error") if isinstance(body, dict) and body.get("error") else text
+            return done(False, error=f"TestScope {what}을 받지 못했다", detail=str(err or "오류")[:300])
+        bodies.append(body)
+    test, defs_b, conds_b = bodies
+    defs = {str(d.get("id")): d for d in defs_b.get("definitions") or [] if isinstance(d, dict)}
+    conds = {str(c.get("id")): c for c in conds_b.get("conditions") or [] if isinstance(c, dict)}
+    steps: dict = {}
+    other = []
+    for v in test.get("attributes") or []:
+        if not isinstance(v, dict) or v.get("is_current") is False:
+            continue
+        d = defs.get(str(v.get("definition_id"))) or {}
+        ck = conds.get(str(d.get("condition_key_id"))) or {}
+        axis = ck.get("key")
+        item = None
+        if axis in _RELIAB_AXES:
+            nums = {k: v.get(k) for k in ("num_value", "num_min", "num_max")
+                    if isinstance(v.get(k), (int, float)) and not isinstance(v.get(k), bool)}
+            conv = {k: _reliab_conv(axis, v.get("unit"), float(x)) for k, x in nums.items()}
+            if nums and None not in conv.values():
+                item = ({"value": conv["num_value"]} if "num_value" in conv else
+                        {k2: conv[k] for k, k2 in (("num_min", "min"), ("num_max", "max")) if k in conv})
+                item["display"] = v.get("display")
+                if v.get("status") == "draft":
+                    item["draft"] = True
+        if item is None:
+            if len(other) < 30:
+                other.append({"label": v.get("label"), "key": d.get("key"), "display": v.get("display"), "unit": v.get("unit"),
+                              **({"condition": axis} if axis else {}), **({"draft": True} if v.get("status") == "draft" else {})})
+            continue
+        sk = (v.get("set_label"), v.get("step_order"), v.get("step_label"))
+        steps.setdefault(sk, {"set_label": sk[0], "step_order": sk[1], "step_label": sk[2]}).setdefault(_RELIAB_AXES[axis], []).append(item)
+    ordered = sorted(steps.values(), key=lambda s: (str(s["set_label"] or ""), s["step_order"] if isinstance(s["step_order"], int) else -1))
+    return done(True, test={k: test.get(k) for k in ("id", "name", "purpose", "division_code", "division_name", "status")},
+                steps=ordered, lux=None, lux_why="TestScope 조건 어휘에 조도 키가 없다(장비 사양에만 있다) — 필요하면 사람에게 묻는다",
+                other_attributes=other,
+                note=("값은 단계마다 목록이다(같은 축이 여럿일 수 있다). draft 는 TestScope 초안 값이라 비교 · 판정에 쓰지 않는다. "
+                      "다른 칸의 조건은 other_attributes 의 display 를 읽는다"))
+
+
 # ── 그림 저장 — 도구 결과의 그림을 파일로 두고, 받고, 보고서에 넣는다(사용자 보고 11-02) ─────────────────────────────────────────────
 # StepForge · DynaForge 의 그림(ImageContent — base64)은 결과 안에만 있었다. 게이트웨이는 그 블록을 그대로 흘리고 아무것도 두지 않아 개인 Claude 가
 # 받은 그림을 파일로 꺼낼 길도, 인사이트로 쓰는 Report Archive 보고서에 넣을 길도 없었다(받는 경로 없음 · 루틴 원장은 글만 · 감사는 글자만 세 chars:0).
@@ -8183,7 +8297,7 @@ def _local_tools() -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
              BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL,
-             ONTO_LOOKUP_TOOL, GAS_TRANSPORT_TOOL]
+             ONTO_LOOKUP_TOOL, GAS_TRANSPORT_TOOL, RELIAB_TOOL]
     # REST 다리는 **등록된 사이트가 있을 때만** 낸다 — 쓸 수 없는 도구를 목록에 두면
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
@@ -9918,6 +10032,7 @@ _LOCAL_READ = frozenset({SEARCH_CONV_TOOL.name, LIST_APPS_TOOL.name, SEARCH_TOOL
                          KIT_GET_TOOL.name,                                # PC 키트 받기 — 파일을 내줄 뿐이다
                          ONTO_LOOKUP_TOOL.name,                            # 온톨로지 조회 — 안쪽 허브 호출은 그 이름으로 다시 판정된다
                          GAS_TRANSPORT_TOOL.name,                          # 가스 투과 물성 — 안쪽 MaterialTwin 읽기도 그 이름으로 다시 판정된다
+                         RELIAB_TOOL.name,                                 # 신뢰성 시험 조건 — 안쪽 TestScope 읽기는 그 사람 토큰으로 다시 판정된다
                          READONLY_ALLOWLIST_TOOL.name})                    # 읽기 전용 허용 목록 보기(관리자) — 고치기는 REST PATCH 뿐이다
 _ROUTINE_NAMES = frozenset(t.name for t in ROUTINE_TOOLS)
 
@@ -10038,6 +10153,8 @@ async def _call_tool_body(name: str, arguments: dict):
         return await _artifact_to_ste(arguments or {})
     if name == GAS_TRANSPORT_TOOL.name:
         return await _gas_transport(arguments or {})
+    if name == RELIAB_TOOL.name:
+        return await _reliab_conditions(arguments or {})
     if FIG_STORE_ON and name in _FIG_NAMES:
         return await _fig_dispatch(name, arguments or {})
     if name == KIT_GET_TOOL.name:
@@ -10415,7 +10532,7 @@ def _bearer_gate(app, pat_verifier=None):
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
                         VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL, ONTO_LOOKUP_TOOL, READONLY_ALLOWLIST_TOOL,
-                        GAS_TRANSPORT_TOOL, *([ARTIFACT_TO_STE_TOOL] if STE_UPLOAD_SITE in REST else [])):
+                        GAS_TRANSPORT_TOOL, RELIAB_TOOL, *([ARTIFACT_TO_STE_TOOL] if STE_UPLOAD_SITE in REST else [])):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서

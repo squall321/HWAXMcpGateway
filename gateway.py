@@ -4386,6 +4386,8 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
                                               BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL])
     if REST:                                   # _visible_tools 와 같은 조건 — 두 목록이 어긋나면 안 된다
         by_app["_gateway"].extend([REST_CATALOG_TOOL, REST_CALL_TOOL])
+    if STE_UPLOAD_SITE in REST:                # _local_tools 와 같은 조건(P-1)
+        by_app["_gateway"].append(ARTIFACT_TO_STE_TOOL)
     # 연결이 끊긴 백엔드는 도구가 집계되지 않아 목록에서 통째로 사라진다 — 접근성 점검이
     # 목적이므로 '앱은 있는데 지금 불통'을 보이게 빈 항목으로 채운다.
     for _k in backends:
@@ -6124,6 +6126,225 @@ async def _onto_lookup(a: dict) -> types.CallToolResult:
     return done("none", tried=tried, hint="정본에 그런 이름이 없다 — 짐작하지 말고 사람에게 묻는다(오타 · 아직 없는 것 · 다른 타입)")
 
 
+# ── StepForge 산출물 → ste 업로드(HWAXPortal docs/ste-stepforge-1117 P-1 · 결정 SS-2) ─────────────────────────────────────────────
+# 11-17 cae00 시험에서 디지털워커가 StepForge 파일을 ste 해석에 넣을 길은 셸뿐이었다(MCP 받기 1 MB 상한 · 공유 경로 없음). 게이트웨이가 부르는 사람
+# 명의로 StepForge download_artifact 조각을 받아 ste 업로드에 흘려 넣는다 — 바이트는 모델 · 인자 · 로그를 지나지 않는다.
+#  · 조각은 offset · content="base64" · full=true 로 받는다 — full 이 없으면 StepForge 가 6000자를 넘는 답의 data_base64 를 접어 뺀다(chat_fold D-512).
+#  · ste 는 그 사람의 위임 PAT(rest.ste 의 per_user)로 연다 — 업로드 열기 POST /api/uploads · 올리기 PUT /api/uploads/{id}/{이름}(업로드 주인 계정도
+#    받는다 — ste 티켓은 받지도 쓰지도 않는다). 업로드 주인 = 제출자라 서비스 PAT 는 막는다.
+#  · 조각마다 file_sha256 이 처음과 같아야 하고, 끝에 흘려 보내며 잰 sha256 · 바이트가 맞아야 한다. 어긋나면 본문 생성기가 던져 PUT 을 끊는다 —
+#    끊긴 업로드는 쓰지 말라고 답한다(ste 에 지우는 창구가 없어 24시간 정리에 맡긴다).
+STE_UPLOAD_SOURCE = "heax-step_forge"
+STE_UPLOAD_SITE = "ste"
+STE_UPLOAD_TIMEOUT_S = float(os.environ.get("GATEWAY_STE_UPLOAD_TIMEOUT_S", "1800") or 1800)
+ARTIFACT_TO_STE_TOOL = types.Tool(
+    name="artifact_to_ste_upload",
+    description=(
+        "StepForge 산출물 파일을 ste(해석 웹) 업로드로 서버끼리 옮긴다 — 파일 바이트가 모델을 지나지 않는다(download_artifact 의 1 MB 상한 · 공유 경로 "
+        "없음을 건넌다). 부르는 사람 명의로 StepForge 파일을 조각으로 받아 그 사람의 ste 업로드에 흘려 넣고 sha256 을 맞댄다. 답의 upload_id 로 ste 잡을 "
+        "제출한다(ste submit_job 의 upload_id — 업로드 주인인 이 사람만 · 한 번만 · expires_at 까지). kind · ref 는 StepForge list_artifacts 의 값 그대로 "
+        "준다. 실패하면 ok:false 와 까닭이고, upload_id_broken 이 있으면 그 업로드는 쓰지 않는다."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "string", "description": "StepForge 과제 id(list_projects · list_artifacts 의 project_id)"},
+            "kind": {"type": "string", "description": "산출물 종류 — StepForge list_artifacts 의 kind 그대로(예 stl · worked_step · glb)"},
+            "ref": {"type": "string", "description": "같은 kind 가 여럿일 때 그 산출물의 ref(list_artifacts 값 그대로). 비우면 그 kind 의 가장 최근 것"},
+            "filename": {"type": "string", "description": "ste 업로드에 둘 파일 이름(경로 없는 이름 · 점으로 시작 불가). 비우면 StepForge 파일 이름. "
+                                                          "앱의 주 입력 패턴에 맞춰야 제출이 된다(part-study 는 *.step)"},
+            "upload_id": {"type": "string", "description": "이미 연 내 ste 업로드에 파일을 더할 때 그 id. 비우면 새 업로드를 연다"},
+        },
+        "required": ["project_id", "kind"],
+    },
+    annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False),
+)
+
+
+class _SteUploadAbort(Exception):
+    """조각 흘려 넣기를 끊는다 — 조각 받기 실패 · 파일 바뀜 · sha256 어긋남. PUT 본문 생성기가 던져 올리기를 끊는다."""
+
+
+def _ste_name_ok(name: str) -> bool:
+    """ste 가 받는 업로드 파일 이름인가 — 경로 없는 평이름 · 점으로 시작 안 함(ste routes/uploads.py 와 같은 규칙, 예약 이름은 ste 가 가른다)."""
+    return bool(name) and "/" not in name and "\\" not in name and Path(name).name == name and not name.startswith(".")
+
+
+def _ste_detail(r: httpx.Response) -> str:
+    try:
+        d = r.json()
+    except ValueError:
+        return r.text[:300]
+    return str(d.get("detail") if isinstance(d, dict) and "detail" in d else d)[:300]
+
+
+async def _artifact_to_ste(a: dict) -> types.CallToolResult:
+    t0 = time.monotonic()
+    caller = _request_user()
+    groups = _request_groups()
+    project_id = str(a.get("project_id") or "").strip()
+    kind = str(a.get("kind") or "").strip()
+    ref = str(a.get("ref") or "").strip()
+    name = str(a.get("filename") or "").strip()
+    upload_id = str(a.get("upload_id") or "").strip()
+    src = {"project_id": project_id, "kind": kind, "ref": ref or None}
+
+    def done(ok: bool, **kw) -> types.CallToolResult:
+        out = {"ok": ok, **kw, "source": src}
+        note = f"{src['kind']}:{kw.get('bytes', '?')}B" + (f":{upload_id}" if upload_id else "")
+        _audit(ARTIFACT_TO_STE_TOOL.name, "_gateway", ok, None if ok else str(kw.get("error") or "")[:200],
+               round((time.monotonic() - t0) * 1000), caller=caller or None, note=note)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(out, ensure_ascii=False))], isError=not ok)
+
+    if _request_service() is not None:
+        return done(False, error="서비스 PAT 로는 부르지 않는다", detail="ste 업로드의 주인이 잡을 제출하는 사람이어야 한다 — 사람 PAT 로 부른다")
+    if not caller:
+        return done(False, error="신원이 없다", detail="포털 PAT(이메일이 든 것)로 게이트웨이에 붙어야 한다 — 업로드는 그 사람 명의로 연다")
+    if not project_id or not kind:
+        return done(False, error="project_id · kind 가 필요하다", detail="StepForge list_artifacts 의 값 그대로 준다")
+    if name and not _ste_name_ok(name):
+        return done(False, error=f"ste 가 받지 않는 파일 이름이다({name!r})", detail="경로 없는 이름 · 점으로 시작하지 않는 이름")
+    if upload_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", upload_id):
+        return done(False, error=f"upload_id 꼴이 아니다({upload_id[:40]!r})")
+    dl = _rt_exposed(STE_UPLOAD_SOURCE, "download_artifact")
+    if dl is None:
+        return done(False, error="StepForge 가 이 게이트웨이에 붙어 있지 않다", detail=f"{STE_UPLOAD_SOURCE} 의 download_artifact 가 목록에 없다")
+    conf = REST.get(STE_UPLOAD_SITE)
+    if not conf or credential_mode(conf) != "per_user" or str(conf.get("per_user")) not in PER_USER_SSO:
+        return done(False, error="ste 사람별 REST 가 설정되지 않았다",
+                    detail=f"게이트웨이 rest.{STE_UPLOAD_SITE}(per_user) · heax_registry.per_user_sso 가 있어야 그 사람 명의로 ste 업로드를 연다")
+    if not _backend_allowed(STE_UPLOAD_SITE, groups):
+        return done(False, error=f"forbidden: {STE_UPLOAD_SITE}", detail=_deny_text(STE_UPLOAD_SITE, groups))
+    app_id = str(conf["per_user"])
+    base_args = {"project_id": project_id, "kind": kind, **({"ref": ref} if ref else {}), "content": "base64", "full": True}
+
+    async def chunk(off: int) -> dict:
+        res = await _call_tool_body(dl, {**base_args, "offset": off})
+        text = _rt_text(res)
+        if getattr(res, "isError", False):
+            raise _SteUploadAbort(f"StepForge 조각(offset {off}) — {text[:300] or '오류'}")
+        try:
+            body = json.loads(text)
+        except ValueError:
+            raise _SteUploadAbort(f"StepForge 조각(offset {off}) 답이 JSON 이 아니다 — {text[:120]}") from None
+        if not isinstance(body, dict) or not isinstance(body.get("data_base64"), str):
+            folded = isinstance(body, dict) and body.get("chat_fold")
+            raise _SteUploadAbort(f"StepForge 조각(offset {off}) 에 본문이 없다 — " + (
+                "본문을 접었다(chat_fold) — full=true 를 받지 않는 판이다" if folded else "offset 조각 받기(StepForge D-666) 전 판이다"))
+        try:
+            for k in ("bytes", "chunk_bytes", "more_after", "offset"):
+                body[k] = int(body[k])
+            body["file_sha256"] = str(body["file_sha256"])
+        except (KeyError, TypeError, ValueError):
+            raise _SteUploadAbort(f"StepForge 조각(offset {off}) 의 칸(bytes · chunk_bytes · more_after · offset · file_sha256)이 꼴 밖이다") from None
+        return body
+
+    try:
+        first = await chunk(0)
+    except _SteUploadAbort as e:
+        return done(False, error=str(e))
+    total, want = first["bytes"], first["file_sha256"]
+    src.update(kind=str(first.get("kind") or kind), ref=first.get("ref") or ref or None)
+    fname = name or str(first.get("filename") or "")
+    if not _ste_name_ok(fname):
+        return done(False, error=f"ste 가 받지 않는 파일 이름이다({fname!r})", detail="filename 으로 이름을 준다")
+    try:
+        tok, hdr = await _rest_mint(app_id, caller)
+    except Exception as e:  # noqa: BLE001 — 서비스 자격으로 조용히 내려가지 않는다
+        return done(False, error=f"{caller} 의 ste 자격을 받지 못했다", detail=_clip(e, 300))
+
+    def auth(t: str) -> dict:
+        return {hdr: t} if hdr else {"Authorization": f"Bearer {t}"}
+    hdrs = {"accept": "application/json", "x-forwarded-user": caller, **auth(tok),
+            **await _proof_headers(app_id, caller, groups, [g for g in groups if not _is_synthetic(g) and g != ADMIN_GROUP])}
+    base = str(conf["base"]).rstrip("/")
+    created = False
+    h = hashlib.sha256()
+    sent = 0
+
+    async def body_stream():
+        nonlocal sent
+        cur = first
+        while True:
+            if cur["file_sha256"] != want:
+                raise _SteUploadAbort("조각 사이에 StepForge 파일이 바뀌었다(file_sha256 이 다르다) — 다시 부른다")
+            if cur["offset"] != sent:
+                raise _SteUploadAbort(f"조각 자리가 어긋났다(받을 자리 {sent} · 온 조각 {cur['offset']})")
+            try:
+                piece = base64.b64decode(cur["data_base64"], validate=True)
+            except ValueError:
+                raise _SteUploadAbort(f"조각(offset {sent}) 의 base64 가 깨졌다") from None
+            if len(piece) != cur["chunk_bytes"]:
+                raise _SteUploadAbort(f"조각(offset {sent}) 바이트가 chunk_bytes 와 다르다({len(piece)} · {cur['chunk_bytes']})")
+            h.update(piece)
+            sent += len(piece)
+            if piece:
+                yield piece
+            if cur["more_after"] <= 0:
+                break
+            if not piece:
+                raise _SteUploadAbort("빈 조각인데 남은 바이트가 있다")
+            cur = await chunk(sent)
+        if sent != total or h.hexdigest() != want:
+            raise _SteUploadAbort(f"받은 파일이 StepForge 의 것과 다르다(바이트 {sent} · {total}, sha256 대조 실패)")
+
+    try:
+        with anyio.fail_after(STE_UPLOAD_TIMEOUT_S):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(STE_UPLOAD_TIMEOUT_S, connect=10.0), follow_redirects=False) as cli:
+                async def call(method: str, path: str) -> httpx.Response:
+                    nonlocal tok, hdrs
+                    r = await cli.request(method, base + path, headers=hdrs)
+                    if r.status_code == 401:
+                        # 위층이 토큰을 거절했다 — 버리고 새로 받아 한 번만 다시(HG-04 와 같은 자세). 본문을 흘리는 PUT 은 다시 못 보내 여기를 타지 않는다
+                        _forget_user_pat(app_id, caller, tok)
+                        tok = await _user_pat(app_id, caller, stale=tok)
+                        hdrs = {**hdrs, **auth(tok)}
+                        r = await cli.request(method, base + path, headers=hdrs)
+                    return r
+
+                if upload_id:
+                    r = await call("GET", f"/api/uploads/{upload_id}")
+                    if r.status_code != 200:
+                        return done(False, error=f"ste 업로드 {upload_id} 를 쓸 수 없다", status=r.status_code, detail=_ste_detail(r))
+                    up = r.json()
+                    if up.get("used_at"):
+                        return done(False, error="이미 제출된 업로드다 — upload_id 를 비우고 새로 연다", status=409)
+                else:
+                    r = await call("POST", "/api/uploads")
+                    if r.status_code not in (200, 201):
+                        return done(False, error="ste 업로드를 열지 못했다", status=r.status_code, detail=_ste_detail(r))
+                    up = r.json()
+                    up.pop("ticket", None)                   # 티켓은 쓰지 않는다 — 답 · 로그 어디에도 남기지 않는다
+                    upload_id = str(up.get("id") or "")
+                    created = True
+                    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", upload_id):
+                        return done(False, error="ste 가 꼴 밖의 업로드 id 를 줬다", detail=upload_id[:40])
+                try:
+                    r = await cli.put(f"{base}/api/uploads/{upload_id}/{quote(fname, safe='')}", content=body_stream(),
+                                      headers={**hdrs, "content-type": "application/octet-stream"})
+                except _SteUploadAbort as e:
+                    return done(False, error=str(e), upload_id_broken=upload_id,
+                                detail="ste 로 올리기를 끊었다 — 이 업로드는 쓰지 않는다(24시간 뒤 ste 가 지운다)")
+                if r.status_code != 200:
+                    return done(False, error="ste 가 파일을 받지 않았다", status=r.status_code, detail=_ste_detail(r),
+                                **({"upload_id_broken": upload_id} if created else {}))
+                put = r.json()
+    except TimeoutError:
+        return done(False, error=f"{STE_UPLOAD_TIMEOUT_S:g}초 안에 옮기지 못했다(GATEWAY_STE_UPLOAD_TIMEOUT_S)",
+                    **({"upload_id_broken": upload_id} if upload_id and (created or sent) else {}))
+    except Exception as e:  # noqa: BLE001
+        return done(False, error="ste 에 닿지 않았다", detail=_clip(e, 300),
+                    **({"upload_id_broken": upload_id} if upload_id and (created or sent) else {}))
+    files = put.get("files") if isinstance(put.get("files"), list) else []
+    if fname not in files:
+        return done(False, error="ste 답의 파일 목록에 올린 파일이 없다", detail=str(files)[:200], upload_id_broken=upload_id)
+    sub = _rt_exposed(STE_UPLOAD_SITE, "submit_job") or "submit_job"
+    return done(True, upload_id=upload_id, filename=fname, bytes=sent, sha256=want, expires_at=up.get("expires_at"), files=files,
+                new_upload=created,
+                next=f"ste 잡 제출 — {sub}(upload_id='{upload_id}', app=<앱>) · 업로드 주인(이 사람)만 · 한 번만 · expires_at 까지. "
+                     "파일을 더 넣으려면 같은 upload_id 로 다시 부른다")
+
+
 # ── 그림 저장 — 도구 결과의 그림을 파일로 두고, 받고, 보고서에 넣는다(사용자 보고 11-02) ─────────────────────────────────────────────
 # StepForge · DynaForge 의 그림(ImageContent — base64)은 결과 안에만 있었다. 게이트웨이는 그 블록을 그대로 흘리고 아무것도 두지 않아 개인 Claude 가
 # 받은 그림을 파일로 꺼낼 길도, 인사이트로 쓰는 Report Archive 보고서에 넣을 길도 없었다(받는 경로 없음 · 루틴 원장은 글만 · 감사는 글자만 세 chars:0).
@@ -7816,6 +8037,8 @@ def _local_tools() -> list[types.Tool]:
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
         local += [REST_CATALOG_TOOL, REST_CALL_TOOL]
+    if STE_UPLOAD_SITE in REST:                # ste 사람별 REST 가 있을 때만 — 없으면 늘 빈손인 도구다(P-1)
+        local.append(ARTIFACT_TO_STE_TOOL)
     return local
 
 
@@ -9659,6 +9882,8 @@ async def _call_tool_body(name: str, arguments: dict):
         return await _insight_dispatch(name, arguments or {})
     if name == ONTO_LOOKUP_TOOL.name:
         return await _onto_lookup(arguments or {})
+    if name == ARTIFACT_TO_STE_TOOL.name:
+        return await _artifact_to_ste(arguments or {})
     if FIG_STORE_ON and name in _FIG_NAMES:
         return await _fig_dispatch(name, arguments or {})
     if name == KIT_GET_TOOL.name:
@@ -10035,7 +10260,8 @@ def _bearer_gate(app, pat_verifier=None):
             # search_tools·invoke_tool 도 게이트웨이 로컬이다 — 빠뜨리면 /tools-map 의 _gateway
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
-                        VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL, ONTO_LOOKUP_TOOL, READONLY_ALLOWLIST_TOOL):
+                        VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL, ONTO_LOOKUP_TOOL, READONLY_ALLOWLIST_TOOL,
+                        *([ARTIFACT_TO_STE_TOOL] if STE_UPLOAD_SITE in REST else [])):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서

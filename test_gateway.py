@@ -125,7 +125,7 @@ def test_visible_tools(monkeypatch):
                               gw.SEARCH_TOOLS_TOOL, gw.INVOKE_TOOL,
                               gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL,
                               gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL, *gw.ROUTINE_TOOLS, *gw.INSIGHT_TOOLS,
-                              *gw.FIGURE_TOOLS, gw.KIT_GET_TOOL, gw.ONTO_LOOKUP_TOOL)}
+                              *gw.FIGURE_TOOLS, gw.KIT_GET_TOOL, gw.ONTO_LOOKUP_TOOL, gw.ARTIFACT_TO_STE_TOOL)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -14619,3 +14619,186 @@ def test_리스크_앱_근거_묶음만_게이트웨이_가림에서_빠진다(m
     for other in (("heax-hwax_risk", "risk_get_registry"), ("signalforge", "risk_get_evidence_bundle"), None):
         assert "[가림:" in gw._pii_mask(mk(), tool=other).content[0].text, other
     assert gw._PII_MASK_EXEMPT == frozenset({("heax-hwax_risk", "risk_get_evidence_bundle")}), "빼는 것은 하나뿐이다(늘리려면 사용자 결정)"
+
+
+# ── StepForge 산출물 → ste 업로드 artifact_to_ste_upload(HWAXPortal docs/ste-stepforge-1117 P-1 · 결정 SS-2) ──────────────────────────────
+# 가짜 StepForge 는 진짜 꼴이다 — download_artifact(offset) 가 _download_chunk 칸을 내고, full 이 없으면 6000자를 넘는 답의 data_base64 를 접어 뺀다
+# (StepForge core/chatfold.py 의 download_artifact 표). 가짜 ste 는 routes/uploads.py 꼴 — 업로드 열기는 티켓을 주고, PUT 은 본문을 끝까지 읽는다.
+_STE_CHUNK = 5000                       # base64 로 6,668자 — full 이 없으면 접히는 크기다
+
+
+def _a2s_kit(monkeypatch, data: bytes = bytes(range(256)) * 48 + b"tail", *, groups=(), user="a@x.com", service=None, ste=None,
+             sf=None, allowed=True):
+    """(부르기, 기록) — 기록은 {sf: [(이름, 인자)], ste: [(메서드, 경로, 머리)], stored: {이름: 바이트}}. sf(args, 기본 답) → 답 바꾸기, ste(요청) → 답 바꾸기."""
+    rec = {"sf": [], "ste": [], "stored": {}}
+    sha = hashlib.sha256(data).hexdigest()
+    monkeypatch.setitem(gw.REST, "ste", {"base": "http://ste.test", "per_user": "ste"})
+    monkeypatch.setitem(gw.PER_USER_SSO, "ste", {})
+    monkeypatch.setattr(gw, "route", {"download_artifact": ("heax-step_forge", "download_artifact"), "ste_submit_job": ("ste", "submit_job")})
+    monkeypatch.setattr(gw, "_request_user", lambda: user)
+    monkeypatch.setattr(gw, "_request_groups", lambda: list(groups))
+    monkeypatch.setattr(gw, "_request_service", lambda: service)
+    monkeypatch.setattr(gw, "_backend_allowed", lambda k, g: allowed)
+    mints = []
+
+    async def mint(app_id, email):
+        mints.append((app_id, email))
+        return f"tok-{len(mints)}", None
+    monkeypatch.setattr(gw, "_rest_mint", mint)
+
+    async def user_pat(app_id, email, *, stale=None, notes=None):
+        mints.append((app_id, email, "re", stale))
+        return f"tok-{len(mints)}"
+    monkeypatch.setattr(gw, "_user_pat", user_pat)
+    monkeypatch.setattr(gw, "_forget_user_pat", lambda *a: None)
+
+    async def sf_body(name, args):
+        rec["sf"].append((name, dict(args)))
+        off = args.get("offset")
+        out = {"project_id": args["project_id"], "kind": args["kind"], "ref": args.get("ref") or "R1", "filename": "part.step",
+               "bytes": len(data), "rest_path": "/api/x"}
+        if off is not None:
+            piece = data[off:off + _STE_CHUNK]
+            out.update({"content": "base64", "encoding": "base64", "offset": off, "chunk_bytes": len(piece),
+                        "more_after": len(data) - off - len(piece), "file_sha256": sha,
+                        "data_base64": base64.b64encode(piece).decode("ascii")})
+        if sf is not None:
+            out = sf(args, out)
+        if isinstance(out, str):
+            return types.CallToolResult(content=[types.TextContent(type="text", text=out)], isError=True)
+        text = json.dumps(out, ensure_ascii=False)
+        if len(text) > 6000 and not args.get("full"):                # StepForge chat_fold — 본문을 접어 뺀다
+            out = {"chat_fold": {"chars": len(text), "dropped": ["data_base64"]}, **{k: v for k, v in out.items() if k != "data_base64"}}
+            text = json.dumps(out, ensure_ascii=False)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
+    monkeypatch.setattr(gw, "_call_tool_body", sf_body)
+
+    async def handler(request: httpx.Request):
+        rec["ste"].append((request.method, request.url.path, dict(request.headers)))
+        if ste is not None:
+            got = ste(request)
+            if got is not None:
+                return got
+        if request.method == "POST" and request.url.path == "/api/uploads":
+            return httpx.Response(201, json={"id": "u1", "owner_id": 7, "expires_at": "2026-11-19T00:00:00Z", "used_at": None,
+                                             "files": [], "bytes": 0, "ticket": "TICKET-SECRET", "put_path": "/api/uploads/u1/{filename}"})
+        if request.method == "GET" and request.url.path.startswith("/api/uploads/"):
+            return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[1], "owner_id": 7, "expires_at": "E", "used_at": None,
+                                             "files": [], "bytes": 0})
+        if request.method == "PUT":
+            uid, fname = request.url.path.split("/")[3:5]
+            body = await request.aread()                               # 본문을 끝까지 — 생성기가 던지면 여기서 끊긴다
+            rec["stored"][fname] = body
+            return httpx.Response(200, json={"id": uid, "file": fname, "files": sorted(rec["stored"]), "bytes": len(body)})
+        return httpx.Response(404, json={"detail": "없다"})
+
+    class _H(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            return await handler(request)
+    monkeypatch.setattr(gw.httpx, "AsyncClient", lambda **kw: _REAL_ASYNC_CLIENT(transport=_H(), **kw))
+
+    def run(**a):
+        res = asyncio.run(gw._artifact_to_ste({"project_id": "P1", "kind": "worked_step", **a}))
+        return json.loads(res.content[0].text), res.isError
+    rec["mints"] = mints
+    return run, rec, data, sha
+
+
+def test_P1_조각을_그_사람_명의로_받아_ste_업로드에_흘려_넣고_sha256_을_맞댄다(monkeypatch):
+    run, rec, data, sha = _a2s_kit(monkeypatch)
+    out, err = run()
+    assert err is False and out["ok"] is True, out
+    assert rec["stored"] == {"part.step": data}, "ste 가 받은 바이트가 StepForge 파일과 같다"
+    assert out["upload_id"] == "u1" and out["bytes"] == len(data) and out["sha256"] == sha and out["filename"] == "part.step"
+    assert out["new_upload"] is True and out["files"] == ["part.step"] and out["expires_at"]
+    assert "ste_submit_job(upload_id='u1'" in out["next"], "ste 의 노출 이름으로 다음 호출을 말한다"
+    offs = [a["offset"] for _n, a in rec["sf"]]
+    assert offs == [0, 5000, 10000], "조각을 차례로"
+    assert all(a["full"] is True and a["content"] == "base64" for _n, a in rec["sf"]), "full 이 없으면 StepForge 가 본문을 접는다"
+    assert [(m, p) for m, p, _h in rec["ste"]] == [("POST", "/api/uploads"), ("PUT", "/api/uploads/u1/part.step")]
+    for _m, _p, h in rec["ste"]:
+        assert h["authorization"] == "Bearer tok-1" and h["x-forwarded-user"] == "a@x.com", "업로드 열기 · 올리기 모두 그 사람의 위임 PAT"
+    assert "TICKET-SECRET" not in json.dumps(out) and all("TICKET-SECRET" not in json.dumps(h) for *_x, h in rec["ste"]), "티켓은 쓰지 않는다"
+    assert rec["mints"] == [("ste", "a@x.com")]
+
+
+def test_P1_full_을_모르는_StepForge_는_접힌_답이라_ste_를_열지_않는다(monkeypatch):
+    def old(args, out):
+        out = dict(out)
+        out.pop("data_base64", None)
+        out["chat_fold"] = {"dropped": ["data_base64"]}
+        return out
+    run, rec, _d, _s = _a2s_kit(monkeypatch, sf=old)
+    out, err = run()
+    assert err is True and "chat_fold" in out["error"] and rec["ste"] == [], "본문이 없으면 업로드를 열기 전에 멈춘다"
+    run, rec, _d, _s = _a2s_kit(monkeypatch, sf=lambda a, o: {k: v for k, v in o.items() if k not in ("data_base64", "offset")})
+    out, err = run()
+    assert err is True and "D-666" in out["error"] and rec["ste"] == []
+
+
+def test_P1_조각_사이에_파일이_바뀌면_올리기를_끊고_그_업로드는_쓰지_말라고_한다(monkeypatch):
+    run, rec, _d, _s = _a2s_kit(monkeypatch, sf=lambda a, o: {**o, "file_sha256": "f" * 64} if a.get("offset") == 5000 else o)
+    out, err = run()
+    assert err is True and "바뀌었다" in out["error"] and out["upload_id_broken"] == "u1"
+    assert rec["stored"] == {}, "PUT 본문이 끝나지 않았다 — ste 가 파일을 두지 않는다"
+    run, rec, _d, _s = _a2s_kit(monkeypatch, sf=lambda a, o: "forbidden: heax-step_forge" if a.get("offset") == 10000 else o)
+    out, err = run()
+    assert err is True and "offset 10000" in out["error"] and out["upload_id_broken"] == "u1" and rec["stored"] == {}
+    run, rec, _d, _s = _a2s_kit(monkeypatch, sf=lambda a, o: {**o, "data_base64": o["data_base64"][:-8] + "AAAAAAAA"}
+                                if a.get("offset") == 10000 else o)
+    out, err = run()
+    assert err is True and "sha256" in out["error"] and rec["stored"] == {}, "마지막에 바이트 · sha256 을 맞댄다"
+
+
+def test_P1_사람_명의가_아니면_아무것도_부르지_않는다(monkeypatch):
+    for kw, why in (({"user": ""}, "신원이 없다"), ({"service": {"job": "x"}}, "서비스 PAT"), ({"allowed": False}, "forbidden")):
+        run, rec, _d, _s = _a2s_kit(monkeypatch, **kw)
+        out, err = run()
+        assert err is True and why in out["error"] and rec["sf"] == [] and rec["ste"] == [], kw
+    run, rec, _d, _s = _a2s_kit(monkeypatch)
+    for a, why in (({"filename": "../x.step"}, "파일 이름"), ({"filename": ".hid"}, "파일 이름"), ({"upload_id": "a/b"}, "upload_id"),
+                   ({"kind": ""}, "project_id · kind")):
+        out, err = run(**a)
+        assert err is True and why in out["error"], a
+    assert rec["sf"] == [] and rec["ste"] == []
+
+
+def test_P1_내_업로드에_더하기_와_ste_거절(monkeypatch):
+    run, rec, data, _s = _a2s_kit(monkeypatch)
+    out, err = run(upload_id="u9", filename="extra.step")
+    assert out["ok"] is True and out["new_upload"] is False and out["upload_id"] == "u9"
+    assert [(m, p) for m, p, _h in rec["ste"]] == [("GET", "/api/uploads/u9"), ("PUT", "/api/uploads/u9/extra.step")], "새로 열지 않는다"
+    run, rec, _d, _s = _a2s_kit(monkeypatch, ste=lambda r: httpx.Response(200, json={"id": "u9", "used_at": "T"}) if r.method == "GET" else None)
+    out, err = run(upload_id="u9")
+    assert err is True and "제출된" in out["error"] and [m for m, *_x in rec["ste"]] == ["GET"]
+    run, rec, _d, _s = _a2s_kit(monkeypatch, ste=lambda r: httpx.Response(404, json={"detail": "업로드가 없다"}) if r.method == "GET" else None)
+    out, err = run(upload_id="u9")
+    assert err is True and out["status"] == 404 and "upload_id_broken" not in out, "남의 업로드 · 없는 업로드는 그대로 말한다"
+    run, rec, _d, _s = _a2s_kit(monkeypatch, ste=lambda r: httpx.Response(413, json={"detail": "업로드 크기 상한 초과 (10MB)"})
+                                if r.method == "PUT" else None)
+    out, err = run()
+    assert err is True and out["status"] == 413 and "상한" in out["detail"] and out["upload_id_broken"] == "u1"
+
+
+def test_P1_ste_가_토큰을_거절하면_한_번만_새로_받아_다시(monkeypatch):
+    seen = []
+
+    def ste(r):
+        if r.method == "POST":
+            seen.append(r.headers["authorization"])
+            if len(seen) == 1:
+                return httpx.Response(401, json={"detail": "expired"})
+        return None
+    run, rec, data, _s = _a2s_kit(monkeypatch, ste=ste)
+    out, _err = run()
+    assert out["ok"] is True and seen == ["Bearer tok-1", "Bearer tok-2"] and rec["stored"] == {"part.step": data}
+    assert rec["ste"][-1][2]["authorization"] == "Bearer tok-2", "PUT 은 새 토큰으로"
+
+
+def test_P1_도구는_ste_REST_가_있을_때만_보이고_쓰기로_다뤄진다(monkeypatch):
+    monkeypatch.setitem(gw.REST, "ste", {"base": "http://ste.test", "per_user": "ste"})
+    t = next(x for x in gw._local_tools() if x.name == "artifact_to_ste_upload")
+    assert t.annotations.readOnlyHint is False and t.name not in gw._LOCAL_READ, "읽기 전용 PAT 는 부르지 못한다"
+    assert gw._routine_read(t, "_gateway", t.name) is False, "엔진 좌석 자유 조회 · 루틴 울타리에 걸리지 않는다"
+    monkeypatch.delitem(gw.REST, "ste")
+    assert "artifact_to_ste_upload" not in {x.name for x in gw._local_tools()}

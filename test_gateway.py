@@ -125,7 +125,8 @@ def test_visible_tools(monkeypatch):
                               gw.SEARCH_TOOLS_TOOL, gw.INVOKE_TOOL,
                               gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL,
                               gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL, *gw.ROUTINE_TOOLS, *gw.INSIGHT_TOOLS,
-                              *gw.FIGURE_TOOLS, gw.KIT_GET_TOOL, gw.ONTO_LOOKUP_TOOL, gw.ARTIFACT_TO_STE_TOOL)}
+                              *gw.FIGURE_TOOLS, gw.KIT_GET_TOOL, gw.ONTO_LOOKUP_TOOL, gw.ARTIFACT_TO_STE_TOOL,
+                              gw.GAS_TRANSPORT_TOOL)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -6267,7 +6268,8 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
     # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 관리자 읽기 목록 보기 1(GW-02 — tools/list 는 관리자에게만)
-    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 23, "reportarchive": 2}
+    # + 가스 투과 물성 1(PT-R1) — ste 업로드 옮기기(P-1)는 rest.ste 가 있을 때만이라 여기(REST 없음)엔 없다
+    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 24, "reportarchive": 2}
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
     assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
@@ -6334,7 +6336,8 @@ def test_기준_미만으로_처음_붙는_앱만_한_번_경고하고_막지_�
 def test_게이트웨이_로컬_도구는_제_앱으로_센다(monkeypatch, _fresh_scores):
     """로컬 도구는 route 에 없다 — `_gateway` 앱으로 세고, tools/list 가 붙이는 것과 같은 목록이다(REST 다리는 사이트가 있을
     때만). 목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
-    for rest, n_local in (({}, 22), ({"s": {"base": "http://x"}}, 24)):      # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1(+ REST 다리 둘)
+    # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 가스 투과 물성 1(+ REST 다리 둘, rest.ste 면 ste 업로드 옮기기 하나 더)
+    for rest, n_local in (({}, 23), ({"s": {"base": "http://x"}}, 25), ({"ste": {"base": "http://x", "per_user": "ste"}}, 26)):
         monkeypatch.setattr(gw, "REST", rest)
         _aggregate_tools(monkeypatch, {"sf": [_stool("sf_q", {"q": None})]})
         row = {r["app"]: r for r in gw._ARG_SCORE["apps"]}["_gateway"]
@@ -14802,3 +14805,116 @@ def test_P1_도구는_ste_REST_가_있을_때만_보이고_쓰기로_다뤄진�
     assert gw._routine_read(t, "_gateway", t.name) is False, "엔진 좌석 자유 조회 · 루틴 울타리에 걸리지 않는다"
     monkeypatch.delitem(gw.REST, "ste")
     assert "artifact_to_ste_upload" not in {x.name for x in gw._local_tools()}
+
+
+# ── 층 재료의 가스 투과 물성 gas_transport_lookup(HWAXPortal docs/ste-stepforge-1117 PT-R1) ──────────────────────────────────────────────
+# 가짜 MaterialTwin 은 get_material_properties 꼴이다(backend/mcp_server.py — 없는 재료는 isError 가 아니라 {"error"}). 값 · 시료 글은 지어낸 것이다.
+def _gr(key, value, unit, tier=1, **cond):
+    return {"key": key, "name": key, "value": value, "unit": unit, "uncertainty": None, "conditions": cond or None, "method": "measured",
+            "quality_tier": tier, "source": {"title": "합성 출처", "doi": None, "url": None, "manufacturer": None, "kind": "paper", "detail": None}}
+
+
+_GD, _GS, _GP = "physical.diffusion_coefficient", "physical.gas_solubility", "physical.gas_permeability_o2"
+_GAS_DB = {
+    1: [_gr(_GD, 1.0e-9, "m^2/s", 1, species="H2O (moisture)", temperature_c=23),
+        _gr(_GD, 3.0e-9, "m^2/s", 1, species="O2", temperature_k=293, corrected_by="x", temperature_K_before_correction=293),
+        _gr(_GD, 9.9e-9, "cm^2/s", 1, species="O2", temperature_k=293),
+        _gr(_GS, 9.0e-5, "mol/(m^3*Pa)", 2, species="O2", temperature_k=293),
+        _gr(_GP, 2.7e-13, "mol/(m*s*Pa)", 1, species="O2", temperature_k=293),
+        _gr("physical.gas_permeance_o2", 5.0e-9, "mol/(m^2*s*Pa)", 1, species="O2", temperature_k=293)],
+    2: [_gr(_GD, 2.0e-13, "m^2/s", 3, species="O2", temperature_c=30, grade_scope="시료 갑"),
+        _gr(_GD, 1.5e-13, "m^2/s", 3, species="O2", temperature_c=30, grade_scope="시료 을"),
+        _gr(_GS, 2.0e-4, "mol/(m^3*Pa)", 3, species="O2", temperature_c=30, grade_scope="시료 갑"),
+        _gr(_GS, 2.5e-4, "mol/(m^3*Pa)", 3, species="O2", temperature_c=30, grade_scope="시료 을")],
+    3: [_gr(_GP, 5.0e-17, "mol/(m*s*Pa)", 3, species="O2", temperature_c=25),
+        _gr(_GP, 8.0e-17, "mol/(m*s*Pa)", 3, species="O2", temperature_c=40),
+        _gr(_GP, 4.0e-15, "mol/(m*s*Pa)", 3, species="O2", temperature_c=None, grade_scope="다른 값과 크게 어긋난다 — 평균 내지 마라"),
+        _gr(_GD, 1.0e-13, "m^2/s", 3, species="O2", temperature_c=30, grade_scope="시료 갑"),
+        _gr(_GS, 2.0e-4, "mol/(m^3*Pa)", 3, species="O2", temperature_c=30, grade_scope="시료 을")],
+}
+
+
+def _gas_kit(monkeypatch, db=None):
+    db = _GAS_DB if db is None else db
+    calls = []
+    monkeypatch.setattr(gw, "route", {"get_material_properties": ("heax-materialtwin_web", "get_material_properties")})
+
+    async def body(name, args):
+        calls.append((name, dict(args)))
+        rows = db.get(args["material_id"])
+        out = {"error": "재료를 찾을 수 없습니다."} if rows is None else {
+            "material_id": args["material_id"], "domains": {"physical": rows}, "n_values": len(rows)}
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(out, ensure_ascii=False))])
+    monkeypatch.setattr(gw, "_call_tool_body", body)
+
+    def run(**a):
+        res = asyncio.run(gw._gas_transport(a))
+        return json.loads(res.content[0].text), res.isError
+    return run, calls
+
+
+def test_PTR1_기체로_거르고_단위가_다른_행은_환산하지_않는다(monkeypatch):
+    run, calls = _gas_kit(monkeypatch)
+    out, err = run(material_ids=[1])
+    assert err is False and out["species"] == "O2" and calls == [("get_material_properties", {"material_id": 1, "domain": "physical"})]
+    m = out["materials"][0]
+    d = m["D_m2_s"]
+    assert d["chosen"]["value"] == 3.0e-9 and d["n_candidates"] == 1, "물(H2O) 확산계수는 O2 가 아니다"
+    assert d["unit_mismatch_skipped"] == 1, "cm^2/s 행은 셈하지 않고 센다"
+    assert d["chosen"]["temperature_K"] == 293.0 and d["chosen"]["quality_tier"] == 1
+    assert "corrected_by" not in d["chosen"]["conditions"] and "temperature_K_before_correction" not in d["chosen"]["conditions"]
+    assert m["S_mol_m3_Pa"]["chosen"]["value"] == 9.0e-5 and m["P_mol_m_s_Pa"]["chosen"]["value"] == 2.7e-13, "permeance 는 투과도가 아니다"
+    out, _e = run(material_ids=[1], species="H2O")
+    m = out["materials"][0]
+    assert m["D_m2_s"]["chosen"]["value"] == 1.0e-9 and "O2 전용" in m["P_mol_m_s_Pa"]["why"]
+    assert "H2O 값이 없다" in m["S_mol_m3_Pa"]["why"]
+
+
+def test_PTR1_P_는_같은_시료의_D_S_로만_셈한다(monkeypatch):
+    run, _c = _gas_kit(monkeypatch)
+    out, _e = run(material_ids=[2, 3])
+    two, three = out["materials"]
+    p = two["P_mol_m_s_Pa"]
+    assert p["derived"] is True and p["value"] == 2.0e-13 * 2.0e-4 and p["formula"] == "P = D·S", "같은 시료(갑) · 같은 온도"
+    assert two["D_m2_s"]["alternatives"][0]["grade_scope"] == "시료 을", "다른 시료는 후보로 함께"
+    assert three["P_mol_m_s_Pa"]["chosen"]["value"] == 5.0e-17, "온도를 안 주면 23 °C 에 가까운 것"
+    db = {**_GAS_DB, 4: [_GAS_DB[3][3], _GAS_DB[3][4]]}
+    run, _c = _gas_kit(monkeypatch, db)
+    four = run(material_ids=[4])[0]["materials"][0]
+    assert "not_derived" in four["P_mol_m_s_Pa"] and "chosen" not in four["P_mol_m_s_Pa"], "시료가 다르면 셈하지 않는다"
+
+
+def test_PTR1_온도를_주면_가까운_온도를_고르고_외삽하지_않는다(monkeypatch):
+    run, _c = _gas_kit(monkeypatch)
+    out, _e = run(material_ids=[3], temperature_K=313.15)
+    p = out["materials"][0]["P_mol_m_s_Pa"]
+    assert p["chosen"]["value"] == 8.0e-17 and p["chosen"]["delta_K"] == 0.0
+    out, _e = run(material_ids=[3], temperature_K=400)
+    p = out["materials"][0]["P_mol_m_s_Pa"]
+    assert p["chosen"]["value"] == 8.0e-17 and p["chosen"]["delta_K"] == 86.85, "가장 가까운 값과 차이 — 셈한 외삽값이 아니다"
+    assert any("평균 내지 마라" in (a["grade_scope"] or "") for a in p["alternatives"]), "시료 경고는 그대로"
+
+
+def test_PTR1_없는_재료_와_인자_검사(monkeypatch):
+    run, calls = _gas_kit(monkeypatch)
+    out, err = run(material_ids=[1, 99])
+    assert err is False and out["materials"][1] == {"material_id": 99, "error": "재료를 찾을 수 없습니다."}
+    for a in ({"material_ids": []}, {"material_ids": ["x"]}, {"material_ids": [True]}, {"material_ids": list(range(13))},
+              {"material_ids": [1], "temperature_K": -3}, {"material_ids": [1], "temperature_K": "300"}):
+        out, err = run(**a)
+        assert err is True and out["ok"] is False, a
+    monkeypatch.setattr(gw, "route", {})
+    out, err = run(material_ids=[1])
+    assert err is True and "MaterialTwin" in out["error"]
+
+
+def test_PTR1_읽기_도구이고_심의_좌석_자유_조회에_새로_열리지_않는다():
+    t = next(x for x in gw._local_tools() if x.name == "gas_transport_lookup")
+    assert t.annotations.readOnlyHint is True and t.name in gw._LOCAL_READ
+    import ast
+    src = gw.Path(gw.__file__).resolve().parent.parent / "HWAXAgentServer" / "deliberation.py"
+    if not src.exists():
+        pytest.skip("형제 HWAXAgentServer 리포가 없다")
+    allow = next(ast.literal_eval(n.value) for n in ast.parse(src.read_text(encoding="utf-8")).body
+                 if isinstance(n, ast.Assign) and any(getattr(x, "id", "") == "_FREE_ALLOW" for x in n.targets))
+    assert not t.name.startswith(tuple(allow)), "리스크 심사 · 심의 좌석 자유 조회에 새로 열리면 안 된다(D-18)"

@@ -6345,6 +6345,157 @@ async def _artifact_to_ste(a: dict) -> types.CallToolResult:
                      "파일을 더 넣으려면 같은 upload_id 로 다시 부른다")
 
 
+# ── 층 재료의 가스 투과 물성(HWAXPortal docs/ste-stepforge-1117 PT-R1) ───────────────────────────────────────────────────────────────
+# MaterialTwin 카탈로그에 확산계수 · 헨리 용해도 · 산소투과도 값이 있는데(dev 59 · 19 · 105종) 디지털워커가 '이 층의 D · S' 를 한 번에 받을 길이 없었다.
+# 재료마다 get_material_properties(domain=physical) 를 부르는 사람 그대로 불러 세 키를 기체(conditions.species)로 거른다 — 카탈로그 대표값
+# 도구(search · distribution)는 기체를 가리지 않아 확산계수의 대표값이 물(H2O)일 수 있다.
+#  · 한 재료 안에도 행마다 시료가 다르다(grade_scope — '상한으로만 써라' · '평균 내지 마라' 같은 경고가 거기 있다). 그래서 고른 값과 다른 후보를 함께
+#    싣고 경고 칸은 그대로 넘긴다. P = D·S 셈은 고른 두 행이 같은 시료(grade_scope 같음)이고 온도가 1 K 안일 때만 — 셈한 값이라고 적는다.
+#  · 온도는 행의 conditions(temperature_k · temperature_c)에만 있다. 외삽하지 않는다 — 가장 가까운 행과 그 차이를 준다.
+#  · 이름은 심의 좌석 자유 조회 접두(material_ · property_ …)에 걸리지 않게 짓는다 — 리스크 심사 · 심의 좌석에 새 길을 열지 않는다(D-18).
+GAS_SOURCE = "heax-materialtwin_web"
+GAS_KEYS = {"D_m2_s": ("physical.diffusion_coefficient", "m^2/s"),
+            "S_mol_m3_Pa": ("physical.gas_solubility", "mol/(m^3*Pa)"),
+            "P_mol_m_s_Pa": ("physical.gas_permeability_o2", "mol/(m*s*Pa)")}
+GAS_MAX_MATERIALS = 12
+GAS_ROOM_K = 296.15
+_GAS_COND_DROP = re.compile(r"(?:_before_correction$|^correction_reason$|^corrected_by$)", re.I)
+GAS_TRANSPORT_TOOL = types.Tool(
+    name="gas_transport_lookup",
+    description=(
+        "층 재료의 가스 투과 물성 — MaterialTwin 재료 id 마다 확산계수 D(m²/s) · 헨리 용해도 S(mol/(m³·Pa)) · 산소투과도 P(mol/(m·s·Pa))를 "
+        "기체(species, 기본 O2)로 걸러 한 번에 준다. 값마다 온도 · 품질 등급(1 측정 … 5 추정) · 방법 · 출처 · 시료 경고(grade_scope)가 붙는다. "
+        "temperature_K 를 주면 가장 가까운 온도의 값을 고른다(외삽하지 않는다 — delta_K 가 차이다). 한 재료에도 시료가 다른 값이 여럿일 수 있어 "
+        "alternatives 로 다른 후보를 함께 준다 — grade_scope 의 경고를 읽고 쓴다. P 가 없고 같은 시료의 D · S 가 있으면 P = D·S 로 셈해 derived 로 "
+        "표시한다. permeance · OTR 은 다른 양이라 셈에 쓰지 않는다. 재료 id 는 MaterialTwin search_catalog_property · get_material 의 material_id."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "material_ids": {"type": "array", "items": {"type": "integer"},
+                             "description": f"MaterialTwin 재료 id(정수) 목록 — 최대 {GAS_MAX_MATERIALS}개, 적층의 층 차례로 주면 그 차례로 답한다"},
+            "temperature_K": {"type": "number", "description": "이 온도(K)에 가장 가까운 값을 고른다. 비우면 품질 등급이 먼저, 그다음 23 °C 에 가까운 값"},
+            "species": {"type": "string", "description": "기체(기본 O2). O2 밖이면 산소투과도 P 는 비운다(O2 전용 키다)"},
+        },
+        "required": ["material_ids"],
+    },
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+
+
+def _gas_species(v) -> str:
+    """'H2O (moisture)' → 'H2O' · 'O2' → 'O2' — 맨 앞 낱말만 대문자로."""
+    s = str(v or "").strip()
+    return re.split(r"[\s(]", s, maxsplit=1)[0].upper() if s else ""
+
+
+def _gas_temp_k(cond: dict) -> float | None:
+    for k, add in (("temperature_k", 0.0), ("temperature_c", 273.15)):
+        v = cond.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return round(float(v) + add, 2)
+    return None
+
+
+def _gas_pick(rows: list, key: str, unit: str, species: str, target: float | None, need_species: bool) -> dict:
+    """한 양의 행들 → {chosen, alternatives, n_candidates} 또는 {why}. 단위가 다른 행은 셈하지 않고 센다(환산하지 않는다)."""
+    cands, other_unit = [], 0
+    for r in rows:
+        if not isinstance(r, dict) or r.get("key") != key or not isinstance(r.get("value"), (int, float)) or isinstance(r.get("value"), bool):
+            continue
+        cond = r.get("conditions") if isinstance(r.get("conditions"), dict) else {}
+        sp = _gas_species(cond.get("species"))
+        if (sp or need_species) and sp != species:
+            continue
+        if r.get("unit") != unit:
+            other_unit += 1
+            continue
+        t = _gas_temp_k(cond)
+        src = r.get("source") if isinstance(r.get("source"), dict) else {}
+        cands.append({"value": float(r["value"]), "unit": unit, "temperature_K": t,
+                      "delta_K": (round(abs(t - target), 2) if (t is not None and target is not None) else None),
+                      "quality_tier": r.get("quality_tier"), "method": r.get("method"), "uncertainty": r.get("uncertainty"),
+                      "source": {k: src.get(k) for k in ("title", "doi", "url") if src.get(k)} or None,
+                      "conditions": {k: v for k, v in cond.items() if not _GAS_COND_DROP.search(k)}})
+    if not cands:
+        why = f"{key} 에 {species} 값이 없다" + (f"(단위가 {unit} 가 아닌 행 {other_unit}건은 환산하지 않았다)" if other_unit else "")
+        return {"why": why}
+    inf = float("inf")
+    tier = lambda c: c["quality_tier"] if isinstance(c["quality_tier"], int) else 9  # noqa: E731
+    if target is not None:
+        cands.sort(key=lambda c: (c["delta_K"] if c["delta_K"] is not None else inf, tier(c)))
+    else:
+        cands.sort(key=lambda c: (tier(c), abs(c["temperature_K"] - GAS_ROOM_K) if c["temperature_K"] is not None else inf))
+    alt = [{k: c[k] for k in ("value", "temperature_K", "quality_tier", "method")} | {"grade_scope": str(c["conditions"].get("grade_scope") or "")[:160] or None}
+           for c in cands[1:6]]
+    return {"chosen": cands[0], "n_candidates": len(cands), **({"alternatives": alt} if alt else {}),
+            **({"unit_mismatch_skipped": other_unit} if other_unit else {})}
+
+
+async def _gas_transport(a: dict) -> types.CallToolResult:
+    t0 = time.monotonic()
+    caller = _request_user()
+    raw = a.get("material_ids")
+    species = _gas_species(a.get("species") or "O2") or "O2"
+    target = a.get("temperature_K")
+
+    def done(ok: bool, **kw) -> types.CallToolResult:
+        _audit(GAS_TRANSPORT_TOOL.name, "_gateway", ok, None if ok else str(kw.get("error") or "")[:200],
+               round((time.monotonic() - t0) * 1000), caller=caller or None, note=f"{species}:{len(kw.get('materials') or [])}")
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps({"ok": ok, **kw}, ensure_ascii=False))],
+                                    isError=not ok)
+
+    if target is not None and (isinstance(target, bool) or not isinstance(target, (int, float)) or not 0 < target < 5000):
+        return done(False, error="temperature_K 는 0 보다 큰 켈빈 값이다")
+    ids: list[int] = []
+    for v in raw if isinstance(raw, list) else []:
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int) or (isinstance(v, str) and v.strip().isdigit()):
+            ids.append(int(v))
+    if not ids or len(ids) != len(raw):
+        return done(False, error="material_ids 는 MaterialTwin 재료 id(정수) 목록이다")
+    if len(ids) > GAS_MAX_MATERIALS:
+        return done(False, error=f"한 번에 {GAS_MAX_MATERIALS}개까지다 — 나눠 부른다")
+    name = _rt_exposed(GAS_SOURCE, "get_material_properties")
+    if name is None:
+        return done(False, error="MaterialTwin 이 이 게이트웨이에 붙어 있지 않다", detail=f"{GAS_SOURCE} 의 get_material_properties 가 목록에 없다")
+    tgt = float(target) if target is not None else None
+    results = await asyncio.gather(*(_call_tool_body(name, {"material_id": i, "domain": "physical"}) for i in ids))
+    mats = []
+    for i, res in zip(ids, results):
+        text = _rt_text(res)
+        try:
+            body = json.loads(text)
+        except ValueError:
+            body = None
+        if getattr(res, "isError", False) or not isinstance(body, dict) or body.get("error"):
+            mats.append({"material_id": i, "error": (str(body.get("error")) if isinstance(body, dict) and body.get("error") else text or "오류")[:300]})
+            continue
+        rows = ((body.get("domains") or {}).get("physical") or []) if isinstance(body.get("domains"), dict) else []
+        one: dict = {"material_id": i}
+        for out_key, (key, unit) in GAS_KEYS.items():
+            if out_key == "P_mol_m_s_Pa" and species != "O2":
+                one[out_key] = {"why": "산소투과도 키는 O2 전용이다 — 이 기체의 P 는 D·S 로만 셈한다"}
+                continue
+            one[out_key] = _gas_pick(rows, key, unit, species, tgt, need_species=out_key != "P_mol_m_s_Pa")
+        d, s, p = one["D_m2_s"].get("chosen"), one["S_mol_m3_Pa"].get("chosen"), one["P_mol_m_s_Pa"].get("chosen")
+        if p is None and d and s:
+            same = (d["conditions"].get("grade_scope") == s["conditions"].get("grade_scope")
+                    and d["temperature_K"] is not None and s["temperature_K"] is not None and abs(d["temperature_K"] - s["temperature_K"]) <= 1.0)
+            if same:
+                one["P_mol_m_s_Pa"] = {"derived": True, "value": d["value"] * s["value"], "unit": GAS_KEYS["P_mol_m_s_Pa"][1],
+                                       "formula": "P = D·S", "temperature_K": d["temperature_K"],
+                                       "from": {"D_quality_tier": d["quality_tier"], "S_quality_tier": s["quality_tier"]},
+                                       "note": "같은 시료 · 같은 온도의 D 와 S 를 곱한 셈값이다(측정값이 아니다)",
+                                       "why_missing": one["P_mol_m_s_Pa"].get("why")}
+            else:
+                one["P_mol_m_s_Pa"]["not_derived"] = "고른 D 와 S 가 다른 시료이거나 온도가 1 K 넘게 달라 P = D·S 로 셈하지 않았다"
+        mats.append(one)
+    return done(True, species=species, temperature_K=tgt, materials=mats,
+                note="값마다 conditions.grade_scope 의 시료 · 쓰임 경고를 읽고 쓴다 — alternatives 는 같은 재료의 다른 후보다(평균 내지 않는다)")
+
+
 # ── 그림 저장 — 도구 결과의 그림을 파일로 두고, 받고, 보고서에 넣는다(사용자 보고 11-02) ─────────────────────────────────────────────
 # StepForge · DynaForge 의 그림(ImageContent — base64)은 결과 안에만 있었다. 게이트웨이는 그 블록을 그대로 흘리고 아무것도 두지 않아 개인 Claude 가
 # 받은 그림을 파일로 꺼낼 길도, 인사이트로 쓰는 Report Archive 보고서에 넣을 길도 없었다(받는 경로 없음 · 루틴 원장은 글만 · 감사는 글자만 세 chars:0).
@@ -8032,7 +8183,7 @@ def _local_tools() -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
              BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL,
-             ONTO_LOOKUP_TOOL]
+             ONTO_LOOKUP_TOOL, GAS_TRANSPORT_TOOL]
     # REST 다리는 **등록된 사이트가 있을 때만** 낸다 — 쓸 수 없는 도구를 목록에 두면
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
@@ -9766,6 +9917,7 @@ _LOCAL_READ = frozenset({SEARCH_CONV_TOOL.name, LIST_APPS_TOOL.name, SEARCH_TOOL
                          *_INSIGHT_NAMES,                                  # 과제 인사이트는 읽기 둘뿐이다
                          KIT_GET_TOOL.name,                                # PC 키트 받기 — 파일을 내줄 뿐이다
                          ONTO_LOOKUP_TOOL.name,                            # 온톨로지 조회 — 안쪽 허브 호출은 그 이름으로 다시 판정된다
+                         GAS_TRANSPORT_TOOL.name,                          # 가스 투과 물성 — 안쪽 MaterialTwin 읽기도 그 이름으로 다시 판정된다
                          READONLY_ALLOWLIST_TOOL.name})                    # 읽기 전용 허용 목록 보기(관리자) — 고치기는 REST PATCH 뿐이다
 _ROUTINE_NAMES = frozenset(t.name for t in ROUTINE_TOOLS)
 
@@ -9884,6 +10036,8 @@ async def _call_tool_body(name: str, arguments: dict):
         return await _onto_lookup(arguments or {})
     if name == ARTIFACT_TO_STE_TOOL.name:
         return await _artifact_to_ste(arguments or {})
+    if name == GAS_TRANSPORT_TOOL.name:
+        return await _gas_transport(arguments or {})
     if FIG_STORE_ON and name in _FIG_NAMES:
         return await _fig_dispatch(name, arguments or {})
     if name == KIT_GET_TOOL.name:
@@ -10261,7 +10415,7 @@ def _bearer_gate(app, pat_verifier=None):
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
                         VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL, ONTO_LOOKUP_TOOL, READONLY_ALLOWLIST_TOOL,
-                        *([ARTIFACT_TO_STE_TOOL] if STE_UPLOAD_SITE in REST else [])):
+                        GAS_TRANSPORT_TOOL, *([ARTIFACT_TO_STE_TOOL] if STE_UPLOAD_SITE in REST else [])):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서

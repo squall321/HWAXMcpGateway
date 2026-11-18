@@ -15008,3 +15008,21 @@ def test_PTR2_읽기_도구이고_심의_좌석_자유_조회에_새로_열리�
     allow = next(ast.literal_eval(n.value) for n in ast.parse(src.read_text(encoding="utf-8")).body
                  if isinstance(n, ast.Assign) and any(getattr(x, "id", "") == "_FREE_ALLOW" for x in n.targets))
     assert not t.name.startswith(tuple(allow))
+
+
+# ── 허브가 적은 앱 판 build(HWAXPortal docs/ste-stepforge-1117 PT-R3 · P-3 — HEAXHub 꼴 {commit 7자, started_at UTC ISO}, 모르면 칸이 없다) ─────────
+def test_PTR3_허브_build_칸은_꼴이_맞을_때만_받는다():
+    assert gw._hub_build({"commit": "bfa1977", "started_at": "2026-11-17T08:12:03Z"}) == {"commit": "bfa1977", "started_at": "2026-11-17T08:12:03Z"}
+    assert gw._hub_build({"commit": "bfa1977"}) == {"commit": "bfa1977"}
+    for bad in (None, "bfa1977", {}, {"commit": "BFA1977"}, {"commit": "abc"}, {"commit": "bfa1977; rm"}, {"commit": 1234567}):
+        assert gw._hub_build(bad) is None, bad
+    assert gw._hub_build({"commit": "bfa1977", "started_at": "x" * 41}) == {"commit": "bfa1977"}, "시각이 꼴 밖이면 그 칸만 뺀다"
+
+
+def test_PTR3_list_tool_apps_는_허브가_준_판만_싣는다(monkeypatch):
+    monkeypatch.setattr(gw, "DISCOVERED_META", {"heax-step_forge": {"label": "StepForge", "description": "",
+                                                                    "build": {"commit": "27b2132", "started_at": "2026-11-17T08:12:03Z"}},
+                                                "fmea": {"label": "FMEA", "description": "", "build": None}})
+    by, _asked, _b = _hg10(monkeypatch)
+    assert by["heax-step_forge"]["build"] == {"commit": "27b2132", "started_at": "2026-11-17T08:12:03Z"}
+    assert "build" not in by["fmea"] and "build" not in by["reportarchive"] and "build" not in by["_gateway"], "허브가 모르면 칸이 없다"

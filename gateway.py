@@ -1564,9 +1564,24 @@ async def _discover_heax() -> dict[str, dict] | None:
                                       # 라벨은 이름이라 80자를 둔다(타일 제목). 설명은 자르지 않는다 — list_tool_apps 로 모델이
                                       # 읽고 search_tools 의 앱 가산점 낱말이라 300자 뒤의 업무 낱말이 사라지면 그 낱말로 못 찾는다.
                                       "label": (s.get("name") or "").strip()[:80],
-                                      "description": (s.get("description") or "").strip()}
+                                      "description": (s.get("description") or "").strip(),
+                                      # 떠 있는 인스턴스의 판(HEAXHub 가 SIF 를 띄울 때 적은 것 — 없으면 칸째 없다, HWAXPortal docs/ste-stepforge-1117 PT-R3)
+                                      "build": _hub_build(s.get("build"))}
     # 발견한 앱의 세션을 열기 **전에** 그 호스트도 프록시에서 뺀다(기동 때와 같은 함수 — 이미 있으면 아무것도 안 한다).
     _bypass_proxy_for(spec["url"] for spec in out.values())
+    return out
+
+
+_HUB_COMMIT_RX = re.compile(r"[0-9a-f]{7,40}")
+
+
+def _hub_build(v) -> dict | None:
+    """허브 서버 줄의 build 칸 → {commit, started_at?} 또는 None. 꼴 밖이면 버린다(판을 틀리게 말하느니 말하지 않는다)."""
+    if not isinstance(v, dict) or not isinstance(v.get("commit"), str) or not _HUB_COMMIT_RX.fullmatch(v["commit"]):
+        return None
+    out = {"commit": v["commit"]}
+    if isinstance(v.get("started_at"), str) and 0 < len(v["started_at"]) <= 40:
+        out["started_at"] = v["started_at"]
     return out
 
 
@@ -1789,7 +1804,7 @@ async def _revive_once_locked(tg) -> bool:
             # 표시 정보는 백엔드 합류 여부와 무관하게 항상 갱신한다 — 이미 붙어 있는 앱도
             # registry 에서 이름이 바뀔 수 있고, 라벨은 세션 생존과 별개다.
             DISCOVERED_META[key] = {"label": spec.get("label") or "",
-                                    "description": spec.get("description") or ""}
+                                    "description": spec.get("description") or "", "build": spec.get("build")}
             if key in backends:
                 continue
             b = _Backend(key, spec["url"], spec.get("headers"))
@@ -1919,7 +1934,7 @@ async def _backends_lifespan():
             _boot_heax = {}
         for key, spec in _boot_heax.items():
             DISCOVERED_META[key] = {"label": spec.get("label") or "",
-                                    "description": spec.get("description") or ""}
+                                    "description": spec.get("description") or "", "build": spec.get("build")}
             b = _Backend(key, spec["url"], spec.get("headers"))
             backends[key] = b
             POLICY[key] = spec.get("allowed_groups") or []   # heax 앱의 그룹 필터 반영
@@ -4435,6 +4450,10 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             "status": "ok" if (accessible and reachable) else
                       ("no_access" if not accessible else "backend_down"),
         }
+        # 떠 있는 판(PT-R3) — 허브가 적은 커밋 · 뜬 시각 그대로. 허브가 모르면(프록시 앱 · 커밋 없는 SIF) 칸이 없다 — 지어내지 않는다
+        _build = None if local else (DISCOVERED_META.get(key) or {}).get("build")
+        if _build:
+            entry["build"] = _build
         # 환경 · 정본 · 옛 키(GW-05) — 앱마다 env 가 dev · prod 로 찬다(박스가 app_keys.local.json · GATEWAY_ENV 로 적는다 — 없으면 unknown)
         entry.update(_app_env_entry(key))
         role = None if local else _app_role(key)

@@ -1079,6 +1079,18 @@ def test_파괴_관문이_이름_패턴_밖도_막는다():
         assert n not in gw._INVOKE_DENY_EXACT, n
 
 
+def test_파괴_관문이_한_호출로_게시하는_RA_도구를_막는다():
+    """Report Archive v0.180.0 의 `create_report_from_format` 은 양식에 수신 게시판이 묶여 있으면 **같은 호출에서 바로 게시**한다
+    (RA backend/app/modules/imports/routes.py `_mount_to_destination` — 확인 토큰이 없다). 게시 취소는 남의 승인이 필요해
+    `publish_report` 와 같은 부류다. 초안만 만드는 `create_report_draft`(boards 를 줘도 확인 토큰을 돌려줄 뿐) ·
+    `create_html_report` 는 막지 않는다 — 관문이 너무 넓으면 범용 실행기가 무용지물이다."""
+    import gateway as gw
+
+    assert "create_report_from_format" in gw._INVOKE_DENY_EXACT
+    for n in ("create_report_draft", "create_html_report", "describe_report_format", "register_report_format"):
+        assert n not in gw._INVOKE_DENY_EXACT, n
+
+
 def test_무인증_헬스는_권한_지도를_안_낸다():
     """nginx 가 게이트웨이를 외부로 프록시한다 — 무인증 프로브에 내부 권한 지도가
     나갈 이유가 없다. 다만 **실려 있는지**는 봐야 한다(비면 권한이 통째로 풀린 것)."""

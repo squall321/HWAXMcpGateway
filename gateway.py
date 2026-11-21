@@ -2930,10 +2930,13 @@ _INVOKE_DENY_SUFFIX = ("_control", "_set_state")
 # 실행기가 **늘 별칭으로** invoke_tool 을 거쳐 부른다(R2c 축 태그 붙이기 등). 그래서 이 목록은
 # 해석된 원본 이름으로도 보고(별칭 우회 차단), 절차 PAT 만 면제한다(`_request_purpose`).
 # 면제를 걷어내면 사람이 승인한 절차 단계가 승인 **뒤에** 죽는다 — 걷어낼 근거로 읽지 마라.
+# 2026-11-21 — `create_report_from_format`(Report Archive v0.180.0)을 더했다. 양식에 수신 게시판이 묶여 있으면 **같은 호출에서 바로 게시**하고
+# 확인 토큰 단계가 없다(RA backend/app/modules/imports/routes.py `_mount_to_destination`). `create_report_draft` 는 boards 를 줘도 확인 토큰만
+# 돌려주므로 넣지 않는다(HWAXPortal docs/leftovers-1121 L21-4 B1).
 _INVOKE_DENY_EXACT = frozenset({
     "publish_report", "publish_report_to_datahub", "request_unpublish",
     "trash_report", "restore_version", "job_stop", "risk_add_finding",
-    "add_report_tags",
+    "add_report_tags", "create_report_from_format",
 })
 
 

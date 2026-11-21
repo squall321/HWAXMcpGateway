@@ -187,6 +187,42 @@ GET · HEAD 는 지금 그대로(`inject` — 허브 서비스 토큰)이고, St
 | `PER_USER_SSO_OFF`(공백 구분 `reportarchive`·`testscope` — HWAXPortal update-all 이 infra/.env 의 빈 비밀을 보고 넘긴다 — 와 일반 앱의 키) | 그 위임 항목을 지운다(토큰 등록으로 되돌리기 — 일반 앱은 등록 토큰 길이 없어 서비스 계정으로 나간다). 비밀 없는 손 실행은 직전 값을 이어받으므로 끄는 길은 이것뿐이다. 비밀이 같이 오면 끄지 않는다. 일반 앱은 두 경우에 꺼진다 — 그 실행의 `PER_USER_SSO_APPS` 에 쌍이 있고 비밀이 비었을 때, 또는 쌍째 빠졌고 항목에 `managed_by` 표지가 있을 때(앱을 걷으며 줄을 지운 경우). 어느 쪽이든 이름이 와야 한다 — 목록이 비었다고 스크립트가 스스로 지우지는 않는다(손 실행에는 목록이 없다). 넘기는 쪽은 provision.env 를 읽은 호출자다(update-all, 손으로는 `PER_USER_SSO_OFF=<키>` 를 주고 `--force`). 표지 없는 항목(손으로 붙인 위임, `ste`·`hwax_risk` 등)은 이름이 와도 지우지 않는다 |
 | `KOORM_SEND_PLAT`(1 · true · yes · on 이면 켬, 그 밖의 값이면 — 빈 값도 — 끔, 안 적으면 직전 config) | `per_user_sso.kooremapper_mcp.send_plat` — DynaForge 위임 호출에 호출자의 `plat:` 권한을 서명과 함께(`X-Heax-User-Plat` · `X-Heax-Plat-Proof`) 싣는다. 위임 항목은 env 가 아니라 KooRemapper `.env` 의 게이트웨이 비밀로 생기고, 비밀을 다시 읽어 항목을 새로 쓰는 실행도 직전 값을 잇는다. 일반 앱의 `<접두>_SEND_PLAT` 과 한 곳이 다르다 — 그것은 그 앱의 비밀이 있는 실행에서만 읽혀 비밀 없는 실행에서는 `0` 도 끄지 못하고, 이것은 비밀 없이 항목째 이어받은 실행에도 먹는다(켬 · 끔 둘 다 — 이 비밀은 provision.env 가 아니라 KooRemapper `.env` 에 있어 heax 토큰이나 그 리포가 없는 실행은 읽지 못한다). 그래서 이것을 본떠 판정하는 쪽(포털의 드리프트 판정 등)은 비밀이 아니라 항목이 있는지로 가른다. 위임이 없으면 칸만 만들지 않고 생략을 로그에 남긴다. 값은 호출자의 환경에서 읽는다(이 스크립트는 provision.env 를 읽지 않는다). provision.env 에 적은 값은 그 파일을 export 해 넘기는 실행에서 그대로 먹으니(HWAXPortal update-all 의 MCP 자동 복구가 이미 그렇게 넘긴다) 켤 때가 되기 전에는 적지 않는다. 손으로 켤 때는 이 디렉터리에서 `( set -a; . ./provision.env; set +a; KOORM_SEND_PLAT=1 bash provision-config.sh --force )` 로 돌리고 게이트웨이를 다시 띄운다 — provision.env 없이 맨손으로 돌리면 거기에만 적힌 설정이 빠진다(예: `SMARTTWIN_MCP_URL` 만 믿던 smart-twin-mcp 백엔드가 config 에서 빠진다) |
 
+### WebDesignAgents — MCP 쪽 주인(선택 · 기본 꺼짐, HWAXPortal docs/wda-deck W-18)
+포털의 '발표자료로' 가 만든 WDA 실행에는 주인이 있고, WDA 는 주인 있는 실행을 MCP 에 **없는 것으로** 답한다(게이트웨이가 상주 세션
+하나로 허브 서비스 토큰을 싣기 때문에 `/mcp` 의 `X-Heax-User-Email` 은 허브 첫 관리자로 접힌다). 개인 Claude 로 **자기** 발표자료의
+장면을 보고 고치게 하려면 이 위임을 켠다 — 게이트웨이가 그 사람의 단기 단언을 받아 실어 보내고, WDA 는 서명을 보고 그 주인에게만 연다.
+꺼 두면 지금과 같다(주인 있는 실행은 MCP 에 없다). 코드는 고칠 것이 없고 **설정만** 한다 — 박스의 `gateway_config.json` 은 사람이 고친다.
+
+1. **WDA 먼저** — 허브의 앱 데이터 디렉터리 `HEAXHub/var/app_data/web_design_agents/secrets.env`(0600)에 한 줄을 적는다.
+   16자 이상의 무작위 값이어야 한다(짧으면 WDA 가 없는 것으로 본다). 파일은 호출마다 읽으므로 WDA 재기동은 없다.
+   ```
+   WDA_GATEWAY_SECRET=<16자 이상 무작위 — 게이트웨이와만 나눈다>
+   ```
+   그 판의 WDA 인지는 `GET /apps/web_design_agents/api/health` 의 `features` 에 `mcp_owner` 가 있는지로 본다(비밀이 있을 때만 실린다).
+2. **게이트웨이** — `gateway_config.json` 의 `heax_registry.per_user_sso` 에 **손으로** 이 항목을 넣고 게이트웨이를 다시 띄운다.
+   ```json
+   "web_design_agents": {
+     "sso_url": "<heax_registry.base>/apps/web_design_agents/api/auth/sso",
+     "secret": "<WDA 의 WDA_GATEWAY_SECRET 과 같은 값>",
+     "client": "gateway",
+     "auth": "heax",
+     "token_header": "X-Heax-Sso-Assertion"
+   }
+   ```
+   - `auth: heax` — 발급 주소가 허브 Caddy 경로라 forward_auth 를 서비스 토큰으로 지난다. `token_header` — 사람별 호출도 Caddy 를 지나야 하므로
+     `Authorization` 은 서비스 토큰으로 두고 단언은 이 머리로 싣는다(hwax_risk 와 같은 까닭).
+   - `PER_USER_SSO_APPS` 로 만들지 **않는다** — 그 순회는 `{sso_url, secret, client}` 만 쓰고 `auth` · `token_header` 를 적지 않아, 발급이
+     Caddy 에서 401 로 끊기고 신원 있는 WDA 호출이 전부 거부된다. 손으로 넣은 항목은 `provision-config.sh` 가 지우지 않고 이어받는다.
+3. **켜면 달라지는 것** — 신원 있는 호출(개인 PAT · 웹 챗)의 WDA 도구는 호출마다 그 사람의 단발 세션으로 간다. 발급이 실패하면 서비스
+   계정으로 내려가지 않고 **거부**한다(위 규칙 그대로) — 그래서 1 을 먼저 하고, 비밀을 바꿀 때는 두 곳을 함께 바꾼 뒤 게이트웨이를 다시 띄운다
+   (단언은 약 58분 캐시한다 — 다시 띄우면 비운다). 신원 없는 내부 호출은 종전대로 서비스 계정이다(주인 있는 실행은 닫힌 채).
+4. **무엇이 열리나** — 그 사람이 주인인 실행에 `scene_list` · `scene_html` · `scene_still` · `scenario_patch` · `scenario_revise` ·
+   `report_fragmentize` · `scenario_build` · `render_submit` · `render_status` · `qa_run` 이 닿는다. 남의 실행 · 지운 실행은 여전히 `NOT_FOUND` 다.
+   MCP 로 만든 실행은 지금처럼 주인이 없다. WDA 의 단언은 `wdsso_` 꼴이라 위 `rrsso_` 접힘 검사는 타지 않는다 — WDA 가 위임 머리
+   (`X-Hwax-Delegate-Email`)로만 발급하고 `X-Heax-User-Email` 로는 내려가지 않아 접힌 신원의 단언이 생기지 않는다(위임 머리가 없으면 400).
+5. **확인** — 감사 원장(`audit.jsonl`)에서 그 사람의 WDA 호출에 `per-user:` 실패 줄이 없는지, 그 사람의 실행 id 로 `scene_list` 가
+   답하는지(다른 사람의 PAT 로는 `NOT_FOUND`) 본다. **끄기** — 항목을 지우고 게이트웨이를 다시 띄운다(WDA 의 `secrets.env` 줄도 지운다).
+
 ## 등록 토큰 방식 — `PORTAL_CONN_BACKENDS`(RA·TestScope)
 사람이 그 서비스에서 직접 받은 개인 토큰을 포털 '개인 토큰 › 외부 연결'(`/tokens?tab=connect`)에 등록하면, 게이트웨이가 호출 때 포털 `GET /internal/connections/<service>?email=`(GW_TOKEN)로 그 토큰을 읽어 그 사람 명의로 부른다. 신원이 있는데 등록이 없거나 포털에 묻지 못하면 **거부**하고 등록을 안내한다(서비스 계정으로 대신 부르지 않는다). 신원 없는 내부 호출만 서비스 세션으로 간다.
 

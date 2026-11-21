@@ -54,6 +54,8 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "INGEST_ROUTES_LOCAL_PATH", tmp_path / "ingest_routes.local.json")
     monkeypatch.setattr(gw, "_INGEST", {"key": None, "data": None, "error": None, "overlay": None})
     monkeypatch.setattr(gw, "_INGEST_CHECK", {})
+    # 이용 통계 창구가 감사 원장을 접어 두는 표도 같다 — 안 걸면 /usage-rollup 시험이 박스의 데이터 루트(원장 곁 usage-rollup.sqlite)에 시험 줄을 접는다
+    monkeypatch.setattr(gw, "USAGE_ROLLUP_PATH", tmp_path / "usage-rollup.sqlite")
 
 
 @pytest.fixture(autouse=True)
@@ -15026,3 +15028,45 @@ def test_PTR3_list_tool_apps_는_허브가_준_판만_싣는다(monkeypatch):
     by, _asked, _b = _hg10(monkeypatch)
     assert by["heax-step_forge"]["build"] == {"commit": "27b2132", "started_at": "2026-11-17T08:12:03Z"}
     assert "build" not in by["fmea"] and "build" not in by["reportarchive"] and "build" not in by["_gateway"], "허브가 모르면 칸이 없다"
+
+
+# ── 이용 통계 창구(/usage-rollup — HWAXPortal docs/ops-dashboard M2) ─────────────────────────────────────────────────────────────────
+def test_이용_통계_창구는_공유_비밀을_요구한다(monkeypatch):
+    for method in ("GET", "POST"):
+        st, body = _gate_call(monkeypatch, "/usage-rollup", method, body={}, token="wrong")
+        assert (st, body) == (401, {"error": "unauthorized"}), method
+    assert not gw.USAGE_ROLLUP_PATH.exists(), "거절한 물음은 접지도 않는다"
+
+
+def test_이용_통계_창구는_감사_줄을_접어_기간으로_내고_뺄_계정은_본문으로_받는다(monkeypatch):
+    monkeypatch.setattr(gw, "route", {"heaxapp_do": ("heax-app", "do")})
+    monkeypatch.setattr(gw, "alias_route", {})
+    gw._audit("heaxapp_do", "heax-app", True, None, 12, caller="someone@example.com", via="pat")
+    gw._audit("do", "heax-app", False, "forbidden", 0, caller="tester@example.com", via="pat")
+    today = gw.datetime.now(gw._KST).date().isoformat()
+    st, body = _gate_call(monkeypatch, "/usage-rollup", qs=f"since={today}&until={today}".encode())
+    assert st == 200 and body["contract"] == 1 and body["complete"] is True and (body["since"], body["until"]) == (today, today)
+    [row] = body["calls"]
+    assert (row["backend"], row["tool"], row["calls"], row["errors_gate"]) == ("heax-app", "do", 2, 1), "접두 이름은 경로표의 원래 이름으로 접는다"
+    assert {a["caller"] for a in body["actors"]} == {"someone@example.com", "tester@example.com"}
+    st, body = _gate_call(monkeypatch, "/usage-rollup", "POST", body={"since": today, "until": today, "exclude": ["tester@example.com"]})
+    assert st == 200 and body["calls"][0]["calls"] == 1 and [a["caller"] for a in body["actors"]] == ["someone@example.com"]
+    assert gw.Path(gw.AUDIT_PATH).read_text(encoding="utf-8").count("\n") == 2, "창구는 감사 원장에 줄을 더하지 않는다"
+
+
+def test_이용_통계_창구는_틀린_물음을_400_으로_답하고_다른_메서드는_받지_않는다(monkeypatch):
+    st, body = _gate_call(monkeypatch, "/usage-rollup", qs=b"since=2026-11-05&until=2026-11-01")
+    assert st == 400 and "since" in body["error"]
+    st, body = _gate_call(monkeypatch, "/usage-rollup", "POST", body={"since": "2026-11-01", "until": "2026-11-02", "exclude": "a@example.com"})
+    assert st == 400 and "exclude" in body["error"]
+    assert _gate_call(monkeypatch, "/usage-rollup", "DELETE")[0] == 405
+
+
+def test_이용_통계_표의_기본_자리는_감사_원장_곁이고_손잡이가_덮는다(monkeypatch, tmp_path):
+    monkeypatch.delenv("GATEWAY_USAGE_ROLLUP", raising=False)
+    monkeypatch.setattr(gw, "AUDIT_PATH", str(tmp_path / "data" / "audit.jsonl"))
+    assert gw._usage_rollup_path_setting() == (tmp_path / "data" / "usage-rollup.sqlite").resolve()
+    monkeypatch.setenv("GATEWAY_USAGE_ROLLUP", "var/usage.sqlite")
+    assert gw._usage_rollup_path_setting() == gw.Path(gw.__file__).resolve().parent / "var" / "usage.sqlite", "상대 경로는 리포 루트 기준"
+    monkeypatch.setenv("GATEWAY_USAGE_ROLLUP", str(tmp_path / "x.sqlite"))
+    assert gw._usage_rollup_path_setting() == tmp_path / "x.sqlite"

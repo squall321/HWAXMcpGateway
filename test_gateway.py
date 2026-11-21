@@ -11626,6 +11626,27 @@ def test_save_conversation_은_꼴이_맞는_주제와_의장_틀을_포털에_�
     assert "subject_dropped" not in json.loads(res.content[0].text)
 
 
+@pytest.mark.parametrize("insights", [["ins:web:c1:r1:default", "ins:delib:job-1:sim-plan", "ins:wf:c9"], "unknown", []])
+def test_save_conversation_은_읽은_인사이트를_주제_안에_실어_넘긴다(monkeypatch, insights):
+    """Claude 워크플로가 앞선 인사이트를 근거로 썼으면 읽은 카드 id(또는 다 알 수 없다는 표지 unknown)를 주제 안의 insights 로 싣는다 — 포털이 그
+    카드들의 범위를 이어받게 한다(HWAXPortal docs/project-insight-graph contracts §10.3 · 반대 검토 11-22 M5). 주제와 한 덩이라 그 칸만 빠져 넓게
+    열리는 일이 없다."""
+    subj = {"sp_task": "알파 개발_C2", "round": "dv1", "insights": insights}
+    res, posts, _audits = _drive_save_all(monkeypatch, {"title": "심의", "messages": [{"role": "user", "content": "q"}], "subject": subj})
+    assert posts[0][1]["subject"] == subj and "subject_dropped" not in json.loads(res.content[0].text)
+
+
+@pytest.mark.parametrize("insights", ["all", ["ins:web:c1"] * 61, ["x"], [7], ["ins:web:" + "c" * 300], {"id": "ins:wf:c"}, ["ins:wf:a b"], None])
+def test_save_conversation_은_읽은_인사이트의_꼴이_틀리면_주제를_통째로_버린다(monkeypatch, insights):
+    """꼴이 틀린 insights 만 떼고 주제를 넘기면 그 카드가 '앞선 인사이트를 읽지 않은 카드' 로 서서 읽은 카드의 범위를 잇지 못한다 — 닫힌 쪽은 주제를
+    버리는 것이다(카드가 서지 않는다 · 대화는 저장한다)."""
+    res, posts, _audits = _drive_save_all(monkeypatch, {"title": "심의", "messages": [{"role": "user", "content": "q"}],
+                                                        "subject": {"sp_task": "x", "insights": insights}})
+    out = json.loads(res.content[0].text)
+    assert not res.isError and out["ok"] is True and "insights" in out["subject_dropped"], out
+    assert "subject" not in posts[0][1]
+
+
 @pytest.mark.parametrize("subject,chair,word", [
     ({"sp_task": "x", "sp_state": "confirmed"}, "default", "모르는 칸"),
     ("알파", "default", "객체다"),

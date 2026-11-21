@@ -15155,7 +15155,9 @@ def test_절차_도구_이름은_심의_좌석_자유_조회_접두에_걸리지
                     if isinstance(n, ast.Assign) and any(getattr(x, "id", "") == name for x in n.targets))
     allow, deny = const("deliberation.py", "_FREE_ALLOW"), const("deliberation.py", "_FREE_DENY")
     assert len(allow) > 20, "추출이 깨졌다"
-    for n in _PROC_NAMES:
+    names = [t.name for t in gw.PROCEDURE_TOOLS]      # 시험의 사본이 아니라 게이트웨이가 실제로 내는 이름을 본다
+    assert len(names) == 4
+    for n in names:
         assert not n.startswith(tuple(allow)), f"{n} — 심의 · 리스크 심사 좌석의 자유 조회에 저절로 열린다(이름을 바꾼다)"
         # 겹침 접두가 붙은 꼴(<앱키>_<이름>)은 좌석 판정이 원래 이름으로 다시 본다 — 로컬 도구는 접두가 붙지 않지만 꼬리 이름도 같이 본다
         assert not n.split("_", 1)[1].startswith(tuple(allow)) or n in deny, n

@@ -5876,6 +5876,177 @@ def _rt_exposed(backend: str, original: str) -> str | None:
     return None
 
 
+# ── 절차(HWAXPortal docs/procedures W-116 · 사용자 결정 11-22) ────────────────────────────────────────────────────────────────
+# 포털 절차(한 번 한 일을 굳혀 대상만 바꿔 재생)를 범용 도구 넷으로 낸다 — 목록 · 계약 · 실행 시작 · 상태. 분석 루틴과 같은 꼴이다: 정의 · 실행
+# 원장 · 사람 확인은 포털(/procedures-api)이 쥐고 게이트웨이는 호출자 사람 PAT 를 그대로 넘긴다(시야 · 권한은 포털이 그 사람으로 판정한다 — 내 절차와
+# 공개한 절차, 실행은 내 것만). 절차마다 도구 하나를 내지 않는다(목록이 사람마다 달라지고 길어진다).
+#   · 실행은 계획 모드가 기본이다(바깥을 부르지 않고 부를 호출만 적는다). live 로 시작해도 사람 확인 단계(gate: human · 되돌리기 어려운 도구)에서
+#     멈춘다. **승인 · 고르기 · 재개 도구는 없다** — 포털의 그 창구는 세션만 받아 호출자 PAT 로는 닿지 않는다. 사람이 포털 화면에서 넘긴다.
+#   · 이름은 procedure_ 로 시작한다 — 엔진의 좌석 자유 조회 접두(_FREE_ALLOW)에 걸리지 않아 심의 · 리스크 심사 좌석에 저절로 열리지 않고, 경로(route)에
+#     없는 로컬 도구라 루틴 단계의 허용 도구에도 들지 않는다(시험이 형제 리포 원문과 맞댄다).
+#   · 절차 실행기의 호출(purpose=procedure)로는 부르지 않는다 — 절차의 단계가 실행 시작을 부르면 절차가 절차를 끝없이 시작한다.
+#   · 읽기 전용 PAT 는 실행 시작을 못 부른다(_readonly_denial). 패널 · 서비스 PAT 는 게이트웨이 자체 도구를 부르지 못한다(_local_tools 로 판정).
+PROCEDURE_TIMEOUT_S = float(os.environ.get("GATEWAY_PROCEDURE_TIMEOUT_S", "60") or 60)
+PROCEDURE_PAGE_CHARS = 60_000        # 단계 결과 한 쪽 — 루틴(ROUTINE_PAGE_CHARS)과 같은 몫
+PROCEDURE_ARGS_CHARS = 1_200         # 상태 보기의 단계 인자 글 상한
+_PR_RUN = {"type": "string", "description": "실행 id — procedure_run_start 가 준 run_id(32자 16진수)"}
+_PR_ID = {"type": "string", "description": "절차 id — procedure_list 의 procedure_id(32자 16진수)"}
+PROCEDURE_LIST_TOOL = _routine_tool(
+    "procedure_list",
+    "포털 절차 목록(내 것 + 공개된 것) — 절차는 한 번 한 일을 굳힌 도구 연쇄이고 변수만 바꿔 다시 돌린다. 줄마다 제목 · 변수 · 단계 수 · 사람 확인에서 "
+    "멈추는 도구(human_gates)다. 차례는 procedure_get(계약 — 입력 스키마) → procedure_run_start(기본은 계획 모드) → procedure_run_status 다.",
+    {"q": {"type": "string", "description": "제목에 든 글(대소문자 없이, 200자까지) — 비우면 전부"}}, [])
+PROCEDURE_GET_TOOL = _routine_tool(
+    "procedure_get",
+    "절차 하나의 도구 계약 — 이름 · 제목 · 설명(단계 사슬) · 입력 스키마(inputSchema — 변수의 뜻 · 형 · 필수) · 사람 확인에서 멈추는 도구"
+    "(human_gates). 멈추는 것은 정상이다 — 그 단계는 사람이 포털 화면에서 승인해야 넘어간다.",
+    {"procedure_id": _PR_ID}, ["procedure_id"])
+PROCEDURE_RUN_START_TOOL = _routine_tool(
+    "procedure_run_start",
+    "절차 실행을 시작한다 — 내 이름 · 내 권한으로 돈다. 기본은 계획 모드(mode=plan)다: 바깥 도구를 부르지 않고 무엇을 어떤 인자로 부를지만 "
+    "실행 기록에 적는다. 사람이 실제로 돌리라고 했을 때만 mode=live 를 준다 — live 도 사람 확인 단계(human_gates · 되돌리기 어려운 도구)에서 멈추고, "
+    "그 단계는 사람이 포털 화면(/procedures/runs/<run_id>)에서 승인해야 넘어간다. 이 도구로는 승인 · 고르기 · 재개를 하지 않는다. 답은 run_id 이고 "
+    "진행은 procedure_run_status 로 본다.",
+    {"procedure_id": _PR_ID,
+     "inputs": {"type": "object", "description": "절차 변수 {키: 값} — procedure_get 의 inputSchema 그대로(모르는 키 · 빠진 필수는 거절된다)"},
+     "mode": {"type": "string", "enum": ["plan", "live"], "description": "plan(기본 — 부를 호출만 적는다) 또는 live(실제로 부른다)"}},
+    ["procedure_id"])
+PROCEDURE_RUN_STATUS_TOOL = _routine_tool(
+    "procedure_run_status",
+    "내 절차 실행의 상태 — 실행 상태(queued · running · gated · done · failed · cancelled)와 단계마다 도구 · 인자 · 상태 · 오류 · 경고다. 사람을 "
+    "기다리면(gated) waiting 이 어느 단계인지와 포털 화면 주소를 말한다 — 사람에게 그 화면에서 확인하라고 전한다. step 을 주면 그 단계 결과 글의 "
+    "한 쪽(page — 쪽마다 60,000자)을 준다.",
+    {"run_id": _PR_RUN,
+     "step": {"type": "integer", "minimum": 0, "description": "단계 번호(steps[].ix, 0부터) — 주면 그 단계의 결과 글을 준다"},
+     "page": {"type": "integer", "minimum": 1, "description": "쪽 번호(1 이상, 기본 1) — step 과 함께"}},
+    ["run_id"])
+PROCEDURE_TOOLS = (PROCEDURE_LIST_TOOL, PROCEDURE_GET_TOOL, PROCEDURE_RUN_START_TOOL, PROCEDURE_RUN_STATUS_TOOL)
+_PROCEDURE_NAMES = frozenset(t.name for t in PROCEDURE_TOOLS)
+
+
+class _ProcedureError(_RoutineError):
+    """절차 도구가 호출자에게 그대로 말할 까닭(루틴 도구의 포털 판정을 같이 쓴다)."""
+
+
+async def _procedure_portal(method: str, path: str, *, body: dict | None = None) -> dict:
+    return await _portal_api("/procedures-api", method, path, body=body, params=None, timeout=PROCEDURE_TIMEOUT_S,
+                             err=_ProcedureError, what="절차",
+                             no_pat="절차는 사람 PAT 로만 돈다 — 실행이 그 사람 이름 · 그 사람 권한이어야 한다(게이트웨이 공유 비밀로는 부를 수 없다)")
+
+
+def _procedure_run_view(run: dict) -> dict:
+    """포털 실행 보기 → 도구 답. 단계는 도구 · 인자 글 · 상태 · 오류 · 경고 · 결과 길이만 — 승인이 묶이는 지문(args_sha256)과 주인 칸은 싣지 않는다."""
+    rid = str(run.get("id") or "")
+    steps, waiting = [], None
+    for s in run.get("steps") or []:
+        if not isinstance(s, dict):
+            continue
+        notes = s.get("notes") if isinstance(s.get("notes"), dict) else {}
+        args = json.dumps(s.get("args") or {}, ensure_ascii=False, sort_keys=True)
+        row = {"ix": s.get("ix"), "backend": s.get("backend"), "tool": s.get("tool"), "state": s.get("state"),
+               **({"stage": s["stage"]} if s.get("stage") else {}),
+               **({"error": _clip(s["error"], 500)} if s.get("error") else {}),
+               "args": args if len(args) <= PROCEDURE_ARGS_CHARS else args[:PROCEDURE_ARGS_CHARS] + f"…(원문 {len(args):,}자)",
+               **({"duration_ms": s["duration_ms"]} if s.get("duration_ms") is not None else {}),
+               **({"result_chars": s["result_bytes"]} if s.get("result_bytes") is not None else {})}
+        warns = notes.get("warnings")
+        if warns:
+            row["warnings"] = [(_clip(w if isinstance(w, str) else json.dumps(w, ensure_ascii=False), 200)) for w in
+                               (warns if isinstance(warns, list) else [warns])][:8]
+        if (notes.get("plan") or {}).get("unverified"):
+            row["unverified"] = True       # 계획 모드 — 앞 단계의 결과에 기대는 인자라 아직 못 풀었다
+        steps.append(row)
+        if waiting is None and s.get("state") == "pending" and run.get("state") == "gated":
+            pick = bool(notes.get("candidates"))
+            waiting = {"step": s.get("ix"), "tool": s.get("tool"), "kind": "pick" if pick else "human_gate",
+                       "where": f"/procedures/runs/{rid}",
+                       "note": ("사람이 포털 화면에서 후보를 고르면 이어진다 — 이 도구로는 고르지 않는다" if pick else
+                                "사람이 포털 화면에서 인자를 보고 승인하면 이어진다 — 이 도구로는 승인하지 않는다")}
+    out = {"run_id": rid, "state": run.get("state"), **({"stage": run["stage"]} if run.get("stage") else {}),
+           "mode": run.get("mode"), "title": run.get("title"), "procedure_id": run.get("procedure_id"),
+           "version_no": run.get("version_no"), "started_at": run.get("started_at"), "ended_at": run.get("ended_at"),
+           "steps": steps}
+    if waiting:
+        out["waiting"] = waiting
+    if run.get("mode") == "plan":
+        out["note"] = "계획 모드 — 바깥 도구를 부르지 않았다. 단계의 인자는 부를 호출이고 결과는 없다. 실제로 돌리려면 사람이 시킨 뒤 mode=live 로 시작한다"
+    return out
+
+
+async def _procedure_simple(name: str, a: dict) -> dict:
+    q = lambda s: quote(str(s or "").strip(), safe="")  # noqa: E731
+    if name == PROCEDURE_LIST_TOOL.name:
+        got = await _procedure_portal("GET", "/catalog")
+        want = str(a.get("q") or "").strip().lower()[:200]
+        rows = [r for r in got.get("procedures") or [] if isinstance(r, dict) and (not want or want in str(r.get("title") or "").lower())]
+        return {"count": len(rows), "procedures": rows,
+                "next": "procedure_get(procedure_id) 로 입력 스키마를 본 뒤 procedure_run_start(procedure_id, inputs) — 기본은 계획 모드다"}
+    if name == PROCEDURE_GET_TOOL.name:
+        if not str(a.get("procedure_id") or "").strip():
+            raise _ProcedureError("procedure_id 를 준다")
+        got = await _procedure_portal("GET", f"/procedures/{q(a['procedure_id'])}/tool")
+        gates = [str(g) for g in got.get("human_gates") or []]
+        got["how"] = ("procedure_run_start(procedure_id, inputs) 로 시작한다 — 기본은 계획 모드다. "
+                      + (f"live 로 돌리면 {', '.join(gates)} 단계에서 멈춘다 — 사람이 포털 화면에서 승인해야 넘어간다(멈추는 것이 정상이다)"
+                         if gates else "사람 확인에서 멈추는 단계가 없다"))
+        return got
+    if name == PROCEDURE_RUN_START_TOOL.name:
+        if not str(a.get("procedure_id") or "").strip():
+            raise _ProcedureError("procedure_id 를 준다")
+        mode = a.get("mode")
+        if mode is None:
+            mode = "plan"
+        if mode not in ("plan", "live"):
+            # 못 읽은 모드를 어느 쪽으로도 읽지 않는다 — live 로 읽으면 계획만 보려던 호출이 바깥을 부른다
+            raise _ProcedureError("mode 는 plan · live 다(비우면 plan)")
+        inputs = a.get("inputs")
+        if inputs is None:
+            inputs = {}
+        if not isinstance(inputs, dict):
+            raise _ProcedureError("inputs 는 객체다 — {변수 키: 값}")
+        got = await _procedure_portal("POST", "/runs", body={"procedure_id": str(a["procedure_id"]).strip(), "vars": inputs, "mode": mode})
+        rid = str(got.get("run_id") or "")
+        return {**got, "mode": mode,
+                "next": (f"procedure_run_status(run_id=\"{rid}\") 로 본다. 사람 확인 단계에서 멈추면(gated) 사람이 포털 화면 "
+                         f"/procedures/runs/{rid} 에서 승인한다 — 이 도구로는 승인하지 않는다")}
+    if name == PROCEDURE_RUN_STATUS_TOOL.name:
+        rid = str(a.get("run_id") or "").strip()
+        if not rid:
+            raise _ProcedureError("run_id 를 준다")
+        if a.get("step") is None:
+            return _procedure_run_view(await _procedure_portal("GET", f"/runs/{q(rid)}"))
+        try:
+            ix, page = int(a["step"]), max(1, int(a.get("page") or 1))
+        except (TypeError, ValueError):
+            raise _ProcedureError("step · page 는 정수다") from None
+        if ix < 0:
+            raise _ProcedureError("step 은 0 이상이다")
+        text = str((await _procedure_portal("GET", f"/runs/{q(rid)}/steps/{ix}/result")).get("text") or "")
+        pages = max(1, -(-len(text) // PROCEDURE_PAGE_CHARS))
+        if page > pages:
+            raise _ProcedureError(f"그 쪽이 없다 — 이 결과는 {pages}쪽이다")
+        out = {"run_id": rid, "step": ix, "page": page, "pages": pages, "chars": len(text),
+               "text": text[(page - 1) * PROCEDURE_PAGE_CHARS: page * PROCEDURE_PAGE_CHARS]}
+        if page < pages:
+            out["next"] = f"procedure_run_status(run_id, step={ix}, page={page + 1}) — 이 답은 {page}/{pages}쪽"
+        return out
+    raise _ProcedureError(f"모르는 절차 도구: {name}")
+
+
+async def _procedure_dispatch(name: str, arguments: dict) -> types.CallToolResult:
+    """절차 로컬 도구 넷 — 포털 창구를 호출자 사람 PAT 로. 실패는 PROCEDURE_ERROR 한 줄(까닭 그대로), 감사는 portal 로 한 줄."""
+    t0 = time.monotonic()
+    try:
+        if _request_purpose() == PROCEDURE_PURPOSE:
+            raise _ProcedureError("절차 실행기의 호출로는 절차 도구를 부르지 않는다 — 절차의 단계가 절차를 시작하면 끝없이 이어진다")
+        res = _rt_json(await _procedure_simple(name, arguments or {}))
+        _audit(name, "portal", True, None, round((time.monotonic() - t0) * 1000))
+        return res
+    except _ProcedureError as exc:
+        _audit(name, "portal", False, str(exc), round((time.monotonic() - t0) * 1000))
+        return types.CallToolResult(content=[types.TextContent(type="text", text=f"PROCEDURE_ERROR: {exc}")], isError=True)
+
+
 # ── 과제 인사이트(HWAXPortal docs/project-insight-graph M2 · contracts §7) ──────────────────────────────────────────────────────
 # 원장 · 시야(읽을 때 거름)는 포털(/insights-api)이 쥐고, 게이트웨이는 호출자 사람 PAT 를 그대로 넘기는 얇은 읽기 도구 둘만 둔다(루틴 도구와 같은
 # 꼴 — _portal_api). 게이트웨이 공유 비밀 · 신원 없는 호출은 아무것도 못 본다. 쓰기 도구는 없다 — 확인 · 고침 · 거둠은 사람이 포털 화면에서 한다.
@@ -8383,7 +8554,7 @@ def _local_tools() -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
              BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL,
-             ONTO_LOOKUP_TOOL, GAS_TRANSPORT_TOOL, RELIAB_TOOL]
+             ONTO_LOOKUP_TOOL, GAS_TRANSPORT_TOOL, RELIAB_TOOL, *PROCEDURE_TOOLS]
     # REST 다리는 **등록된 사이트가 있을 때만** 낸다 — 쓸 수 없는 도구를 목록에 두면
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
@@ -8911,6 +9082,9 @@ def _readonly_denial(name: str, arguments: dict) -> str:
     if name in _ROUTINE_NAMES:
         # 루틴 도구는 경로(route)에 없는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸린다 — 실행 · 원장 쓰기는 여기서 막는다(목록 · 계획은 _LOCAL_READ)
         return f"read_only: {name} — {_RO_WHY}은 루틴을 돌리지 못한다(원장에 쓴다). routine_list · routine_get 만 된다."
+    if name in _PROCEDURE_NAMES:
+        # 절차 도구도 경로에 없는 로컬 도구다 — 실행 시작만 여기서 막는다(목록 · 계약 · 상태는 _LOCAL_READ). 포털도 같은 토큰을 거절한다
+        return f"read_only: {name} — {_RO_WHY}은 절차를 실행하지 못한다(실행 원장에 쓴다). procedure_list · procedure_get · procedure_run_status 만 된다."
     if FIG_STORE_ON and name in _FIG_NAMES:
         # 그림 도구 — 받기 · 목록은 읽기다. 보고서 · 문서 쓰기는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸리므로 여기서 막는다. 끄면 이 이름들은 그림
         # 도구가 아니다 — _LOCAL_READ 에 두면 끈 박스에서 같은 이름의 백엔드 쓰기 도구가 읽기 전용 PAT 로 열렸다(반대 검토 6)
@@ -10114,6 +10288,7 @@ async def _list_tools(req: types.ListToolsRequest):
 _LOCAL_READ = frozenset({SEARCH_CONV_TOOL.name, LIST_APPS_TOOL.name, SEARCH_TOOLS_TOOL.name, BROWSE_EXPERTS_TOOL.name,
                          USE_EXPERTS_TOOL.name, VERIFY_TOOL.name, REST_CATALOG_TOOL.name,
                          ROUTINE_LIST_TOOL.name, ROUTINE_GET_TOOL.name,   # 루틴 실행 · 원장 쓰기는 읽기 전용 PAT 밖
+                         PROCEDURE_LIST_TOOL.name, PROCEDURE_GET_TOOL.name, PROCEDURE_RUN_STATUS_TOOL.name,   # 절차 실행 시작은 밖
                          *_INSIGHT_NAMES,                                  # 과제 인사이트는 읽기 둘뿐이다
                          KIT_GET_TOOL.name,                                # PC 키트 받기 — 파일을 내줄 뿐이다
                          ONTO_LOOKUP_TOOL.name,                            # 온톨로지 조회 — 안쪽 허브 호출은 그 이름으로 다시 판정된다
@@ -10233,6 +10408,8 @@ async def _call_tool_body(name: str, arguments: dict):
         return await _routine_dispatch(name, arguments or {})
     if name in _INSIGHT_NAMES:
         return await _insight_dispatch(name, arguments or {})
+    if name in _PROCEDURE_NAMES:
+        return await _procedure_dispatch(name, arguments or {})
     if name == ONTO_LOOKUP_TOOL.name:
         return await _onto_lookup(arguments or {})
     if name == ARTIFACT_TO_STE_TOOL.name:
@@ -10619,7 +10796,8 @@ def _bearer_gate(app, pat_verifier=None):
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
                         VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL, ONTO_LOOKUP_TOOL, READONLY_ALLOWLIST_TOOL,
-                        GAS_TRANSPORT_TOOL, RELIAB_TOOL, *([ARTIFACT_TO_STE_TOOL] if STE_UPLOAD_SITE in REST else [])):
+                        GAS_TRANSPORT_TOOL, RELIAB_TOOL, *PROCEDURE_TOOLS,
+                        *([ARTIFACT_TO_STE_TOOL] if STE_UPLOAD_SITE in REST else [])):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서

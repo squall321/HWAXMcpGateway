@@ -134,7 +134,7 @@ def test_visible_tools(monkeypatch):
                               gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL,
                               gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL, *gw.ROUTINE_TOOLS, *gw.INSIGHT_TOOLS,
                               *gw.FIGURE_TOOLS, gw.KIT_GET_TOOL, gw.ONTO_LOOKUP_TOOL, gw.ARTIFACT_TO_STE_TOOL,
-                              gw.GAS_TRANSPORT_TOOL, gw.RELIAB_TOOL)}
+                              gw.GAS_TRANSPORT_TOOL, gw.RELIAB_TOOL, *gw.PROCEDURE_TOOLS)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -6288,8 +6288,9 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
     # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 관리자 읽기 목록 보기 1(GW-02 — tools/list 는 관리자에게만)
-    # + 가스 투과 물성 1(PT-R1) + 신뢰성 시험 조건 1(PT-R2) — ste 업로드 옮기기(P-1)는 rest.ste 가 있을 때만이라 여기(REST 없음)엔 없다
-    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 25, "reportarchive": 2}
+    # + 가스 투과 물성 1(PT-R1) + 신뢰성 시험 조건 1(PT-R2) + 절차 4(목록 · 계약 · 실행 시작 · 상태 — HWAXPortal docs/procedures W-116) —
+    # ste 업로드 옮기기(P-1)는 rest.ste 가 있을 때만이라 여기(REST 없음)엔 없다
+    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 29, "reportarchive": 2}
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
     assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
@@ -6357,7 +6358,8 @@ def test_게이트웨이_로컬_도구는_제_앱으로_센다(monkeypatch, _fre
     """로컬 도구는 route 에 없다 — `_gateway` 앱으로 세고, tools/list 가 붙이는 것과 같은 목록이다(REST 다리는 사이트가 있을
     때만). 목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
     # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 가스 투과 물성 1 + 신뢰성 시험 조건 1(+ REST 다리 둘, rest.ste 면 ste 업로드 옮기기 하나 더)
-    for rest, n_local in (({}, 24), ({"s": {"base": "http://x"}}, 26), ({"ste": {"base": "http://x", "per_user": "ste"}}, 27)):
+    # 절차 도구 넷(목록 · 계약 · 실행 시작 · 상태 — HWAXPortal docs/procedures W-116)이 늘 붙는다 — 24 · 26 · 27 에서 넷씩 늘었다
+    for rest, n_local in (({}, 28), ({"s": {"base": "http://x"}}, 30), ({"ste": {"base": "http://x", "per_user": "ste"}}, 31)):
         monkeypatch.setattr(gw, "REST", rest)
         _aggregate_tools(monkeypatch, {"sf": [_stool("sf_q", {"q": None})]})
         row = {r["app"]: r for r in gw._ARG_SCORE["apps"]}["_gateway"]
@@ -12187,7 +12189,11 @@ def test_search_tools_는_그림_이미지_보고서에_그림으로_그림_도�
     _no_embed(monkeypatch)
     ranked = json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]
     assert ranked[0] == want, (q, ranked)
-    assert {"figure_get", "figure_list", "figure_to_report"} <= set(ranked), (q, ranked)
+    # 그림 도구 셋이 여덟 자리 안에 다 나온다. '이미지 목록' 만 둘이다 — '목록' 은 목록 도구 전부(list_* · *_list)가 함께 받는 낱말이라, 로컬 목록
+    # 도구가 하나 늘 때마다(루틴 · 절차 — HWAXPortal docs/procedures W-116) 그 낱말에 걸리지 않는 그림 쓰기 도구(figure_to_report)가 한 자리씩
+    # 밀린다. 그 질의가 찾는 것(그림 목록)과 받기 도구가 남는지를 본다 — 보고서에 넣기는 '보고서에 그림' 질의가 첫 자리로 본다.
+    need = {"figure_get", "figure_list"} if q == "이미지 목록" else {"figure_get", "figure_list", "figure_to_report"}
+    assert need <= set(ranked), (q, ranked)
 
 
 def test_받기_표는_게이트웨이_로그에_남지_않는다():
@@ -15083,3 +15089,211 @@ def test_루틴_보고서_초안은_글자로_박힌_템플릿_id_없이_박스_
     # 하나는 _ra_format_args 가 돌려주는 dict 자신이다
     assert len(literal) == 1, f"template_id 를 글자로 든 dict — 줄 {literal}"
     assert src.count('**_ra_format_args("deliberation")') == 1
+
+
+# ── 절차(HWAXPortal docs/procedures W-116 · 사용자 결정 11-22) — 범용 도구 넷, 분석 루틴과 같은 꼴 ──────────────────────────────────────
+# 목록 · 계약 · 실행 시작 · 상태. 정의 · 실행 원장 · 사람 확인은 포털(/procedures-api)이 쥐고 게이트웨이는 호출자 사람 PAT 를 그대로 넘긴다.
+# 승인 도구는 없다 — 사람 확인 단계는 포털 화면에서만 넘어간다.
+_PROC_NAMES = ("procedure_list", "procedure_get", "procedure_run_start", "procedure_run_status")
+_PROC_RUN = {"id": "r" * 32, "state": "gated", "stage": "step:1", "mode": "live", "title": "보고서 태그", "procedure_id": "p" * 32,
+             "version_no": 2, "started_at": 100, "ended_at": None, "inputs": {"report_id": 7}, "owner_sub": "u@corp.com",
+             "steps": [{"ix": 0, "backend": "reportarchive", "tool": "find_reports", "args": {"q": "x"}, "args_sha256": "a" * 64,
+                        "state": "done", "ok": 1, "error": None, "stage": None, "duration_ms": 12, "result_bytes": 40, "truncated": 0,
+                        "notes": {"warnings": ["W120: ply 제외"], "judge": {"ok": True}}, "mode": "live"},
+                       {"ix": 1, "backend": "reportarchive", "tool": "add_report_tags", "args": {"report_id": 7, "tags": ["a"]},
+                        "args_sha256": "b" * 64, "state": "pending", "ok": 0, "error": None, "stage": "gate", "duration_ms": None,
+                        "result_bytes": None, "truncated": 0, "notes": None, "mode": "live"}]}
+
+
+def _proc_portal(monkeypatch, responder, auth="Bearer pat-person", headers=None):
+    sent = []
+
+    def handler(req):
+        sent.append(req)
+        return responder(req)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(gw.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(gw, "PORTAL", {"api_base": "http://portal.test"})
+    _set_request_headers(monkeypatch, {**({"authorization": auth} if auth else {}), **(headers or {})})
+    return sent
+
+
+def _proc_call(name, args):
+    res = asyncio.run(gw._call_tool(name, args))
+    return res, res.content[0].text
+
+
+def test_절차_도구_넷은_로컬_목록_도구_지도에_있고_읽기_전용_PAT_는_실행_시작만_못_부른다(monkeypatch):
+    names = [t.name for t in gw._local_tools()]
+    assert tuple(t.name for t in gw.PROCEDURE_TOOLS) == _PROC_NAMES and set(_PROC_NAMES) <= set(names)
+    for t in gw.PROCEDURE_TOOLS:
+        props = t.inputSchema.get("properties") or {}
+        assert all((p.get("description") or "").strip() for p in props.values()), f"{t.name} 인자 설명(점수판)"
+    assert {n for n in gw._LOCAL_READ if n.startswith("procedure_")} == {"procedure_list", "procedure_get", "procedure_run_status"}
+    for n in ("procedure_list", "procedure_get", "procedure_run_status"):
+        assert gw._readonly_denial(n, {}) == "", n
+    assert gw._readonly_denial("procedure_run_start", {}).startswith("read_only: procedure_run_start"), "실행 원장에 쓴다"
+    st, body = _gate_call(monkeypatch, "/tools-map")
+    assert st == 200 and all(body["map"].get(n) == "_gateway" for n in _PROC_NAMES), "도구 지도 · list_tool_apps 의 수가 맞는다"
+    assert not set(_PROC_NAMES) & (set(body["write"]) | set(body["routine_read"])), "로컬 도구는 백엔드 도구가 아니다"
+    # 승인 · 고르기 · 재개 · 중단 도구는 없다 — 사람 확인은 포털 화면만 받는다
+    assert not [n for n in names if n.startswith("procedure_") and n not in _PROC_NAMES]
+    assert "포털 화면" in gw.PROCEDURE_RUN_START_TOOL.description and "계획" in gw.PROCEDURE_RUN_START_TOOL.description
+
+
+def test_절차_도구_이름은_심의_좌석_자유_조회_접두에_걸리지_않고_웹_챗의_확인_관문에_있다():
+    """게이트웨이 로컬 도구의 이름이 엔진의 좌석 자유 조회 접두(_FREE_ALLOW — list_ · get_ · search_ …)로 시작하면 심의 · 리스크 심사 좌석에 저절로
+    열린다(D-18). 절차 실행을 시작하는 도구가 좌석에 열리면 좌석이 사람이 고르지 않은 연쇄를 돈다. 웹 챗에서는 실행 시작이 잡 시작 바닥 목록
+    (_CONFIRM_JOB_TOOLS)에 있어야 사람이 이번 말로 시키지 않은 호출이 확인 카드로 멈춘다 — 형제 리포의 원문(AST)으로 본다."""
+    import ast
+    root = gw.Path(gw.__file__).resolve().parent.parent / "HWAXAgentServer"
+    if not (root / "deliberation.py").exists():
+        pytest.skip("형제 HWAXAgentServer 리포가 없다")
+
+    def const(path, name):
+        return next(ast.literal_eval(n.value) for n in ast.parse((root / path).read_text(encoding="utf-8")).body
+                    if isinstance(n, ast.Assign) and any(getattr(x, "id", "") == name for x in n.targets))
+    allow, deny = const("deliberation.py", "_FREE_ALLOW"), const("deliberation.py", "_FREE_DENY")
+    assert len(allow) > 20, "추출이 깨졌다"
+    for n in _PROC_NAMES:
+        assert not n.startswith(tuple(allow)), f"{n} — 심의 · 리스크 심사 좌석의 자유 조회에 저절로 열린다(이름을 바꾼다)"
+        # 겹침 접두가 붙은 꼴(<앱키>_<이름>)은 좌석 판정이 원래 이름으로 다시 본다 — 로컬 도구는 접두가 붙지 않지만 꼬리 이름도 같이 본다
+        assert not n.split("_", 1)[1].startswith(tuple(allow)) or n in deny, n
+    jobs = const("app.py", "_CONFIRM_JOB_TOOLS")
+    assert "procedure_run_start" in jobs, "웹 챗에서 사람이 이번 말로 시키지 않은 절차 실행이 확인 카드 없이 나간다"
+    assert not {"procedure_list", "procedure_get", "procedure_run_status"} & set(jobs), "읽기 셋은 카드로 멈추지 않는다"
+
+
+def test_procedure_list_는_호출자_PAT_로_포털_목록을_읽고_제목으로_거른다(monkeypatch):
+    rows = [{"procedure_id": "a" * 32, "title": "열충격 SED 판정", "version_no": 3, "mine": True, "updated_at": 5,
+             "vars": [{"key": "odb_job", "label": "ODB 잡", "type": "string", "required": True}], "steps": 3, "human_gates": ["create_report_draft"]},
+            {"procedure_id": "b" * 32, "title": "적층 굴곡 수명", "version_no": 1, "mine": False, "updated_at": 4, "vars": [], "steps": 4,
+             "human_gates": []}]
+    sent = _proc_portal(monkeypatch, lambda req: httpx.Response(200, json={"count": 2, "procedures": rows}))
+    res, text = _proc_call("procedure_list", {})
+    out = json.loads(text)
+    assert not res.isError and out["count"] == 2 and out["procedures"] == rows
+    assert sent[0].headers["authorization"] == "Bearer pat-person" and sent[0].url.path == "/procedures-api/catalog"
+    assert "procedure_get" in out["next"] and "procedure_run_start" in out["next"]
+    out = json.loads(_proc_call("procedure_list", {"q": "sed"})[1])
+    assert [r["procedure_id"] for r in out["procedures"]] == ["a" * 32] and out["count"] == 1
+
+
+def test_procedure_get_은_계약을_그대로_준다(monkeypatch):
+    contract = {"name": "procedure_" + "a" * 32, "title": "열충격 SED 판정", "description": "단계 3개", "version_no": 3,
+                "inputSchema": {"type": "object", "properties": {"odb_job": {"type": "string"}}, "required": ["odb_job"],
+                                "additionalProperties": False}, "human_gates": ["create_report_draft"]}
+    sent = _proc_portal(monkeypatch, lambda req: httpx.Response(200, json=contract))
+    res, text = _proc_call("procedure_get", {"procedure_id": "a" * 32})
+    out = json.loads(text)
+    assert not res.isError and {k: out[k] for k in contract} == contract, "W-50 계약 다섯 칸을 그대로"
+    assert sent[0].url.path == f"/procedures-api/procedures/{'a' * 32}/tool"
+    assert "create_report_draft" in out["how"] and "포털 화면" in out["how"], "멈추는 것이 정상이라는 사실이 계약의 일부다"
+    res, text = _proc_call("procedure_get", {})
+    assert res.isError and text.startswith("PROCEDURE_ERROR:") and "procedure_id" in text
+
+
+def test_procedure_run_start_의_기본은_계획_모드이고_입력을_vars_로_넘긴다(monkeypatch):
+    sent = _proc_portal(monkeypatch, lambda req: httpx.Response(202, json={"run_id": "r" * 32, "state": "queued",
+                                                                         "poll": "/procedures-api/runs/" + "r" * 32}))
+    res, text = _proc_call("procedure_run_start", {"procedure_id": "a" * 32, "inputs": {"odb_job": "J1"}})
+    out = json.loads(text)
+    assert not res.isError and out["run_id"] == "r" * 32 and out["mode"] == "plan"
+    assert sent[0].method == "POST" and sent[0].url.path == "/procedures-api/runs"
+    assert json.loads(sent[0].content) == {"procedure_id": "a" * 32, "vars": {"odb_job": "J1"}, "mode": "plan"}
+    assert "procedure_run_status" in out["next"] and f"/procedures/runs/{'r' * 32}" in out["next"]
+    _proc_call("procedure_run_start", {"procedure_id": "a" * 32, "mode": "live"})
+    assert json.loads(sent[1].content) == {"procedure_id": "a" * 32, "vars": {}, "mode": "live"}
+
+
+@pytest.mark.parametrize("args,why", [({}, "procedure_id"), ({"procedure_id": "a" * 32, "mode": "LIVE!"}, "plan · live"),
+                                      ({"procedure_id": "a" * 32, "mode": True}, "plan · live"),
+                                      ({"procedure_id": "a" * 32, "inputs": "x=1"}, "객체")])
+def test_procedure_run_start_는_틀린_인자를_포털로_보내지_않는다(monkeypatch, args, why):
+    """모드를 못 읽었을 때 live 로 읽으면 계획만 보려던 호출이 바깥을 부른다 — 못 읽으면 거절한다."""
+    sent = _proc_portal(monkeypatch, lambda req: httpx.Response(202, json={}))
+    res, text = _proc_call("procedure_run_start", args)
+    assert res.isError and text.startswith("PROCEDURE_ERROR:") and why in text and sent == [], text
+
+
+def test_procedure_run_status_는_단계_상태와_사람을_기다리는_자리를_말하고_승인_지문은_싣지_않는다(monkeypatch):
+    sent = _proc_portal(monkeypatch, lambda req: httpx.Response(200, json=_PROC_RUN))
+    res, text = _proc_call("procedure_run_status", {"run_id": "r" * 32})
+    out = json.loads(text)
+    assert not res.isError and (out["run_id"], out["state"], out["mode"]) == ("r" * 32, "gated", "live")
+    assert sent[0].url.path == f"/procedures-api/runs/{'r' * 32}"
+    s0, s1 = out["steps"]
+    assert (s0["tool"], s0["state"], s0["result_chars"], s0["warnings"]) == ("find_reports", "done", 40, ["W120: ply 제외"])
+    assert (s1["tool"], s1["state"], s1["stage"]) == ("add_report_tags", "pending", "gate") and json.loads(s1["args"]) == {"report_id": 7, "tags": ["a"]}
+    w = out["waiting"]
+    assert w["step"] == 1 and w["tool"] == "add_report_tags" and w["where"] == f"/procedures/runs/{'r' * 32}"
+    assert "사람" in w["note"] and "이 도구로는" in w["note"]
+    assert "a" * 64 not in text and "b" * 64 not in text and "args_sha256" not in text, "승인이 묶이는 지문은 도구로 내지 않는다"
+    assert "owner_sub" not in text
+
+
+def test_procedure_run_status_는_단계_결과를_쪽으로_준다(monkeypatch):
+    big = "가" * 130_000
+    sent = _proc_portal(monkeypatch, lambda req: httpx.Response(200, json={"run_id": "r" * 32, "ix": 0, "text": big}))
+    res, text = _proc_call("procedure_run_status", {"run_id": "r" * 32, "step": 0})
+    out = json.loads(text)
+    assert sent[0].url.path == f"/procedures-api/runs/{'r' * 32}/steps/0/result"
+    assert (out["step"], out["page"], out["pages"], len(out["text"])) == (0, 1, 3, 60_000) and "page=2" in out["next"]
+    out = json.loads(_proc_call("procedure_run_status", {"run_id": "r" * 32, "step": 0, "page": 3})[1])
+    assert len(out["text"]) == 10_000 and "next" not in out
+    res, text = _proc_call("procedure_run_status", {"run_id": "r" * 32, "step": 0, "page": 4})
+    assert res.isError and "쪽" in text
+
+
+def test_절차_도구는_사람_PAT_가_아니면_포털을_부르지_않는다(monkeypatch):
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    for auth in ("Bearer gw-secret", None):
+        sent = _proc_portal(monkeypatch, lambda req: httpx.Response(200, json={}), auth=auth)
+        for n, a in (("procedure_list", {}), ("procedure_get", {"procedure_id": "a" * 32}),
+                     ("procedure_run_start", {"procedure_id": "a" * 32}), ("procedure_run_status", {"run_id": "r" * 32})):
+            res, text = _proc_call(n, a)
+            assert res.isError and text.startswith("PROCEDURE_ERROR: 절차는 사람 PAT 로만") and sent == [], (auth, n, text)
+
+
+def test_절차_실행기의_호출로는_절차_도구를_부르지_않는다(monkeypatch):
+    """절차의 단계가 이 도구를 부르면(단계의 별칭 `<백엔드>_<도구>` 가 procedure_run_start 가 되게 적으면 invoke_tool 로 닿는다) 절차가 절차를
+    끝없이 시작한다. 실행기의 PAT(purpose=procedure — 검증된 클레임에서만 온다)로 온 호출은 넷 다 거절하고 포털을 부르지 않는다."""
+    sent = _proc_portal(monkeypatch, lambda req: httpx.Response(202, json={"run_id": "r" * 32}),
+                        headers={gw.PURPOSE_HEADER: gw.PROCEDURE_PURPOSE})
+    for n, a in (("procedure_run_start", {"procedure_id": "a" * 32, "mode": "live"}), ("procedure_list", {}),
+                 ("invoke_tool", {"name": "procedure_run_start", "arguments": {"procedure_id": "a" * 32, "mode": "live"}})):
+        res, text = _proc_call(n, a)
+        assert res.isError and "절차 실행기" in text and sent == [], (n, text)
+
+
+def test_invoke_tool_로_불러도_같은_도구이고_읽기_전용_PAT_는_실행_시작이_막힌다(monkeypatch):
+    sent = _proc_portal(monkeypatch, lambda req: httpx.Response(202, json={"run_id": "r" * 32, "state": "queued"}))
+    res, text = _proc_call("invoke_tool", {"name": "procedure_run_start", "arguments": {"procedure_id": "a" * 32}})
+    assert not res.isError and json.loads(sent[0].content)["mode"] == "plan", "범용 실행기로 불러도 기본은 계획 모드다"
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person", gw.READONLY_HEADER: "1"})
+    for n, a in (("procedure_run_start", {"procedure_id": "a" * 32}),
+                 ("invoke_tool", {"name": "procedure_run_start", "arguments": {"procedure_id": "a" * 32}})):
+        res, text = _proc_call(n, a)
+        assert res.isError and text.startswith("read_only: procedure_run_start") and len(sent) == 1, (n, text)
+
+
+def test_루틴_단계는_절차_실행_시작을_부르지_못한다(monkeypatch):
+    """루틴 단계의 울타리는 계획의 허용 도구(백엔드 도구 가운데 읽기로 확인된 것)뿐이다 — 게이트웨이 자체 도구는 백엔드가 없어 허용 목록에 들 수
+    없고, 이름을 그대로 적어도 울타리 밖이다."""
+    seen, inner = _rt_kit(monkeypatch)
+    for name in ("procedure_run_start", "signalforge:procedure_run_start", "_gateway:procedure_run_start"):
+        res, text = _rt_run("routine_call", {"run_id": "r1", "step": "voc", "name": name, "arguments": {"procedure_id": "a" * 32}})
+        assert res.isError and text.startswith("ROUTINE_ERROR:"), (name, text)
+    assert inner == [] and not [s for s in seen if s[0] == "POST"], "울타리 밖 호출이 나갔거나 원장에 적혔다"
+
+
+@pytest.mark.parametrize("resp,why", [
+    (httpx.Response(200, text="<html>SPA</html>", headers={"content-type": "text/html"}), "포털에 절차 창구가 없다"),
+    (httpx.Response(404, json={"detail": "실행을 찾을 수 없습니다"}), "실행을 찾을 수 없습니다"),
+    (httpx.Response(403, json={"detail": "권한이 없습니다(feat:procedures)"}), "feat:procedures"),
+    (httpx.Response(401, json={"detail": "invalid or expired PAT"}), "포털이 이 토큰을 받지 않았다"),
+    (httpx.Response(502, json={"detail": "x"}), "포털 오류(HTTP 502)")])
+def test_절차_도구는_포털의_거절과_낡음을_그대로_말한다(monkeypatch, resp, why):
+    _proc_portal(monkeypatch, lambda req: resp)
+    res, text = _proc_call("procedure_run_status", {"run_id": "r" * 32})
+    assert res.isError and text.startswith("PROCEDURE_ERROR:") and why in text, text

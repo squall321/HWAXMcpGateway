@@ -2654,10 +2654,10 @@ def test_토큰_거절이_아니면_다시_부르지_않는다(monkeypatch, err)
 _HG03_SSO, _HG03_MCP = "http://simflow.example/api/auth/sso", "http://simflow.example/mcp"
 
 
-def _hg03_kit(monkeypatch, decide, *, sso_status=200, calls=1):
+def _hg03_kit(monkeypatch, decide, *, sso_status=200, calls=1, list_status=200):
     """`decide(Authorization, n)` 이 tools/call 마다 백엔드의 HTTP 상태를 정한다(200 이면 성공, 예외면 그 예외). `calls` 번을 한꺼번에
     부른다 → (결과 목록, 센 것 — 발급 · tools/call 이 실은 토큰, 감사 줄)."""
-    n = {"mints": 0, "tokens": []}
+    n = {"mints": 0, "tokens": [], "lists": 0}
 
     def handler(req):
         u = str(req.url)
@@ -2677,6 +2677,9 @@ def _hg03_kit(monkeypatch, decide, *, sso_status=200, calls=1):
         if "id" not in msg:
             return httpx.Response(202)
         if msg.get("method") == "tools/list":    # 진짜 클라이언트는 tools/call 뒤에 출력 스키마를 보러 목록을 부른다(mcp 1.28)
+            n["lists"] += 1
+            if list_status != 200:
+                return httpx.Response(list_status, json={"detail": "거절"})
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [
                 {"name": "list_workflows", "inputSchema": {"type": "object"}}]}})
         assert msg.get("method") == "tools/call", msg
@@ -2749,6 +2752,115 @@ def test_HG03_다시_받은_토큰도_거절되면_두_번에서_멈춘다(monke
     res, n, rows = _hg03_kit(monkeypatch, lambda auth, i: 401)
     assert res[0].isError and (n["mints"], n["tokens"]) == (2, ["Bearer t1", "Bearer t2"])
     assert "401" in rows[-1]["error"], rows
+
+
+def test_RF26_호출이_성공한_뒤의_목록_묻기가_401_이어도_쓰기_도구를_다시_돌리지_않는다(monkeypatch):
+    """MCP 클라이언트(mcp 1.28 `call_tool`)는 tools/call 이 성공한 **뒤에** 출력 스키마를 보려고 tools/list 를 한 번 더 부른다. 일회성 세션은
+    캐시가 비어 있어 호출마다 그렇다. 그 사이에 토큰이 거절되면(401) 예외가 올라와 '토큰 재발급 후 1회 재시도' 가 **이미 돈 도구를 다시**
+    돌렸다 — 쓰기 도구면 같은 블록이 두 번 들어간다(HWAXPortal docs/report-figures RF-26). 일회성 세션은 tools/call 만 보낸다."""
+    res, n, rows = _hg03_kit(monkeypatch, lambda auth, i: 200, list_status=401)
+    assert not res[0].isError, res[0].content[0].text
+    assert (n["mints"], n["tokens"]) == (1, ["Bearer t1"]), f"도구가 두 번 돌았다 — {n}"
+    assert n["lists"] == 0, "일회성 세션이 호출 뒤에 목록을 물었다"
+    assert [(r["ok"], r["mode"], r.get("note")) for r in rows] == [(True, "as-user-pat", None)]
+
+
+def test_RF26_일회성_세션은_호출마다_목록을_묻지_않는다(monkeypatch):
+    """목록이 멀쩡할 때도 묻지 않는다 — 사람별 위임 호출마다 왕복이 하나 준다. 답은 그대로 돌려준다(게이트웨이는 중계다)."""
+    res, n, _rows = _hg03_kit(monkeypatch, lambda auth, i: 200, calls=2)
+    assert [r.isError for r in res] == [False, False] and n["lists"] == 0 and len(n["tokens"]) == 2
+    assert res[0].content[0].text == '{"rows": []}'
+
+
+# ── 상주 세션도 tools/call 만 보낸다(반대 검토 2026-11-22 — RF-26 의 같은 틈) ─────────────────────────────────
+class _SchemaSess:
+    """진짜 MCP 클라이언트(mcp 1.28)의 꼴 — `call_tool` 은 tools/call 을 보낸 **뒤에** 출력 스키마를 대조하고, 안 맞으면 던진다.
+    `send_request` 는 요청 하나만 보낸다. 백엔드에 닿은 tools/call 을 runs 에 적는다."""
+    def __init__(self, runs):
+        self.runs = runs
+
+    async def send_request(self, request, result_type, **_kw):
+        root = request.root
+        assert root.method == "tools/call", root.method
+        self.runs.append((root.params.name, dict(root.params.arguments or {})))
+        return types.CallToolResult(content=[types.TextContent(type="text", text='{"created": 1}')], isError=False)
+
+    async def call_tool(self, name, arguments=None, **_kw):
+        res = await self.send_request(types.ClientRequest(types.CallToolRequest(
+            params=types.CallToolRequestParams(name=name, arguments=arguments))), types.CallToolResult)
+        raise RuntimeError(f"Tool {name} has an output schema but did not return structured content")
+
+
+def _shared_kit(monkeypatch):
+    runs = []
+
+    class _B(_ReconB):
+        async def reconnect(self, tg, seen_gen=None):
+            self.reconnects += 1
+            self.session = _SchemaSess(runs)
+
+    b = _B(["create_thing"])
+    b.session = _SchemaSess(runs)
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {"some-app": b})
+    monkeypatch.setattr(gw, "route", {"create_thing": ("some-app", "create_thing")})
+    for name, val in (("alias_route", {}), ("POLICY", {}), ("_ACCESS_POLICY", {}), ("_ACCESS_POLICY_READY", True), ("PER_USER_SSO", {}),
+                      ("IDENTITY_FWD", set()), ("_task_group_holder", {"tg": object()}), ("_REAGG", {})):
+        monkeypatch.setattr(gw, name, val)
+    monkeypatch.setattr(gw, "_portal_access", _noop_async({"keys": [], "affiliation": "CAEG"}))
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["mes-user", "feat:chat"])
+    return b, runs
+
+
+def test_상주_세션의_호출도_성공_뒤의_스키마_대조로_다시_돌지_않는다(monkeypatch):
+    """`call_tool` 의 호출 뒤 대조가 던지면 `_call_tool` 의 「재연결 후 한 번 더」 가 **이미 돈 도구를 다시** 돌렸다 — 쓰기 도구가 두 번 들어가고
+    그러고도 실패로 보고된다. 상주 세션도 tools/call 만 보내고 답을 그대로 돌려준다(대조는 끝 클라이언트 몫)."""
+    b, runs = _shared_kit(monkeypatch)
+    res = asyncio.run(gw._call_tool("create_thing", {"title": "가"}))
+    assert not res.isError and res.content[0].text == '{"created": 1}', res.content[0].text
+    assert runs == [("create_thing", {"title": "가"})], f"도구가 {len(runs)}번 돌았다"
+    assert b.reconnects == 0
+    row = _rows()[-1]
+    assert (row["ok"], row["mode"]) == (True, "service") and "note" not in row
+
+
+def test_send_request_가_없는_세션은_call_tool_로_떨어지고_한_번만_알린다(monkeypatch, caplog):
+    """옛 SDK · 시험 대역의 꼴 — 종전 길 그대로다. 그 길에는 호출 뒤 대조의 틈이 남아 있으니 조용히 떨어지지 않는다."""
+    import logging
+
+    class _Old:
+        def __init__(self):
+            self.calls = []
+
+        async def call_tool(self, name, arguments=None, **_kw):
+            self.calls.append(name)
+            return types.CallToolResult(content=[types.TextContent(type="text", text="{}")], isError=False)
+
+    monkeypatch.setattr(gw, "_CALL_ONLY_WARNED", [])
+    old = _Old()
+
+    async def go():
+        await gw._tools_call_only(old, "a", {})
+        await gw._tools_call_only(old, "b", {})
+
+    with caplog.at_level(logging.WARNING, logger=gw.log.name):
+        asyncio.run(go())
+    assert old.calls == ["a", "b"]
+    assert len([r for r in caplog.records if "send_request 가 없다" in r.getMessage()]) == 1
+
+
+def test_tools_call_only_는_메서드를_글자로_적어_보낸다():
+    """SDK 가 CallToolRequest 의 method 기본값을 바꾸거나 없애도 tools/call 이 나간다."""
+    import ast
+    from pathlib import Path as _P
+    fn = next(n for n in ast.walk(ast.parse(_P(gw.__file__).read_text(encoding="utf-8")))
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == "_tools_call_only")
+    kws = [k for c in ast.walk(fn) if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "CallToolRequest" for k in c.keywords]
+    assert any(k.arg == "method" and isinstance(k.value, ast.Constant) and k.value.value == "tools/call" for k in kws)
+    # 게이트웨이 본문에서 백엔드 세션의 call_tool 을 직접 부르는 자리는 이 도우미의 내림 길 하나뿐이다
+    src = _P(gw.__file__).read_text(encoding="utf-8")
+    assert src.count("sess.call_tool(") == 1, "백엔드 세션의 call_tool 을 직접 부르는 자리가 늘었다 — _tools_call_only 를 쓴다"
 
 
 # ── REST 다리 — 위층이 우리가 실은 사람 토큰을 401 로 거절하면 캐시에서 버린다(HWAXPortal docs/request-1027 HG-04) ─────────────
@@ -12665,7 +12777,7 @@ def _mx_kit(monkeypatch, decide=_mx_ok, *, tools=("upload_image_bytes", "insert_
     요청자는 a@corp.com(사람 PAT · plat:mxwhitepaper). 반환은 (부르기, 센 것 — mints: 발급이 받은 위임 이메일, calls: tools/call 마다 (이름, 인자,
     머리), backend)."""
     served = tuple(tools if served is None else served)
-    seen = {"mints": [], "calls": []}
+    seen = {"mints": [], "calls": [], "lists": 0}
 
     async def handler(req):
         u = str(req.url)
@@ -12683,7 +12795,8 @@ def _mx_kit(monkeypatch, decide=_mx_ok, *, tools=("upload_image_bytes", "insert_
                 "serverInfo": {"name": "mxwp-rag", "version": "1"}}})
         if "id" not in msg:
             return httpx.Response(202)
-        if msg.get("method") == "tools/list":      # 진짜 클라이언트는 tools/call 뒤에 출력 스키마를 보러 목록을 부른다(mcp 1.28)
+        if msg.get("method") == "tools/list":      # 진짜 클라이언트의 call_tool 은 tools/call 뒤에 출력 스키마를 보러 목록을 부른다(mcp 1.28)
+            seen["lists"] += 1
             st = list_status(seen) if list_status else None
             if isinstance(st, int):
                 return httpx.Response(st, json={"error": "x"})
@@ -12859,10 +12972,10 @@ def test_figure_to_doc_는_MXWP_의_거절을_그대로_말한다(monkeypatch, t
     assert (row["tool"], row["backend"], row["ok"]) == ("figure_to_doc", "mx-white-paper", False)
 
 
-@pytest.mark.parametrize("case", ["api-timeout", "api-5xx", "envelope", "gateway-timeout", "after-call-list"])
+@pytest.mark.parametrize("case", ["api-timeout", "api-5xx", "envelope", "gateway-timeout"])
 def test_figure_to_doc_는_넣었는지_모르는_실패를_넣지_못했다로_말하지_않고_다시_부르지_않는다(monkeypatch, case):
-    """넣기 요청이 MXWP 에 닿은 뒤의 실패 — 그쪽 API 시간 초과 · 5xx · 봉투 오류 · 게이트웨이 호출 한도 · 넣은 뒤 클라이언트가 출력 검증으로 부르는
-    tools/list 의 실패(MXWP 는 이미 넣었다) — 는 넣었을 수 있다. '넣지 못했다' 로 말하던 판은 다시 부르게 해 같은 그림 블록이 둘 됐다(반대 검토 1)."""
+    """넣기 요청이 MXWP 에 닿은 뒤의 실패 — 그쪽 API 시간 초과 · 5xx · 봉투 오류 · 게이트웨이 호출 한도 — 는 넣었을 수 있다. '넣지 못했다' 로
+    말하던 판은 다시 부르게 해 같은 그림 블록이 둘 됐다(반대 검토 1). 넣은 뒤의 tools/list 실패는 이제 생기지 않는다 — 아래 시험(RF-26)."""
     decide, list_status = _mx_ok, None
     if case == "api-timeout":
         decide = lambda n, a: ("timeout (15.0s) on POST /api/v1/documents/hinge-durability/blocks"     # noqa: E731
@@ -12876,8 +12989,6 @@ def test_figure_to_doc_는_넣었는지_모르는_실패를_넣지_못했다로_
             if n == "insert_image_block":
                 await asyncio.sleep(3)                  # MXWP 는 받아서 넣는 중이다
             return _mx_ok(n, a)
-    else:
-        list_status = lambda seen: 500 if any(c[0] == "insert_image_block" for c in seen["calls"]) else None     # noqa: E731
     call, seen = _mx_kit(monkeypatch, decide, list_status=list_status)
     if case == "gateway-timeout":
         monkeypatch.setattr(gw, "CALL_TIMEOUT_S", 0.5)
@@ -12885,6 +12996,16 @@ def test_figure_to_doc_는_넣었는지_모르는_실패를_넣지_못했다로_
     assert text.startswith("FIGURE_ERROR: MX 백서 문서에 그림 블록을 넣었는지 모른다 — "), text
     assert "넣지 못했다" not in text and f"이 그림(image_id {_MX_IMAGE_ID})" in text and "get_document_outline" in text, text
     assert [c[0] for c in seen["calls"]] == ["upload_image_bytes", "insert_image_block"], "다시 부르지 않는다"
+
+
+def test_figure_to_doc_는_넣은_뒤의_목록_묻기를_하지_않아_넣은_것을_넣었다고_답한다(monkeypatch):
+    """종전에는 넣은 뒤 클라이언트가 출력 검증으로 부르는 tools/list 가 실패하면(MXWP 는 이미 넣었다) '넣었는지 모른다' 가 됐다. 일회성 세션이
+    tools/call 만 보내게 된 뒤로는 그 목록 묻기가 없다(HWAXPortal docs/report-figures RF-26) — 목록이 늘 500 이어도 넣은 것은 넣었다고 답한다."""
+    call, seen = _mx_kit(monkeypatch, list_status=lambda seen: 500)
+    res = call({"ref": _fig_stored(), **_MX_AT})
+    assert not res.isError, res.content[0].text
+    assert json.loads(res.content[0].text)["block_id"] == _MX_BLOCK_ID
+    assert [c[0] for c in seen["calls"]] == ["upload_image_bytes", "insert_image_block"] and seen["lists"] == 0
 
 
 def test_figure_to_doc_는_넣었다는_답에_block_id_가_없으면_다시_부르지_말라고_말한다(monkeypatch):
@@ -15083,3 +15204,17 @@ def test_루틴_보고서_초안은_글자로_박힌_템플릿_id_없이_박스_
     # 하나는 _ra_format_args 가 돌려주는 dict 자신이다
     assert len(literal) == 1, f"template_id 를 글자로 든 dict — 줄 {literal}"
     assert src.count('**_ra_format_args("deliberation")') == 1
+
+
+# ── 그림 표지 — 래스터와 svg 가 함께 오면 어느 ref 를 넣을지 말한다(HWAXPortal docs/report-figures 99행) ─────────────────────
+def test_그림_표지는_png_와_svg_짝이_오면_보고서에_넣을_ref_를_말한다():
+    png, svg = ("fig_" + "a" * 22, "image/png", 2048), ("fig_" + "b" * 22, "image/svg+xml", 1024)
+    both = gw._fig_note([png, svg])
+    assert "(png · " in both and "(svg · " in both
+    assert "래스터 ref 만 들어간다 — svg ref 는 넣지 못한다" in both and "같은 그림이 svg 와 래스터 짝으로 왔으면 래스터 쪽" in both
+    # 두 그림이 같은 그림의 짝이 아닐 때도 참인 글이어야 한다 — 「svg 대신 png 를 넣어라」 는 서로 다른 그림이면 엉뚱한 그림을 넣게 한다(반대 검토).
+    assert "svg 가 아니라" not in both and "svg 는 화면용" not in both
+    # 한쪽만 오면 종전 글 그대로다 — 짝 안내가 붙지 않는다
+    for only in ([png], [svg], [png, ("fig_" + "c" * 22, "image/jpeg", 10)]):
+        assert "래스터 ref" not in gw._fig_note(only)
+    assert gw._fig_note([png]) == f"그림 저장 — {png[0]} (png · {gw._fig_size(2048)}) · 파일로 받기 figure_get · 보고서에 넣기 figure_to_report"

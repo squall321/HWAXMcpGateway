@@ -7137,7 +7137,13 @@ def _fig_note(outcomes: list[tuple]) -> str:
     skip = " · ".join(f"{_FIG_SKIP_TEXT[w].format(cap=_fig_size(FIG_MAX_BYTES))} {k}장" for w, k in why.items())
     if not kept:
         return f"그림 저장 못 함 — {skip}"
-    return ("그림 저장 — " + ", ".join(kept) + " · 파일로 받기 figure_get · 보고서에 넣기 figure_to_report"
+    # 같은 결과에 래스터와 svg 가 함께 오면(StepForge 의 png+svg_live 짝 — 화면 호버용 svg 와 판독 · 보고서용 png) 어느 ref 를 넣을지 말해 준다 —
+    # svg ref 를 넣으려다 거절당하고 도구를 다시 부르는 왕복을 줄인다(HWAXPortal docs/report-figures 99행). 한쪽만 오면 글은 종전 그대로다.
+    mimes = {mime for ref, mime, _n in outcomes if ref}
+    # 글은 두 그림이 같은 그림의 짝이 아니어도 참이어야 한다 — 「svg 대신 png 를 넣어라」 고만 하면 서로 다른 그림일 때 엉뚱한 그림을 넣게 된다.
+    pair = (" (보고서 · 문서에는 png 등 래스터 ref 만 들어간다 — svg ref 는 넣지 못한다. 같은 그림이 svg 와 래스터 짝으로 왔으면 래스터 쪽을 넣는다)"
+            if "image/svg+xml" in mimes and len(mimes) > 1 else "")
+    return ("그림 저장 — " + ", ".join(kept) + " · 파일로 받기 figure_get · 보고서에 넣기 figure_to_report" + pair
             + (f" · 못 둔 그림 — {skip}" if skip else ""))
 
 
@@ -9835,10 +9841,38 @@ async def _call_shared(b: "_Backend", backend_key: str, original: str, arguments
     with anyio.move_on_after(CALL_TIMEOUT_S) as scope:
         mine[scope] = None
         try:
-            return await sess.call_tool(original, arguments)
+            # tools/call 만 보낸다(_tools_call_only) — 클라이언트의 call_tool 은 성공한 뒤에 출력 스키마를 대조하는데, 그 대조가 실패하면
+            # (목록에 없는 이름이라 tools/list 를 다시 묻다 실패 · 스키마와 안 맞는 답) 예외가 올라와 호출부의 「재연결 후 한 번 더」 가
+            # 이미 돈 도구를 다시 돌린다.
+            return await _tools_call_only(sess, original, arguments)
         finally:
             why = mine.pop(scope, None)
     raise _Late("released", why) if why else _Late("call")
+
+
+_CALL_ONLY_WARNED: list = []        # send_request 없는 세션으로 떨어진 것을 한 번만 알린다
+
+
+async def _tools_call_only(sess, name: str, arguments: dict):
+    """tools/call 한 번만 보낸다 — MCP 클라이언트의 `call_tool` 이 성공한 **뒤에** 하는 일(출력 스키마를 보려는 tools/list 한 번과 스키마
+    대조)을 건너뛴다(HWAXPortal docs/report-figures RF-26 · docs/leftovers-1121 L21-10 ④).
+
+    일회성 세션은 스키마 캐시가 비어 있어 호출마다 그 tools/list 가 나갔다(mcp 1.28 `ClientSession._validate_tool_result`). 그 사이에 토큰이
+    거절되면(401) 예외가 올라와 사람별 위임의 '토큰 재발급 후 1회 재시도' 가 **이미 돈 도구를 다시** 돌렸다 — 쓰기 도구면 같은 것이 두 번
+    들어간다. 목록이 다른 까닭으로 실패해도 성공한 호출이 실패로 보고됐다. 게이트웨이는 중계라 백엔드의 답을 그대로 돌려주면 되고, 구조화
+    출력의 대조는 그 답을 받는 쪽(끝 클라이언트)이 한다 — **게이트웨이는 백엔드 답의 출력 스키마를 대조하지 않는다.**
+    상주 세션(_call_shared)도 이 길로 부른다. 붙을 때 목록을 받아 캐시가 차 있어 보통은 목록을 다시 묻지 않지만, 캐시에 없는 이름이거나 답이
+    스키마와 안 맞으면 같은 예외가 호출 **뒤에** 올라와 「재연결 후 한 번 더」 가 도구를 다시 돌렸다(반대 검토 2026-11-22).
+    `send_request` 가 없는 세션 꼴(옛 SDK · 시험 대역)은 종전처럼 `call_tool` 을 부른다 — 그 길에는 위의 틈이 그대로라 한 번 알린다."""
+    send = getattr(sess, "send_request", None)
+    if send is None:
+        if not _CALL_ONLY_WARNED:
+            _CALL_ONLY_WARNED.append(True)
+            log.warning("MCP 세션에 send_request 가 없다(%s) — call_tool 로 부른다(성공 뒤 출력 스키마 대조가 돌아 실패하면 호출이 실패로 "
+                        "보인다). 이 알림은 한 번만 낸다", type(sess).__name__)
+        return await sess.call_tool(name, arguments)
+    return await send(types.ClientRequest(types.CallToolRequest(
+        method="tools/call", params=types.CallToolRequestParams(name=name, arguments=arguments))), types.CallToolResult)
 
 
 async def _oneshot(b: "_Backend", hdrs: dict, original: str, arguments: dict, timeout_s: float, op=None):
@@ -9863,7 +9897,7 @@ async def _oneshot(b: "_Backend", hdrs: dict, original: str, arguments: dict, ti
                 if stage == "call":
                     with anyio.move_on_after(timeout_s):
                         # op — 도구 호출이 아닌 단발 요청(resources/read — HG-07). 기한 · 단계 표시는 같다.
-                        res = await (op(sess) if op is not None else sess.call_tool(original, arguments))
+                        res = await (op(sess) if op is not None else _tools_call_only(sess, original, arguments))
                         stage = "done"
     if stage != "done":
         raise _Late(stage)

@@ -6628,8 +6628,9 @@ GAS_TRANSPORT_TOOL = types.Tool(
         "층 재료의 가스 투과 물성 — MaterialTwin 재료 id 마다 확산계수 D(m²/s) · 헨리 용해도 S(mol/(m³·Pa)) · 산소투과도 P(mol/(m·s·Pa))를 "
         "기체(species, 기본 O2)로 걸러 한 번에 준다. 값마다 온도 · 품질 등급(1 측정 … 5 추정) · 방법 · 출처 · 시료 경고(grade_scope)가 붙는다. "
         "temperature_K 를 주면 가장 가까운 온도의 값을 고른다(외삽하지 않는다 — delta_K 가 차이다). 한 재료에도 시료가 다른 값이 여럿일 수 있어 "
-        "alternatives 로 다른 후보를 함께 준다 — grade_scope 의 경고를 읽고 쓴다. P 가 없고 같은 시료의 D · S 가 있으면 P = D·S 로 셈해 derived 로 "
-        "표시한다. permeance · OTR 은 다른 양이라 셈에 쓰지 않는다. 재료 id 는 MaterialTwin search_catalog_property · get_material 의 material_id."
+        "alternatives 로 다른 후보를 함께 준다 — grade_scope 의 경고를 읽고 쓴다. P 가 없고 같은 시료의 D · S 가 있으면 P = D·S 로, S 가 없고 같은 "
+        "시료의 P · D 가 있으면 S = P/D 로 셈해 derived 로 표시한다(측정값이 아니다 — O2 만, 같은 시료 · 온도 1 K 안일 때만). permeance · OTR 은 다른 "
+        "양이라 셈에 쓰지 않는다. 재료 id 는 MaterialTwin search_catalog_property · get_material 의 material_id."
     ),
     inputSchema={
         "type": "object",
@@ -6753,6 +6754,19 @@ async def _gas_transport(a: dict) -> types.CallToolResult:
                                        "why_missing": one["P_mol_m_s_Pa"].get("why")}
             else:
                 one["P_mol_m_s_Pa"]["not_derived"] = "고른 D 와 S 가 다른 시료이거나 온도가 1 K 넘게 달라 P = D·S 로 셈하지 않았다"
+        # S 가 없고 P · D 가 있으면 S = P/D(HWAXPortal docs/ste-stepforge-1117 BG-4 — 운영 박스 재시험 11-21: 층 재료 둘이 S 가 비어 레디쉬가 모든
+        # 층에 템플릿 값을 썼다). P = D·S 와 같은 조건에서만 셈한다 — 같은 시료 · 온도 1 K 안. P 키는 O2 전용이라 O2 일 때만 여기에 온다.
+        if s is None and d and p:
+            same = (d["conditions"].get("grade_scope") == p["conditions"].get("grade_scope")
+                    and d["temperature_K"] is not None and p["temperature_K"] is not None and abs(d["temperature_K"] - p["temperature_K"]) <= 1.0)
+            if same and d["value"] > 0:
+                one["S_mol_m3_Pa"] = {"derived": True, "value": p["value"] / d["value"], "unit": GAS_KEYS["S_mol_m3_Pa"][1],
+                                      "formula": "S = P/D", "temperature_K": d["temperature_K"],
+                                      "from": {"P_quality_tier": p["quality_tier"], "D_quality_tier": d["quality_tier"]},
+                                      "note": "같은 시료 · 같은 온도의 P 를 D 로 나눈 셈값이다(측정값이 아니다)",
+                                      "why_missing": one["S_mol_m3_Pa"].get("why")}
+            else:
+                one["S_mol_m3_Pa"]["not_derived"] = "고른 P 와 D 가 다른 시료이거나 온도가 1 K 넘게 달라 S = P/D 로 셈하지 않았다"
         mats.append(one)
     return done(True, species=species, temperature_K=tgt, materials=mats,
                 note="값마다 conditions.grade_scope 의 시료 · 쓰임 경고를 읽고 쓴다 — alternatives 는 같은 재료의 다른 후보다(평균 내지 않는다)")

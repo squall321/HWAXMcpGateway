@@ -15036,6 +15036,33 @@ def test_PTR1_P_는_같은_시료의_D_S_로만_셈한다(monkeypatch):
     assert "not_derived" in four["P_mol_m_s_Pa"] and "chosen" not in four["P_mol_m_s_Pa"], "시료가 다르면 셈하지 않는다"
 
 
+def test_BG4_S_는_같은_시료의_P_D_로만_셈한다(monkeypatch):
+    """운영 박스 재시험(11-21) — 층 재료 둘이 「gas_solubility 에 O2 값이 없다」 로 S 가 비어, 레디쉬가 모든 층에 템플릿 값을 썼다. P 와 D 가 같은 시료 ·
+    같은 온도면 S = P/D 로 셈해 derived 로 표시한다(P = D·S 와 같은 조건). 다르면 셈하지 않고 까닭을 남긴다."""
+    db = {5: [_gr(_GD, 2.0e-13, "m^2/s", 2, species="O2", temperature_c=30, grade_scope="시료 갑"),
+              _gr(_GP, 4.0e-17, "mol/(m*s*Pa)", 3, species="O2", temperature_c=30.5, grade_scope="시료 갑")],
+          6: [_gr(_GD, 2.0e-13, "m^2/s", 2, species="O2", temperature_c=30, grade_scope="시료 갑"),
+              _gr(_GP, 4.0e-17, "mol/(m*s*Pa)", 3, species="O2", temperature_c=30, grade_scope="시료 을")],
+          7: [_gr(_GD, 2.0e-13, "m^2/s", 2, species="O2", temperature_c=30),
+              _gr(_GP, 4.0e-17, "mol/(m*s*Pa)", 3, species="O2", temperature_c=40)],
+          8: [_gr(_GD, 2.0e-13, "m^2/s", 2, species="H2O", temperature_c=30),
+              _gr(_GP, 4.0e-17, "mol/(m*s*Pa)", 3, temperature_c=30)]}
+    run, _c = _gas_kit(monkeypatch, db)
+    five, six, seven = run(material_ids=[5, 6, 7])[0]["materials"]
+    s = five["S_mol_m3_Pa"]
+    assert s["derived"] is True and s["formula"] == "S = P/D" and s["value"] == 4.0e-17 / 2.0e-13 and s["unit"] == "mol/(m^3*Pa)"
+    assert s["from"] == {"P_quality_tier": 3, "D_quality_tier": 2} and "O2 값이 없다" in s["why_missing"] and "측정값이 아니다" in s["note"]
+    assert "chosen" not in s, "셈값을 고른 측정값처럼 싣지 않는다"
+    for other in (six, seven):
+        assert "not_derived" in other["S_mol_m3_Pa"] and "derived" not in other["S_mol_m3_Pa"], "시료가 다르거나 온도가 1 K 넘게 다르면 셈하지 않는다"
+    # 기체가 O2 가 아니면 P(O2 전용 키)가 비어 S 를 셈하지 않는다 — 다른 기체의 D 로 나누지 않는다
+    h2o = run(material_ids=[8], species="H2O")[0]["materials"][0]
+    assert "derived" not in h2o["S_mol_m3_Pa"] and "not_derived" not in h2o["S_mol_m3_Pa"]
+    # S 가 있으면 그대로다(셈하지 않는다)
+    run, _c = _gas_kit(monkeypatch)
+    assert run(material_ids=[1])[0]["materials"][0]["S_mol_m3_Pa"]["chosen"]["value"] == 9.0e-5
+
+
 def test_PTR1_온도를_주면_가까운_온도를_고르고_외삽하지_않는다(monkeypatch):
     run, _c = _gas_kit(monkeypatch)
     out, _e = run(material_ids=[3], temperature_K=313.15)

@@ -242,6 +242,16 @@ def test_인증_실패는_도구_호출과_따로_센다(tmp_path):
     assert "203.0.113.5" not in json.dumps(v)
 
 
+def test_scanned_through_는_파일_차례의_마지막_줄이다(tmp_path):
+    """시각이 뒤섞인 줄(앞날로 적힌 시험 줄 등)이 가운데 있어도 '어디까지 읽었나' 는 읽은 자리로 말한다 — 가장 늦은 날의 줄로 말하면 덜 접은 답을
+    다 접은 것처럼 읽는다."""
+    box = Box(tmp_path)
+    box.write(_line("2026-11-03T01:00:00+00:00", "t", "app"), _line("2027-01-01T00:00:00+00:00", "t", "app"),
+              _line("2026-11-04T01:00:00+00:00", "t", "app"))
+    v = box.view(since="2026-11-01", until="2027-01-31")
+    assert v["scanned_through"] == "2026-11-04T10:00:00+09:00" and v["audit"]["last_day"] == "2027-01-01"
+
+
 def test_칸이_처음_나온_날을_싣는다(tmp_path):
     box = Box(tmp_path)
     box.write(_line("2026-09-01T01:00:00+00:00", "t", "app"),

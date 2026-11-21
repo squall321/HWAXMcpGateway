@@ -4,7 +4,8 @@
   · 감사 원장은 덧붙이기만 하고 돌리지 않는다(무기한). 물을 때마다 훑지 않게 **읽은 자리**(바이트)를 적어 두고 그 뒤의 줄만 접는다. 원장이
     줄었거나 머리가 달라졌으면(잘림 · 바꿔치기) 접은 표를 비우고 처음부터 다시 접는다. 줄바꿈이 아직 없는 끝 줄은 다음에 읽는다.
   · 접은 표는 sqlite 하나다 — 셈과 읽은 자리를 한 트랜잭션으로 적는다(중간에 죽어도 두 번 세지 않는다). 파일은 0600 이다(사람별 줄이 든다).
-  · 한 번에 접는 시간에 기한이 있다(BUDGET_S). 넘기면 접은 데까지만 내고 complete=false 와 scanned_through 로 말한다 — 다음 물음이 잇는다.
+  · 한 번에 접는 시간에 기한이 있다(BUDGET_S). 넘기면 접은 데까지만 내고 complete=false 와 scanned_through(파일 차례로 마지막에 접은 줄의
+    시각)로 말한다 — 다음 물음이 잇는다. 덜 접은 답의 수는 모자랄 수 있다(포털은 complete 인 답만 접어 둔다).
   · 날은 KST 로 가른다(원장의 ts 는 UTC). 사람은 소문자 메일이다.
   · 도구 이름은 원래 이름으로 접는다(E-2 — 겹침 접두 · 호출 별칭). 떠 있는 경로표(resolve)가 아는 이름은 그 답을, 모르는 이름은 접두 규칙
     (백엔드 키에서 하이픈을 뺀 것 + '_')을 쓴다. 주소가 든 이름(rest_call · resources/read)은 주소를 뗀다. 모르는 도구(호출자가 적은 글자)는
@@ -154,7 +155,7 @@ class _Fold:
         self.auth: dict[tuple, int] = {}
         self.fields: dict[str, str] = {}
         self.lines = self.bad = 0
-        self.first = self.last = self.last_ts = None
+        self.first = self.last = self.tail_ts = None
 
     def add(self, raw: bytes, resolve) -> None:
         if not raw.strip():
@@ -169,8 +170,8 @@ class _Fold:
             self.bad += 1
             return
         self.first = day if self.first is None or day < self.first else self.first
-        if self.last is None or day >= self.last:
-            self.last, self.last_ts = day, rec.get("ts")
+        self.last = day if self.last is None or day > self.last else self.last
+        self.tail_ts = rec.get("ts")                # 파일 차례로 마지막에 접은 줄의 시각(가장 늦은 날의 줄이 아니다 — 시각이 뒤섞인 줄이 있어도 읽은 자리를 말한다)
         for k in FIELDS:
             if rec.get(k) not in (None, "") and (k not in self.fields or day < self.fields[k]):
                 self.fields[k] = day
@@ -246,8 +247,10 @@ def _commit(conn: sqlite3.Connection, fold: _Fold, meta: dict, *, wipe: bool, of
                    lines=str(int(meta.get("lines") or 0) + fold.lines), bad=str(int(meta.get("bad") or 0) + fold.bad))
         if fold.first and (not meta.get("first_day") or fold.first < meta["first_day"]):
             new["first_day"] = fold.first
-        if fold.last and (not meta.get("last_day") or fold.last >= meta["last_day"]):
-            new["last_day"], new["last_ts"] = fold.last, str(fold.last_ts or "")
+        if fold.last and (not meta.get("last_day") or fold.last > meta["last_day"]):
+            new["last_day"] = fold.last
+        if fold.tail_ts:
+            new["tail_ts"] = str(fold.tail_ts)
         for k, d in fold.fields.items():
             if not meta.get(f"field:{k}") or d < meta[f"field:{k}"]:
                 new[f"field:{k}"] = d
@@ -372,7 +375,7 @@ def query(db_path, p: dict) -> dict:
             "SELECT day, reason, n FROM auth WHERE day BETWEEN ? AND ? ORDER BY day, reason", span)]
     return {
         "contract": CONTRACT, "tz": "Asia/Seoul", "since": p["since"], "until": p["until"],
-        "scanned_through": _kst_iso(meta.get("last_ts")),
+        "scanned_through": _kst_iso(meta.get("tail_ts")),
         "audit": {"lines": int(meta.get("lines") or 0), "bad": int(meta.get("bad") or 0),
                   "first_day": meta.get("first_day"), "last_day": meta.get("last_day")},
         "fields": {k: meta[f"field:{k}"] for k in FIELDS if meta.get(f"field:{k}")},

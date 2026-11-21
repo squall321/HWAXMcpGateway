@@ -35,6 +35,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 # (rest_proxy 는 gateway 를 import 하지 않으므로 이 방향은 순환이 아니다.)
 from rest_proxy import (EXPIRED_BODY, JWKS_TIMEOUT_S, REST_PROXY_UPSTREAM_TIMEOUT_S, PatExpired, allowed_methods, credential_mode,
                         is_read_only)
+import usage_rollup as _usage_rollup    # 이용 통계 창구의 셈(/usage-rollup) — 표준 라이브러리만 읽는 모듈이다(이 파일을 읽지 않는다)
 
 # 쿼리에 실린 비밀(…/mcp?token=…)이 로그에 평문으로 남지 않게 한다. ODB 는 토큰을 주소 쿼리로 받았고(10-27 에 헤더로 옮겼다 —
 # HWAXPortal docs/request-1027 HG-02. 재프로비저닝 전 config 는 아직 쿼리 꼴이다), httpx 는 INFO 로 요청마다 주소를 통째로 찍었다 —
@@ -3341,6 +3342,26 @@ def _search_eval_run() -> dict:
                       **{g: len(ids) for g, ids in by_src.items() if g != "전체"}},
             "variants": out_v, "changed": changed[:40], "changed_count": len(changed),
             "seconds": round(time.monotonic() - t0, 1)}
+
+
+# ── 이용 통계 창구(/usage-rollup — HWAXPortal docs/ops-dashboard M2 · OD-12) ──────────────────────────────────────────────────────────
+# 포털 관리자 '이용 통계' 가 날마다 접어 가는 원천이다 — 포털 컨테이너는 감사 원장을 열 수 없다. 감사 원장을 KST 날마다 접어 둔 표(sqlite)는 원장이 사는
+# 자리(GATEWAY_AUDIT, 또는 리포의 audit.jsonl 다리가 가리키는 데이터 루트)에 둔다 — 원장과 함께 옮겨지고 함께 백업된다. 원장이 리포 안이면 리포 안이고
+# .gitignore 가 막는다. GATEWAY_USAGE_ROLLUP 이 덮는다(상대 경로는 리포 루트 기준). 셈 · 규칙은 usage_rollup.py 머리에 있다.
+def _usage_rollup_path_setting() -> Path:
+    raw = (os.environ.get("GATEWAY_USAGE_ROLLUP") or "").strip()
+    if not raw:
+        return Path(AUDIT_PATH).expanduser().resolve().parent / "usage-rollup.sqlite"
+    p = Path(raw).expanduser()
+    return p if p.is_absolute() else Path(__file__).resolve().parent / p
+
+
+USAGE_ROLLUP_PATH = _usage_rollup_path_setting()
+
+
+def _usage_rollup_view(raw: dict) -> dict:
+    """/usage-rollup — 밀린 감사 줄을 접고 기간의 답을 낸다(일꾼 스레드에서 돈다). 도구 이름은 지금 경로표가 아는 원래 이름으로 접는다."""
+    return _usage_rollup.view(USAGE_ROLLUP_PATH, AUDIT_PATH, raw, resolve=lambda n: route.get(n) or alias_route.get(n))
 
 
 async def _read_json_body(receive, limit: int = 64 * 1024) -> dict:
@@ -11001,6 +11022,32 @@ def _bearer_gate(app, pat_verifier=None):
             except Exception as exc:  # noqa: BLE001 — 창구의 실패가 게이트웨이를 죽이면 안 된다
                 log.warning("%s 실패: %r", path, exc)
                 await _reply(500, {"error": _clip(exc, 200)})
+            return
+        if scope.get("path") == "/usage-rollup":
+            # 이용 통계 창구(HWAXPortal docs/ops-dashboard M2) — 포털이 공유 비밀로 부른다. 사람별 호출 수(이메일)를 내므로 무인증으로 두지 않는다.
+            # GET 은 ?since&until(KST 날), POST 는 본문 {since, until, exclude, actor_tools} — 뺄 계정의 이메일을 주소(접근 로그)에 싣지 않게 본문으로 받는다.
+            # 읽기만 한다(감사 원장은 건드리지 않고 접은 표만 쓴다).
+            async def _usage_reply(status: int, obj: dict):
+                await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": json.dumps(obj, ensure_ascii=False).encode()})
+            if not _secret_eq(dict(scope.get("headers") or {}).get(b"authorization", b"").decode("latin-1"), expected):
+                await _usage_reply(401, {"error": "unauthorized"})
+                return
+            try:
+                if scope.get("method") == "GET":
+                    _uq = parse_qs((scope.get("query_string") or b"").decode("utf-8"))
+                    _ureq = {k: _uq[k][0] for k in ("since", "until") if _uq.get(k)}
+                elif scope.get("method") == "POST":
+                    _ureq = await _read_json_body(receive)
+                else:
+                    await _usage_reply(405, {"error": "method not allowed"})
+                    return
+                await _usage_reply(200, await anyio.to_thread.run_sync(lambda: _usage_rollup_view(_ureq)))
+            except ValueError as exc:
+                await _usage_reply(400, {"error": str(exc)[:300]})
+            except Exception as exc:  # noqa: BLE001 — 창구의 실패가 게이트웨이를 죽이면 안 된다
+                log.warning("/usage-rollup 실패: %r", exc)
+                await _usage_reply(500, {"error": _clip(exc, 200)})
             return
         if scope.get("path") == "/refresh" and scope.get("method") == "POST":
             # 외부 MCP 의 기능 변경을 **즉시** 반영시키는 트리거. 주기 루프가 60초마다 같은

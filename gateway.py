@@ -5885,10 +5885,14 @@ INSIGHT_TIMEOUT_S = float(os.environ.get("GATEWAY_INSIGHT_TIMEOUT_S", "30") or 3
 INSIGHT_FIND_TOOL = _routine_tool(
     "insight_find",
     "과제 인사이트 — 내가 볼 수 있는 앞선 일반 심의의 결정 카드를 과제(SP 허브 key) · 차수로 찾는다(웹 심의 · MCP 심의 · Claude 워크플로가 모두 "
-    "같은 (과제, 차수) 칸에 모인다). 카드는 단마다 하나 — 주장(핵심 요약) · 표결 · RA 보고서 · 근거 표지 · 상태(초안 · 확인 · 반박)다. 결과는 "
-    "앞선 인사이트일 뿐 검증 대상이고 독립 근거가 아니다 — 새 심의의 근거로 넘기면(deliberate_start 의 evidence 에 tool 칸으로 이 도구 이름을 "
-    "남긴다) 그 심의의 인사이트 카드는 원래 카드들의 보이는 범위를 이어받는 규칙이 서기 전까지 주인만 본다. 과제 key 는 "
-    "find_plm_task 결과 행의 key 다(과제코드가 아니다). 리스크 심사 결과는 risk_find_projects_by_subject 로 본다.",
+    "같은 (과제, 차수) 칸에 모인다). 카드는 단마다 하나 — 주장(핵심 요약) · 표결 · RA 보고서 · 근거 표지 · 상태(초안 · 확인 · 반박)다. 과제의 옛 "
+    "key(이름 바뀜 · 합쳐짐)로 남은 카드도 함께 온다(previous_keys). 결과는 앞선 인사이트일 뿐 검증 대상이고 독립 근거가 아니다. 새 심의의 "
+    "근거로 넘길 때는 카드마다 한 항목으로 — deliberate_start 의 evidence 에 {source: '앞선 인사이트 — 검증 대상, 독립 근거 아님', tool 칸 "
+    "'insight_get', args '{\"id\": \"<카드 id>\"}', result: 주장 · 출처 · 상태}. 같은 (과제, 차수)의 것만, 범위(scope)가 소속(aff:) · 조직(org)뿐인 "
+    "확인 · 반박 카드만 넘긴다(plat: 가 붙은 카드 · 초안은 넘기지 않는다 — 그 심의의 잡 기록 · 보고서를 읽는 사람은 플랫폼 권한으로 걸러지지 "
+    "않는다). 그 꼴이어야 새 심의가 낳는 카드가 읽은 카드들의 보이는 범위를 이어받는다 — 찾기 결과를 묶음째 넘기면 확인해도 주인만 본다. "
+    "리스크 심사에는 넘기지 않는다(엔진이 그 항목을 뺀다). 과제 key 는 find_plm_task 결과 행의 key 다(과제코드가 아니다). 리스크 심사 결과는 "
+    "risk_find_projects_by_subject 로 본다.",
     {"sp_task": {"type": "string", "maxLength": 200, "description": "허브 과제 key(글자 그대로) — 비우면 모든 과제"},
      "round": {"type": "string", "maxLength": 40, "description": "차수 — pre · dv1 ~ dv3 · dvr · pv1 ~ pv3 · pvr · pra · mp, 차수 모름 칸만은 unknown, "
                                                                  "비우면 모든 차수"},
@@ -5899,7 +5903,8 @@ INSIGHT_FIND_TOOL = _routine_tool(
 INSIGHT_GET_TOOL = _routine_tool(
     "insight_get",
     "과제 인사이트 카드 하나의 전부 — 주제(과제 · 차수 · 설계 자료) · 주장 · 표결 · RA 보고서 · 근거 표지(도구 · 인자 · 결과 지문) · 상태 · 범위 · "
-    "반박 잇기. 볼 수 없는 카드는 없는 것과 같다. 검증 대상이고 독립 근거가 아니다.",
+    "반박 잇기 · 판 표지(stale — 기구 CAD 에 뒤 판이 있거나 내용이 바뀌었으면 '낡았을 수 있다', 못 읽으면 '모름' · 뒤 판의 리스크 변경 심사 줄 "
+    "risk_diffs) · 같은 결론인 다른 카드(same — 내가 볼 수 있는 것만). 볼 수 없는 카드는 없는 것과 같다. 검증 대상이고 독립 근거가 아니다.",
     {"id": {"type": "string", "maxLength": 300, "description": "카드 id — insight_find 결과의 id(ins:web:… · ins:delib:… · ins:wf:…)"}}, ["id"])
 INSIGHT_TOOLS = (INSIGHT_FIND_TOOL, INSIGHT_GET_TOOL)
 _INSIGHT_NAMES = frozenset(t.name for t in INSIGHT_TOOLS)

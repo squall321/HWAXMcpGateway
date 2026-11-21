@@ -2772,6 +2772,97 @@ def test_RF26_일회성_세션은_호출마다_목록을_묻지_않는다(monkey
     assert res[0].content[0].text == '{"rows": []}'
 
 
+# ── 상주 세션도 tools/call 만 보낸다(반대 검토 2026-11-22 — RF-26 의 같은 틈) ─────────────────────────────────
+class _SchemaSess:
+    """진짜 MCP 클라이언트(mcp 1.28)의 꼴 — `call_tool` 은 tools/call 을 보낸 **뒤에** 출력 스키마를 대조하고, 안 맞으면 던진다.
+    `send_request` 는 요청 하나만 보낸다. 백엔드에 닿은 tools/call 을 runs 에 적는다."""
+    def __init__(self, runs):
+        self.runs = runs
+
+    async def send_request(self, request, result_type, **_kw):
+        root = request.root
+        assert root.method == "tools/call", root.method
+        self.runs.append((root.params.name, dict(root.params.arguments or {})))
+        return types.CallToolResult(content=[types.TextContent(type="text", text='{"created": 1}')], isError=False)
+
+    async def call_tool(self, name, arguments=None, **_kw):
+        res = await self.send_request(types.ClientRequest(types.CallToolRequest(
+            params=types.CallToolRequestParams(name=name, arguments=arguments))), types.CallToolResult)
+        raise RuntimeError(f"Tool {name} has an output schema but did not return structured content")
+
+
+def _shared_kit(monkeypatch):
+    runs = []
+
+    class _B(_ReconB):
+        async def reconnect(self, tg, seen_gen=None):
+            self.reconnects += 1
+            self.session = _SchemaSess(runs)
+
+    b = _B(["create_thing"])
+    b.session = _SchemaSess(runs)
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {"some-app": b})
+    monkeypatch.setattr(gw, "route", {"create_thing": ("some-app", "create_thing")})
+    for name, val in (("alias_route", {}), ("POLICY", {}), ("_ACCESS_POLICY", {}), ("_ACCESS_POLICY_READY", True), ("PER_USER_SSO", {}),
+                      ("IDENTITY_FWD", set()), ("_task_group_holder", {"tg": object()}), ("_REAGG", {})):
+        monkeypatch.setattr(gw, name, val)
+    monkeypatch.setattr(gw, "_portal_access", _noop_async({"keys": [], "affiliation": "CAEG"}))
+    monkeypatch.setattr(gw, "_request_user", lambda: "u@corp.com")
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["mes-user", "feat:chat"])
+    return b, runs
+
+
+def test_상주_세션의_호출도_성공_뒤의_스키마_대조로_다시_돌지_않는다(monkeypatch):
+    """`call_tool` 의 호출 뒤 대조가 던지면 `_call_tool` 의 「재연결 후 한 번 더」 가 **이미 돈 도구를 다시** 돌렸다 — 쓰기 도구가 두 번 들어가고
+    그러고도 실패로 보고된다. 상주 세션도 tools/call 만 보내고 답을 그대로 돌려준다(대조는 끝 클라이언트 몫)."""
+    b, runs = _shared_kit(monkeypatch)
+    res = asyncio.run(gw._call_tool("create_thing", {"title": "가"}))
+    assert not res.isError and res.content[0].text == '{"created": 1}', res.content[0].text
+    assert runs == [("create_thing", {"title": "가"})], f"도구가 {len(runs)}번 돌았다"
+    assert b.reconnects == 0
+    row = _rows()[-1]
+    assert (row["ok"], row["mode"]) == (True, "service") and "note" not in row
+
+
+def test_send_request_가_없는_세션은_call_tool_로_떨어지고_한_번만_알린다(monkeypatch, caplog):
+    """옛 SDK · 시험 대역의 꼴 — 종전 길 그대로다. 그 길에는 호출 뒤 대조의 틈이 남아 있으니 조용히 떨어지지 않는다."""
+    import logging
+
+    class _Old:
+        def __init__(self):
+            self.calls = []
+
+        async def call_tool(self, name, arguments=None, **_kw):
+            self.calls.append(name)
+            return types.CallToolResult(content=[types.TextContent(type="text", text="{}")], isError=False)
+
+    monkeypatch.setattr(gw, "_CALL_ONLY_WARNED", [])
+    old = _Old()
+
+    async def go():
+        await gw._tools_call_only(old, "a", {})
+        await gw._tools_call_only(old, "b", {})
+
+    with caplog.at_level(logging.WARNING, logger=gw.log.name):
+        asyncio.run(go())
+    assert old.calls == ["a", "b"]
+    assert len([r for r in caplog.records if "send_request 가 없다" in r.getMessage()]) == 1
+
+
+def test_tools_call_only_는_메서드를_글자로_적어_보낸다():
+    """SDK 가 CallToolRequest 의 method 기본값을 바꾸거나 없애도 tools/call 이 나간다."""
+    import ast
+    from pathlib import Path as _P
+    fn = next(n for n in ast.walk(ast.parse(_P(gw.__file__).read_text(encoding="utf-8")))
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == "_tools_call_only")
+    kws = [k for c in ast.walk(fn) if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "CallToolRequest" for k in c.keywords]
+    assert any(k.arg == "method" and isinstance(k.value, ast.Constant) and k.value.value == "tools/call" for k in kws)
+    # 게이트웨이 본문에서 백엔드 세션의 call_tool 을 직접 부르는 자리는 이 도우미의 내림 길 하나뿐이다
+    src = _P(gw.__file__).read_text(encoding="utf-8")
+    assert src.count("sess.call_tool(") == 1, "백엔드 세션의 call_tool 을 직접 부르는 자리가 늘었다 — _tools_call_only 를 쓴다"
+
+
 # ── REST 다리 — 위층이 우리가 실은 사람 토큰을 401 로 거절하면 캐시에서 버린다(HWAXPortal docs/request-1027 HG-04) ─────────────
 # 버리지 않던 때는 위층이 폐기한 토큰을 캐시 수명(12시간) 동안 계속 실었다. SimFlow 는 발급할 때마다 직전 토큰을 폐기한다.
 _HG04_KEY = ("simflow", "u@corp.com")
@@ -15120,7 +15211,9 @@ def test_그림_표지는_png_와_svg_짝이_오면_보고서에_넣을_ref_를_
     png, svg = ("fig_" + "a" * 22, "image/png", 2048), ("fig_" + "b" * 22, "image/svg+xml", 1024)
     both = gw._fig_note([png, svg])
     assert "(png · " in both and "(svg · " in both
-    assert "svg 가 아니라 png 등 래스터 ref 를 넣는다" in both
+    assert "래스터 ref 만 들어간다 — svg ref 는 넣지 못한다" in both and "같은 그림이 svg 와 래스터 짝으로 왔으면 래스터 쪽" in both
+    # 두 그림이 같은 그림의 짝이 아닐 때도 참인 글이어야 한다 — 「svg 대신 png 를 넣어라」 는 서로 다른 그림이면 엉뚱한 그림을 넣게 한다(반대 검토).
+    assert "svg 가 아니라" not in both and "svg 는 화면용" not in both
     # 한쪽만 오면 종전 글 그대로다 — 짝 안내가 붙지 않는다
     for only in ([png], [svg], [png, ("fig_" + "c" * 22, "image/jpeg", 10)]):
         assert "래스터 ref" not in gw._fig_note(only)

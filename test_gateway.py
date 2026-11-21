@@ -15113,3 +15113,15 @@ def test_루틴_보고서_초안은_글자로_박힌_템플릿_id_없이_박스_
     # 하나는 _ra_format_args 가 돌려주는 dict 자신이다
     assert len(literal) == 1, f"template_id 를 글자로 든 dict — 줄 {literal}"
     assert src.count('**_ra_format_args("deliberation")') == 1
+
+
+# ── 그림 표지 — 래스터와 svg 가 함께 오면 어느 ref 를 넣을지 말한다(HWAXPortal docs/report-figures 99행) ─────────────────────
+def test_그림_표지는_png_와_svg_짝이_오면_보고서에_넣을_ref_를_말한다():
+    png, svg = ("fig_" + "a" * 22, "image/png", 2048), ("fig_" + "b" * 22, "image/svg+xml", 1024)
+    both = gw._fig_note([png, svg])
+    assert "(png · " in both and "(svg · " in both
+    assert "svg 가 아니라 png 등 래스터 ref 를 넣는다" in both
+    # 한쪽만 오면 종전 글 그대로다 — 짝 안내가 붙지 않는다
+    for only in ([png], [svg], [png, ("fig_" + "c" * 22, "image/jpeg", 10)]):
+        assert "래스터 ref" not in gw._fig_note(only)
+    assert gw._fig_note([png]) == f"그림 저장 — {png[0]} (png · {gw._fig_size(2048)}) · 파일로 받기 figure_get · 보고서에 넣기 figure_to_report"

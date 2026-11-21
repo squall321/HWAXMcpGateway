@@ -7137,7 +7137,12 @@ def _fig_note(outcomes: list[tuple]) -> str:
     skip = " · ".join(f"{_FIG_SKIP_TEXT[w].format(cap=_fig_size(FIG_MAX_BYTES))} {k}장" for w, k in why.items())
     if not kept:
         return f"그림 저장 못 함 — {skip}"
-    return ("그림 저장 — " + ", ".join(kept) + " · 파일로 받기 figure_get · 보고서에 넣기 figure_to_report"
+    # 같은 결과에 래스터와 svg 가 함께 오면(StepForge 의 png+svg_live 짝 — 화면 호버용 svg 와 판독 · 보고서용 png) 어느 ref 를 넣을지 말해 준다 —
+    # svg ref 를 넣으려다 거절당하고 도구를 다시 부르는 왕복을 줄인다(HWAXPortal docs/report-figures 99행). 한쪽만 오면 글은 종전 그대로다.
+    mimes = {mime for ref, mime, _n in outcomes if ref}
+    pair = (" (보고서 · 문서에는 svg 가 아니라 png 등 래스터 ref 를 넣는다 — svg 는 화면용이다)"
+            if "image/svg+xml" in mimes and len(mimes) > 1 else "")
+    return ("그림 저장 — " + ", ".join(kept) + " · 파일로 받기 figure_get · 보고서에 넣기 figure_to_report" + pair
             + (f" · 못 둔 그림 — {skip}" if skip else ""))
 
 

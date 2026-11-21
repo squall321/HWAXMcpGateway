@@ -11554,8 +11554,13 @@ def test_인사이트_도구_둘은_로컬_목록_읽기_전용_도구_지도에
         assert gw._readonly_denial(t.name, {}) == "", "읽기 전용 PAT 도 부른다"
     st, body = _gate_call(monkeypatch, "/tools-map")
     assert st == 200 and all(body["map"].get(t.name) == "_gateway" for t in gw.INSIGHT_TOOLS)
-    # 결과를 새 심의 근거로 넘기는 길은 막지 않되, 그 카드가 주인만 본다는 것을 설명이 말한다(포털 반대 검토 11-02 의 3 — 범위 이어받기는 M3)
-    assert "주인만 본다" in gw.INSIGHT_FIND_TOOL.description and "tool 칸" in gw.INSIGHT_FIND_TOOL.description
+    # 결과를 새 심의 근거로 넘기는 법을 설명이 말한다(포털 docs/project-insight-graph PLAN §7.1 · M3) — 카드마다 한 항목(tool 칸 insight_get · args 의
+    # 카드 id)이어야 새 심의의 카드가 읽은 카드들의 범위를 이어받고, 묶음째 넘기면 주인만 본다. 넘기는 것은 소속 · 조직 범위의 확인 카드뿐이고
+    # (plat: 가 붙은 것 · 초안은 아니다) 리스크 심사에는 넘기지 않는다(엔진이 뺀다 — D-18).
+    desc = gw.INSIGHT_FIND_TOOL.description
+    for want in ("카드마다 한 항목", "tool 칸", "insight_get", "이어받는다", "주인만 본다", "plat:", "같은 (과제, 차수)", "리스크 심사", "previous_keys"):
+        assert want in desc, want
+    assert "stale" in gw.INSIGHT_GET_TOOL.description and "same" in gw.INSIGHT_GET_TOOL.description
 
 
 def _insight_portal(monkeypatch, responder, auth="Bearer pat-person"):

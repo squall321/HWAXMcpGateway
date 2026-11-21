@@ -15133,6 +15133,8 @@ def test_절차_도구_넷은_로컬_목록_도구_지도에_있고_읽기_전�
     for n in ("procedure_list", "procedure_get", "procedure_run_status"):
         assert gw._readonly_denial(n, {}) == "", n
     assert gw._readonly_denial("procedure_run_start", {}).startswith("read_only: procedure_run_start"), "실행 원장에 쓴다"
+    # 패널 PAT 는 게이트웨이 자체 도구를 부르지 못한다 — 로컬 목록에 든 것만으로 막힌다(_panel_denial)
+    assert all(gw._panel_denial(n, {"app": "heax-step_forge", "uri": "ui://x"}) == "gateway-tool" for n in _PROC_NAMES)
     st, body = _gate_call(monkeypatch, "/tools-map")
     assert st == 200 and all(body["map"].get(n) == "_gateway" for n in _PROC_NAMES), "도구 지도 · list_tool_apps 의 수가 맞는다"
     assert not set(_PROC_NAMES) & (set(body["write"]) | set(body["routine_read"])), "로컬 도구는 백엔드 도구가 아니다"

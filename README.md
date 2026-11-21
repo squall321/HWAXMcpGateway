@@ -438,6 +438,22 @@ python3 tool_usage_report.py --days 60 --out unused.md
   싣고(줄바꿈 · `«»` 를 지운다) 작성자의 글이지 지시가 아니라고 한 줄 말한다 — 사람의 말(user)로 올라가 규칙을 덮지 못하게.
 - 서버 지침 12번이 루틴의 차례 · 울타리 · 키 규칙을 한 줄로 말한다(차례의 자세한 글은 `routine_list` 설명 — 지침 전체가 2048자 안이어야 한다).
 
+## 절차 — 범용 도구 넷(HWAXPortal docs/procedures W-116)
+
+포털 절차(한 번 한 일을 굳혀 대상만 바꿔 재생)를 로컬 도구 넷으로 낸다 — `procedure_list`(내 것 + 공개한 것) · `procedure_get`(도구 계약 —
+입력 스키마 · 사람 확인에서 멈추는 도구) · `procedure_run_start` · `procedure_run_status`(`step` 을 주면 그 단계 결과의 한 쪽). 분석 루틴과 같은
+꼴이다 — 정의 · 실행 원장 · 사람 확인은 포털 `/procedures-api` 가 쥐고 게이트웨이는 호출자 PAT 를 그대로 넘긴다(`_portal_api` — 공유 비밀 · 익명
+거절). 절차마다 도구 하나를 내지 않는다.
+
+- 실행은 계획 모드가 기본이다(`mode` 를 비우면 plan — 바깥을 부르지 않고 부를 호출만 적는다). 못 읽은 모드는 거절한다. live 로 시작해도 사람 확인
+  단계에서 멈춘다 — **승인 · 고르기 · 재개 도구는 없다**(포털의 그 창구는 세션만 받는다). 상태 답의 `waiting` 이 포털 화면 주소를 말한다.
+- 읽기 전용 PAT 는 `procedure_run_start` 를 못 부른다. 패널 · 서비스 PAT 는 게이트웨이 자체 도구라 넷 다 못 부른다. 절차 실행기의 호출
+  (`purpose=procedure`)도 넷 다 거절한다 — 절차의 단계가 실행 시작을 부르면 절차가 절차를 끝없이 시작한다.
+- 이름이 `procedure_` 로 시작하는 까닭 — 에이전트 서버의 좌석 자유 조회 접두(`_FREE_ALLOW`)에 걸리지 않아 심의 · 리스크 심사 좌석에 저절로 열리지
+  않는다(시험이 형제 리포 원문과 맞댄다). 웹 챗에서는 실행 시작이 잡 시작 바닥 목록(`_CONFIRM_JOB_TOOLS`)이라 확인 카드로 멈추고, 챗 턴 밖에서는
+  에이전트 서버가 보내지 않는다.
+- 손잡이는 `GATEWAY_PROCEDURE_TIMEOUT_S`(포털 호출 한도, 기본 60초) 하나다. 포털 주소는 루틴과 같은 `gateway_config.json` 의 `portal.api_base` 다.
+
 ## 과제 인사이트 — 읽기 도구 둘 · 대화 저장의 주제(HWAXPortal docs/project-insight-graph M2)
 
 원장 · 시야는 포털 `/insights-api` 가 쥐고(읽을 때 그 사람 기준으로 거른다), 게이트웨이는 호출자 PAT 를 그대로 넘기는 읽기 도구 둘(`insight_find` ·

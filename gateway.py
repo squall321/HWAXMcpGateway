@@ -9841,6 +9841,22 @@ async def _call_shared(b: "_Backend", backend_key: str, original: str, arguments
     raise _Late("released", why) if why else _Late("call")
 
 
+async def _tools_call_only(sess, name: str, arguments: dict):
+    """tools/call 한 번만 보낸다 — MCP 클라이언트의 `call_tool` 이 성공한 **뒤에** 하는 일(출력 스키마를 보려는 tools/list 한 번과 스키마
+    대조)을 건너뛴다(HWAXPortal docs/report-figures RF-26 · docs/leftovers-1121 L21-10 ④).
+
+    일회성 세션은 스키마 캐시가 비어 있어 호출마다 그 tools/list 가 나갔다(mcp 1.28 `ClientSession._validate_tool_result`). 그 사이에 토큰이
+    거절되면(401) 예외가 올라와 사람별 위임의 '토큰 재발급 후 1회 재시도' 가 **이미 돈 도구를 다시** 돌렸다 — 쓰기 도구면 같은 것이 두 번
+    들어간다. 목록이 다른 까닭으로 실패해도 성공한 호출이 실패로 보고됐다. 게이트웨이는 중계라 백엔드의 답을 그대로 돌려주면 되고, 구조화
+    출력의 대조는 그 답을 받는 쪽(끝 클라이언트)이 한다. 상주 세션(_call_shared)은 붙을 때 목록을 받아 캐시가 차 있어 이 틈이 없다 — 그대로 둔다.
+    `send_request` 가 없는 세션 꼴(옛 SDK · 시험 대역)은 종전처럼 `call_tool` 을 부른다."""
+    send = getattr(sess, "send_request", None)
+    if send is None:
+        return await sess.call_tool(name, arguments)
+    return await send(types.ClientRequest(types.CallToolRequest(
+        params=types.CallToolRequestParams(name=name, arguments=arguments))), types.CallToolResult)
+
+
 async def _oneshot(b: "_Backend", hdrs: dict, original: str, arguments: dict, timeout_s: float, op=None):
     """이 호출만을 위한 단발 세션 — 핸드셰이크(connect + initialize)와 도구 호출에 기한을 **따로** 준다.
 
@@ -9863,7 +9879,7 @@ async def _oneshot(b: "_Backend", hdrs: dict, original: str, arguments: dict, ti
                 if stage == "call":
                     with anyio.move_on_after(timeout_s):
                         # op — 도구 호출이 아닌 단발 요청(resources/read — HG-07). 기한 · 단계 표시는 같다.
-                        res = await (op(sess) if op is not None else sess.call_tool(original, arguments))
+                        res = await (op(sess) if op is not None else _tools_call_only(sess, original, arguments))
                         stage = "done"
     if stage != "done":
         raise _Late(stage)

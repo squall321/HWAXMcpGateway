@@ -2654,10 +2654,10 @@ def test_토큰_거절이_아니면_다시_부르지_않는다(monkeypatch, err)
 _HG03_SSO, _HG03_MCP = "http://simflow.example/api/auth/sso", "http://simflow.example/mcp"
 
 
-def _hg03_kit(monkeypatch, decide, *, sso_status=200, calls=1):
+def _hg03_kit(monkeypatch, decide, *, sso_status=200, calls=1, list_status=200):
     """`decide(Authorization, n)` 이 tools/call 마다 백엔드의 HTTP 상태를 정한다(200 이면 성공, 예외면 그 예외). `calls` 번을 한꺼번에
     부른다 → (결과 목록, 센 것 — 발급 · tools/call 이 실은 토큰, 감사 줄)."""
-    n = {"mints": 0, "tokens": []}
+    n = {"mints": 0, "tokens": [], "lists": 0}
 
     def handler(req):
         u = str(req.url)
@@ -2677,6 +2677,9 @@ def _hg03_kit(monkeypatch, decide, *, sso_status=200, calls=1):
         if "id" not in msg:
             return httpx.Response(202)
         if msg.get("method") == "tools/list":    # 진짜 클라이언트는 tools/call 뒤에 출력 스키마를 보러 목록을 부른다(mcp 1.28)
+            n["lists"] += 1
+            if list_status != 200:
+                return httpx.Response(list_status, json={"detail": "거절"})
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [
                 {"name": "list_workflows", "inputSchema": {"type": "object"}}]}})
         assert msg.get("method") == "tools/call", msg
@@ -2749,6 +2752,24 @@ def test_HG03_다시_받은_토큰도_거절되면_두_번에서_멈춘다(monke
     res, n, rows = _hg03_kit(monkeypatch, lambda auth, i: 401)
     assert res[0].isError and (n["mints"], n["tokens"]) == (2, ["Bearer t1", "Bearer t2"])
     assert "401" in rows[-1]["error"], rows
+
+
+def test_RF26_호출이_성공한_뒤의_목록_묻기가_401_이어도_쓰기_도구를_다시_돌리지_않는다(monkeypatch):
+    """MCP 클라이언트(mcp 1.28 `call_tool`)는 tools/call 이 성공한 **뒤에** 출력 스키마를 보려고 tools/list 를 한 번 더 부른다. 일회성 세션은
+    캐시가 비어 있어 호출마다 그렇다. 그 사이에 토큰이 거절되면(401) 예외가 올라와 '토큰 재발급 후 1회 재시도' 가 **이미 돈 도구를 다시**
+    돌렸다 — 쓰기 도구면 같은 블록이 두 번 들어간다(HWAXPortal docs/report-figures RF-26). 일회성 세션은 tools/call 만 보낸다."""
+    res, n, rows = _hg03_kit(monkeypatch, lambda auth, i: 200, list_status=401)
+    assert not res[0].isError, res[0].content[0].text
+    assert (n["mints"], n["tokens"]) == (1, ["Bearer t1"]), f"도구가 두 번 돌았다 — {n}"
+    assert n["lists"] == 0, "일회성 세션이 호출 뒤에 목록을 물었다"
+    assert [(r["ok"], r["mode"], r.get("note")) for r in rows] == [(True, "as-user-pat", None)]
+
+
+def test_RF26_일회성_세션은_호출마다_목록을_묻지_않는다(monkeypatch):
+    """목록이 멀쩡할 때도 묻지 않는다 — 사람별 위임 호출마다 왕복이 하나 준다. 답은 그대로 돌려준다(게이트웨이는 중계다)."""
+    res, n, _rows = _hg03_kit(monkeypatch, lambda auth, i: 200, calls=2)
+    assert [r.isError for r in res] == [False, False] and n["lists"] == 0 and len(n["tokens"]) == 2
+    assert res[0].content[0].text == '{"rows": []}'
 
 
 # ── REST 다리 — 위층이 우리가 실은 사람 토큰을 401 로 거절하면 캐시에서 버린다(HWAXPortal docs/request-1027 HG-04) ─────────────
@@ -12665,7 +12686,7 @@ def _mx_kit(monkeypatch, decide=_mx_ok, *, tools=("upload_image_bytes", "insert_
     요청자는 a@corp.com(사람 PAT · plat:mxwhitepaper). 반환은 (부르기, 센 것 — mints: 발급이 받은 위임 이메일, calls: tools/call 마다 (이름, 인자,
     머리), backend)."""
     served = tuple(tools if served is None else served)
-    seen = {"mints": [], "calls": []}
+    seen = {"mints": [], "calls": [], "lists": 0}
 
     async def handler(req):
         u = str(req.url)
@@ -12683,7 +12704,8 @@ def _mx_kit(monkeypatch, decide=_mx_ok, *, tools=("upload_image_bytes", "insert_
                 "serverInfo": {"name": "mxwp-rag", "version": "1"}}})
         if "id" not in msg:
             return httpx.Response(202)
-        if msg.get("method") == "tools/list":      # 진짜 클라이언트는 tools/call 뒤에 출력 스키마를 보러 목록을 부른다(mcp 1.28)
+        if msg.get("method") == "tools/list":      # 진짜 클라이언트의 call_tool 은 tools/call 뒤에 출력 스키마를 보러 목록을 부른다(mcp 1.28)
+            seen["lists"] += 1
             st = list_status(seen) if list_status else None
             if isinstance(st, int):
                 return httpx.Response(st, json={"error": "x"})
@@ -12859,10 +12881,10 @@ def test_figure_to_doc_는_MXWP_의_거절을_그대로_말한다(monkeypatch, t
     assert (row["tool"], row["backend"], row["ok"]) == ("figure_to_doc", "mx-white-paper", False)
 
 
-@pytest.mark.parametrize("case", ["api-timeout", "api-5xx", "envelope", "gateway-timeout", "after-call-list"])
+@pytest.mark.parametrize("case", ["api-timeout", "api-5xx", "envelope", "gateway-timeout"])
 def test_figure_to_doc_는_넣었는지_모르는_실패를_넣지_못했다로_말하지_않고_다시_부르지_않는다(monkeypatch, case):
-    """넣기 요청이 MXWP 에 닿은 뒤의 실패 — 그쪽 API 시간 초과 · 5xx · 봉투 오류 · 게이트웨이 호출 한도 · 넣은 뒤 클라이언트가 출력 검증으로 부르는
-    tools/list 의 실패(MXWP 는 이미 넣었다) — 는 넣었을 수 있다. '넣지 못했다' 로 말하던 판은 다시 부르게 해 같은 그림 블록이 둘 됐다(반대 검토 1)."""
+    """넣기 요청이 MXWP 에 닿은 뒤의 실패 — 그쪽 API 시간 초과 · 5xx · 봉투 오류 · 게이트웨이 호출 한도 — 는 넣었을 수 있다. '넣지 못했다' 로
+    말하던 판은 다시 부르게 해 같은 그림 블록이 둘 됐다(반대 검토 1). 넣은 뒤의 tools/list 실패는 이제 생기지 않는다 — 아래 시험(RF-26)."""
     decide, list_status = _mx_ok, None
     if case == "api-timeout":
         decide = lambda n, a: ("timeout (15.0s) on POST /api/v1/documents/hinge-durability/blocks"     # noqa: E731
@@ -12876,8 +12898,6 @@ def test_figure_to_doc_는_넣었는지_모르는_실패를_넣지_못했다로_
             if n == "insert_image_block":
                 await asyncio.sleep(3)                  # MXWP 는 받아서 넣는 중이다
             return _mx_ok(n, a)
-    else:
-        list_status = lambda seen: 500 if any(c[0] == "insert_image_block" for c in seen["calls"]) else None     # noqa: E731
     call, seen = _mx_kit(monkeypatch, decide, list_status=list_status)
     if case == "gateway-timeout":
         monkeypatch.setattr(gw, "CALL_TIMEOUT_S", 0.5)
@@ -12885,6 +12905,16 @@ def test_figure_to_doc_는_넣었는지_모르는_실패를_넣지_못했다로_
     assert text.startswith("FIGURE_ERROR: MX 백서 문서에 그림 블록을 넣었는지 모른다 — "), text
     assert "넣지 못했다" not in text and f"이 그림(image_id {_MX_IMAGE_ID})" in text and "get_document_outline" in text, text
     assert [c[0] for c in seen["calls"]] == ["upload_image_bytes", "insert_image_block"], "다시 부르지 않는다"
+
+
+def test_figure_to_doc_는_넣은_뒤의_목록_묻기를_하지_않아_넣은_것을_넣었다고_답한다(monkeypatch):
+    """종전에는 넣은 뒤 클라이언트가 출력 검증으로 부르는 tools/list 가 실패하면(MXWP 는 이미 넣었다) '넣었는지 모른다' 가 됐다. 일회성 세션이
+    tools/call 만 보내게 된 뒤로는 그 목록 묻기가 없다(HWAXPortal docs/report-figures RF-26) — 목록이 늘 500 이어도 넣은 것은 넣었다고 답한다."""
+    call, seen = _mx_kit(monkeypatch, list_status=lambda seen: 500)
+    res = call({"ref": _fig_stored(), **_MX_AT})
+    assert not res.isError, res.content[0].text
+    assert json.loads(res.content[0].text)["block_id"] == _MX_BLOCK_ID
+    assert [c[0] for c in seen["calls"]] == ["upload_image_bytes", "insert_image_block"] and seen["lists"] == 0
 
 
 def test_figure_to_doc_는_넣었다는_답에_block_id_가_없으면_다시_부르지_말라고_말한다(monkeypatch):

@@ -57,6 +57,14 @@ def _no_prod_audit(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_ra_formats(monkeypatch, tmp_path):
+    """RA 템플릿 박스 파일(형제 포털 리포 infra/ra-formats.local.json) 격리 — 기본은 '없음'(종전 'deliberation' v1)이다. 안 걸면 등록을 마친
+    박스에서 루틴 보고서 시험의 초안 인자가 달라진다. 파일을 보는 시험은 본문에서 다시 건다."""
+    monkeypatch.setattr(gw, "RA_FORMATS_PATH", tmp_path / "no-ra-formats.local.json")
+    monkeypatch.setattr(gw, "_RA_FORMATS", {"key": "아직 읽지 않음", "map": {}, "error": None})
+
+
+@pytest.fixture(autouse=True)
 def _no_real_portal(monkeypatch):
     """포털 격리 — 설정 파일(gateway_config.json)의 실제 포털 주소로 시험이 묻지 않게 **모든 시험에 자동으로** 비운다.
 
@@ -15038,3 +15046,40 @@ def test_PTR3_list_tool_apps_는_허브가_준_판만_싣는다(monkeypatch):
     by, _asked, _b = _hg10(monkeypatch)
     assert by["heax-step_forge"]["build"] == {"commit": "27b2132", "started_at": "2026-11-17T08:12:03Z"}
     assert "build" not in by["fmea"] and "build" not in by["reportarchive"] and "build" not in by["_gateway"], "허브가 모르면 칸이 없다"
+
+
+# ── Report Archive 초안의 템플릿 id · 판(HWAXPortal docs/leftovers-1121 L21-6 ①) ─────────────────────────────
+def test_RA_템플릿은_박스_파일이_없으면_종전_그대로이고_있으면_그_줄을_쓴다(monkeypatch, tmp_path):
+    assert gw._ra_format_args("deliberation") == {"template_id": "deliberation", "template_version": 1}
+    assert gw._ra_formats_health() == {"file": False, "error": None, "kinds": {
+        "deliberation": {"template_id": "deliberation", "template_version": 1, "source": "default"}}}
+    f = tmp_path / "ra-formats.local.json"
+    f.write_text(json.dumps({"_doc": "메모", "deliberation": {"template_id": "sys.hwax.deliberation", "template_version": 4}}), encoding="utf-8")
+    monkeypatch.setattr(gw, "RA_FORMATS_PATH", f)
+    assert gw._ra_format_args() == {"template_id": "sys.hwax.deliberation", "template_version": 4}
+    assert gw._ra_formats_health()["kinds"]["deliberation"]["source"] == "box"
+
+
+@pytest.mark.parametrize("raw", ["{ 깨진", "[1]", json.dumps({"deliberation": {"template_id": "../x", "template_version": 1}}),
+                                 json.dumps({"deliberation": {"template_id": "sys.hwax.deliberation", "template_version": True}}),
+                                 json.dumps({"deliberation": {"template_id": "sys.hwax.deliberation", "template_version": "2"}}),
+                                 json.dumps({"deliberation": "글"}), json.dumps({"모르는종류": {"template_id": "a", "template_version": 1}})])
+def test_RA_템플릿_박스_파일이_틀리면_버리고_기본으로_돈다(monkeypatch, tmp_path, raw):
+    f = tmp_path / "ra-formats.local.json"
+    f.write_text(raw, encoding="utf-8")
+    monkeypatch.setattr(gw, "RA_FORMATS_PATH", f)
+    assert gw._ra_format_args() == {"template_id": "deliberation", "template_version": 1}
+    h = gw._ra_formats_health()
+    assert h["file"] is True and h["error"], h
+
+
+def test_루틴_보고서_초안은_글자로_박힌_템플릿_id_없이_박스_파일을_따른다():
+    """create_report_draft 인자에 template_id 를 글자로 들고 있으면 박스 파일을 따라가지 않는 자리가 남는다."""
+    import ast
+    from pathlib import Path as _P
+    src = _P(gw.__file__).read_text(encoding="utf-8")
+    literal = [n.lineno for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Dict)
+               and "template_id" in [k.value for k in n.keys if isinstance(k, ast.Constant)]]
+    # 하나는 _ra_format_args 가 돌려주는 dict 자신이다
+    assert len(literal) == 1, f"template_id 를 글자로 든 dict — 줄 {literal}"
+    assert src.count('**_ra_format_args("deliberation")') == 1

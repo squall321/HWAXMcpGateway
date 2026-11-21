@@ -3551,6 +3551,70 @@ def _tuning_health() -> dict:
         out["error"] = _TUNING["error"]
     return out
 
+# ── Report Archive 초안의 템플릿 id · 판(HWAXPortal docs/leftovers-1121 L21-6 ① — 기본 끔) ─────────────────────────────
+# 분석 루틴 보고서는 RA 의 `deliberation` v1 템플릿에 초안을 만든다. 그 템플릿은 RA 데이터베이스에 손으로 둔 것이라 없는 박스에서는 실패한다.
+# RA v0.176.0 의 형식 등록(`sys.<system>.<kind>`)으로 스스로 등록한 뒤에는 포털 리포의 박스 파일(infra/ra-formats.local.json — gitignore,
+# infra/scripts/ra-register-format.py 가 쓴다)이 그 id · 판을 말한다. **파일이 없으면 인자가 종전과 바이트까지 같다.** 깨진 파일 · 꼴이 틀린
+# 줄은 버리고 기본으로 돌며 까닭을 /health ra_formats 에 싣는다. 에이전트 서버(ra_formats.py — 심의 보고서 · /보고서)가 같은 파일을 같은
+# 규칙으로 읽는다(포털 시험이 두 쪽을 맞댄다). 바뀐 시각 · 크기가 다르면 다시 읽는다.
+_RA_FORMATS_ENV = os.environ.get("RA_FORMATS_PATH", "").strip()
+RA_FORMATS_PATH = (Path(__file__).resolve().parent / Path(_RA_FORMATS_ENV).expanduser() if _RA_FORMATS_ENV
+                   else Path(__file__).resolve().parent.parent / "HWAXPortal" / "infra" / "ra-formats.local.json")
+_RA_FORMAT_DEFAULTS: dict = {"deliberation": ("deliberation", 1)}
+_RA_FORMAT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_RA_FORMATS: dict = {"key": "아직 읽지 않음", "map": {}, "error": None}
+
+
+def _ra_formats_load() -> dict:
+    try:
+        st = RA_FORMATS_PATH.stat()
+        key = (str(RA_FORMATS_PATH), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (str(RA_FORMATS_PATH), None, None)
+    if key == _RA_FORMATS["key"]:
+        return _RA_FORMATS
+    got: dict = {}
+    error = None
+    if key[1] is not None:
+        try:
+            doc = json.loads(RA_FORMATS_PATH.read_text(encoding="utf-8"))
+            if not isinstance(doc, dict):
+                raise ValueError("객체가 아니다")
+        except (OSError, ValueError) as exc:
+            error = f"못 읽음({type(exc).__name__})"
+            doc = {}
+        bad = []
+        for kind, row in doc.items():
+            if kind.startswith("_"):
+                continue
+            tid = row.get("template_id") if isinstance(row, dict) else None
+            ver = row.get("template_version") if isinstance(row, dict) else None
+            if (kind in _RA_FORMAT_DEFAULTS and isinstance(tid, str) and _RA_FORMAT_ID.fullmatch(tid)
+                    and isinstance(ver, int) and not isinstance(ver, bool) and ver >= 1):
+                got[kind] = (tid, ver)
+            else:
+                bad.append(str(kind)[:40])
+        if bad:
+            error = f"꼴이 틀리거나 모르는 종류 {', '.join(sorted(bad))} — 그 줄은 기본값으로 돈다"
+        if error:
+            log.warning("ra-formats: %s — %s", RA_FORMATS_PATH.name, error)
+    _RA_FORMATS.update(key=key, map=got, error=error)
+    return _RA_FORMATS
+
+
+def _ra_format_args(kind: str = "deliberation") -> dict:
+    """create_report_draft 인자의 템플릿 두 칸 — 박스 파일에 맞는 줄이 있으면 그것, 아니면 기본."""
+    tid, ver = _ra_formats_load()["map"].get(kind) or _RA_FORMAT_DEFAULTS[kind]
+    return {"template_id": tid, "template_version": ver}
+
+
+def _ra_formats_health() -> dict:
+    st = _ra_formats_load()
+    return {"file": st["key"][1] is not None, "error": st["error"],
+            "kinds": {k: {**_ra_format_args(k), "source": "box" if k in st["map"] else "default"}
+                      for k in sorted(_RA_FORMAT_DEFAULTS)}}
+
+
 # ── 코어 어휘표(HWAXPortal docs/request-1029 B-1 · C-11) ──────────────────────────────────────────────
 # 정본은 포털 리포의 backend/config/core_vocab.json 이다. 게이트웨이 · 포털은 늘 한 박스에 형제 리포로 있어(dev ~/claude · cae00 ~/Projects)
 # 그 파일을 직접 읽는다 — 새 통로가 없고 포털이 내려가 있어도 표가 산다. 바뀐 시각이 다르면 다시 읽는다. 없거나 꼴이 틀리면 지금 동작
@@ -8187,7 +8251,7 @@ async def _routine_report(a: dict) -> types.CallToolResult:
         else:
             tok = _ROUTINE_CORR.set(f"routine:{run_id}:report"[:120])
             try:
-                res = await _call_tool_body(exposed, {"template_id": "deliberation", "template_version": 1,
+                res = await _call_tool_body(exposed, {**_ra_format_args("deliberation"),
                                                       "title": ra.get("title") or "분석 루틴 보고서",
                                                       "blocks": ra.get("blocks") or {}, "tags": ra.get("tags") or []})
             finally:
@@ -10523,6 +10587,7 @@ def _bearer_gate(app, pat_verifier=None):
                 "access_policy_ready": _ACCESS_POLICY_READY,
                 # 외부 연결 플랫폼 — 키와 상태만(주소 · 이메일은 싣지 않는다). 스모크는 이 키를 신원 없이 부르지 않는다(HWAXPortal PX1).
                 "conn_platforms": _conn_platforms(),
+                "ra_formats": _ra_formats_health(),
                 "conn_since": {k: _CONN_SINCE[k] for k in sorted(_CONN_SINCE) if k in _CONN_STATUS},
                 # 프록시 우회 보정 — 수만(주소는 싣지 않는다). 포털 출구 점검이 게이트웨이 목적지를 이것으로 판정한다(HG-18).
                 "no_proxy": _no_proxy_health(),

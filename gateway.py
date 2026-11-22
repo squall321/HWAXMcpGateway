@@ -2959,6 +2959,12 @@ _INVOKE_DENY_EXACT = frozenset({
     "trash_report", "restore_version", "job_stop", "risk_add_finding",
     "add_report_tags", "create_report_from_format",
     "merge_objects", "move_objects_to_type", "forget_dimension",
+    # 2026-11-22 추가(사용자 결정 — 인구조사 W-118 이 「사람이 정할 것」 으로 올린 넷 묶음을 모두 관문에). RA 관리자 온톨로지 쓰기(기준정보 타입 ·
+    # 속성 · 관계 · 매핑과 원천 동기화 — 남의 보고서 분류가 바뀐다) · 잡 취소 · 멈춤(job_stop 과 같은 성격) · StepForge 리스크 판정 적기 ·
+    # 밖으로 내보내는 등록 둘과 심의 묶음 시작. risk_job_action 은 action 마다 갈리지 않고 통째로 거절이다(닫힌 쪽) — 포털 MUST_GATE 와 같은 목록(시험이 견준다).
+    "sync_data_source", "create_sp_types", "create_sp_properties", "create_sp_relation_types", "set_sp_type_mapping",
+    "docforge_cancel", "risk_job_action", "deliberate_batch_stop", "set_risk_verdict",
+    "recipe_register", "approval_record", "deliberate_batch_start",
 })
 
 

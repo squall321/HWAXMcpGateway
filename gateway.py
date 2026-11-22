@@ -2950,10 +2950,15 @@ _INVOKE_DENY_SUFFIX = ("_control", "_set_state")
 # 2026-11-21 — `create_report_from_format`(Report Archive v0.180.0)을 더했다. 양식에 수신 게시판이 묶여 있으면 **같은 호출에서 바로 게시**하고
 # 확인 토큰 단계가 없다(RA backend/app/modules/imports/routes.py `_mount_to_destination`). `create_report_draft` 는 boards 를 줘도 확인 토큰만
 # 돌려주므로 넣지 않는다(HWAXPortal docs/leftovers-1121 L21-4 B1).
+# 2026-11-22 — 인구조사 480 → 773종에서 되돌릴 수 없는 지우기 셋을 더했다(HWAXPortal docs/procedures W-118). Report Archive `merge_objects`
+# (원본 객체를 지우고 남의 보고서 태그를 옮긴다 — RA 독스트링 '되돌릴 수 없는 작업') · `move_objects_to_type`(대상 타입에 같은 값이 있으면 원본을
+# 지운다), StepForge `forget_dimension`(키 전체면 모든 과제의 치수 기록을 지운다 — '되돌릴 수 없다', destructiveHint). 셋 다 접두 · 접미에 안
+# 걸린다. 태깅만 옮기는 `move_object_taggings`(되돌릴 수 있다)와 치수 기록 · 비교는 넣지 않는다.
 _INVOKE_DENY_EXACT = frozenset({
     "publish_report", "publish_report_to_datahub", "request_unpublish",
     "trash_report", "restore_version", "job_stop", "risk_add_finding",
     "add_report_tags", "create_report_from_format",
+    "merge_objects", "move_objects_to_type", "forget_dimension",
 })
 
 

@@ -1101,6 +1101,17 @@ def test_파괴_관문이_한_호출로_게시하는_RA_도구를_막는다():
         assert n not in gw._INVOKE_DENY_EXACT, n
 
 
+def test_파괴_관문이_되돌릴_수_없는_지우기를_막는다():
+    """인구조사 11-22(HWAXPortal docs/procedures W-118) — 원본을 지우는 RA 객체 합치기 · 타입 옮기기와 StepForge 치수 기록 지우기는
+    `delete_` 꼴이 아니라 이름 패턴을 지난다. 되돌릴 수 있는 이웃(태깅만 옮기기 · 치수 기록 · 비교)은 막지 않는다."""
+    import gateway as gw
+
+    for n in ("merge_objects", "move_objects_to_type", "forget_dimension"):
+        assert n in gw._INVOKE_DENY_EXACT, n
+    for n in ("move_object_taggings", "record_dimension", "compare_dimension"):
+        assert n not in gw._INVOKE_DENY_EXACT, n
+
+
 def test_무인증_헬스는_권한_지도를_안_낸다():
     """nginx 가 게이트웨이를 외부로 프록시한다 — 무인증 프로브에 내부 권한 지도가
     나갈 이유가 없다. 다만 **실려 있는지**는 봐야 한다(비면 권한이 통째로 풀린 것)."""

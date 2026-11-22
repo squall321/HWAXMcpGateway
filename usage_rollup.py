@@ -11,6 +11,8 @@
     (백엔드 키에서 하이픈을 뺀 것 + '_')을 쓴다. 주소가 든 이름(rest_call · resources/read)은 주소를 뗀다. 모르는 도구(호출자가 적은 글자)는
     '(unknown)' 한 칸이다 — 요청이 정한 글자를 통계에 싣지 않는다.
   · 뺄 계정(exclude)은 물을 때 건다 — 접은 표는 호출자까지 갈라 두어 호출 수 · 지연 · 사람 줄 모두에서 빠진다.
+  · 호출자가 빈 줄의 `audit_for`(그 호출이 누구의 일에서 나왔나 — 에이전트 서버가 서비스 자격 호출에 실은 감사 전용 머리, 검증하지 않은 주장)는
+    따로 갈라 둔다 — 사람 줄은 actors_for · actor_tools_for 로 따로 내고, 이름 없는 줄(anon)에서는 뺀다. 뺄 계정은 이 칸에도 건다(OD-52).
   · 싣지 않는 것 — IP · 오류 글 · 메모 · 대화 열쇠(corr) · 요청 ID. 실패는 앱 쪽 · 관문 쪽 둘로만 가른다.
 
 이 모듈은 표준 라이브러리만 읽는다(게이트웨이 모듈을 읽지 않는다 — 시험이 따로 돈다).
@@ -29,6 +31,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 CONTRACT = 1
+SCHEMA_VERSION = "2"            # 접은 표의 꼴 — 다르면 표를 버리고 원장 처음부터 다시 접는다(원장에서 다시 지을 수 있는 셈이라 잃는 것이 없다)
 KST = timezone(timedelta(hours=9))
 MAX_RANGE_DAYS = 400            # 포털 이용 통계의 가장 긴 기간(HWAXPortal backend/app/usage_stats.py MAX_DAYS)
 DEFAULT_RANGE_DAYS = 3          # 비우면 오늘까지 사흘 — 포털이 날마다 다시 접는 창
@@ -46,14 +49,16 @@ STATUS_SUFFIX = "_status"
 # 관문 쪽 실패 — 게이트웨이가 백엔드에 보내기 전에 막았거나(권한 · 울타리 · 모르는 도구) 사람 자격을 받지 못했다. 그 밖의 실패는 앱 쪽이다.
 GATE_ERRORS = ("forbidden", "unknown tool", "read-only", "panel-denied", "invoke-denied", "service-denied", "backend removed",
                "unauthorized", "method not allowed", "bad request", "per-user", "assertion")
-FIELDS = ("caller", "via", "ip", "chars")       # 처음 나온 날을 싣는 칸(그 전 날의 그 칸은 '없음' 이 아니라 '기록 전' 이다)
+FIELDS = ("caller", "via", "ip", "chars", "audit_for")       # 처음 나온 날을 싣는 칸(그 전 날의 그 칸은 '없음' 이 아니라 '기록 전' 이다)
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS calls (day TEXT NOT NULL, backend TEXT NOT NULL, tool TEXT NOT NULL, via TEXT NOT NULL,"
-    " outcome TEXT NOT NULL, caller TEXT NOT NULL, n INTEGER NOT NULL, chars INTEGER NOT NULL, chars_max INTEGER NOT NULL,"
-    " cache INTEGER NOT NULL, big INTEGER NOT NULL, PRIMARY KEY (day, backend, tool, via, outcome, caller)) WITHOUT ROWID",
+    " outcome TEXT NOT NULL, caller TEXT NOT NULL, for_user TEXT NOT NULL, n INTEGER NOT NULL, chars INTEGER NOT NULL,"
+    " chars_max INTEGER NOT NULL, cache INTEGER NOT NULL, big INTEGER NOT NULL,"
+    " PRIMARY KEY (day, backend, tool, via, outcome, caller, for_user)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS lat (day TEXT NOT NULL, backend TEXT NOT NULL, tool TEXT NOT NULL, via TEXT NOT NULL,"
-    " caller TEXT NOT NULL, le INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (day, backend, tool, via, caller, le)) WITHOUT ROWID",
+    " caller TEXT NOT NULL, for_user TEXT NOT NULL, le INTEGER NOT NULL, n INTEGER NOT NULL,"
+    " PRIMARY KEY (day, backend, tool, via, caller, for_user, le)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS auth (day TEXT NOT NULL, reason TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (day, reason)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID",
 )
@@ -66,6 +71,7 @@ _VIA_OK = re.compile(r"[a-z-]{1,20}")
 _REASON_OK = re.compile(r"[a-z-]{1,40}")
 _AUTH_TOOL = re.compile(r"[A-Z]{3,7} /mcp/?")
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
+_FOR_OK = re.compile(r"[^@\s,;]{1,100}@[^@\s,;]{1,100}")      # 게이트웨이가 audit_for 에 적는 꼴(gateway._AUDIT_FOR_RE)
 
 
 def kst_day(ts) -> str | None:
@@ -190,11 +196,13 @@ class _Fold:
         via = str(rec.get("via") or "")
         via = via if _VIA_OK.fullmatch(via) else ""
         caller = str(rec.get("caller") or "").strip().lower()[:200]
+        for_user = "" if caller else str(rec.get("audit_for") or "").strip().lower()[:200]
+        for_user = for_user if _FOR_OK.fullmatch(for_user) else ""
         outcome = _outcome(rec)
         chars = rec.get("chars")
         chars = chars if isinstance(chars, int) and not isinstance(chars, bool) and chars >= 0 else 0
         cached = "cache-hit" in str(rec.get("note") or "").split("+")
-        row = self.calls.setdefault((day, bk, tool, via, outcome, caller), [0, 0, 0, 0, 0])
+        row = self.calls.setdefault((day, bk, tool, via, outcome, caller, for_user), [0, 0, 0, 0, 0])
         row[0] += 1
         row[1] += chars
         row[2] = max(row[2], chars)
@@ -202,7 +210,7 @@ class _Fold:
         row[4] += int(chars >= BIG_CHARS)
         ms = rec.get("ms")
         if outcome == "ok" and not cached and isinstance(ms, (int, float)) and not isinstance(ms, bool) and ms >= 0:
-            key = (day, bk, tool, via, caller, _le(ms))
+            key = (day, bk, tool, via, caller, for_user, _le(ms))
             self.lat[key] = self.lat.get(key, 0) + 1
 
 
@@ -212,6 +220,21 @@ def _open(path) -> sqlite3.Connection:
     if not p.exists():
         os.close(os.open(p, os.O_WRONLY | os.O_CREAT, 0o600))       # 사람별 줄이 든다 — 처음부터 주인만
     conn = sqlite3.connect(str(p), timeout=30.0, isolation_level=None)
+    conn.execute(_SCHEMA[-1])                          # meta 먼저 — 꼴 판을 본다
+    got = conn.execute("SELECT v FROM meta WHERE k = 'schema'").fetchone()
+    if (got[0] if got else None) != SCHEMA_VERSION:
+        # 옛 꼴(또는 판 표지가 없는 첫 판)이면 표를 버리고 처음부터 다시 접는다 — 감사 원장은 그대로라 잃는 것이 없다.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for t in ("calls", "lat", "auth", "meta"):
+                conn.execute(f"DROP TABLE IF EXISTS {t}")  # noqa: S608 — 표 이름은 이 파일의 고정 글자
+            for ddl in _SCHEMA:
+                conn.execute(ddl)
+            conn.execute("INSERT INTO meta VALUES ('schema', ?)", (SCHEMA_VERSION,))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
     for ddl in _SCHEMA:
         conn.execute(ddl)
     return conn
@@ -231,14 +254,15 @@ def _commit(conn: sqlite3.Connection, fold: _Fold, meta: dict, *, wipe: bool, of
     conn.execute("BEGIN IMMEDIATE")
     try:
         if wipe:
-            for t in ("calls", "lat", "auth", "meta"):
+            for t in ("calls", "lat", "auth"):
                 conn.execute(f"DELETE FROM {t}")  # noqa: S608 — 표 이름은 이 파일의 고정 글자
-            meta = {}
+            conn.execute("DELETE FROM meta WHERE k != 'schema'")
+            meta = {"schema": SCHEMA_VERSION}
         conn.executemany(
-            "INSERT INTO calls VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (day, backend, tool, via, outcome, caller) DO UPDATE SET"
+            "INSERT INTO calls VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (day, backend, tool, via, outcome, caller, for_user) DO UPDATE SET"
             " n = n + excluded.n, chars = chars + excluded.chars, chars_max = MAX(chars_max, excluded.chars_max),"
             " cache = cache + excluded.cache, big = big + excluded.big", [(*k, *v) for k, v in fold.calls.items()])
-        conn.executemany("INSERT INTO lat VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (day, backend, tool, via, caller, le) DO UPDATE SET"
+        conn.executemany("INSERT INTO lat VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (day, backend, tool, via, caller, for_user, le) DO UPDATE SET"
                          " n = n + excluded.n", [(*k, v) for k, v in fold.lat.items()])
         conn.executemany("INSERT INTO auth VALUES (?, ?, ?) ON CONFLICT (day, reason) DO UPDATE SET n = n + excluded.n",
                          [(*k, v) for k, v in fold.auth.items()])
@@ -334,8 +358,10 @@ def params(raw: dict, today: str | None = None) -> dict:
 def query(db_path, p: dict) -> dict:
     """접은 표에서 기간의 답을 짓는다(params 가 읽은 칸으로)."""
     span = (p["since"], p["until"])
-    ex = p["exclude"]
-    not_ex = f" AND caller NOT IN ({','.join('?' * len(ex))})" if ex else ""
+    excluded = len(p["exclude"])
+    marks = ",".join("?" * excluded)
+    not_ex = f" AND caller NOT IN ({marks}) AND for_user NOT IN ({marks})" if excluded else ""
+    ex = [*p["exclude"], *p["exclude"]]                # 두 칸 모두에 건다 — 뺄 계정의 일에서 나온 엔진 호출도 뺀다
     with closing(_open(db_path)) as conn:
         meta = _meta(conn)
         rows: dict[tuple, dict] = {}
@@ -364,12 +390,22 @@ def query(db_path, p: dict) -> dict:
         actors = [{"day": d, "caller": c, "via": v, "n": n} for d, c, v, n in conn.execute(
             f"SELECT day, caller, via, SUM(n) FROM calls WHERE day BETWEEN ? AND ? AND caller != ''{not_ex}"
             " GROUP BY day, caller, via ORDER BY day, caller, via", (*span, *ex))]
+        # 호출자가 비었지만 누구의 일에서 나왔는지 적힌 줄(audit_for — 검증하지 않은 주장)은 따로 낸다 — 이름 없는 줄(anon)에 들지 않는다.
+        actors_for = [{"day": d, "user": u, "via": v, "n": n} for d, u, v, n in conn.execute(
+            f"SELECT day, for_user, via, SUM(n) FROM calls WHERE day BETWEEN ? AND ? AND caller = '' AND for_user != ''{not_ex}"
+            " GROUP BY day, for_user, via ORDER BY day, for_user, via", (*span, *ex))]
         anon = [{"day": d, "via": v, "n": n} for d, v, n in conn.execute(
-            "SELECT day, via, SUM(n) FROM calls WHERE day BETWEEN ? AND ? AND caller = '' GROUP BY day, via ORDER BY day, via", span)]
+            "SELECT day, via, SUM(n) FROM calls WHERE day BETWEEN ? AND ? AND caller = '' AND for_user = ''"
+            " GROUP BY day, via ORDER BY day, via", span)]
         tools = p["actor_tools"]
+        tmarks = ",".join("?" * len(tools))
         actor_tools = [] if not tools else [{"day": d, "caller": c, "tool": t, "n": n} for d, c, t, n in conn.execute(
             "SELECT day, caller, tool, SUM(n) FROM calls WHERE day BETWEEN ? AND ? AND caller != '' AND outcome = 'ok'"
-            f" AND tool IN ({','.join('?' * len(tools))}){not_ex} GROUP BY day, caller, tool ORDER BY day, caller, tool",
+            f" AND tool IN ({tmarks}){not_ex} GROUP BY day, caller, tool ORDER BY day, caller, tool",
+            (*span, *tools, *ex))]
+        actor_tools_for = [] if not tools else [{"day": d, "user": u, "tool": t, "n": n} for d, u, t, n in conn.execute(
+            "SELECT day, for_user, tool, SUM(n) FROM calls WHERE day BETWEEN ? AND ? AND caller = '' AND for_user != ''"
+            f" AND outcome = 'ok' AND tool IN ({tmarks}){not_ex} GROUP BY day, for_user, tool ORDER BY day, for_user, tool",
             (*span, *tools, *ex))]
         auth = [{"day": d, "reason": r, "n": n} for d, r, n in conn.execute(
             "SELECT day, reason, n FROM auth WHERE day BETWEEN ? AND ? ORDER BY day, reason", span)]
@@ -381,7 +417,8 @@ def query(db_path, p: dict) -> dict:
         "fields": {k: meta[f"field:{k}"] for k in FIELDS if meta.get(f"field:{k}")},
         "rules": {"status_tools": sorted(STATUS_TOOLS), "status_suffix": STATUS_SUFFIX, "big_chars": BIG_CHARS,
                   "lat_le_ms": list(LAT_LE_MS), "gate_errors": list(GATE_ERRORS)},
-        "excluded": len(ex), "calls": calls, "auth": auth, "actors": actors, "anon": anon, "actor_tools": actor_tools,
+        "excluded": excluded, "calls": calls, "auth": auth, "actors": actors, "anon": anon, "actor_tools": actor_tools,
+        "actors_for": actors_for, "actor_tools_for": actor_tools_for,
     }
 
 

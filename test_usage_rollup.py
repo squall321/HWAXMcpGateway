@@ -284,3 +284,51 @@ def test_접은_표는_주인만_읽는다(tmp_path):
     assert (box.db.stat().st_mode & 0o777) == 0o600, "사람별 줄이 든다 — 감사 원장보다 넓게 열지 않는다"
     with closing(sqlite3.connect(box.db)) as c:
         assert c.execute("SELECT SUM(n) FROM calls").fetchone()[0] == 1
+
+
+# ── 누구의 일(audit_for — OD-52) ───────────────────────────────────────────────────────────────────────────
+def test_호출자가_빈_줄의_누구의_일은_따로_내고_이름_없는_줄에서_뺀다(tmp_path):
+    box = Box(tmp_path)
+    box.write(_line("2026-11-03T01:00:00+00:00", "recommend_agents", "ai-data-hub", via="gw-token", audit_for="A@Example.com"),
+              _line("2026-11-03T01:00:01+00:00", "recommend_agents", "ai-data-hub", via="gw-token", audit_for="a@example.com"),
+              _line("2026-11-03T01:00:02+00:00", "create_report_draft", "reportarchive", via="gw-token", audit_for="a@example.com"),
+              _line("2026-11-03T01:00:03+00:00", "create_report_draft", "reportarchive", via="gw-token", audit_for="a@example.com", ok=False,
+                    error="upstream: x"),
+              _line("2026-11-03T01:00:04+00:00", "list_agents", "ai-data-hub", via="gw-token"),
+              _line("2026-11-03T01:00:05+00:00", "list_agents", "ai-data-hub", via="gw-token", audit_for="이메일 아님"),
+              _line("2026-11-03T01:00:06+00:00", "list_agents", "ai-data-hub", via="gw-token", caller="b@example.com", audit_for="a@example.com"))
+    v = box.view(actor_tools=["create_report_draft"])
+    assert v["actors_for"] == [{"day": "2026-11-03", "user": "a@example.com", "via": "gw-token", "n": 4}]
+    assert v["anon"] == [{"day": "2026-11-03", "via": "gw-token", "n": 2}], "꼴이 틀린 주장은 이름 없는 줄로 남는다"
+    assert v["actors"] == [{"day": "2026-11-03", "caller": "b@example.com", "via": "gw-token", "n": 1}], "호출자가 있으면 그 줄은 호출자의 것이다"
+    assert v["actor_tools_for"] == [{"day": "2026-11-03", "user": "a@example.com", "tool": "create_report_draft", "n": 1}]
+    assert v["actor_tools"] == [] and sum(r["calls"] for r in v["calls"]) == 7, "합계 칸은 그대로 센다"
+    assert v["fields"]["audit_for"] == "2026-11-03"
+
+
+def test_뺄_계정은_누구의_일_칸에도_걸린다(tmp_path):
+    box = Box(tmp_path)
+    box.write(_line("2026-11-03T01:00:00+00:00", "t", "app", via="gw-token", audit_for="tester@example.com", ms=20),
+              _line("2026-11-03T01:00:01+00:00", "t", "app", via="gw-token", audit_for="real@example.com", ms=20),
+              # 호출자가 있는 줄의 주장은 접기도 버린다 — 남(뺄 계정)의 일이라는 주장이 호출자 본인의 호출을 빼지 못한다
+              _line("2026-11-03T01:00:02+00:00", "t", "app", via="gw-token", caller="b@example.com", audit_for="tester@example.com", ms=20))
+    v = box.view(exclude=["tester@example.com"])
+    assert [a["user"] for a in v["actors_for"]] == ["real@example.com"] and _only(v["calls"])["calls"] == 2 and sum(_only(v["calls"])["lat"]) == 2
+    assert [a["caller"] for a in v["actors"]] == ["b@example.com"]
+    assert v["excluded"] == 1
+
+
+def test_옛_꼴의_접은_표는_버리고_원장_처음부터_다시_접는다(tmp_path):
+    box = Box(tmp_path)
+    with closing(sqlite3.connect(box.db)) as c, c:             # 판 표지 없는 첫 판의 표 — 누구의 일 칸이 없다
+        c.execute("CREATE TABLE calls (day TEXT, backend TEXT, tool TEXT, via TEXT, outcome TEXT, caller TEXT, n INTEGER, chars INTEGER,"
+                  " chars_max INTEGER, cache INTEGER, big INTEGER, PRIMARY KEY (day, backend, tool, via, outcome, caller))")
+        c.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        c.execute("INSERT INTO calls VALUES ('2026-11-03', 'app', 't', '', 'ok', '', 99, 0, 0, 0, 0)")
+        c.execute("INSERT INTO meta VALUES ('offset', '999999')")
+    box.write(_line("2026-11-03T01:00:00+00:00", "t", "app", via="gw-token", audit_for="a@example.com"))
+    v = box.view()
+    assert _only(v["calls"])["calls"] == 1 and v["actors_for"][0]["user"] == "a@example.com", "옛 셈 · 읽은 자리를 버렸다"
+    with closing(sqlite3.connect(box.db)) as c:
+        assert c.execute("SELECT v FROM meta WHERE k = 'schema'").fetchone()[0] == ur.SCHEMA_VERSION
+    assert _only(box.view()["calls"])["calls"] == 1, "새 꼴에서는 다시 버리지 않는다"

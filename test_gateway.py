@@ -15619,3 +15619,109 @@ def test_procedure_run_status_는_포털이_낸_경고_표식을_옮긴다(monke
     _proc_portal(monkeypatch, lambda req: httpx.Response(200, json=run))
     s0, s1 = json.loads(_proc_call("procedure_run_status", {"run_id": "r" * 32})[1])["steps"]
     assert s0["warnings"] == ["합성 데이터로 학습한 데모", "W120"] and "warnings" not in s1
+
+
+# ── 감사 전용 머리(누구의 일 — HWAXPortal docs/ops-dashboard OD-52 · 사용자 결정 2026-11-22) ─────────────────────────────────
+def test_누구의_일_머리는_GW_TOKEN_분기에서만_살고_PAT_서비스_분기는_버린다(monkeypatch):
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["headers"] = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+
+    async def no_portal(email, base, **_kw):
+        return None
+    monkeypatch.setattr(gw, "_portal_access", no_portal)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+
+    class _V:
+        def __init__(self, claims): self.claims = claims
+        async def verify(self, token, aud): return self.claims
+
+    def run(auth, claims):
+        seen.clear()
+        hdrs = [(b"authorization", auth), (gw.AUDIT_FOR_HEADER.encode(), b"someone@example.com")]
+        asyncio.run(gw._bearer_gate(app, _V(claims))({"type": "http", "path": "/mcp", "headers": hdrs}, None, None))
+        return seen.get("headers", {})
+
+    assert run(b"Bearer gw-secret", None)[gw.AUDIT_FOR_HEADER] == "someone@example.com"
+    assert gw.AUDIT_FOR_HEADER not in run(b"Bearer user-pat", {"email": "u@example.com", "groups": []}), "검증된 호출자가 있는 PAT 는 버린다"
+    _svc_file({_SVC_JOB: {}})
+    got, status, _body, _ = _svc_gate(monkeypatch, _svc_claims(), extra=((gw.AUDIT_FOR_HEADER.encode(), b"someone@example.com"),))
+    assert status is None and gw.AUDIT_FOR_HEADER not in got, "서비스 PAT 도 버린다"
+
+
+def test_누구의_일은_GW_TOKEN_요청의_이메일_꼴만_읽는다(monkeypatch):
+    _set_request(monkeypatch, {gw.VIA_HEADER: "gw-token", gw.AUDIT_FOR_HEADER: "A%40Example.com "}, None)
+    assert gw._request_audit_for() == "a@example.com"
+    for bad in ("", "이메일 아님", "a@b@c", "a@example.com,b@example.com", "x" * 120 + "@example.com"):
+        _set_request(monkeypatch, {gw.VIA_HEADER: "gw-token", gw.AUDIT_FOR_HEADER: bad}, None)
+        assert gw._request_audit_for() == "", bad
+    _set_request(monkeypatch, {gw.VIA_HEADER: "pat", gw.AUDIT_FOR_HEADER: "a@example.com"}, None)
+    assert gw._request_audit_for() == "", "GW_TOKEN 분기가 아니면 읽지 않는다(미들웨어가 버린 뒤에도 한 겹 더)"
+
+
+def _audit_for_kit(monkeypatch):
+    """캐시되는 읽기 도구 하나를 가진 백엔드 — 요청 머리는 진짜 읽기 함수(_request_user · _request_groups)가 읽는다."""
+    real = {n: getattr(gw, n) for n in ("_request_user", "_request_groups", "_request_muted")}
+    sess = _PanelCallSess([_tool("list_records")], [])
+    _panel_kit(monkeypatch, {"ai-data-hub": sess})
+    for n, f in real.items():
+        monkeypatch.setattr(gw, n, f)
+    monkeypatch.setattr(gw, "CACHE_TTL_S", 300)
+    gw._RESP_CACHE.clear()
+    return sess
+
+
+def _as_engine(monkeypatch, audit_for=None):
+    h = {gw.VIA_HEADER: "gw-token", gw.GROUPS_HEADER: gw.SERVICE_GROUP}
+    if audit_for is not None:
+        h[gw.AUDIT_FOR_HEADER] = audit_for
+    _set_request(monkeypatch, h, "127.0.0.1")
+
+
+def test_누구의_일_머리는_결과_권한_캐시_열쇠를_바꾸지_않고_감사_칸에만_남는다(monkeypatch):
+    """머리를 바꿔 보내도 백엔드가 받은 호출 · 돌려준 결과(바이트) · 캐시 열쇠가 같다 — 다른 값으로 온 두 번째 호출이 첫 호출의 캐시를 그대로 쓴다."""
+    sess = _audit_for_kit(monkeypatch)
+    outs, keys = [], []
+    for who in (None, "a@example.com", "b@example.com"):
+        gw._RESP_CACHE.clear()
+        _as_engine(monkeypatch, who)
+        keys.append(gw._cache_key("ai-data-hub", "list_records", {"i": 1}))
+        outs.append(asyncio.run(gw._call_tool("list_records", {"i": 1})).model_dump_json())
+    assert len(set(outs)) == 1 and len(set(keys)) == 1 and keys[0] is not None, (outs, keys)
+    assert sess.calls == ["list_records"] * 3
+    _as_engine(monkeypatch, "c@example.com")
+    again = asyncio.run(gw._call_tool("list_records", {"i": 1})).model_dump_json()
+    assert again == outs[0] and sess.calls == ["list_records"] * 3, "다른 이름으로 와도 같은 캐시를 쓴다(열쇠에 들지 않는다)"
+    rows = [r for r in _rows() if r["tool"] == "list_records"]
+    assert [r.get("audit_for") for r in rows] == [None, "a@example.com", "b@example.com", "c@example.com"]
+    strip = [{k: v for k, v in r.items() if k not in ("ts", "audit_for", "ms")} for r in rows[:3]]
+    assert all(x == strip[0] for x in strip), "백엔드에 다녀온 세 줄은 누구의 일 칸만 다르다"
+    assert rows[3].get("note") == "cache-hit"
+    assert all("caller" not in r for r in rows), "호출자 칸에 들지 않는다 — 신원이 아니다"
+
+
+def test_호출자가_있으면_누구의_일을_싣지_않는다(monkeypatch):
+    sess = _audit_for_kit(monkeypatch)
+    _set_request(monkeypatch, {gw.VIA_HEADER: "gw-token", gw.USER_HEADER: "b%40example.com", gw.AUDIT_FOR_HEADER: "a@example.com"}, None)
+    asyncio.run(gw._call_tool("list_records", {}))
+    [row] = [r for r in _rows() if r["tool"] == "list_records"]
+    assert row["caller"] == "b@example.com" and "audit_for" not in row and sess.calls == ["list_records"]
+
+
+def test_누구의_일을_읽는_자리는_감사_줄_하나뿐이다():
+    """권한 · 위임 · 신원 · 캐시 · 가림이 이 값을 읽기 시작하면 검증하지 않은 주장이 동작을 바꾼다 — 부르는 자리 · 머리 이름을 쓰는 자리를 고정한다."""
+    import ast
+    from pathlib import Path
+    tree = ast.parse(Path(gw.__file__).read_text(encoding="utf-8"))
+    uses: dict[str, set] = {"_request_audit_for": set(), "AUDIT_FOR_HEADER": set()}
+
+    def walk(node, owner):
+        for ch in ast.iter_child_nodes(node):
+            here = ch.name if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)) else owner
+            if isinstance(ch, ast.Name) and ch.id in uses and isinstance(ch.ctx, ast.Load):
+                uses[ch.id].add(owner)
+            walk(ch, here)
+    walk(tree, "<module>")
+    assert uses["_request_audit_for"] == {"_audit"}, uses
+    assert uses["AUDIT_FOR_HEADER"] == {"_request_audit_for", "middleware"}, uses

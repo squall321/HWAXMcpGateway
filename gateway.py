@@ -334,6 +334,13 @@ PROCEDURE_PURPOSE = "procedure"
 # 클라이언트가 보낸 사본은 두 분기 모두 버린다. 박스 안 호출은 IP 가 전부 127.0.0.1 이라 이게 없으면 '웹 챗 경유' 와
 # '박스 안 Claude Code' 를 못 가른다(HWAXPortal docs/gateway-audit-ip D-5).
 VIA_HEADER = "x-hwax-via"
+# 이 호출이 **누구의 일에서** 나왔나 — 감사 전용(HWAXPortal docs/ops-dashboard OD-52 · 사용자 결정 2026-11-22). 에이전트 서버가 사람의 챗 · 심의 ·
+# 심의 준비에서 나온 호출을 서비스 자격(GW_TOKEN)으로 보낼 때 그 사람의 이메일을 싣는다. 게이트웨이는 **GW_TOKEN 분기에서만** 받아 감사 줄의
+# `audit_for` 칸에만 적는다(호출자 칸이 빌 때만) — 권한 판정 · 위임 길 · 신원 · 캐시 열쇠 · 가림 · 검색 고리 어디에도 쓰지 않는다(시험이 고정한다).
+# 검증하지 않은 주장이다 — GW_TOKEN 을 쥔 쪽이 아무 이름이나 적을 수 있고, 그러면 이용 통계의 '누구의 일' 만 틀린다. PAT · 서비스 · 패널 분기는
+# 클라이언트가 보낸 사본을 버린다(그쪽 호출자는 검증된 신원이 있다).
+AUDIT_FOR_HEADER = "x-hwax-audit-for"
+_AUDIT_FOR_RE = re.compile(r"[^@\s,;]{1,100}@[^@\s,;]{1,100}")
 # 이 PAT 가 읽기 전용인가(scopes 에 read 만) — **게이트웨이가 PAT 분기에서만** '1' 을 싣고, 클라이언트가 보낸 사본은 두 분기 모두 버린다.
 # 읽기 전용이면 허용 목록(read_tools.json) · readOnlyHint · 게이트웨이 자체 조회만 부른다(HWAXPortal docs/followups-1017 결정 5).
 READONLY_HEADER = "x-hwax-readonly"
@@ -1057,6 +1064,8 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
     215줄이 그 모양이었다. 그러면 `error` 는 실패 신호로 못 쓰고 신원 질의에도 못 쓴다.
     **성공이 실패처럼 생긴 것**이라 이 리포가 싫어하는 그 모양이다. 칸을 갈랐다 —
       caller : 누가 불렀나(MCP 경로도 이제 남긴다. 종전엔 93%가 신원 0이었다)
+      audit_for : 호출자가 비었을 때 그 호출이 **누구의 일에서** 나왔나 — 에이전트 서버가 GW_TOKEN 분기로 실은 감사 전용 머리(AUDIT_FOR_HEADER)의
+               값. 검증하지 않은 주장이라 이용 통계만 읽는다(HWAXPortal docs/ops-dashboard OD-52).
       mode   : 어느 명의로 갔나(service | as-user | as-conn | identity-fwd)
       note   : 실패가 아닌 메모(cache-hit · reconnected)
       corr   : 어느 대화·실행의 호출인가(X-HWAX-Corr). 이게 없어서 감사와 대화를 못 이었다
@@ -1098,6 +1107,11 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
             note = "+".join(n for n in (f"svc:{_svc['jti8']}", note) if n)
         if caller:
             rec["caller"] = caller
+        else:
+            # 누구의 일에서 나온 호출인가(감사 전용 — 검증하지 않은 주장, AUDIT_FOR_HEADER). 호출자가 있으면 싣지 않는다(위임 길의 줄은 그대로다).
+            _for = _request_audit_for()
+            if _for:
+                rec["audit_for"] = _for
         if mode:
             rec["mode"] = mode
         if corr:
@@ -8538,6 +8552,20 @@ def _request_via() -> str:
     return (raw or "").strip()[:20]
 
 
+def _request_audit_for() -> str:
+    """이 호출이 누구의 일에서 나왔나(감사 전용 — AUDIT_FOR_HEADER) — GW_TOKEN 분기로 들어온 요청에서만 읽고, 이메일 꼴이 아니면 ''.
+    ⚠ 감사 줄(_audit)만 부른다. 권한 · 위임 · 신원 · 캐시 · 가림에서 부르면 검증하지 않은 주장이 동작을 바꾼다(시험이 부르는 자리를 고정한다).
+    어떤 이유로든 못 읽으면 '' — 여기서 터지면 `_audit` 의 except 가 줄 전체를 삼킨다."""
+    try:
+        req = _low.request_context.request
+        if req is None or _request_via() != "gw-token":
+            return ""
+        v = unquote(str(req.headers.get(AUDIT_FOR_HEADER) or "")).strip().lower()
+    except Exception:  # noqa: BLE001 — LookupError(컨텍스트 없음) 포함
+        return ""
+    return v if len(v) <= 200 and _AUDIT_FOR_RE.fullmatch(v) else ""
+
+
 def _panel_scope(claims: dict) -> tuple[bool, dict | None]:
     """검증된 PAT 클레임이 패널 PAT 인가 — (패널이라 주장하나, 범위 {app, uri} 또는 None). 패널 표지(purpose · 청중 · jti 머리 · panel 칸) 가운데
     하나라도 있으면 패널로 다룬다. 그때 꼴이 하나라도 어긋나면 범위가 None 이라 미들웨어가 401 로 닫는다 — 일반 PAT 로 떨어뜨리면 패널 PAT 가
@@ -10871,7 +10899,7 @@ def _bearer_gate(app, pat_verifier=None):
                                           DELEGATE_HEADER.lower().encode(), DELEGATE_SERVICE_HEADER.lower().encode(),
                                           READONLY_HEADER.encode(),
                                           VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode(),
-                                          SERVICE_HEADER.encode())]
+                                          SERVICE_HEADER.encode(), AUDIT_FOR_HEADER.encode())]
             fresh += [(GROUPS_HEADER.encode(), SERVICE_GROUP.encode()), (SERVICE_HEADER.encode(), _job.encode()),
                       (VIA_HEADER.encode(), b"service")]
             await app({**scope, "headers": fresh}, receive, send)
@@ -10915,7 +10943,7 @@ def _bearer_gate(app, pat_verifier=None):
                                           DELEGATE_HEADER.lower().encode(), DELEGATE_SERVICE_HEADER.lower().encode(),
                                           READONLY_HEADER.encode(),
                                           VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode(),
-                                          SERVICE_HEADER.encode())]
+                                          SERVICE_HEADER.encode(), AUDIT_FOR_HEADER.encode())]
             if is_read_only(claims):
                 fresh.append((READONLY_HEADER.encode(), b"1"))
             # PAT 의 groups 에도 한글이 올 수 있다 — 같은 규칙으로 인코딩해 실어야 헤더가 안 깨진다.

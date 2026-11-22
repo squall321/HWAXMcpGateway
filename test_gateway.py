@@ -11561,6 +11561,8 @@ def test_인사이트_도구_둘은_로컬_목록_읽기_전용_도구_지도에
     for want in ("카드마다 한 항목", "tool 칸", "insight_get", "이어받는다", "주인만 본다", "plat:", "같은 (과제, 차수)", "리스크 심사", "previous_keys"):
         assert want in desc, want
     assert "stale" in gw.INSIGHT_GET_TOOL.description and "same" in gw.INSIGHT_GET_TOOL.description
+    # 판 표지는 판정 낱말만 온다(포털이 사람 PAT 의 읽기에는 뒤 판의 이름 · id · 리스크 변경 줄을 싣지 않는다 — 반대 검토 11-22 M1). 없는 칸을 약속하지 않는다
+    assert "판정 낱말만" in gw.INSIGHT_GET_TOOL.description and "risk_diffs" not in gw.INSIGHT_GET_TOOL.description
 
 
 def _insight_portal(monkeypatch, responder, auth="Bearer pat-person"):

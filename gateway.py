@@ -5852,8 +5852,9 @@ INSIGHT_FIND_TOOL = _routine_tool(
 INSIGHT_GET_TOOL = _routine_tool(
     "insight_get",
     "과제 인사이트 카드 하나의 전부 — 주제(과제 · 차수 · 설계 자료) · 주장 · 표결 · RA 보고서 · 근거 표지(도구 · 인자 · 결과 지문) · 상태 · 범위 · "
-    "반박 잇기 · 판 표지(stale — 기구 CAD 에 뒤 판이 있거나 내용이 바뀌었으면 '낡았을 수 있다', 못 읽으면 '모름' · 뒤 판의 리스크 변경 심사 줄 "
-    "risk_diffs) · 같은 결론인 다른 카드(same — 내가 볼 수 있는 것만). 볼 수 없는 카드는 없는 것과 같다. 검증 대상이고 독립 근거가 아니다.",
+    "반박 잇기 · 판 표지(stale — 판정 낱말만: 기구 CAD 에 뒤 판이 있거나 내용이 바뀌었으면 '낡았을 수 있다', 못 읽으면 '모름'. 뒤 판의 이름 · "
+    "id · 리스크 변경 심사 줄은 여기 싣지 않는다 — 포털의 과제 인사이트 화면에서 본다) · 같은 결론인 다른 카드(same — 내가 볼 수 있는 것만). "
+    "볼 수 없는 카드는 없는 것과 같다. 검증 대상이고 독립 근거가 아니다.",
     {"id": {"type": "string", "maxLength": 300, "description": "카드 id — insight_find 결과의 id(ins:web:… · ins:delib:… · ins:wf:…)"}}, ["id"])
 INSIGHT_TOOLS = (INSIGHT_FIND_TOOL, INSIGHT_GET_TOOL)
 _INSIGHT_NAMES = frozenset(t.name for t in INSIGHT_TOOLS)

@@ -309,9 +309,12 @@ def test_호출자가_빈_줄의_누구의_일은_따로_내고_이름_없는_�
 def test_뺄_계정은_누구의_일_칸에도_걸린다(tmp_path):
     box = Box(tmp_path)
     box.write(_line("2026-11-03T01:00:00+00:00", "t", "app", via="gw-token", audit_for="tester@example.com", ms=20),
-              _line("2026-11-03T01:00:01+00:00", "t", "app", via="gw-token", audit_for="real@example.com", ms=20))
+              _line("2026-11-03T01:00:01+00:00", "t", "app", via="gw-token", audit_for="real@example.com", ms=20),
+              # 호출자가 있는 줄의 주장은 접기도 버린다 — 남(뺄 계정)의 일이라는 주장이 호출자 본인의 호출을 빼지 못한다
+              _line("2026-11-03T01:00:02+00:00", "t", "app", via="gw-token", caller="b@example.com", audit_for="tester@example.com", ms=20))
     v = box.view(exclude=["tester@example.com"])
-    assert [a["user"] for a in v["actors_for"]] == ["real@example.com"] and _only(v["calls"])["calls"] == 1 and sum(_only(v["calls"])["lat"]) == 1
+    assert [a["user"] for a in v["actors_for"]] == ["real@example.com"] and _only(v["calls"])["calls"] == 2 and sum(_only(v["calls"])["lat"]) == 2
+    assert [a["caller"] for a in v["actors"]] == ["b@example.com"]
     assert v["excluded"] == 1
 
 

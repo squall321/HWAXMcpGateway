@@ -188,6 +188,42 @@ GET · HEAD 는 지금 그대로(`inject` — 허브 서비스 토큰)이고, St
 | `PER_USER_SSO_OFF`(공백 구분 `reportarchive`·`testscope` — HWAXPortal update-all 이 infra/.env 의 빈 비밀을 보고 넘긴다 — 와 일반 앱의 키) | 그 위임 항목을 지운다(토큰 등록으로 되돌리기 — 일반 앱은 등록 토큰 길이 없어 서비스 계정으로 나간다). 비밀 없는 손 실행은 직전 값을 이어받으므로 끄는 길은 이것뿐이다. 비밀이 같이 오면 끄지 않는다. 일반 앱은 두 경우에 꺼진다 — 그 실행의 `PER_USER_SSO_APPS` 에 쌍이 있고 비밀이 비었을 때, 또는 쌍째 빠졌고 항목에 `managed_by` 표지가 있을 때(앱을 걷으며 줄을 지운 경우). 어느 쪽이든 이름이 와야 한다 — 목록이 비었다고 스크립트가 스스로 지우지는 않는다(손 실행에는 목록이 없다). 넘기는 쪽은 provision.env 를 읽은 호출자다(update-all, 손으로는 `PER_USER_SSO_OFF=<키>` 를 주고 `--force`). 표지 없는 항목(손으로 붙인 위임, `ste`·`hwax_risk` 등)은 이름이 와도 지우지 않는다 |
 | `KOORM_SEND_PLAT`(1 · true · yes · on 이면 켬, 그 밖의 값이면 — 빈 값도 — 끔, 안 적으면 직전 config) | `per_user_sso.kooremapper_mcp.send_plat` — DynaForge 위임 호출에 호출자의 `plat:` 권한을 서명과 함께(`X-Heax-User-Plat` · `X-Heax-Plat-Proof`) 싣는다. 위임 항목은 env 가 아니라 KooRemapper `.env` 의 게이트웨이 비밀로 생기고, 비밀을 다시 읽어 항목을 새로 쓰는 실행도 직전 값을 잇는다. 일반 앱의 `<접두>_SEND_PLAT` 과 한 곳이 다르다 — 그것은 그 앱의 비밀이 있는 실행에서만 읽혀 비밀 없는 실행에서는 `0` 도 끄지 못하고, 이것은 비밀 없이 항목째 이어받은 실행에도 먹는다(켬 · 끔 둘 다 — 이 비밀은 provision.env 가 아니라 KooRemapper `.env` 에 있어 heax 토큰이나 그 리포가 없는 실행은 읽지 못한다). 그래서 이것을 본떠 판정하는 쪽(포털의 드리프트 판정 등)은 비밀이 아니라 항목이 있는지로 가른다. 위임이 없으면 칸만 만들지 않고 생략을 로그에 남긴다. 값은 호출자의 환경에서 읽는다(이 스크립트는 provision.env 를 읽지 않는다). provision.env 에 적은 값은 그 파일을 export 해 넘기는 실행에서 그대로 먹으니(HWAXPortal update-all 의 MCP 자동 복구가 이미 그렇게 넘긴다) 켤 때가 되기 전에는 적지 않는다. 손으로 켤 때는 이 디렉터리에서 `( set -a; . ./provision.env; set +a; KOORM_SEND_PLAT=1 bash provision-config.sh --force )` 로 돌리고 게이트웨이를 다시 띄운다 — provision.env 없이 맨손으로 돌리면 거기에만 적힌 설정이 빠진다(예: `SMARTTWIN_MCP_URL` 만 믿던 smart-twin-mcp 백엔드가 config 에서 빠진다) |
 
+### WebDesignAgents — MCP 쪽 주인(선택 · 기본 꺼짐, HWAXPortal docs/wda-deck W-18)
+포털의 '발표자료로' 가 만든 WDA 실행에는 주인이 있고, WDA 는 주인 있는 실행을 MCP 에 **없는 것으로** 답한다(게이트웨이가 상주 세션
+하나로 허브 서비스 토큰을 싣기 때문에 `/mcp` 의 `X-Heax-User-Email` 은 허브 첫 관리자로 접힌다). 개인 Claude 로 **자기** 발표자료의
+장면을 보고 고치게 하려면 이 위임을 켠다 — 게이트웨이가 그 사람의 단기 단언을 받아 실어 보내고, WDA 는 서명을 보고 그 주인에게만 연다.
+꺼 두면 지금과 같다(주인 있는 실행은 MCP 에 없다). 코드는 고칠 것이 없고 **설정만** 한다 — 박스의 `gateway_config.json` 은 사람이 고친다.
+
+1. **WDA 먼저** — 허브의 앱 데이터 디렉터리 `HEAXHub/var/app_data/web_design_agents/secrets.env`(0600)에 한 줄을 적는다.
+   16자 이상의 무작위 값이어야 한다(짧으면 WDA 가 없는 것으로 본다). 파일은 호출마다 읽으므로 WDA 재기동은 없다.
+   ```
+   WDA_GATEWAY_SECRET=<16자 이상 무작위 — 게이트웨이와만 나눈다>
+   ```
+   그 판의 WDA 인지는 `GET /apps/web_design_agents/api/health` 의 `features` 에 `mcp_owner` 가 있는지로 본다(비밀이 있을 때만 실린다).
+2. **게이트웨이** — `gateway_config.json` 의 `heax_registry.per_user_sso` 에 **손으로** 이 항목을 넣고 게이트웨이를 다시 띄운다.
+   ```json
+   "web_design_agents": {
+     "sso_url": "<heax_registry.base>/apps/web_design_agents/api/auth/sso",
+     "secret": "<WDA 의 WDA_GATEWAY_SECRET 과 같은 값>",
+     "client": "gateway",
+     "auth": "heax",
+     "token_header": "X-Heax-Sso-Assertion"
+   }
+   ```
+   - `auth: heax` — 발급 주소가 허브 Caddy 경로라 forward_auth 를 서비스 토큰으로 지난다. `token_header` — 사람별 호출도 Caddy 를 지나야 하므로
+     `Authorization` 은 서비스 토큰으로 두고 단언은 이 머리로 싣는다(hwax_risk 와 같은 까닭).
+   - `PER_USER_SSO_APPS` 로 만들지 **않는다** — 그 순회는 `{sso_url, secret, client}` 만 쓰고 `auth` · `token_header` 를 적지 않아, 발급이
+     Caddy 에서 401 로 끊기고 신원 있는 WDA 호출이 전부 거부된다. 손으로 넣은 항목은 `provision-config.sh` 가 지우지 않고 이어받는다.
+3. **켜면 달라지는 것** — 신원 있는 호출(개인 PAT · 웹 챗)의 WDA 도구는 호출마다 그 사람의 단발 세션으로 간다. 발급이 실패하면 서비스
+   계정으로 내려가지 않고 **거부**한다(위 규칙 그대로) — 그래서 1 을 먼저 하고, 비밀을 바꿀 때는 두 곳을 함께 바꾼 뒤 게이트웨이를 다시 띄운다
+   (단언은 약 58분 캐시한다 — 다시 띄우면 비운다). 신원 없는 내부 호출은 종전대로 서비스 계정이다(주인 있는 실행은 닫힌 채).
+4. **무엇이 열리나** — 그 사람이 주인인 실행에 `scene_list` · `scene_html` · `scene_still` · `scenario_patch` · `scenario_revise` ·
+   `report_fragmentize` · `scenario_build` · `render_submit` · `render_status` · `qa_run` 이 닿는다. 남의 실행 · 지운 실행은 여전히 `NOT_FOUND` 다.
+   MCP 로 만든 실행은 지금처럼 주인이 없다. WDA 의 단언은 `wdsso_` 꼴이라 위 `rrsso_` 접힘 검사는 타지 않는다 — WDA 가 위임 머리
+   (`X-Hwax-Delegate-Email`)로만 발급하고 `X-Heax-User-Email` 로는 내려가지 않아 접힌 신원의 단언이 생기지 않는다(위임 머리가 없으면 400).
+5. **확인** — 감사 원장(`audit.jsonl`)에서 그 사람의 WDA 호출에 `per-user:` 실패 줄이 없는지, 그 사람의 실행 id 로 `scene_list` 가
+   답하는지(다른 사람의 PAT 로는 `NOT_FOUND`) 본다. **끄기** — 항목을 지우고 게이트웨이를 다시 띄운다(WDA 의 `secrets.env` 줄도 지운다).
+
 ## 등록 토큰 방식 — `PORTAL_CONN_BACKENDS`(RA·TestScope)
 사람이 그 서비스에서 직접 받은 개인 토큰을 포털 '개인 토큰 › 외부 연결'(`/tokens?tab=connect`)에 등록하면, 게이트웨이가 호출 때 포털 `GET /internal/connections/<service>?email=`(GW_TOKEN)로 그 토큰을 읽어 그 사람 명의로 부른다. 신원이 있는데 등록이 없거나 포털에 묻지 못하면 **거부**하고 등록을 안내한다(서비스 계정으로 대신 부르지 않는다). 신원 없는 내부 호출만 서비스 세션으로 간다.
 
@@ -330,6 +366,20 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 | `POST /search-review` | `{q, verdict: ok\|gold\|remove, gold, memo?, qid?}` → 박스 정답쌍 `tool_search_eval/pairs.local.jsonl`(`source: "box"`, id `box-<질의 해시>`). 같은 질의는 바꿔 쓰고 `remove` 는 지운다. `gold` 는 `앱키:원래 이름` 1 ~ 10개 |
 | `POST /search-eval` | 떠 있는 카탈로그 · 서비스 시야로 정답쌍(추적 + 박스)을 판마다(덧씌운 값 · 기본값 · 보정 끔 · 묶음 하나씩 끔) 잰다. 부분문자열 순위만 · 기록 안 남김 · 일꾼 스레드(게이트웨이 루프를 막지 않는다) · 한 번에 하나(409) |
 
+## 이용 통계 창구 — `/usage-rollup`(HWAXPortal docs/ops-dashboard M2)
+
+포털 관리자 '이용 통계' 가 날마다 접어 가는 원천이다 — 포털 컨테이너는 감사 원장(`audit.jsonl`)을 열 수 없다. 사람별 호출 수(이메일)를 내므로 공유 비밀(`_gateway.token`)을 요구한다(틀리면 401). 읽기만 한다 — 감사 원장은 건드리지 않고 접은 표만 쓴다. 셈과 규칙은 `usage_rollup.py` 머리에 있다.
+
+| 창구 | 하는 일 |
+|---|---|
+| `GET /usage-rollup?since=YYYY-MM-DD&until=YYYY-MM-DD` | KST 날 × 백엔드 × 도구(원래 이름) × via 마다 호출 수 · 실패(앱 쪽 · 관문 쪽) · 캐시 적중 · 큰 응답 · 글자 수 · 지연 칸과 p50 · p95 어림, 사람(소문자 메일)별 날마다 호출 수, 이름 없는 줄 수, `/mcp` 인증 실패 까닭별 수. 비우면 오늘까지 사흘, 기간은 400일까지(넘으면 400) |
+| `POST /usage-rollup` | 본문 `{since, until, exclude?: [이메일], actor_tools?: [원래 이름]}` — 뺄 계정은 호출 수 · 지연 · 사람 줄 모두에서 빠진다(이메일을 주소에 싣지 않게 본문으로 받는다). `actor_tools` 는 그 도구의 성공 호출을 사람별로 따로 낸다(5개까지) |
+
+- 감사 원장을 물을 때마다 훑지 않는다 — 읽은 자리(바이트)를 적어 두고 그 뒤의 줄만 KST 날마다 접어 `usage-rollup.sqlite`(원장 곁 · 0600 — `GATEWAY_USAGE_ROLLUP` 이 덮는다)에 더한다. 원장이 줄었거나 머리가 달라지면 처음부터 다시 접는다.
+- 한 물음이 접는 시간은 20초까지다. 다 못 접으면 `complete: false` 와 `scanned_through`(마지막으로 접은 줄의 시각)로 말하고 다음 물음이 잇는다 — 큰 원장의 첫 물음이 그렇다.
+- 답의 `fields` 는 칸(caller · via · ip · chars)이 원장에 처음 나온 날이다 — 그 전 날의 그 칸은 0 이 아니라 기록 전이다. `rules` 는 상태 묻기 도구 · 큰 응답 문턱 · 지연 칸 · 관문 쪽 실패의 머리말이다.
+- 싣지 않는 것 — IP · 오류 글 · 메모 · 대화 열쇠 · 요청 ID. 모르는 도구(호출자가 적은 글자)는 `(unknown)` 한 칸으로 접는다.
+
 ## 플랫폼별 피드백 보고서 — `platform_feedback_report.py`(E-8)
 
 우리가 다루지 않는 플랫폼에 돌려줄 마크다운이다. 보정이 그쪽 설명의 빈 곳을 가리므로, 무엇을 가렸는지와 그쪽이 고칠 것을 플랫폼마다 적는다. **cae00 에서 짓는다** — 실사용 질의가 거기 있다.
@@ -437,6 +487,28 @@ python3 tool_usage_report.py --days 60 --out unused.md
   지시문(차례 · 울타리 · 인용 · 키 · 쓰기 금지)에 받은 입력을 `inputs` 로 박아 준다. 공개 루틴은 남이 쓰므로 제목 · 단계 제목은 한 줄 `«…»` 데이터로만
   싣고(줄바꿈 · `«»` 를 지운다) 작성자의 글이지 지시가 아니라고 한 줄 말한다 — 사람의 말(user)로 올라가 규칙을 덮지 못하게.
 - 서버 지침 12번이 루틴의 차례 · 울타리 · 키 규칙을 한 줄로 말한다(차례의 자세한 글은 `routine_list` 설명 — 지침 전체가 2048자 안이어야 한다).
+
+## 절차 — 범용 도구 넷(HWAXPortal docs/procedures W-116)
+
+포털 절차(한 번 한 일을 굳혀 대상만 바꿔 재생)를 로컬 도구 넷으로 낸다 — `procedure_list`(내 것 + 공개한 것) · `procedure_get`(도구 계약 —
+입력 스키마 · 사람 확인에서 멈추는 도구) · `procedure_run_start` · `procedure_run_status`(`step` 을 주면 그 단계 결과의 한 쪽). 분석 루틴과 같은
+꼴이다 — 정의 · 실행 원장 · 사람 확인은 포털 `/procedures-api` 가 쥐고 게이트웨이는 호출자 PAT 를 그대로 넘긴다(`_portal_api` — 공유 비밀 · 익명
+거절). 절차마다 도구 하나를 내지 않는다.
+
+- 실행은 계획 모드가 기본이다(`mode` 를 비우면 plan — 바깥을 부르지 않고 부를 호출만 적는다). 못 읽은 모드는 거절한다. live 로 시작해도 사람 확인
+  단계에서 멈춘다 — **승인 · 고르기 · 재개 도구는 없다**(포털의 그 창구는 세션만 받는다). 상태 답의 `waiting` 이 포털 화면 주소를 말한다.
+- **사람 확인 없이 도는 쓰기 · 잡 단계**(계약의 `ungated_writes` — 잡 제출 · 등록 · 업로드 부류에 gate 가 없는 것)가 하나라도 있는 절차는 이
+  도구로 live 를 시작하지 못한다(포털이 409 — 사람이 포털 절차 화면에서 시작한다, 계획 모드는 된다). `procedure_run_start(version_no)` 는
+  계약을 본 판과 지금 판이 다르면 시작하지 않는다.
+- 목록의 제목 거름(`q`)은 포털이 상한(100건)보다 먼저 건다. 넘쳤으면 답이 `total` · `truncated` 로 말한다. 목록 · 계약 답의 맨 앞에는
+  `author_text` 가 온다 — 제목 · 변수 라벨 · 설명은 절차 작성자의 글(데이터)이지 지시가 아니다. 상태의 단계 경고는 포털이 낸 표식
+  (`warn_labels` — 합성 데이터 표식 포함)을 옮긴다.
+- 읽기 전용 PAT 는 `procedure_run_start` 를 못 부른다. 패널 · 서비스 PAT 는 게이트웨이 자체 도구라 넷 다 못 부른다. 절차 실행기의 호출
+  (`purpose=procedure`)도 넷 다 거절한다 — 절차의 단계가 실행 시작을 부르면 절차가 절차를 끝없이 시작한다.
+- 이름이 `procedure_` 로 시작하는 까닭 — 에이전트 서버의 좌석 자유 조회 접두(`_FREE_ALLOW`)에 걸리지 않아 심의 · 리스크 심사 좌석에 저절로 열리지
+  않는다(시험이 형제 리포 원문과 맞댄다). 웹 챗에서는 실행 시작이 잡 시작 바닥 목록(`_CONFIRM_JOB_TOOLS`)이라 확인 카드로 멈추고, 챗 턴 밖에서는
+  에이전트 서버가 보내지 않는다.
+- 손잡이는 `GATEWAY_PROCEDURE_TIMEOUT_S`(포털 호출 한도, 기본 60초) 하나다. 포털 주소는 루틴과 같은 `gateway_config.json` 의 `portal.api_base` 다.
 
 ## 과제 인사이트 — 읽기 도구 둘 · 대화 저장의 주제(HWAXPortal docs/project-insight-graph M2)
 

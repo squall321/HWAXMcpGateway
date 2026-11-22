@@ -34,3 +34,6 @@ app_keys.local.json
 # 적재 경로 선언의 박스 덧씌우기(HWAXPortal docs/request-1117 GW-01 — 공개만) — 점검 주소(check_base) · 박스에서만 쓰는 경로는 박스의 사실이다.
 # 무시 목록에 없으면 deploy-all · update-all 의 git stash -u 가 치운다
 ingest_routes.local.json
+# 이용 통계 창구(/usage-rollup)가 감사 원장을 날마다 접어 두는 표(HWAXPortal docs/ops-dashboard M2) — 원장이 리포 안에 있는 박스에서만 여기 생긴다
+# (데이터 루트가 있으면 원장 곁). 사람별 줄이 든다. 무시 목록에 없으면 deploy-all · update-all 의 git stash -u 가 치운다
+usage-rollup.sqlite*

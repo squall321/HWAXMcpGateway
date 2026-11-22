@@ -2414,6 +2414,13 @@ CONV_BATCH_MAX = 200
 # 받는 칸은 넷이고(확인 상태 · 지문 · 차수 출처는 서버가 적는다) 객체 JSON 이 상한 안이어야 한다. 아니면 버리고 답의 subject_dropped 로 말한다.
 CONV_SUBJECT_FIELDS = ("sp_task", "round", "text", "artifacts")
 CONV_SUBJECT_MAX_CHARS = 20000          # 포털 ConvCreate 가 받는 subject JSON 상한과 같다(넘으면 포털이 버린다 — 여기서 먼저 말한다)
+# 읽은 인사이트(contracts §10.3 · 반대 검토 11-22 M5) — 워크플로가 앞선 과제 인사이트를 근거로 썼으면 그 카드 id 들(또는 다 알 수 없다는 표지
+# "unknown")을 주제 안의 insights 로 싣는다. 포털이 주제에서 떼어 그 카드들의 범위를 이어받는다. 주제와 한 덩이로 두는 까닭 — 따로 둔 칸은 빠져도
+# 주제만으로 카드가 서서 읽은 카드의 범위를 잇지 못한 채 열린다. 꼴이 틀리면 그 칸만 떼지 않고 주제를 버린다(카드가 서지 않는 닫힌 쪽).
+CONV_INSIGHTS_FIELD = "insights"
+CONV_INSIGHTS_MAX = 60
+CONV_INSIGHTS_UNKNOWN = "unknown"
+_CONV_INSIGHT_ID_RE = re.compile(r"ins:(?:web|delib|wf):[^\s'\"\\]{1,290}")
 _CONV_CHAIR_RE = re.compile(r"[a-z0-9-]{1,40}")
 
 
@@ -2423,9 +2430,15 @@ def _conv_subject(raw) -> tuple[dict | None, str]:
         return None, ""
     if not isinstance(raw, dict):
         return None, f"subject 는 {{{', '.join(CONV_SUBJECT_FIELDS)}}} 객체다"
-    extra = sorted(set(raw) - set(CONV_SUBJECT_FIELDS))
+    extra = sorted(set(raw) - set(CONV_SUBJECT_FIELDS) - {CONV_INSIGHTS_FIELD})
     if extra:
         return None, f"subject 에 모르는 칸 {extra[:5]} — 받는 칸은 {' · '.join(CONV_SUBJECT_FIELDS)} 다(확인 상태는 서버가 적는다)"
+    if CONV_INSIGHTS_FIELD in raw:
+        ins = raw[CONV_INSIGHTS_FIELD]
+        if not (ins == CONV_INSIGHTS_UNKNOWN or (isinstance(ins, list) and len(ins) <= CONV_INSIGHTS_MAX
+                                                 and all(isinstance(x, str) and _CONV_INSIGHT_ID_RE.fullmatch(x) for x in ins))):
+            return None, (f"subject.insights 는 읽은 과제 인사이트 카드 id 목록({CONV_INSIGHTS_MAX}개까지 — insight_find 결과의 id)이거나 "
+                          f"\"{CONV_INSIGHTS_UNKNOWN}\" 다 — 꼴이 틀려 주제를 싣지 않았다(그 칸만 떼면 읽은 카드의 범위를 잇지 못한다)")
     if len(json.dumps(raw, ensure_ascii=False, default=str)) > CONV_SUBJECT_MAX_CHARS:
         return None, f"subject 가 {CONV_SUBJECT_MAX_CHARS:,}자(JSON)를 넘는다"
     return dict(raw), ""
@@ -2468,13 +2481,16 @@ SAVE_CONV_TOOL = types.Tool(
                 "type": "object",
                 "description": ("심의 주제(선택) — {sp_task: 허브 과제 key(find_plm_task 결과 행의 key), round: 차수(pre · dv1 ~ dv3 · dvr · "
                                 "pv1 ~ pv3 · pvr · pra · mp), text: 사람이 적은 과제 글, artifacts: [{kind: mcad|ecad|cae, app, id, rev}]}. "
-                                "넷 밖의 칸은 받지 않는다. 과제 대상이 아니면 뺀다"),
+                                "넷과 insights(읽은 과제 인사이트) 밖의 칸은 받지 않는다. 과제 대상이 아니면 뺀다"),
                 "properties": {
                     "sp_task": {"type": "string", "description": "허브 과제 key — find_plm_task 결과 행의 key 그대로(과제코드가 아니다)"},
                     "round": {"type": "string", "description": "차수 — 개발 단계 코드(dv1 꼴), 모르면 뺀다"},
                     "text": {"type": "string", "description": "사람이 적은 과제 이름 · 코드 · 차수 글(500자까지)"},
                     "artifacts": {"type": "array", "description": "설계 자료 — [{kind: mcad|ecad|cae, app?, id, rev?}] 8개까지",
                                   "items": {"type": "object"}},
+                    "insights": {"description": ("이 심의가 근거로 읽은 과제 인사이트 카드 id 목록(insight_find 결과의 id — 60개까지), 다 알 수 "
+                                                 "없으면 \"unknown\". 앞선 인사이트를 근거로 쓰지 않았으면 뺀다 — 포털이 그 카드들의 보이는 범위를 "
+                                                 "이어받는다(unknown 이면 확인해도 주인만 본다)")},
                 },
             },
             "chair_template": {"type": "string",
@@ -6095,8 +6111,9 @@ INSIGHT_FIND_TOOL = _routine_tool(
 INSIGHT_GET_TOOL = _routine_tool(
     "insight_get",
     "과제 인사이트 카드 하나의 전부 — 주제(과제 · 차수 · 설계 자료) · 주장 · 표결 · RA 보고서 · 근거 표지(도구 · 인자 · 결과 지문) · 상태 · 범위 · "
-    "반박 잇기 · 판 표지(stale — 기구 CAD 에 뒤 판이 있거나 내용이 바뀌었으면 '낡았을 수 있다', 못 읽으면 '모름' · 뒤 판의 리스크 변경 심사 줄 "
-    "risk_diffs) · 같은 결론인 다른 카드(same — 내가 볼 수 있는 것만). 볼 수 없는 카드는 없는 것과 같다. 검증 대상이고 독립 근거가 아니다.",
+    "반박 잇기 · 판 표지(stale — 판정 낱말만: 기구 CAD 에 뒤 판이 있거나 내용이 바뀌었으면 '낡았을 수 있다', 못 읽으면 '모름'. 뒤 판의 이름 · "
+    "id · 리스크 변경 심사 줄은 여기 싣지 않는다 — 포털의 과제 인사이트 화면에서 본다) · 같은 결론인 다른 카드(same — 내가 볼 수 있는 것만). "
+    "볼 수 없는 카드는 없는 것과 같다. 검증 대상이고 독립 근거가 아니다.",
     {"id": {"type": "string", "maxLength": 300, "description": "카드 id — insight_find 결과의 id(ins:web:… · ins:delib:… · ins:wf:…)"}}, ["id"])
 INSIGHT_TOOLS = (INSIGHT_FIND_TOOL, INSIGHT_GET_TOOL)
 _INSIGHT_NAMES = frozenset(t.name for t in INSIGHT_TOOLS)

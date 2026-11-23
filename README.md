@@ -638,7 +638,7 @@ svg 만). 감사 줄에는 그 결과의 `images` · `image_bytes` 가 붙는다
 
 | 손잡이 | 기본 | 뜻 |
 |---|---|---|
-| `GATEWAY_RESULT_REFS` | 끔 | `1` 이면 켠다(그리고 연결 머리 `X-HWAX-Result: ref`) |
+| `GATEWAY_RESULT_REFS` | 끔 | `1` 이면 켠다(그리고 연결 머리 `X-HWAX-Result: ref`). 띄운 셸의 환경이 먼저고, 없으면 곁의 `provision.env` 줄을 읽는다(`start.sh` 는 그 파일을 환경으로 싣지 않는다 — 박스는 거기 한 줄 적고 게이트웨이를 다시 띄운다) |
 | `GATEWAY_RESULT_REF_MIN_CHARS` | 20000 | 이 글자 수를 넘는 결과만 줄인다(1,000 이상) |
 | `GATEWAY_RESULT_REF_HEAD_CHARS` | 4000 | 줄인 결과에 싣는 앞머리(0 이면 손잡이만, 문턱 이상이면 문턱의 반으로 돈다) |
 | `GATEWAY_RESULT_REF_TTL_DAYS` | 7 | 원문 하나의 보존(날) |

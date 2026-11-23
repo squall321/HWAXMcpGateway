@@ -7955,7 +7955,31 @@ async def _fig_download(scope, send, pat_verifier, gw_auth: str) -> None:
 #    GATEWAY_RESULT_REF_TTL_DAYS(7일) · 사람당 · 전체 상한(넘으면 오래된 것부터), 청소는 주기마다 디스크에서 다시 짓는다. 비밀이 원문 그대로 남는
 #    것은 지금 결과도 같다 — 새로 가리지 않고 주인만 · 기한 뒤 지운다.
 #  · 내부 창구 GET /internal/result/<ref> — 에이전트 서버(draft_section)가 근거 ref 를 읽는다(_res_internal_http).
-RESULT_REFS_ON = os.environ.get("GATEWAY_RESULT_REFS", "").strip() == "1"
+def _provision_env_value(key: str, path: Path | None = None) -> str:
+    """게이트웨이 곁 provision.env(박스 파일 · gitignore)의 마지막 활성 줄 값 — 없거나 못 읽으면 ''. 이 리포의 start.sh 는 그 파일을 프로세스 환경으로
+    싣지 않아(provision-config.sh 가 설정 파일을 지을 때만 읽는다) 박스 스위치를 거기 적어도 먹지 않았다. 포털 update-all 이 같은 파일 · 같은 키를 읽어
+    「안 켠 것」 을 알리고, 그 파일이 바뀌면 게이트웨이를 다시 띄운다(지문 목록 identity). 줄 읽기는 포털 _envfile_value 와 같은 규칙 — `export ` 머리 ·
+    줄 끝 `#` 주석 · 따옴표를 뗀다."""
+    p = path or Path(__file__).with_name("provision.env")
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    val = ""
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("export "):
+            s = s[len("export "):].lstrip()
+        if not s.startswith(f"{key}="):
+            continue
+        v = s[len(key) + 1:]
+        v = re.sub(r"\s+#.*$", "", v).strip().strip("\"'")
+        val = v
+    return val
+
+
+# 켜짐 — 띄운 셸의 환경이 먼저(비어 있지 않으면), 없으면 provision.env 의 줄. 값은 '1' 만 켬(계약 offload-v2 §2).
+RESULT_REFS_ON = (os.environ.get("GATEWAY_RESULT_REFS", "").strip() or _provision_env_value("GATEWAY_RESULT_REFS")) == "1"
 RESULT_HEADER = "x-hwax-result"            # 연결 머리 — 값이 'ref' 일 때만. 게이트웨이가 PAT 분기에서 정해 싣고 클라이언트 사본은 모든 분기가 버린다
 RESULT_HEADER_REF = "ref"
 RESULT_REF_MIN_CHARS = _fig_env_int("GATEWAY_RESULT_REF_MIN_CHARS", 20000, 1000)   # 이 글자 수를 넘는 결과만 줄인다

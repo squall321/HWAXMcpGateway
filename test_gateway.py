@@ -16183,3 +16183,26 @@ def test_결과_손잡이_SDK_의_tools_call_처리기가_바깥_처리기를_�
     _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com"})
     out = asyncio.run(handler(types.CallToolRequest(params=types.CallToolRequestParams(name="get_rows", arguments={})))).root
     assert out.content[0].text == _RES_TXT, "머리 없는 연결은 원문"
+
+
+# ── 결과 손잡이 스위치를 provision.env 에서도 읽는다(HWAXPortal docs/token-saving TS-9) — start.sh 는 그 파일을 환경으로 싣지 않는다 ──
+def test_결과_손잡이_스위치는_provision_env_의_마지막_활성_줄을_읽는다(tmp_path):
+    p = tmp_path / "provision.env"
+    p.write_text("# GATEWAY_RESULT_REFS=1\nGATEWAY_RESULT_REFS=0\nexport GATEWAY_RESULT_REFS=\"1\"   # 켬\nOTHER=x\n", encoding="utf-8")
+    assert gw._provision_env_value("GATEWAY_RESULT_REFS", p) == "1"
+    p.write_text("GATEWAY_RESULT_REFS=1\nGATEWAY_RESULT_REFS=0\n", encoding="utf-8")
+    assert gw._provision_env_value("GATEWAY_RESULT_REFS", p) == "0"
+    assert gw._provision_env_value("GATEWAY_RESULT_REFS", tmp_path / "없음.env") == ""
+    p.write_text("GATEWAY_RESULT_REFS_X=1\n", encoding="utf-8")
+    assert gw._provision_env_value("GATEWAY_RESULT_REFS", p) == "", "앞머리만 같은 다른 키를 읽지 않는다"
+
+
+def test_결과_손잡이_켜짐은_환경이_먼저고_없으면_파일이다():
+    import ast
+    from pathlib import Path as _P
+    src = _P(gw.__file__).read_text(encoding="utf-8")
+    node = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Assign)
+                and any(getattr(t, "id", "") == "RESULT_REFS_ON" for t in n.targets))
+    seg = ast.get_source_segment(src, node)
+    assert 'os.environ.get("GATEWAY_RESULT_REFS"' in seg and '_provision_env_value("GATEWAY_RESULT_REFS")' in seg, seg
+    assert seg.index("os.environ.get") < seg.index("_provision_env_value"), "환경이 먼저다"

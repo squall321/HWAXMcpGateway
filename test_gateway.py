@@ -8545,6 +8545,18 @@ def test_read_tools_deny_는_StepForge_mesh_size_advice_를_루틴_단계에서_
     assert gw._routine_read(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice"), "닫기 목록이 없으면 이름 꼴(advice)로 열린다"
 
 
+def test_read_tools_deny_는_리스크_앱_근거_묶음_만들기를_읽기로_보지_않는다(monkeypatch):
+    """risk_build_evidence_bundle 은 심의 근거 묶음을 만들어 원장에 남기는 쓰기다(리스크 앱 설명 '쓰기:' · 편집자 이상) — 이름의 조회 낱말(evidence)로
+    루틴 단계 · /tools-map routine_read 에 열려 포털 운영자 미리보기가 '읽기를 쓰기로' 를 알렸다(cae00 11-23 라운드). 닫기 목록이 이름 꼴보다 먼저다.
+    같은 앱의 받기(risk_get_evidence_bundle)는 그대로 읽기다."""
+    key = "heax-hwax_risk:risk_build_evidence_bundle"
+    assert key in json.load(open(gw.Path(gw.__file__).with_name("read_tools.json"), encoding="utf-8"))["deny"] and key in gw.READ_DENY
+    assert not gw._routine_read(_tool("risk_build_evidence_bundle"), "heax-hwax_risk", "risk_build_evidence_bundle")
+    assert gw._routine_read(_tool("risk_get_evidence_bundle"), "heax-hwax_risk", "risk_get_evidence_bundle")
+    monkeypatch.setattr(gw, "READ_DENY", frozenset())
+    assert gw._routine_read(_tool("risk_build_evidence_bundle"), "heax-hwax_risk", "risk_build_evidence_bundle"), "닫기 목록이 없으면 이름 꼴(evidence)로 열린다"
+
+
 def test_read_tools_override_는_앱이_readOnlyHint_False_를_적어도_읽기로_다룬다(monkeypatch, _fresh_scores):
     """앱 표지가 읽기가 아니어도 포털이 읽기로 다루는 도구(read_tools.json override — 사용자 결정으로만). StepForge 가 잡 · 파일을 남기는
     단면 · 적층 도구 넷의 readOnlyHint 를 뗐지만(StepForge D-677 S7) 측정 잡은 읽기 토큰 · 루틴으로도 스스로 건다(HWAXPortal

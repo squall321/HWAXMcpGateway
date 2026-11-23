@@ -285,6 +285,8 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 운영 모델의 창은 1,048,576 토큰(GLM-5.2)이다. Claude 사용자는 이 게이트웨이를 거쳐 받은 결과로 심의하므로 여기서 잘리면 잘린 근거로 심의한다. 그래서 게이트웨이는 **생산자로서 자르지 않고**, 작은 창이 필요한 소비자(에이전트 서버의 웹 챗)가 자기 쪽에서 자른다(`TOOL_RESULT_MAX`).
 
 - 백엔드 도구 결과(직접 호출·`invoke_tool`·캐시 적중)는 본문을 그대로 준다. 감사 줄의 `chars` 가 돌려준 결과의 글자 수다.
+  예외 하나 — 박스가 결과 손잡이를 켜고(`GATEWAY_RESULT_REFS=1`) 연결이 `X-HWAX-Result: ref` 로 청하면 큰 결과는 앞머리 + 손잡이로 간다(원문은
+  게이트웨이에 남아 쪽으로 받거나 묻는다 — 아래 '결과 손잡이'). 그때도 `chars` 는 원문 크기다.
 - `search_tools` 는 `detail=true` 일 때 찾은 도구의 설명 전문과 인자 스키마 전부(`$defs` 포함)를(아래 표의 상한 안에서 — 기본은 한 줄 요약 · 필수 인자), `list_tool_apps` 는 도구·앱 설명 전문을, `use_experts` 는 역할 문서 전문을, `rest_catalog` 는 경로의 인자(`params`)·본문(`body`) 스키마를 준다. `rest_call` 은 JSON 이 아닌 본문도 통째로 준다.
 - 순위·목록은 이름을 먼저 싣는다 — `search_tools` 의 `ranked`(그다음 `truncated`·`detail_capped`·`note`, 전문 `matches` 는 맨 뒤), `list_tool_apps(app=)` 의 `tool_names`. 작은 창의 소비자가 앞에서부터 글자로 잘라도(dev 웹 챗 6,000자) 뒤 순위 도구가 '없다' 로 읽히지 않는다.
 - `search_tools` 의 답은 촘촘한 JSON 이다(빈칸 없는 구분자 · 한글 그대로 — 11-02, HWAXPortal docs/token-saving TS-5). 들여쓴 꼴(indent=2)은 같은 내용을 10-16 카탈로그 스냅샷 · 평가셋 150 질의에서 기본 1.55배 · `detail=true` 1.33배로 불렸다. 받는 쪽은 JSON 으로 읽거나(`/search-eval` · `tool_search_eval/run.py`) 글을 그대로 모델에 준다(Claude Code · 웹 챗 안내대) — 줄 · 빈칸 꼴에 기대는 곳이 없어 골라 쓰기가 아니라 기본이다.
@@ -595,6 +597,54 @@ svg 만). 감사 줄에는 그 결과의 `images` · `image_bytes` 가 붙는다
 | `GATEWAY_FIG_OWNER_MAX_COUNT` | 5000 | 사람당 장 수 — 넘으면 그 사람의 오래된 것부터 |
 | `GATEWAY_FIG_TICKET_TTL_S` | 3600 | 받기 표의 수명 |
 | `GATEWAY_FIG_SWEEP_S` | 3600 | 청소 주기(기동 때 한 번 디스크에서 표를 짓는다). 상한은 쓸 때마다 지킨다 |
+
+## 결과 손잡이 — 큰 도구 결과를 머리 + 손잡이로(선택, 기본 꺼짐 — HWAXPortal docs/token-saving offload-v2 §3-2 B · TS-3 · TS-6)
+
+개인 Claude 의 토큰은 도구 결과가 문맥에 그대로 쌓이는 양에서 나온다. 켜면 큰 결과의 원문을 주인만 보는 저장소에 두고 Claude 에는 앞머리와 손잡이만
+준다 — 나머지는 `result_get` 으로 쪽을 받거나 `result_ask` 로 서버 LLM 에 묻는다.
+
+- **켜는 조건 둘** — 박스 `GATEWAY_RESULT_REFS=1` **그리고** 그 연결의 머리 `X-HWAX-Result: ref`(대소문자 · 앞뒤 빈칸 무시). 머리는 보기 머리처럼
+  PAT 분기에서만 정해 갈아 끼운다 — 웹 챗 · 절차 · 패널 PAT 는 늘 원문, GW_TOKEN(엔진 · 에이전트 서버) · 서비스 분기는 머리를 버린다. 머리 없이 사람
+  PAT 로 부르는 서버 쪽 길(루틴 · 리스크 앱 · MXWP 위키)도 원문이다. 하나라도 없으면 결과 · 도구 목록 · 경로가 지금과 바이트까지 같다(`/health` 의
+  `result_refs` 칸만 늘 있다).
+- **줄이는 것** — 바깥 `tools/call` 하나의 결과만(게이트웨이 안쪽 호출 — `browse_experts` 의 `list_agents` · 루틴 · 온톨로지 조회 — 은 원문). 결과 글
+  (글 블록을 줄바꿈으로 이은 것, `structuredContent` 의 촘촘한 JSON 이 더 길면 그것)이 `GATEWAY_RESULT_REF_MIN_CHARS` 를 넘을 때 글 블록을 둘로 바꾼다 —
+  앞머리(`…_HEAD_CHARS` 자)와 손잡이 JSON `{ref, chars, sha256, pages, how}`(`sha256` 은 그 글의 UTF-8, `pages` 는 20,000자 쪽 수). `structuredContent`
+  가 있던 결과는 그것도 `{ref, chars, sha256, pages, how, head}` 로 바꾼다. 그림 블록 · '그림 저장 —' 줄은 그대로 둔다. 실패(`isError`) · 신원 없음 ·
+  저장 실패 · `result_get` · `result_ask` 자신은 줄이지 않는다. 응답 캐시 · 쓰기 뒤 비우기 · `verify_answer` 근거 원장 · 감사(`chars` 는 원문 크기) ·
+  그림 보관은 줄이기 앞이라 그대로다.
+- **그 연결의 `tools/list` 는 `outputSchema` 를 뗀다** — 줄인 `structuredContent` 는 도구의 출력 스키마에 맞지 않아 Claude Code(MCP TS SDK)가 결과를
+  거절한다. 머리 없는 연결 · 끈 박스의 목록은 그대로다.
+- **저장** — 그림 보관소와 같은 꼴. `res_` + 무작위 16바이트 ref, 곁 JSON(`owner` · `tool` · `chars` · `sha256` · `bytes` · `created` · `expires`) +
+  원문 `.body`(`{text, structured}`), 파일 0600 · 폴더 0700. 같은 사람 · 같은 원문은 같은 ref(한 시간 넘게 지났으면 기한을 새로 적는다 — 남의 원문과는
+  같은 ref 가 되지 않는다). 사람당 · 전체 상한을 넘으면 오래된 것부터 지우고, 한 원문이 상한보다 크면 두지 않고 원문을 그대로 준다. 청소는 기동 때 한 번
+  디스크에서 표를 짓고 주기마다 끝난 것 · 깨진 것 · 떠돌이를 지운다(남의 파일 · 못 읽은 곁 JSON 은 그대로). 스위치를 끈 뒤에도 폴더가 남아 있으면
+  청소는 돈다(켜 두었던 동안의 원문이 기한 뒤 지워지게). 비밀이 원문 그대로 남는 것은 지금 결과도 같다 — 새로 가리지 않고 주인만 · 기한 뒤 지운다.
+- **`result_get(ref, page=1, page_chars=20000)`**(읽기 · 주인만) — 첫 블록 `{ref, page, pages, page_chars, start, end, chars}`, 둘째 블록이 그 쪽의
+  원문 글. `page_chars` 는 1,000 ~ 100,000. 없는 것 · 끝난 것 · 남의 것은 같은 `RESULT_ERROR:` 다.
+- **`result_ask(ref, question, max_answer_chars?)`**(읽기 · 주인만) — 원문을 에이전트 서버 묻기 창구에 넘긴다.
+  `POST <심의 백엔드 주소에서 /mcp 를 뗀 것>/llm/ask_over_text`(dev `http://127.0.0.1:9009/llm/ask_over_text`), 머리 `Authorization: Bearer <GW_TOKEN>`
+  (에이전트 서버의 공유 비밀 창구와 같은 값) · `x-hwax-user: <주인 이메일 — %-인코딩>` · `x-hwax-corr`(있으면), 본문 `{text, question,
+  max_answer_chars?}`(비우면 싣지 않는다). 답은 `{ref, answer, quotes, numbers, model}`. 404 는 '묻기 창구가 꺼져 있거나(RESULT_ASK_ENABLED) 낡았다',
+  401 · 403 · 503 은 '공유 비밀이 맞지 않는다' 로 말한다. 한도는 `GATEWAY_CALL_TIMEOUT` 과 같다. 질문 2,000자까지.
+- 두 도구는 **박스 스위치만** 보고 목록에 싣는다(머리 없는 연결에도 보인다 — 그 연결에는 손잡이가 생기지 않아 부르면 '없다' 로 끝난다). 이름은 심의 좌석
+  자유 조회 접두(`_FREE_ALLOW`)에 걸리지 않는다(시험). 같은 이름의 백엔드 도구는 접두를 단다. 읽기 전용 PAT 도 부른다.
+- **내부 창구 `GET /internal/result/<ref>`** — 에이전트 서버(`draft_section`)가 근거 ref 를 읽는다. `Authorization: Bearer <GW_TOKEN>`(한 번만) +
+  `x-hwax-user: <그 ref 를 받은 사람 이메일>`. 답 `{ref, tool, chars, sha256, pages, created, expires, text, structured}`. 비밀이 틀리면 401, 사람 머리가
+  없으면 400, 없는 것 · 끝난 것 · 남의 것은 같은 404. **박스 안 직접 연결만** — `X-Forwarded-For` · `X-Forwarded-Host` 가 실린 요청(포털 nginx 의
+  `/mcp-gw/` — 서버 단계에서 싣는다)과 끈 박스에서는 이 길이 없다(지금처럼 아래 인증으로 간다). 감사 한 줄(`GET /internal/result` · `via` gw-token).
+- `/health` 의 `result_refs: {enabled, min_chars, head_chars, ttl_days, stored}` — 포털 PC 킷 칸이 '이 박스에서 꺼져 있음' 을 가린다. 기동 로그에 켬 · 끔
+  한 줄(끄면 켜는 법).
+
+| 손잡이 | 기본 | 뜻 |
+|---|---|---|
+| `GATEWAY_RESULT_REFS` | 끔 | `1` 이면 켠다(그리고 연결 머리 `X-HWAX-Result: ref`) |
+| `GATEWAY_RESULT_REF_MIN_CHARS` | 20000 | 이 글자 수를 넘는 결과만 줄인다(1,000 이상) |
+| `GATEWAY_RESULT_REF_HEAD_CHARS` | 4000 | 줄인 결과에 싣는 앞머리(0 이면 손잡이만, 문턱 이상이면 문턱의 반으로 돈다) |
+| `GATEWAY_RESULT_REF_TTL_DAYS` | 7 | 원문 하나의 보존(날) |
+| `GATEWAY_RESULT_REF_DIR` | 데이터 루트의 `results` | 그림 폴더와 같은 규칙(원장이 리포 안이면 리포 옆 `<리포>-results`, 체크아웃 밖이어야 한다). 상대 경로는 리포 루트 기준 |
+| `GATEWAY_RESULT_REF_OWNER_QUOTA` · `GATEWAY_RESULT_REF_TOTAL_CAP` | 1 GiB · 10 GiB | 사람당 · 전체 디스크 몫(4 KiB 블록 + 곁 JSON) — 넘으면 오래된 것부터, 이번 것은 남긴다 |
+| `GATEWAY_RESULT_REF_SWEEP_S` | 3600 | 청소 주기 |
 
 ## PC 키트 — 개인 Claude 가 PC 로 받는 도구 파일(HWAXPortal infra/pc-kit · docs/report-figures RF-22, 사용자 보고 11-02)
 

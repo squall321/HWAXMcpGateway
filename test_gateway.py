@@ -44,6 +44,14 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "_FIG_TOTAL", {"bytes": 0})
     monkeypatch.setattr(gw, "_FIG_SWEEP", {"on": False, "added": set(), "dropped": set()})
     monkeypatch.setattr(gw, "_FIG_LIMITER", {"lim": None})
+    # 결과 손잡이 원문 폴더도 같다 — 안 걸면 시험이 박스의 데이터 루트(/data/svc/mcp-gateway/results)나 리포 옆 폴더에 원문을 쌓는다. 표도 시험마다 새것이다
+    monkeypatch.setattr(gw, "RES_DIR", tmp_path / "results")
+    monkeypatch.setattr(gw, "_RES_META", {})
+    monkeypatch.setattr(gw, "_RES_KEY", {})
+    monkeypatch.setattr(gw, "_RES_USAGE", {})
+    monkeypatch.setattr(gw, "_RES_TOTAL", {"bytes": 0})
+    monkeypatch.setattr(gw, "_RES_SWEEP", {"on": False, "added": set(), "dropped": set()})
+    monkeypatch.setattr(gw, "_RES_LIMITER", {"lim": None})
     # PC 키트 폴더도 같다 — 안 걸면 시험이 형제 리포(HWAXPortal infra/pc-kit)의 실제 변환기를 읽는다. 기본은 없는 폴더, 키트 시험이 제 파일을 둔다
     monkeypatch.setattr(gw, "KIT_DIR", tmp_path / "pc-kit")
     # 앱 키 표의 박스 덧씌우기 · 띄운 셸의 GATEWAY_ENV 도 같다 — 박스에 app_keys.local.json 이 있으면 env 시험이 그 박스 값으로 돈다(GW-05)
@@ -15737,3 +15745,441 @@ def test_누구의_일을_읽는_자리는_감사_줄_하나뿐이다():
     walk(tree, "<module>")
     assert uses["_request_audit_for"] == {"_audit"}, uses
     assert uses["AUDIT_FOR_HEADER"] == {"_request_audit_for", "middleware"}, uses
+
+
+# ── 결과 손잡이(HWAXPortal docs/token-saving offload-v2 §3-2 B · TS-3 · TS-6) — 큰 결과는 머리 + 손잡이, 원문은 주인만 · 쪽으로 · 묻기로 ──────────────
+# 켜는 조건은 둘(박스 GATEWAY_RESULT_REFS=1 그리고 연결 머리 X-HWAX-Result: ref)이고, 하나라도 없으면 결과 · 목록 · 경로가 지금과 바이트까지 같다. 줄이는 자리는
+# 바깥 처리기(_call_tool_entry) 하나다 — 안쪽 호출(_call_tool)은 원문을 받는다. 시험은 _call_tool_entry 를 실제로 태운다.
+_RES_TXT = "".join(f"줄{i:05d}\n" for i in range(5000))            # 35,000자 — 문턱(20,000)을 넘는다
+_RES_SMALL = "작은 결과"
+_RES_RE = _re.compile(r"res_[A-Za-z0-9_-]{22}")
+
+
+def _res_text_result(text=_RES_TXT, **kw) -> types.CallToolResult:
+    return types.CallToolResult(content=[types.TextContent(type="text", text=text)], **kw)
+
+
+def _res_kit(monkeypatch, results=None, *, on=True, hdr="ref", user="a@corp.com", extra=None):
+    """결과 손잡이 스위치(on) · 연결 머리(hdr) · 신원(user)을 세운 요청 문맥에 StepForge 꼴 백엔드 하나 — 바깥 처리기를 실제로 태운다."""
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", on)
+    _inner, b = _fig_kit(monkeypatch, user=user, results=results or {"get_rows": _res_text_result, "small": lambda: _res_text_result(_RES_SMALL)},
+                         headers={**({gw.RESULT_HEADER: hdr} if hdr else {}), **(extra or {})})
+
+    def call(name, args=None):
+        return asyncio.run(gw._call_tool_entry(name, args or {}))
+    return call, b
+
+
+def _res_handle_of(res) -> dict:
+    h = json.loads(res.content[1].text)
+    assert set(h) == {"ref", "chars", "sha256", "pages", "how"}, h
+    return h
+
+
+def test_결과_손잡이_끄거나_머리가_없으면_결과_목록_경로가_지금과_바이트까지_같다(monkeypatch):
+    want = _res_text_result().model_dump_json()
+    for on, hdr in ((False, "ref"), (True, None), (True, "full"), (False, None)):
+        call, _b = _res_kit(monkeypatch, on=on, hdr=hdr)
+        assert call("get_rows").model_dump_json() == want, (on, hdr)
+        assert call("get_rows").model_dump_json() == want, ("캐시 적중도", on, hdr)
+        assert not gw.RES_DIR.exists(), "아무것도 두지 않는다"
+        assert gw._request_result_ref() is (hdr == "ref"), "머리는 게이트웨이가 정한 'ref' 만 읽는다"
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", False)
+    assert not {"result_get", "result_ask"} & {t.name for t in gw._local_tools()}, "끄면 도구 목록도 지금과 같다"
+    call, _b = _res_kit(monkeypatch, on=False)
+    assert call("result_get", {"ref": "res_" + "a" * 22}).content[0].text == "unknown tool: result_get"
+    # 끄면 내부 창구 길이 없다 — 공유 비밀로 와도 지금처럼 앱(라우트 없음)으로 간다
+    seen = []
+
+    async def app(scope, receive, send):
+        seen.append(scope["path"])
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    asyncio.run(gw._bearer_gate(app, None)({"type": "http", "method": "GET", "path": "/internal/result/res_" + "a" * 22,
+                                            "headers": [(b"authorization", b"Bearer gw-secret"), (b"x-hwax-user", b"a@corp.com")]}, None, None))
+    assert seen == ["/internal/result/res_" + "a" * 22]
+
+
+def test_결과_손잡이_큰_결과는_머리와_손잡이로_주고_원문은_주인만_쪽으로_받는다(monkeypatch):
+    call, b = _res_kit(monkeypatch)
+    res = call("get_rows")
+    assert not res.isError and res.structuredContent is None, "structuredContent 가 없던 결과에 새로 달지 않는다"
+    assert res.content[0].text == _RES_TXT[:gw.RESULT_REF_HEAD_CHARS] and len(res.content) == 2
+    h = _res_handle_of(res)
+    ref = h["ref"]
+    assert _RES_RE.fullmatch(ref) and h["chars"] == len(_RES_TXT) and h["pages"] == 2
+    assert h["sha256"] == hashlib.sha256(_RES_TXT.encode("utf-8")).hexdigest()
+    assert "result_get" in h["how"] and "result_ask" in h["how"] and "7일" in h["how"]
+    # 저장 — 곁 JSON + 원문, 0600 · 폴더 0700
+    assert sorted(p.name for p in gw.RES_DIR.iterdir()) == [f"{ref}.body", f"{ref}.json"]
+    assert stat.S_IMODE(os.stat(gw.RES_DIR).st_mode) == 0o700
+    assert {stat.S_IMODE(os.stat(p).st_mode) for p in gw.RES_DIR.iterdir()} == {0o600}
+    side = json.loads((gw.RES_DIR / f"{ref}.json").read_text(encoding="utf-8"))
+    assert side["owner"] == "a@corp.com" and side["tool"] == "get_rows" and side["chars"] == len(_RES_TXT)
+    # 감사 — 백엔드 호출 줄의 chars 는 원문 크기 그대로다
+    row = [r for r in _audit_rows() if r["tool"] == "get_rows"][-1]
+    assert row["chars"] == len(_RES_TXT) and row["caller"] == "a@corp.com"
+    # 쪽으로 받기 — 두 쪽을 이으면 원문이다
+    pages = []
+    for p in (1, 2):
+        r = call("result_get", {"ref": ref, "page": p})
+        info = json.loads(r.content[0].text)
+        assert info == {"ref": ref, "page": p, "pages": 2, "page_chars": 20000, "start": (p - 1) * 20000,
+                        "end": min(len(_RES_TXT), p * 20000), "chars": len(_RES_TXT)}
+        pages.append(r.content[1].text)
+    assert "".join(pages) == _RES_TXT
+    assert "page 는 1 ~ 2" in call("result_get", {"ref": ref, "page": 3}).content[0].text
+    assert json.loads(call("result_get", {"ref": ref, "page_chars": 1000}).content[0].text)["pages"] == 35
+    assert call("result_get", {"ref": ref, "page_chars": 999}).isError, "쪽 크기 하한"
+    # result_get 자신은 다시 줄이지 않는다 — 한 쪽(35,000자)이 문턱을 넘어도, invoke_tool 로 불러도
+    whole = call("result_get", {"ref": ref, "page_chars": 100000})
+    assert whole.content[1].text == _RES_TXT and not _RES_RE.search(whole.content[0].text.replace(ref, ""))
+    inv = call("invoke_tool", {"name": "result_get", "arguments": {"ref": ref, "page_chars": 100000}})
+    assert inv.content[1].text == _RES_TXT
+    # 남의 것 · 없는 것 · 신원 없음 — 같은 말
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "b@corp.com", gw.RESULT_HEADER: "ref"})
+    other = call("result_get", {"ref": ref})
+    nosuch = call("result_get", {"ref": "res_" + "z" * 22})
+    assert other.isError and other.content[0].text == nosuch.content[0].text == f"RESULT_ERROR: {gw._RES_MISSING}"
+    _set_request_headers(monkeypatch, {gw.RESULT_HEADER: "ref"})
+    assert "사람 신원이 없는" in call("result_get", {"ref": ref}).content[0].text
+
+
+def test_결과_손잡이_작은_결과_실패_신원_없음은_그대로다(monkeypatch):
+    call, _b = _res_kit(monkeypatch, results={"small": lambda: _res_text_result(_RES_SMALL), "get_rows": _res_text_result,
+                                              "get_bad": lambda: _res_text_result(isError=True)})
+    assert call("small").content[0].text == _RES_SMALL
+    assert call("get_bad").model_dump_json() == _res_text_result(isError=True).model_dump_json(), "실패는 그대로 보인다"
+    _set_request_headers(monkeypatch, {gw.RESULT_HEADER: "ref"})
+    assert call("get_rows").model_dump_json() == _res_text_result().model_dump_json()
+    assert not gw.RES_DIR.exists(), "주인이 없으면 남의 칸에 두느니 안 둔다"
+
+
+def test_결과_손잡이_안쪽_호출은_원문을_받는다(monkeypatch):
+    """browse_experts 의 list_agents 처럼 게이트웨이 도구가 안쪽에서 부르는 결과는 줄이지 않는다 — 줄이면 그 도구가 빈손이 된다."""
+    agents = [{"agent_type": f"a{i:03d}", "display_name": f"전문가 {i}", "domain": "x" * 40} for i in range(400)]
+    big = json.dumps(agents, ensure_ascii=False)
+    assert len(big) > gw.RESULT_REF_MIN_CHARS
+    call, _b = _res_kit(monkeypatch, results={"list_agents": lambda: _res_text_result(big)})
+    assert len(asyncio.run(gw._agents_json({}))) == 400, "안쪽 호출은 원문 그대로"
+    assert asyncio.run(gw._call_tool("list_agents", {})).content[0].text == big
+    assert _RES_RE.fullmatch(_res_handle_of(call("list_agents"))["ref"]), "바깥 호출만 줄인다"
+
+
+def test_결과_손잡이_structuredContent_도_같은_꼴로_줄이고_그_연결의_목록은_출력_스키마를_뗀다(monkeypatch):
+    obj = {"rows": [{"i": i, "v": "값" * 8} for i in range(1500)]}
+    js = json.dumps(obj, ensure_ascii=False, indent=2)
+    call, _b = _res_kit(monkeypatch, results={"get_obj": lambda: types.CallToolResult(
+        content=[types.TextContent(type="text", text=js)], structuredContent=obj)})
+    res = call("get_obj")
+    h = _res_handle_of(res)
+    assert res.structuredContent == {**h, "head": js[:gw.RESULT_REF_HEAD_CHARS]}, "structuredContent 도 머리 + 손잡이"
+    meta = gw._res_load(h["ref"])
+    text, sc = gw._res_read_body(meta)
+    assert text == js and sc == obj, "원문 글과 structuredContent 를 함께 둔다"
+    # 글이 짧고 structuredContent 가 크면 그 촘촘한 JSON 이 원문이다
+    call2, _ = _res_kit(monkeypatch, results={"get_sc": lambda: types.CallToolResult(
+        content=[types.TextContent(type="text", text="ok")], structuredContent=obj)})
+    h2 = _res_handle_of(call2("get_sc"))
+    assert h2["chars"] == len(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+    # 목록 — 머리를 청한 연결만 출력 스키마를 뗀다(줄인 structuredContent 를 클라이언트가 스키마로 거절하지 않게)
+    tool = types.Tool(name="get_obj", description="", inputSchema={"type": "object"}, outputSchema={"type": "object", "required": ["rows"]})
+    monkeypatch.setattr(gw, "exposed_tools", [tool])
+    monkeypatch.setattr(gw, "route", {"get_obj": ("heax-step_forge", "get_obj")})
+
+    def listed(hdrs):
+        _set_request_headers(monkeypatch, {gw.GROUPS_HEADER: "", **hdrs})
+        return {t.name: t for t in asyncio.run(gw._list_tools(types.ListToolsRequest()))}
+    assert listed({gw.RESULT_HEADER: "ref"})["get_obj"].outputSchema is None
+    assert listed({})["get_obj"].outputSchema == tool.outputSchema, "머리 없는 연결은 그대로"
+    assert gw.exposed_tools[0].outputSchema == tool.outputSchema, "집계 목록은 건드리지 않는다"
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", False)
+    assert listed({gw.RESULT_HEADER: "ref"})["get_obj"].outputSchema == tool.outputSchema, "끄면 그대로"
+    _set_request_headers(monkeypatch, {gw.RESULT_HEADER: "ref"})
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", True)
+    assert asyncio.run(gw._list_tools(None))[0].outputSchema == tool.outputSchema, "SDK 캐시 채우기(요청 없음)는 그대로"
+
+
+def test_결과_손잡이_그림_블록과_그림_저장_줄은_남기고_원문에_넣지_않는다(monkeypatch):
+    call, _b = _res_kit(monkeypatch, results={"render_3d": lambda: types.CallToolResult(
+        content=[types.TextContent(type="text", text=_RES_TXT), _img(_PNG)])})
+    res = call("render_3d")
+    assert [c.type for c in res.content] == ["text", "text", "image", "text"]
+    assert res.content[3].text.startswith("그림 저장 — fig_") and res.content[2].data == _img(_PNG).data
+    h = _res_handle_of(res)
+    text, _sc = gw._res_read_body(gw._res_load(h["ref"]))
+    assert text == _RES_TXT, "그림 저장 줄은 원문 글에 넣지 않는다"
+    for outcomes in ([("fig_" + "a" * 22, "image/png", 10)], [(None, "big", 10)]):
+        assert gw._fig_note(outcomes).startswith(gw._FIG_NOTE_HEADS), "그림 저장 줄의 머리가 바뀌면 줄이기가 그 줄을 원문으로 삼킨다"
+
+
+def test_결과_손잡이_캐시_적중도_줄이고_같은_원문은_같은_ref_다(monkeypatch):
+    call, b = _res_kit(monkeypatch)
+    r1, r2 = _res_handle_of(call("get_rows"))["ref"], _res_handle_of(call("get_rows"))["ref"]
+    assert r1 == r2 and b.session.calls == ["get_rows"], "캐시 적중 — 백엔드는 한 번, ref 는 같다"
+    assert len(gw._RES_META) == 1 and len(list(gw.RES_DIR.iterdir())) == 2
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "b@corp.com", gw.RESULT_HEADER: "ref"})
+    r3 = _res_handle_of(call("get_rows"))["ref"]
+    assert r3 != r1, "같은 원문이라도 사람이 다르면 다른 ref(남의 ref 를 찾지 못한다)"
+
+
+def test_결과_손잡이_같은_원문을_한_시간_넘어_다시_받으면_기한을_새로_적는다(monkeypatch):
+    t0 = 1_800_000_000.0
+    ref, _sha = gw._res_store_sync("a@corp.com", "get_rows", _RES_TXT, None, now=t0)
+    assert gw._res_store_sync("a@corp.com", "get_rows", _RES_TXT, None, now=t0 + 60)[0] == ref
+    assert gw._RES_META[ref]["created_ts"] == t0, "한 시간 안이면 그대로"
+    again, _ = gw._res_store_sync("a@corp.com", "get_rows", _RES_TXT, None, now=t0 + 2 * 3600)
+    assert again == ref and gw._RES_META[ref]["expires_ts"] == t0 + 2 * 3600 + gw.RESULT_REF_TTL_S
+    assert gw._res_meta_from((gw.RES_DIR / f"{ref}.json").read_bytes())["expires_ts"] == t0 + 2 * 3600 + gw.RESULT_REF_TTL_S
+    assert gw._res_store_sync("a@corp.com", "get_rows", _RES_TXT, None, now=t0 + 2 * 3600 + gw.RESULT_REF_TTL_S + 1)[0] != ref, \
+        "끝난 것은 다시 쓰지 않는다"
+    live, _ = gw._res_store_sync("a@corp.com", "get_rows", _RES_TXT + "y", None, now=t0)
+    (gw.RES_DIR / f"{live}.body").unlink()
+    assert gw._res_store_sync("a@corp.com", "get_rows", _RES_TXT + "y", None, now=t0 + 1)[0] != live, "원문 파일이 없어진 ref 는 다시 쓰지 않는다"
+
+
+def test_결과_원문_청소는_끝난_것_깨진_것_떠돌이를_지우고_남의_파일은_두며_표를_다시_짓는다(monkeypatch):
+    t0 = 1_800_000_000.0
+    old, _ = gw._res_store_sync("a@corp.com", "t", _RES_TXT, None, now=t0)
+    new, _ = gw._res_store_sync("a@corp.com", "t", _RES_TXT + "x", None, now=t0 + 6 * 86400)
+    stray = gw.RES_DIR / ("res_" + "s" * 22 + ".body")            # 곁 JSON 없는 원문(한 시간 넘은 것)
+    stray.write_text("{}")
+    os.utime(stray, (t0, t0))
+    broken = gw.RES_DIR / ("res_" + "b" * 22 + ".json")           # 원문 없는 곁 JSON
+    broken.write_text("{}")
+    foreign = gw.RES_DIR / "README.txt"
+    foreign.write_text("남의 파일")
+    gw._RES_META.clear()                                           # 기동 — 표는 디스크에서 짓는다
+    got = gw._res_sweep_sync(now=t0 + 7 * 86400 + 1)
+    assert (got["expired"], got["broken"], got["orphans"], got["kept"]) == (1, 1, 1, 1)
+    assert sorted(p.name for p in gw.RES_DIR.iterdir()) == ["README.txt", f"{new}.body", f"{new}.json"]
+    assert set(gw._RES_META) == {new}
+    assert gw._res_load(old, now=t0 + 1) is None, "지운 것은 없다"
+    assert gw._res_health()["stored"] == 1
+    # 기한이 지났으면 청소 전이라도 읽히지 않는다(디스크의 곁 JSON 이 정본)
+    assert gw._res_load(new, now=t0 + 6 * 86400 + gw.RESULT_REF_TTL_S + 1) is None
+
+
+def test_결과_원문_상한은_사람당_오래된_것부터_지우고_이번_것은_남긴다(monkeypatch):
+    t0 = 1_800_000_000.0
+    one = gw._res_disk(len(json.dumps({"text": _RES_TXT, "structured": None}, ensure_ascii=False).encode()))
+    monkeypatch.setattr(gw, "RESULT_REF_OWNER_QUOTA", one * 2)
+    refs = [gw._res_store_sync("a@corp.com", "t", _RES_TXT + str(i), None, now=t0 + i)[0] for i in range(3)]
+    other = gw._res_store_sync("b@corp.com", "t", _RES_TXT, None, now=t0)[0]
+    assert set(gw._RES_META) == {refs[1], refs[2], other}, "그 사람의 가장 오래된 것만 지운다 — 남의 것은 그대로"
+    assert not (gw.RES_DIR / f"{refs[0]}.body").exists()
+    monkeypatch.setattr(gw, "RESULT_REF_OWNER_QUOTA", 1024)
+    assert gw._res_store_sync("a@corp.com", "t", _RES_TXT + "big", None, now=t0) is None, "상한보다 큰 원문은 두지 않는다(원문을 그대로 준다)"
+
+
+def _res_gate(monkeypatch, *, on=True):
+    """인증 미들웨어를 태워 앱이 받은 결과 머리(값 목록)를 본다."""
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", on)
+
+    def run(auth, claims, client=None, *, svc=False):
+        extra = [(gw.RESULT_HEADER.encode(), client.encode())] if client is not None else []
+        if svc:
+            h, st, _body, _ = _svc_gate(monkeypatch, claims, extra)
+        else:
+            h, st = _gate_headers(monkeypatch, auth, claims, extra)
+        assert st is None, st
+        return h.get(gw.RESULT_HEADER, [])
+    return run
+
+
+def test_결과_손잡이_머리는_사람_PAT_가_청할_때만_싣고_챗_절차_패널_서비스_GW_TOKEN_은_버린다(monkeypatch):
+    run = _res_gate(monkeypatch)
+    me = {"email": "u@corp.com", "groups": []}
+    assert run(b"Bearer me", me, "ref") == ["ref"]
+    assert run(b"Bearer me", me, " REF ") == ["ref"], "게이트웨이가 정한 'ref' 하나만 싣는다"
+    assert run(b"Bearer me", me, "full") == [] and run(b"Bearer me", me) == [], "청하지 않은 연결(루틴 · 리스크 앱 · MXWP 위키)은 원문"
+    chat = {**me, "pat_name": gw.CHAT_PAT_NAME, "jti": "chat-u-1790000000"}
+    assert run(b"Bearer chat", chat, "ref") == [], "웹 챗 PAT 는 늘 원문(그 결과는 에이전트 서버가 읽는다)"
+    assert run(b"Bearer proc", {**me, "purpose": gw.PROCEDURE_PURPOSE}, "ref") == [], "절차는 늘 원문"
+    assert run(b"Bearer panel", _panel_claims(), "ref") == [], "패널은 늘 원문"
+    assert run(b"Bearer gw-secret", None, "ref") == [], "GW_TOKEN(엔진 · 에이전트 서버)은 머리를 버린다"
+    _svc_file({_SVC_JOB: {"tools": []}})
+    assert run(b"Bearer s", _svc_claims(), "ref", svc=True) == [], "서비스 PAT 는 머리를 버린다"
+    off = _res_gate(monkeypatch, on=False)
+    assert off(b"Bearer me", me, "ref") == [], "끄면 싣지 않는다(클라이언트 사본도 버린다)"
+
+
+def test_결과_손잡이_도구는_박스_스위치만_보고_읽기_전용_PAT_도_부르며_겹치는_백엔드_이름은_접두를_단다(monkeypatch):
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", True)
+    names = {t.name for t in gw._local_tools()}
+    assert {"result_get", "result_ask"} <= names
+    assert gw._readonly_denial("result_get", {}) == "" and gw._readonly_denial("result_ask", {}) == ""
+    assert gw._panel_denial("result_get", {"app": "heax-step_forge"}) == "gateway-tool"
+    for t in gw.RESULT_TOOLS:
+        assert t.annotations.readOnlyHint is True
+        assert all(p.get("description") for p in t.inputSchema["properties"].values()), "인자 설명(점수판)"
+    b = _CallB(["result_get", "other"])
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": b})
+    for k, v in (("exposed_tools", []), ("route", {}), ("alias_route", {}), ("POLICY", {}), ("_ACCESS_POLICY", {})):
+        monkeypatch.setattr(gw, k, v)
+    asyncio.run(gw._aggregate())
+    assert "result_get" not in gw.route and "heaxstep_forge_result_get" in gw.route, "로컬 도구와 같은 이름의 백엔드 도구는 접두를 단다"
+    sent = []
+
+    async def send(m): sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/tools-map", "headers": []}, None, send))
+    assert json.loads(sent[1]["body"])["map"]["result_get"] == "_gateway"
+
+
+def test_결과_손잡이_health_는_켬_문턱_머리_보존_둔_수를_말한다(monkeypatch):
+    sent = []
+
+    async def send(m): sent.append(m)
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", False)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/health", "headers": []}, None, send))
+    assert json.loads(sent[1]["body"])["result_refs"] == {"enabled": False, "min_chars": 20000, "head_chars": 4000, "ttl_days": 7, "stored": 0}
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", True)
+    gw._res_store_sync("a@corp.com", "t", _RES_TXT, None)
+    sent.clear()
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/health", "headers": []}, None, send))
+    rr = json.loads(sent[1]["body"])["result_refs"]
+    assert rr["enabled"] is True and rr["stored"] == 1
+    assert gw._res_line().startswith("결과 손잡이 켬") and "X-HWAX-Result: ref" in gw._res_line()
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", False)
+    assert gw._res_line().startswith("결과 손잡이 끔") and "켜려면" in gw._res_line(), "안 켠 기능도 로그에"
+
+
+def test_결과_손잡이_도구_이름은_심의_좌석_자유_조회_접두에_걸리지_않는다():
+    """게이트웨이 로컬 읽기 도구 이름이 엔진의 _FREE_ALLOW 접두로 시작하면 심의 · 리스크 심사 좌석에 저절로 열린다(D-18) — 형제 리포 원문(AST)으로 본다."""
+    import ast
+    root = gw.Path(gw.__file__).resolve().parent.parent / "HWAXAgentServer"
+    if not (root / "deliberation.py").exists():
+        pytest.skip("형제 HWAXAgentServer 리포가 없다")
+    allow = next(ast.literal_eval(n.value) for n in ast.parse((root / "deliberation.py").read_text(encoding="utf-8")).body
+                 if isinstance(n, ast.Assign) and any(getattr(x, "id", "") == "_FREE_ALLOW" for x in n.targets))
+    assert len(allow) > 20, "추출이 깨졌다"
+    for t in gw.RESULT_TOOLS:
+        assert not t.name.startswith(tuple(allow)), t.name
+        assert not t.name.split("_", 1)[1].startswith(tuple(allow)), t.name
+
+
+def _res_agent(monkeypatch, responder):
+    """에이전트 서버 묻기 창구를 가짜로 — 받은 요청을 기록한다. 심의 백엔드 주소에서 /mcp 를 뗀 자리로 부르는지 본다."""
+    sent = []
+
+    def handler(req):
+        sent.append(req)
+        return responder(req)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(gw.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    from types import SimpleNamespace as NS
+    gw.backends["hwax-deliberation"] = NS(url="http://agent.test:9009/mcp/", session=None)
+    return sent
+
+
+def test_result_ask_는_원문을_에이전트_서버_묻기_창구에_서비스_자격과_사람_머리로_넘긴다(monkeypatch):
+    call, _b = _res_kit(monkeypatch, extra={gw.CORR_HEADER: "conv-1"})
+    ref = _res_handle_of(call("get_rows"))["ref"]
+    answer = {"answer": "줄00042 가 있다", "quotes": [{"page": 1, "start": 294, "end": 301, "text": "줄00042"}], "numbers": {"checked": 1},
+              "model": "qwen"}
+    sent = _res_agent(monkeypatch, lambda req: httpx.Response(200, json=answer))
+    res = call("result_ask", {"ref": ref, "question": "42번 줄이 있나?", "max_answer_chars": 500})
+    assert not res.isError and json.loads(res.content[0].text) == {"ref": ref, **answer}
+    req = sent[0]
+    assert str(req.url) == "http://agent.test:9009/llm/ask_over_text" and req.method == "POST"
+    assert req.headers["authorization"] == "Bearer gw-secret" and req.headers["x-hwax-user"] == "a@corp.com"
+    assert req.headers[gw.CORR_HEADER] == "conv-1"
+    assert json.loads(req.content) == {"text": _RES_TXT, "question": "42번 줄이 있나?", "max_answer_chars": 500}
+    call("result_ask", {"ref": ref, "question": "q"})
+    assert "max_answer_chars" not in json.loads(sent[1].content), "비우면 싣지 않는다(서버 기본)"
+    # 남의 ref 는 서버로 가지 않는다
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "b@corp.com", gw.RESULT_HEADER: "ref"})
+    assert call("result_ask", {"ref": ref, "question": "q"}).isError and len(sent) == 2
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", gw.RESULT_HEADER: "ref"})
+    assert "question 을 준다" in call("result_ask", {"ref": ref, "question": "  "}).content[0].text and len(sent) == 2
+
+
+@pytest.mark.parametrize("status,body,want", [
+    (404, {"detail": "Not Found"}, "RESULT_ASK_ENABLED"),
+    (401, {"error": "unauthorized"}, "공유 비밀"),
+    (503, {"error": "공유 비밀이 없다"}, "공유 비밀"),
+    (422, {"code": "too_long", "message": "질문이 너무 길다"}, "질문이 너무 길다"),
+    (200, {"no": "answer"}, "answer 가 없다"),
+])
+def test_result_ask_창구가_꺼졌거나_거절하면_사람이_읽을_글로_말한다(monkeypatch, status, body, want):
+    call, _b = _res_kit(monkeypatch)
+    ref = _res_handle_of(call("get_rows"))["ref"]
+    _res_agent(monkeypatch, lambda req: httpx.Response(status, json=body))
+    res = call("result_ask", {"ref": ref, "question": "q"})
+    assert res.isError and res.content[0].text.startswith("RESULT_ERROR: ") and want in res.content[0].text, res.content[0].text
+    assert "result_get" in res.content[0].text or status in (422, 200)
+
+
+def test_result_ask_에이전트_서버에_닿지_못하면_말한다(monkeypatch):
+    call, _b = _res_kit(monkeypatch)
+    ref = _res_handle_of(call("get_rows"))["ref"]
+
+    def boom(req):
+        raise httpx.ConnectError("refused")
+    _res_agent(monkeypatch, boom)
+    assert "닿지 못했다" in call("result_ask", {"ref": ref, "question": "q"}).content[0].text
+    gw.backends.pop("hwax-deliberation")
+    monkeypatch.setattr(gw, "BACKENDS", {"hwax-deliberation": {"url": "http://cfg.test:9009/mcp"}})
+    assert gw._agent_base() == "http://cfg.test:9009", "붙기 전이면 설정의 주소"
+    monkeypatch.setattr(gw, "BACKENDS", {})
+    assert gw._agent_base() is None
+    assert "hwax-deliberation" in call("result_ask", {"ref": ref, "question": "q"}).content[0].text
+
+
+def _res_internal(monkeypatch, path, headers, method="GET"):
+    """내부 창구를 인증 미들웨어째 태운다 — (상태, 몸, 앱으로 넘어간 경로)."""
+    sent, seen = [], []
+
+    async def app(scope, receive, send):
+        seen.append(scope["path"])
+
+    async def send(m): sent.append(m)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    asyncio.run(gw._bearer_gate(app, None)({"type": "http", "method": method, "path": path, "headers": headers,
+                                            "client": ("127.0.0.1", 0)}, None, send))
+    status = next((m["status"] for m in sent if m["type"] == "http.response.start"), None)
+    body = next((json.loads(m["body"]) for m in sent if m["type"] == "http.response.body"), None)
+    return status, body, seen
+
+
+def test_내부_창구는_공유_비밀과_주인_이메일일_때만_원문을_주고_nginx_를_거친_요청은_받지_않는다(monkeypatch):
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", True)
+    obj = {"k": [1, 2, 3]}
+    ref, sha = gw._res_store_sync("a@corp.com", "get_rows", _RES_TXT, obj)
+    path = f"/internal/result/{ref}"
+    ok = [(b"authorization", b"Bearer gw-secret"), (b"x-hwax-user", b"a%40corp.com")]
+    st, body, seen = _res_internal(monkeypatch, path, ok)
+    assert st == 200 and not seen
+    assert body["text"] == _RES_TXT and body["structured"] == obj and body["sha256"] == sha and body["chars"] == len(_RES_TXT)
+    assert (body["ref"], body["tool"], body["pages"]) == (ref, "get_rows", 2) and body["expires"]
+    row = [r for r in _audit_rows() if r["tool"] == "GET /internal/result"][-1]
+    assert row["ok"] and row["caller"] == "a@corp.com" and row["via"] == "gw-token" and row["note"] == ref
+    assert _res_internal(monkeypatch, path, [ok[0], (b"x-hwax-user", b"B@corp.com")])[:2] == (404, {"error": "not found"}), "남의 것"
+    assert _res_internal(monkeypatch, "/internal/result/res_" + "q" * 22, ok)[:2] == (404, {"error": "not found"}), "없는 것 — 같은 답"
+    assert _res_internal(monkeypatch, path, [ok[0]])[0] == 400, "사람 머리가 없다"
+    assert _res_internal(monkeypatch, path, [(b"authorization", b"Bearer wrong"), ok[1]])[0] == 401
+    assert _res_internal(monkeypatch, path, [(b"authorization", b"Bearer gw-secret"), *ok])[0] == 401, "Authorization 이 두 번이면 없는 것"
+    assert _res_internal(monkeypatch, path, ok, method="POST")[0] == 405
+    # nginx(/mcp-gw/)를 거친 요청 — X-Forwarded-* 가 있으면 이 길이 없다(지금처럼 아래 인증으로 간다)
+    for fwd in ((b"x-forwarded-for", b"203.0.113.9"), (b"x-forwarded-host", b"portal.example")):
+        st, body, seen = _res_internal(monkeypatch, path, [*ok, fwd])
+        assert seen == [path] and st is None, "공유 비밀이 맞아도 내부 창구가 아니라 앱(라우트 없음)으로 간다"
+        st, body, seen = _res_internal(monkeypatch, path, [ok[1], fwd])
+        assert st == 401 and not seen, "밖에서는 지금과 같은 401"
+    # 기한이 지나면 404 — 디스크의 곁 JSON 이 정본이다(청소 전이라도)
+    stale, _ = gw._res_store_sync("a@corp.com", "get_rows", _RES_TXT + "old", None, now=_ptime.time() - gw.RESULT_REF_TTL_S - 60)
+    assert (gw.RES_DIR / f"{stale}.body").exists()
+    assert _res_internal(monkeypatch, f"/internal/result/{stale}", ok)[0] == 404
+
+
+def test_결과_손잡이_SDK_의_tools_call_처리기가_바깥_처리기를_부른다(monkeypatch):
+    """줄이기는 _call_tool_entry 에만 있다 — SDK 에 등록된 처리기가 그것이 아니면 켜도 아무것도 줄지 않는다(안쪽 _call_tool 은 원문)."""
+    real = gw.fm._mcp_server
+    monkeypatch.setattr(real, "_tool_cache", {})
+    handler = real.request_handlers[types.CallToolRequest]
+    _res_kit(monkeypatch)
+    out = asyncio.run(handler(types.CallToolRequest(params=types.CallToolRequestParams(name="get_rows", arguments={})))).root
+    assert _RES_RE.fullmatch(_res_handle_of(out)["ref"]) and out.content[0].text == _RES_TXT[:gw.RESULT_REF_HEAD_CHARS]
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com"})
+    out = asyncio.run(handler(types.CallToolRequest(params=types.CallToolRequestParams(name="get_rows", arguments={})))).root
+    assert out.content[0].text == _RES_TXT, "머리 없는 연결은 원문"

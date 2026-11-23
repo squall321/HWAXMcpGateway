@@ -73,6 +73,8 @@
     ["^get_server_info$", "system"]
   ],
   "tools": {
+    "delegate_start": "system", "delegate_status": "system", "delegate_result": "system", "delegate_cancel": "system",
+    "draft_section": "report", "llm_transform": "report",
     "mesh_forecast": "mesh", "mesh_report": "mesh", "mesh_size_advice": "mesh", "remesh_parts": "mesh",
     "part_mesh_map": "mesh", "contact_preview": "mesh", "check_deck": "mesh", "set_interface": "mesh",
     "confirm_interfaces": "mesh", "list_interfaces": "mesh", "interface_graph": "mesh", "interface_summary": "mesh",

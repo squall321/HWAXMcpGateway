@@ -1473,7 +1473,7 @@ async def _aggregate():
         # 그림 도구(로컬)와 같은 이름의 백엔드 도구는 접두를 단다 — 맨 이름이면 tools/list 에 같은 이름이 둘이고 그 이름의 호출은 늘 로컬로 가서
         # 백엔드 도구에 닿지 못했다(반대 검토 7). 그림 저장 · PC 키트가 새로 맡은 이름만이다 — 다른 로컬 이름은 지금 그대로다.
         clash = (clash or (FIG_STORE_ON and t.name in _FIG_NAMES) or t.name == KIT_GET_TOOL.name
-                 or t.name == READONLY_ALLOWLIST_TOOL.name)
+                 or t.name == READONLY_ALLOWLIST_TOOL.name or (RESULT_REFS_ON and t.name in _RES_NAMES))
         if clash or key in family:
             prefix = key.replace("-", "")  # mx-white-paper -> mxwhitepaper
             exposed_name = f"{prefix}_{t.name}"
@@ -1970,6 +1970,10 @@ async def _backends_lifespan():
         if FIG_STORE_ON:
             _FIG_LIMITER["lim"] = anyio.CapacityLimiter(4)      # 그림 파일 일은 일꾼 넷까지 — 기본 풀(PAT 검증 등)을 다 잡지 않게
             tg.start_soon(_fig_sweep_loop)        # 기동 때 한 번 디스크에서 그림 표를 짓고, 뒤로는 주기마다 끝난 것을 치운다
+        if RESULT_REFS_ON or RES_DIR.is_dir():
+            # 결과 손잡이 원문 — 켰으면 표를 짓고 끝난 것을 치운다. 끈 뒤에도 폴더가 남아 있으면 돈다(켜 두었던 동안의 원문이 기한 뒤 지워지게)
+            _RES_LIMITER["lim"] = anyio.CapacityLimiter(4)
+            tg.start_soon(_res_sweep_loop)
         try:
             yield
         finally:
@@ -7933,6 +7937,633 @@ async def _fig_download(scope, send, pat_verifier, gw_auth: str) -> None:
         _aud(sent == size, None if sent == size else f"short: {sent}/{size}", caller=who, via=via, size=sent)
 
 
+# ── 결과 손잡이 — 큰 도구 결과를 원문 대신 머리 + 손잡이로(HWAXPortal docs/token-saving offload-v2 §3-2 B · TS-3 · TS-6) ─────────────────────────
+# 개인 Claude 의 토큰은 도구 결과가 문맥에 그대로 쌓이는 양에서 나온다(dev 감사에 한 번 50만 자). 큰 결과의 원문을 주인만 보는 저장소에 두고 Claude 에는
+# 앞머리와 손잡이(ref)만 준다 — 나머지는 result_get 으로 쪽을 받거나 result_ask 로 서버(에이전트 서버 묻기 창구)에 묻는다.
+#  · 켜는 조건 둘 — 박스 GATEWAY_RESULT_REFS=1 **그리고** 그 연결의 머리 X-HWAX-Result: ref. 머리는 보기 머리(E-4)처럼 PAT 분기에서만 정해 갈아
+#    끼운다 — 웹 챗 · 절차 · 패널 PAT 는 늘 원문이고, GW_TOKEN(엔진) · 서비스 분기는 머리를 버린다. 머리 없이 사람 PAT 로 부르는 서버 쪽 길(루틴 ·
+#    리스크 앱 · MXWP 위키)도 원문이다(TS-3 — via=pat 로 가르지 않는 까닭). 하나라도 없으면 결과 · 목록 · 경로가 지금과 바이트까지 같다.
+#  · 줄이는 자리는 바깥 호출 하나뿐이다(_call_tool_entry) — 게이트웨이 안쪽 호출(browse_experts 의 list_agents · 루틴 · 온톨로지 조회 …)은 원문을
+#    받는다. 응답 캐시 · 쓰기 뒤 비우기 · 근거 원장(verify_answer — 검증 근거에는 전체) · 감사 chars(원문 크기) · 그림 보관은 줄이기 앞이라 그대로다.
+#  · 결과 글(글 블록을 줄바꿈으로 이은 것 — structuredContent 의 촘촘한 JSON 이 더 길면 그것)이 GATEWAY_RESULT_REF_MIN_CHARS 를 넘을 때만 — 글
+#    블록 대신 머리(앞 GATEWAY_RESULT_REF_HEAD_CHARS 자)와 손잡이 {ref, chars, sha256, pages, how} 를 주고, structuredContent 는 같은 꼴(+head)로
+#    준다. 그림 블록 · 그림 저장 줄은 그대로 둔다. 실패 결과 · 주인(검증된 신원) 없음 · result_get · result_ask 자신은 줄이지 않는다.
+#  · 이 연결의 tools/list 는 outputSchema 를 뗀다 — 줄인 structuredContent 는 도구의 출력 스키마에 맞지 않아 Claude Code(MCP TS SDK)가 결과를
+#    거절한다(스키마가 있으면 검증한다). 끈 연결 · 머리 없는 연결의 목록은 그대로다.
+#  · 저장 — 그림 보관소와 같은 꼴: ref 는 res_ + 무작위 16바이트, 곁 JSON(주인 · 도구 · 글자 · sha256 · 바이트 · 만든 때 · 끝나는 때)과 원문 파일
+#    (.body — {text, structured}), 파일 0600 · 폴더 0700, 같은 사람 · 같은 원문은 같은 ref(한 시간 넘게 지났으면 기한을 새로 적는다), 기한
+#    GATEWAY_RESULT_REF_TTL_DAYS(7일) · 사람당 · 전체 상한(넘으면 오래된 것부터), 청소는 주기마다 디스크에서 다시 짓는다. 비밀이 원문 그대로 남는
+#    것은 지금 결과도 같다 — 새로 가리지 않고 주인만 · 기한 뒤 지운다.
+#  · 내부 창구 GET /internal/result/<ref> — 에이전트 서버(draft_section)가 근거 ref 를 읽는다(_res_internal_http).
+RESULT_REFS_ON = os.environ.get("GATEWAY_RESULT_REFS", "").strip() == "1"
+RESULT_HEADER = "x-hwax-result"            # 연결 머리 — 값이 'ref' 일 때만. 게이트웨이가 PAT 분기에서 정해 싣고 클라이언트 사본은 모든 분기가 버린다
+RESULT_HEADER_REF = "ref"
+RESULT_REF_MIN_CHARS = _fig_env_int("GATEWAY_RESULT_REF_MIN_CHARS", 20000, 1000)   # 이 글자 수를 넘는 결과만 줄인다
+RESULT_REF_HEAD_CHARS = _fig_env_int("GATEWAY_RESULT_REF_HEAD_CHARS", 4000, 0)     # 줄인 결과에 싣는 앞머리
+if RESULT_REF_HEAD_CHARS >= RESULT_REF_MIN_CHARS:
+    log.warning("GATEWAY_RESULT_REF_HEAD_CHARS=%d 가 _MIN_CHARS=%d 보다 작지 않다 — 줄인 결과가 원문보다 길어진다. 머리를 %d 자로 돈다",
+                RESULT_REF_HEAD_CHARS, RESULT_REF_MIN_CHARS, RESULT_REF_MIN_CHARS // 2)
+    RESULT_REF_HEAD_CHARS = RESULT_REF_MIN_CHARS // 2
+RESULT_REF_TTL_DAYS = _fig_env_int("GATEWAY_RESULT_REF_TTL_DAYS", 7, 1)          # 원문 하나의 보존(날)
+RESULT_REF_TTL_S = RESULT_REF_TTL_DAYS * 86400
+RESULT_REF_OWNER_QUOTA = _fig_env_int("GATEWAY_RESULT_REF_OWNER_QUOTA", 1024 ** 3, 1024)      # 사람당 디스크 몫 — 넘으면 그 사람의 오래된 것부터
+RESULT_REF_TOTAL_CAP = _fig_env_int("GATEWAY_RESULT_REF_TOTAL_CAP", 10 * 1024 ** 3, 1024)     # 전체 디스크 몫 — 넘으면 모두의 오래된 것부터
+RESULT_REF_SWEEP_S = _fig_env_int("GATEWAY_RESULT_REF_SWEEP_S", 3600, 30)                     # 청소 주기
+RESULT_PAGE_CHARS = 20000                  # result_get 의 기본 쪽 — 손잡이의 pages 가 이것으로 센다
+RESULT_PAGE_MIN, RESULT_PAGE_MAX = 1000, 100000
+RESULT_ASK_Q_MAX = 2000                    # result_ask 질문 상한
+RESULT_ASK_PATH = "/llm/ask_over_text"     # 에이전트 서버 묻기 창구(offload-v2 §3-2) — 그쪽 스위치 RESULT_ASK_ENABLED 가 꺼지면 404
+RESULT_INTERNAL_PREFIX = "/internal/result/"
+_RES_DELIB_BACKEND = "hwax-deliberation"   # 에이전트 서버 MCP 백엔드 키 — 묻기 창구의 주소는 이 백엔드 주소에서 /mcp 를 뗀 것이다
+
+
+def _res_dir_setting() -> Path:
+    """감사 원장이 사는 데이터 루트의 results — 원장이 리포 안이면(데이터 루트 없는 박스) 리포 옆 <리포>-results. GATEWAY_RESULT_REF_DIR 이 덮는다
+    (상대 경로는 리포 루트 기준). 체크아웃 밖이어야 한다(git stash -u — 그림 폴더와 같은 까닭)."""
+    repo = Path(__file__).resolve().parent
+    raw = (os.environ.get("GATEWAY_RESULT_REF_DIR") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        return p if p.is_absolute() else repo / p
+    root = Path(AUDIT_PATH).expanduser().resolve().parent
+    if root == repo or repo in root.parents:
+        return repo.with_name(repo.name + "-results")
+    return root / "results"
+
+
+RES_DIR = _res_dir_setting()
+_RES_REF_RE = re.compile(r"res_[A-Za-z0-9_-]{22}")
+_RES_FILE_RE = re.compile(r"(res_[A-Za-z0-9_-]{22})\.(?:json|body)(?:\.part)?")      # 청소가 지워도 되는 이름 — 이 꼴만 지운다
+_RES_LOCK = threading.Lock()
+_RES_META: dict[str, dict] = {}            # ref → 곁 JSON + created_ts · expires_ts — 청소가 디스크에서 다시 짓는다
+_RES_KEY: dict[tuple, str] = {}            # (주인, sha256) → ref — 같은 원문은 같은 ref(캐시 적중 · 같은 호출)
+_RES_USAGE: dict[str, int] = {}            # 주인 → 디스크 몫 합
+_RES_TOTAL = {"bytes": 0}
+_RES_SWEEP: dict = {"on": False, "added": set(), "dropped": set()}
+_RES_LIMITER: dict = {"lim": None}         # 파일 일의 일꾼 수 — 기동이 만든다(없으면 기본 풀)
+# 그림 저장이 결과 끝에 덧붙이는 글 블록의 머리(_fig_note) — 줄일 때 이 블록은 원문에 넣지 않고 그대로 둔다(그림 ref 를 Claude 가 본다)
+_FIG_NOTE_HEADS = ("그림 저장 — ", "그림 저장 못 함 — ")
+
+
+def _res_disk(n: int) -> int:
+    """원문 하나의 디스크 몫 — 원문 파일을 4 KiB 블록으로 올려 세고 곁 JSON 한 블록을 더한다(그림과 같은 셈)."""
+    return -(-n // 4096) * 4096 + 4096
+
+
+def _res_thread(fn, *args):
+    return anyio.to_thread.run_sync(fn, *args, limiter=_RES_LIMITER["lim"])
+
+
+def _res_files(ref: str) -> list[Path]:
+    return [RES_DIR / f"{ref}.body", RES_DIR / f"{ref}.json"]
+
+
+def _res_add(ref: str, meta: dict) -> None:
+    """표에 넣는다(잠금 안에서)."""
+    disk = _res_disk(meta["bytes"])
+    _RES_META[ref] = meta
+    _RES_KEY[(meta["owner"], meta["sha256"])] = ref
+    _RES_USAGE[meta["owner"]] = _RES_USAGE.get(meta["owner"], 0) + disk
+    _RES_TOTAL["bytes"] += disk
+    if _RES_SWEEP["on"]:
+        _RES_SWEEP["added"].add(ref)
+
+
+def _res_forget(ref: str) -> None:
+    """표에서만 뺀다(잠금 안에서) — 파일은 그대로다."""
+    meta = _RES_META.pop(ref, None)
+    if meta is None:
+        return
+    owner, disk = meta["owner"], _res_disk(meta["bytes"])
+    if _RES_KEY.get((owner, meta["sha256"])) == ref:
+        del _RES_KEY[(owner, meta["sha256"])]
+    left = _RES_USAGE.get(owner, 0) - disk
+    if left > 0:
+        _RES_USAGE[owner] = left
+    else:
+        _RES_USAGE.pop(owner, None)
+    _RES_TOTAL["bytes"] = max(0, _RES_TOTAL["bytes"] - disk)
+    if _RES_SWEEP["on"]:
+        _RES_SWEEP["dropped"].add(ref)
+
+
+def _res_unlink(ref: str) -> None:
+    for p in _res_files(ref):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("결과 원문 파일을 지우지 못했다(%s): %r", p.name, exc)
+
+
+def _res_drop(ref: str) -> None:
+    _res_forget(ref)
+    _res_unlink(ref)
+
+
+def _res_enforce(keep=frozenset()) -> int:
+    """사람당 상한을 먼저, 그다음 전체 상한 — 넘친 만큼 오래된 것부터 지운다(keep 은 빼고). 잠금 안에서 부른다."""
+    over = {o for o, n in _RES_USAGE.items() if n > RESULT_REF_OWNER_QUOTA}
+    if not over and _RES_TOTAL["bytes"] <= RESULT_REF_TOTAL_CAP:
+        return 0
+    order = sorted(_RES_META, key=lambda r: (_RES_META[r]["created_ts"], r))
+    n = 0
+    for ref in order:
+        m = _RES_META.get(ref)
+        if m is not None and ref not in keep and m["owner"] in over and _RES_USAGE.get(m["owner"], 0) > RESULT_REF_OWNER_QUOTA:
+            _res_drop(ref)
+            n += 1
+    for ref in order:
+        if _RES_TOTAL["bytes"] <= RESULT_REF_TOTAL_CAP:
+            break
+        if ref in _RES_META and ref not in keep:
+            _res_drop(ref)
+            n += 1
+    return n
+
+
+def _res_side(owner: str, tool: str, chars: int, sha: str, size: int, now: float) -> dict:
+    return {"owner": owner, "tool": tool, "chars": chars, "sha256": sha, "bytes": size,
+            "created": _fig_iso(now), "expires": _fig_iso(now + RESULT_REF_TTL_S)}
+
+
+def _res_store_sync(owner: str, tool: str, text: str, structured, now: float | None = None) -> tuple[str, str] | None:
+    """원문(이은 글 · structuredContent)을 두고 (ref, 글의 sha256) 을 준다 — 같은 사람 · 같은 글이 살아 있으면 그 ref. 두지 못하면 None(호출부가
+    원문을 그대로 준다). 일꾼 스레드에서 돈다. 원문 파일은 잠금 밖에서 쓴다(무작위 새 이름이라 겹칠 일이 없다) — 큰 원문을 쓰는 동안 다른 결과가
+    멈추지 않게."""
+    now = time.time() if now is None else now
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    with _RES_LOCK:
+        ref = _RES_KEY.get((owner, sha))
+        m = _RES_META.get(ref) if ref else None
+        if (m is not None and m["expires_ts"] > now and (RES_DIR / f"{ref}.json").is_file()
+                and (RES_DIR / f"{ref}.body").is_file()):
+            if m["expires_ts"] - now < RESULT_REF_TTL_S - 3600:
+                # 다시 받은 결과의 ref 가 옛 기한으로 곧 끝나지 않게 만든 때 · 끝나는 때를 새로 적는다(그림 _fig_reuse 와 같다)
+                side = _res_side(owner, m["tool"], m["chars"], sha, m["bytes"], now)
+                try:
+                    _fig_write(RES_DIR / f"{ref}.json", json.dumps(side, ensure_ascii=False).encode("utf-8"))
+                except OSError as exc:
+                    log.warning("결과 원문 기한을 새로 적지 못했다(%s) — 새로 둔다: %r", ref, exc)
+                    ref = None
+                else:
+                    _res_forget(ref)
+                    _res_add(ref, {**side, "created_ts": now, "expires_ts": now + RESULT_REF_TTL_S})
+            if ref is not None:
+                return ref, sha
+    body = json.dumps({"text": text, "structured": structured}, ensure_ascii=False, default=str).encode("utf-8")
+    if _res_disk(len(body)) > min(RESULT_REF_OWNER_QUOTA, RESULT_REF_TOTAL_CAP):
+        log.warning("결과 원문 %d 바이트가 사람당 · 전체 상한보다 커 두지 않는다 — 원문을 그대로 준다(%s)", len(body), tool)
+        return None
+    ref = "res_" + secrets.token_urlsafe(16)
+    side = _res_side(owner, tool, len(text), sha, len(body), now)
+    try:
+        RES_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _fig_write(RES_DIR / f"{ref}.body", body)
+        _fig_write(RES_DIR / f"{ref}.json", json.dumps(side, ensure_ascii=False).encode("utf-8"))
+    except OSError as exc:
+        log.warning("결과 원문을 디스크에 쓰지 못했다(%s) — 원문을 그대로 준다: %r", RES_DIR, exc)
+        for p in _res_files(ref):
+            for q in (p, p.with_name(p.name + ".part")):
+                try:
+                    q.unlink()
+                except OSError:
+                    pass
+        return None
+    with _RES_LOCK:
+        _res_add(ref, {**side, "created_ts": now, "expires_ts": now + RESULT_REF_TTL_S})
+        _res_enforce(keep={ref})
+    return ref, sha
+
+
+def _res_meta_from(blob) -> dict | None:
+    """곁 JSON → 정보(+created_ts · expires_ts). JSON · 칸이 어긋나면 None."""
+    try:
+        m = json.loads(blob)
+        meta = {"owner": str(m["owner"]), "tool": str(m["tool"]), "chars": int(m["chars"]), "sha256": str(m["sha256"]),
+                "bytes": int(m["bytes"]), "created": str(m["created"]), "expires": str(m["expires"])}
+        meta["created_ts"], meta["expires_ts"] = _fig_ts(meta["created"]), _fig_ts(meta["expires"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not meta["owner"] or meta["chars"] < 0 or meta["bytes"] < 0:
+        return None
+    return meta
+
+
+def _res_load(ref: str, now: float | None = None) -> dict | None:
+    """읽을 수 있는 원문의 정보 — ref 꼴이 맞고 곁 JSON 이 맞고 끝나지 않았고 원문 파일이 있으면, 아니면 None. 표가 아니라 디스크가 정본이다
+    (주인 판정)."""
+    if not isinstance(ref, str) or not _RES_REF_RE.fullmatch(ref):
+        return None
+    try:
+        with _fig_open(RES_DIR / f"{ref}.json") as f:
+            meta = _res_meta_from(f.read())
+    except OSError:
+        return None
+    if meta is None or meta["expires_ts"] <= (time.time() if now is None else now) or not (RES_DIR / f"{ref}.body").is_file():
+        return None
+    return {**meta, "ref": ref}
+
+
+def _res_read_body(meta: dict) -> tuple[str, object]:
+    """원문 (글, structuredContent) — 링크는 따라가지 않는다. 못 읽으면 OSError(호출부가 없는 것과 같은 말을 한다)."""
+    with _fig_open(RES_DIR / f"{meta['ref']}.body") as f:
+        try:
+            d = json.loads(f.read())
+            return str(d["text"]), d.get("structured")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise OSError(f"원문 파일이 깨졌다: {exc!r}") from None
+
+
+def _res_sweep_sync(now: float | None = None) -> dict:
+    """청소 — 디스크에서 표를 다시 짓는다(그림 청소와 같은 꼴). 곁 JSON 은 잠금 밖에서 읽고 잠금 안에서는 표만 바꿔 끼운다. 끝난 것 · 곁 JSON 이
+    깨진 것 · 원문 없는 곁 JSON 을 지우고, 곁 JSON 없는 원문 · 남은 .part(한 시간 넘은 것)를 지우고, 상한을 다시 지킨다. 못 읽은 곁 JSON(권한 · I/O)은
+    지우지도 세지도 않는다."""
+    now = time.time() if now is None else now
+    gone = {"expired": 0, "broken": 0, "orphans": 0, "unreadable": 0}
+    with _RES_LOCK:
+        _RES_SWEEP.update(on=True, added=set(), dropped=set())
+    evicted = 0
+    known: set[str] = set()
+    try:
+        try:
+            entries = list(os.scandir(RES_DIR))
+        except FileNotFoundError:
+            entries = []
+        live: dict[str, dict] = {}
+        dead: list[str] = []
+        held: set[str] = set()
+        for e in entries:
+            if not e.name.endswith(".json") or not _RES_REF_RE.fullmatch(e.name[:-5]):
+                continue
+            ref = e.name[:-5]
+            try:
+                with _fig_open(Path(e.path)) as f:
+                    blob = f.read()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                held.add(ref)
+                gone["unreadable"] += 1
+                continue
+            meta = _res_meta_from(blob)
+            if meta is None or not (RES_DIR / f"{ref}.body").is_file():
+                dead.append(ref)
+                gone["broken"] += 1
+            elif meta["expires_ts"] <= now:
+                dead.append(ref)
+                gone["expired"] += 1
+            else:
+                live[ref] = meta
+        with _RES_LOCK:
+            added, dropped = _RES_SWEEP["added"], _RES_SWEEP["dropped"]
+            _RES_SWEEP.update(on=False, added=set(), dropped=set())
+            carry = {r: _RES_META[r] for r in added if r in _RES_META}
+            _RES_META.clear()
+            _RES_KEY.clear()
+            _RES_USAGE.clear()
+            _RES_TOTAL["bytes"] = 0
+            for r, m in live.items():
+                if r not in dropped and r not in carry:
+                    _res_add(r, m)
+            for r, m in carry.items():
+                _res_add(r, m)
+            evicted = _res_enforce()
+            known = set(_RES_META)
+        for ref in dead:
+            if ref not in known:
+                _res_unlink(ref)
+        for e in entries:
+            m = _RES_FILE_RE.fullmatch(e.name)
+            if not m or e.name.endswith(".json") or m.group(1) in known or m.group(1) in held or m.group(1) in live:
+                continue
+            try:
+                if now - e.stat(follow_symlinks=False).st_mtime > 3600 and (e.is_symlink() or e.is_file()):
+                    os.unlink(e.path)
+                    gone["orphans"] += 1
+            except OSError:
+                pass
+    finally:
+        with _RES_LOCK:
+            if _RES_SWEEP["on"]:
+                _RES_SWEEP.update(on=False, added=set(), dropped=set())
+    return {**gone, "evicted": evicted, "kept": len(known), "bytes": _RES_TOTAL["bytes"]}
+
+
+async def _res_sweep_loop() -> None:
+    """기동 때 한 번(표를 채운다), 뒤로는 RESULT_REF_SWEEP_S 마다 — 한 번의 실패가 루프를 죽이지 않는다. 스위치를 끈 뒤에도 폴더가 남아 있으면 돈다 —
+    켜 두었던 동안의 원문이 기한 뒤 지워지게."""
+    while True:
+        try:
+            got = await _res_thread(_res_sweep_sync)
+            if got["expired"] or got["evicted"] or got["broken"] or got["orphans"] or got["unreadable"]:
+                log.info("결과 원문 청소 — 끝남 %d · 상한 %d · 깨짐 %d · 떠돌이 %d 지움, 못 읽음 %d(그대로 둔다), 남은 %d개 %s", got["expired"],
+                         got["evicted"], got["broken"], got["orphans"], got["unreadable"], got["kept"], _fig_size(got["bytes"]))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("결과 원문 청소 실패: %r", exc)
+        await anyio.sleep(RESULT_REF_SWEEP_S)
+
+
+def _request_result_ref() -> bool:
+    """이 요청이 결과 손잡이를 청한 연결인가 — 게이트웨이가 PAT 분기에서만 싣는 머리(RESULT_HEADER)를 읽는다. 문맥이 없으면 아니다."""
+    try:
+        req = _low.request_context.request
+    except LookupError:
+        return False
+    h = req.headers if req is not None else {}
+    return str(h.get(RESULT_HEADER) or "").strip().lower() == RESULT_HEADER_REF
+
+
+def _res_split(res) -> tuple[str, object, list] | None:
+    """줄일 결과면 (원문 글, structuredContent, 남길 블록), 아니면 None. 원문 글은 글 블록(그림 저장 줄 빼고)을 줄바꿈으로 이은 것이고, structuredContent
+    의 촘촘한 JSON 이 더 길면 그것이다(손잡이의 chars · sha256 · 쪽이 이 글을 센다). 그림 블록 · 그림 저장 줄은 남긴다."""
+    texts, keep = [], []
+    for c in getattr(res, "content", None) or []:
+        t = getattr(c, "text", None)
+        if getattr(c, "type", None) == "text" and isinstance(t, str) and not (FIG_STORE_ON and t.startswith(_FIG_NOTE_HEADS)):
+            texts.append(t)
+        else:
+            keep.append(c)
+    text = "\n".join(texts)
+    sc = getattr(res, "structuredContent", None)
+    if sc is not None:
+        sjson = json.dumps(sc, ensure_ascii=False, separators=(",", ":"), default=str)
+        if len(sjson) > len(text):
+            text = sjson
+    if len(text) <= RESULT_REF_MIN_CHARS:
+        return None
+    return text, sc, keep
+
+
+def _res_pages(chars: int, page_chars: int = RESULT_PAGE_CHARS) -> int:
+    return max(1, -(-chars // page_chars))
+
+
+def _res_handle(ref: str, sha: str, text: str, head: str) -> dict:
+    """손잡이 — {ref, chars, sha256, pages, how}(offload-v2 §3-2). pages 는 result_get 의 기본 쪽(20,000자)으로 센다."""
+    chars, pages = len(text), _res_pages(len(text))
+    return {"ref": ref, "chars": chars, "sha256": sha, "pages": pages,
+            "how": (f"원문 {chars:,}자 가운데 앞 {len(head):,}자만 실었다. 원문은 게이트웨이에 {RESULT_REF_TTL_DAYS}일 둔다(이 결과를 받은 사람만 본다) — "
+                    f"쪽으로 받기 result_get(ref, page=1~{pages}, 한 쪽 {RESULT_PAGE_CHARS:,}자) · 서버 LLM 에 묻기 result_ask(ref, question). "
+                    "sha256 은 원문 글(UTF-8)의 것이다")}
+
+
+def _res_inner_name(name: str, arguments) -> str:
+    """invoke_tool 이면 안쪽 이름, 아니면 그 이름."""
+    if name == INVOKE_TOOL.name and isinstance(arguments, dict):
+        return str(arguments.get("name") or "").strip()
+    return name
+
+
+async def _res_keep(name: str, arguments, res):
+    """바깥 호출의 큰 결과를 머리 + 손잡이로 줄인 **사본**을 준다 — 실패 · 작은 결과 · 주인 없음 · result_* 자신 · 저장 실패면 그대로다.
+    ⚠ 던지지 않는다 — 결과 손잡이가 도구 결과를 막으면 안 된다(저장이 안 되면 원문을 준다)."""
+    if res is None or not isinstance(res, types.CallToolResult) or res.isError:
+        return res
+    try:
+        tool = _res_inner_name(name, arguments)
+        if name in _RES_NAMES or tool in _RES_NAMES:
+            return res
+        owner = _request_user()
+        if not owner:
+            return res
+        got = _res_split(res)
+        if got is None:
+            return res
+        text, sc, keep = got
+        kept = await _res_thread(_res_store_sync, owner, tool[:120], text, sc)
+        if kept is None:
+            return res
+        head = text[:RESULT_REF_HEAD_CHARS]
+        handle = _res_handle(*kept, text, head)
+        blocks = ([types.TextContent(type="text", text=head)] if head else []) + [
+            types.TextContent(type="text", text=json.dumps(handle, ensure_ascii=False, separators=(",", ":")))]
+        return res.model_copy(update={"content": blocks + keep,
+                                      "structuredContent": None if sc is None else {**handle, "head": head}})
+    except Exception as exc:  # noqa: BLE001 — 결과 손잡이가 도구 결과를 막으면 안 된다
+        log.warning("결과 손잡이 실패(%s) — 원문을 그대로 준다: %r", name, exc)
+        return res
+
+
+_RES_REF_ARG = {"type": "string", "maxLength": 26, "description": "결과 손잡이 — 줄인 도구 결과의 ref(res_… 26자)"}
+RESULT_GET_TOOL = types.Tool(
+    name="result_get",
+    description=("줄인 도구 결과(결과 손잡이 res_…)의 원문을 쪽으로 받는다 — 게이트웨이가 큰 결과를 앞머리 + ref 로 줄였을 때 나머지를 읽는다. "
+                 "첫 블록은 {ref, page, pages, page_chars, start, end, chars}, 둘째 블록이 그 쪽의 원문 글이다. 내 결과만 보인다. "
+                 "통째로 읽기보다 result_ask 로 물어보는 편이 토큰이 적다."),
+    inputSchema={"type": "object", "properties": {
+        "ref": _RES_REF_ARG,
+        "page": {"type": "integer", "minimum": 1, "description": "받을 쪽(1부터, 기본 1) — 손잡이의 pages 가 기본 쪽 크기의 쪽 수다"},
+        "page_chars": {"type": "integer", "minimum": RESULT_PAGE_MIN, "maximum": RESULT_PAGE_MAX,
+                       "description": f"한 쪽 글자 수({RESULT_PAGE_MIN:,} ~ {RESULT_PAGE_MAX:,}자, 기본 {RESULT_PAGE_CHARS:,})"}},
+        "required": ["ref"]},
+    annotations=types.ToolAnnotations(readOnlyHint=True))
+RESULT_ASK_TOOL = types.Tool(
+    name="result_ask",
+    description=("줄인 도구 결과(결과 손잡이 res_…)의 원문에 서버 LLM 이 답한다 — 원문을 Claude 로 가져오지 않고 묻는다. 답은 "
+                 "{ref, answer, quotes: [{page, start, end, text}], numbers, model} — 인용은 원문 위치이고 원문에 없는 인용은 서버가 버린다. "
+                 "내 결과만 묻는다. 서버의 묻기 창구가 꺼져 있으면 그렇다고 말한다(그때는 result_get)."),
+    inputSchema={"type": "object", "properties": {
+        "ref": _RES_REF_ARG,
+        "question": {"type": "string", "maxLength": RESULT_ASK_Q_MAX, "description": f"원문에 물을 것({RESULT_ASK_Q_MAX:,}자까지)"},
+        "max_answer_chars": {"type": "integer", "minimum": 100, "maximum": 20000,
+                             "description": "답의 글자 상한(100 ~ 20,000자, 비우면 서버 기본)"}},
+        "required": ["ref", "question"]},
+    annotations=types.ToolAnnotations(readOnlyHint=True))
+RESULT_TOOLS = (RESULT_GET_TOOL, RESULT_ASK_TOOL)
+_RES_NAMES = frozenset(t.name for t in RESULT_TOOLS)
+
+
+def _res_tools() -> tuple:
+    """도구 목록에 싣는 결과 손잡이 도구 — 박스 스위치만 본다(연결 머리는 보지 않는다 — 머리 없는 연결에도 보인다. 그 연결에는 손잡이가 생기지
+    않아 부르면 '없다' 로 끝난다. 연결마다 목록이 갈리면 같은 PAT 의 다른 클라이언트가 서로 다른 도구를 본다)."""
+    return RESULT_TOOLS if RESULT_REFS_ON else ()
+
+
+def _res_line() -> str:
+    """기동 로그 한 줄 — 켰는지 · 어디에 · 손잡이. 끈 것도 남긴다(안 켠 기능도 로그에)."""
+    if not RESULT_REFS_ON:
+        return ("결과 손잡이 끔(GATEWAY_RESULT_REFS) — 큰 도구 결과는 종전대로 원문 그대로 간다. 켜려면 GATEWAY_RESULT_REFS=1 로 재기동하고, "
+                "개인 Claude 연결에 머리 X-HWAX-Result: ref 를 단다(HWAXPortal docs/token-saving offload-v2 B)")
+    repo = Path(__file__).resolve().parent
+    inside = RES_DIR.resolve() == repo or repo in RES_DIR.resolve().parents
+    return (f"결과 손잡이 켬 — 머리 X-HWAX-Result: ref 인 연결만 · {RES_DIR} · {RESULT_REF_MIN_CHARS:,}자 넘는 결과 · 머리 {RESULT_REF_HEAD_CHARS:,}자 · "
+            f"보존 {RESULT_REF_TTL_DAYS}일 · 사람당 {_fig_size(RESULT_REF_OWNER_QUOTA)} · 전체 {_fig_size(RESULT_REF_TOTAL_CAP)} · 청소 {RESULT_REF_SWEEP_S}초"
+            + (" · ⚠ 체크아웃 안이다 — git stash -u 가 쓸어 갈 수 있다(GATEWAY_RESULT_REF_DIR 를 리포 밖으로)" if inside else ""))
+
+
+def _res_health() -> dict:
+    """/health 의 result_refs — 포털 E(PC 킷 칸)가 '이 박스에서 꺼져 있음' 을 가린다. 수만 싣는다(주인 · ref 는 싣지 않는다)."""
+    return {"enabled": RESULT_REFS_ON, "min_chars": RESULT_REF_MIN_CHARS, "head_chars": RESULT_REF_HEAD_CHARS,
+            "ttl_days": RESULT_REF_TTL_DAYS, "stored": len(_RES_META)}
+
+
+class _ResError(Exception):
+    """결과 손잡이 도구가 호출자에게 그대로 말할 까닭."""
+
+
+_RES_MISSING = "그런 결과 손잡이가 없다 — 없거나 · 보존 기간이 지났거나 · 내 것이 아니다"
+
+
+def _res_int(a: dict, key: str, default: int | None, lo: int, hi: int) -> int | None:
+    v = a.get(key)
+    if v is None or v == "":
+        return default
+    if isinstance(v, bool) or not isinstance(v, (int, str)) or not str(v).strip().isdigit() or not lo <= int(v) <= hi:
+        raise _ResError(f"{key} 는 {lo:,} ~ {hi:,} 의 정수다")
+    return int(v)
+
+
+def _agent_base() -> str | None:
+    """에이전트 서버의 HTTP 뿌리 — 게이트웨이가 이미 부르는 심의 백엔드(hwax-deliberation)의 주소에서 /mcp 를 뗀 것. 없으면 None."""
+    b = backends.get(_RES_DELIB_BACKEND)
+    url = str(getattr(b, "url", "") or (BACKENDS.get(_RES_DELIB_BACKEND) or {}).get("url") or "").strip().rstrip("/")
+    if not url:
+        return None
+    return url[:-len("/mcp")] if url.endswith("/mcp") else url
+
+
+async def _res_ask(ref: str, text: str, a: dict, owner: str) -> dict:
+    """에이전트 서버 묻기 창구 POST /llm/ask_over_text — 게이트웨이 서비스 자격(Authorization: Bearer GW_TOKEN — 에이전트 서버의 공유 비밀 창구와 같은
+    값, seat_box.secret) + 사람 이메일 머리(x-hwax-user) + 상관 ID(있으면). 본문 {text, question, max_answer_chars?}. 꺼져 있으면(404) 사람이 읽을
+    글로 말한다. 한도는 게이트웨이 호출 한도(GATEWAY_CALL_TIMEOUT)와 같다."""
+    q = str(a.get("question") or "").strip()
+    if not q:
+        raise _ResError("question 을 준다 — 원문에 물을 것")
+    if len(q) > RESULT_ASK_Q_MAX:
+        raise _ResError(f"question 은 {RESULT_ASK_Q_MAX:,}자까지다")
+    body: dict = {"text": text, "question": q}
+    mac = _res_int(a, "max_answer_chars", None, 100, 20000)
+    if mac is not None:
+        body["max_answer_chars"] = mac
+    base = _agent_base()
+    if not base or not GW_TOKEN:
+        raise _ResError("에이전트 서버 묻기 창구를 부를 수 없다 — 게이트웨이 설정에 심의 백엔드(hwax-deliberation) 주소나 공유 비밀이 없다. "
+                        "result_get 으로 쪽을 받아 읽는다")
+    hdrs = {"authorization": f"Bearer {GW_TOKEN}", "content-type": "application/json", USER_HEADER: quote(owner, safe="@.")}
+    corr = _request_corr()
+    if corr:
+        hdrs[CORR_HEADER] = corr
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(CALL_TIMEOUT_S, connect=8.0)) as cli:
+            r = await cli.post(f"{base}{RESULT_ASK_PATH}", content=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers=hdrs)
+    except httpx.TimeoutException:
+        raise _ResError(f"에이전트 서버 묻기 창구가 {CALL_TIMEOUT_S}초 안에 답하지 않았다 — 질문을 좁히거나 result_get 으로 쪽을 받아 읽는다") from None
+    except httpx.HTTPError as exc:
+        raise _ResError(f"에이전트 서버에 닿지 못했다({type(exc).__name__}) — result_get 으로 쪽을 받아 읽는다") from None
+    if r.status_code == 404:
+        raise _ResError("에이전트 서버에 묻기 창구가 없다 — 이 박스에서 꺼져 있거나(에이전트 서버 RESULT_ASK_ENABLED) 그 판이 낡았다. "
+                        "켜기 전에는 result_get 으로 쪽을 받아 읽는다")
+    if r.status_code in (401, 403, 503):
+        raise _ResError(f"게이트웨이가 에이전트 서버 묻기 창구에 들어가지 못했다(HTTP {r.status_code}) — 두 서버의 공유 비밀(GW_TOKEN)이 맞지 않거나 "
+                        "에이전트 서버에 게이트웨이 연결이 없다. 운영자에게 알리고, 그동안은 result_get 으로 쪽을 받아 읽는다")
+    try:
+        data = r.json()
+    except ValueError:
+        data = None
+    if r.status_code >= 400:
+        why = ""
+        if isinstance(data, dict):
+            why = str(data.get("message") or data.get("detail") or data.get("error") or "")
+        raise _ResError(f"에이전트 서버 묻기 창구가 거절했다(HTTP {r.status_code})" + (f" — {_clip(why, 300)}" if why else ""))
+    if not isinstance(data, dict) or "answer" not in data:
+        raise _ResError("에이전트 서버 묻기 창구의 답에 answer 가 없다 — 그 판이 계약(offload-v2 §3-2)과 다르다")
+    return {"ref": ref, **data}
+
+
+async def _res_dispatch(name: str, arguments: dict) -> types.CallToolResult:
+    """result_get · result_ask — 주인(검증된 신원)만. 없는 것 · 끝난 것 · 남의 것은 같은 말이다. 실패는 RESULT_ERROR 한 줄, 감사는 한 줄."""
+    t0 = time.monotonic()
+    a = arguments or {}
+    ref = str(a.get("ref") or "").strip()
+    backend = "_gateway"
+    try:
+        owner = _request_user()
+        if not owner:
+            raise _ResError("사람 신원이 없는 호출이다 — 결과 손잡이는 그 결과를 받은 사람(PAT 주인)만 본다")
+        meta = await _res_thread(_res_load, ref)
+        if meta is None or meta["owner"] != owner:
+            raise _ResError(_RES_MISSING)
+        try:
+            text, _sc = await _res_thread(_res_read_body, meta)
+        except OSError as exc:
+            log.warning("결과 원문을 읽지 못했다(%s): %r", ref, exc)
+            raise _ResError(_RES_MISSING) from None
+        if name == RESULT_GET_TOOL.name:
+            page_chars = _res_int(a, "page_chars", RESULT_PAGE_CHARS, RESULT_PAGE_MIN, RESULT_PAGE_MAX)
+            pages = _res_pages(len(text), page_chars)
+            page = _res_int(a, "page", 1, 1, 10 ** 9)
+            if page > pages:
+                raise _ResError(f"page 는 1 ~ {pages} 다(한 쪽 {page_chars:,}자 · 원문 {len(text):,}자)")
+            start = (page - 1) * page_chars
+            end = min(len(text), start + page_chars)
+            info = {"ref": ref, "page": page, "pages": pages, "page_chars": page_chars, "start": start, "end": end, "chars": len(text)}
+            _audit(name, backend, True, None, round((time.monotonic() - t0) * 1000), note=f"{ref}#{page}")
+            return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(info, ensure_ascii=False)),
+                                                 types.TextContent(type="text", text=text[start:end])])
+        out = await _res_ask(ref, text, a, owner)
+        _audit(name, backend, True, None, round((time.monotonic() - t0) * 1000), note=ref)
+        return _rt_json(out)
+    except _ResError as exc:
+        _audit(name, backend, False, str(exc), round((time.monotonic() - t0) * 1000), note=ref[:40] or None)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=f"RESULT_ERROR: {exc}")], isError=True)
+
+
+async def _res_internal_http(scope, send, gw_auth: str) -> None:
+    """GET /internal/result/<ref> — 에이전트 서버(draft_section)가 근거 ref 의 원문을 읽는다. 자격은 게이트웨이 공유 비밀(Authorization: Bearer
+    GW_TOKEN — 한 번만) 하나이고, 사람 머리 x-hwax-user(그 ref 를 받은 사람의 이메일, %-인코딩 가능)가 ref 주인일 때만 준다. 비밀이 틀리면 401,
+    사람 머리가 없으면 400, 없는 것 · 끝난 것 · 남의 것은 같은 404 다. 답은 {ref, tool, chars, sha256, pages, created, expires, text, structured}.
+    nginx 를 거친 요청은 호출부가 이리 보내지 않는다(지금처럼 아래 인증으로 간다 — 밖에서 보이지 않는다). 감사는 한 줄."""
+    t0 = time.monotonic()
+    ref = scope.get("path", "")[len(RESULT_INTERNAL_PREFIX):]
+    hdrs = scope.get("headers") or []
+    ip = (scope.get("client") or (None,))[0]
+
+    def _aud(ok: bool, err: str | None, caller=None, size=None):
+        _audit("GET /internal/result", "_gateway", ok, err, round((time.monotonic() - t0) * 1000), caller=caller, via="gw-token", ip=ip,
+               note=ref[:40] or None, size=size)
+
+    async def _reply(status: int, obj: dict, extra=()):
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"application/json"), (b"cache-control", b"no-store"), *extra]})
+        await send({"type": "http.response.body", "body": json.dumps(obj, ensure_ascii=False).encode("utf-8")})
+
+    if scope.get("method") != "GET":
+        await _reply(405, {"error": "method not allowed"}, [(b"allow", b"GET")])
+        return
+    auths = [v.decode("latin-1") for k, v in hdrs if k.lower() == b"authorization"]
+    if len(auths) != 1 or not GW_TOKEN or not _secret_eq(auths[0], gw_auth):
+        _aud(False, "unauthorized")
+        await _reply(401, {"error": "unauthorized"})
+        return
+    users = [v.decode("latin-1") for k, v in hdrs if k.lower() == USER_HEADER.encode()]
+    try:
+        email = unquote(users[0]).strip().lower() if len(users) == 1 else ""
+    except Exception:  # noqa: BLE001
+        email = ""
+    if not email:
+        _aud(False, "no-user")
+        await _reply(400, {"error": "x-hwax-user 머리(그 ref 를 받은 사람의 이메일)를 하나 싣는다 — 주인일 때만 준다"})
+        return
+    try:
+        meta = await _res_thread(_res_load, ref)
+        if meta is None or meta["owner"] != email:
+            raise _ResError("not-found")
+        text, sc = await _res_thread(_res_read_body, meta)
+    except Exception as exc:  # noqa: BLE001 — 없는 것 · 남의 것 · 못 읽음은 같은 404(ref 마다 다른 답을 내지 않는다)
+        _aud(False, f"not-found: {type(exc).__name__}", caller=email)
+        await _reply(404, {"error": "not found"})
+        return
+    out = {"ref": ref, "tool": meta["tool"], "chars": len(text), "sha256": meta["sha256"], "pages": _res_pages(len(text)),
+           "created": meta["created"], "expires": meta["expires"], "text": text, "structured": sc}
+    body = json.dumps(out, ensure_ascii=False).encode("utf-8")
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(b"content-type", b"application/json"), (b"cache-control", b"no-store")]})
+    await send({"type": "http.response.body", "body": body})
+    _aud(True, None, caller=email, size=len(body))
+
+
 # ── PC 키트 — 개인 Claude 가 PC 로 받아 쓰는 도구 파일(HWAXPortal infra/pc-kit · docs/report-figures RF-19 ~, 사용자 보고 11-02 '표칸그림 필요해') ──
 # 현장 변환기(md2docx_z.py)는 표 칸 · 문단 안 그림을 글자로 남기고 없는 그림을 말없이 넘겼다. 그것을 대신하는 보고서 md → docx 변환기를
 # 게이트웨이가 내려준다 — 개인 Claude 가 kit_get 으로 받는 주소와 curl 한 줄을 받는다.
@@ -8685,7 +9316,7 @@ def _local_tools() -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
              BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL,
-             ONTO_LOOKUP_TOOL, GAS_TRANSPORT_TOOL, RELIAB_TOOL, *PROCEDURE_TOOLS]
+             ONTO_LOOKUP_TOOL, GAS_TRANSPORT_TOOL, RELIAB_TOOL, *PROCEDURE_TOOLS, *_res_tools()]
     # REST 다리는 **등록된 사이트가 있을 때만** 낸다 — 쓸 수 없는 도구를 목록에 두면
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
@@ -10453,7 +11084,12 @@ async def _list_tools(req: types.ListToolsRequest):
     if req is None:
         return _visible_tools(_request_groups())
     _VIEW_LISTS[_request_view()[0]] += 1
-    return _listed_tools(_request_groups())
+    listed = _listed_tools(_request_groups())
+    if RESULT_REFS_ON and _request_result_ref():
+        # 결과 손잡이를 청한 연결 — 출력 스키마를 뗀다. 줄인 structuredContent({ref, chars, …, head})는 도구의 출력 스키마에 맞지 않아 Claude Code(MCP
+        # TS SDK)가 결과를 거절한다. 떼면 클라이언트가 검증하지 않는다. 사본만 바꾼다 — 집계 목록 · 다른 연결의 목록은 그대로다.
+        listed = [t.model_copy(update={"outputSchema": None}) if getattr(t, "outputSchema", None) else t for t in listed]
+    return listed
 
 
 # 게이트웨이 자체 도구 가운데 조회만 하는 것 — 읽기 전용 토큰도 부른다. save_conversation(쓰기)은 빠지고, rest_call 은 메서드로,
@@ -10475,13 +11111,23 @@ _ROUTINE_NAMES = frozenset(t.name for t in ROUTINE_TOOLS)
 _INFLIGHT_CALLS = {"n": 0}
 
 
-@_low.call_tool(validate_input=False)
 async def _call_tool(name: str, arguments: dict):
+    """도구 호출 — 바깥 호출(_call_tool_entry)과 게이트웨이 안쪽 호출(browse_experts 의 list_agents 등)이 함께 쓴다. 결과는 원문이다."""
     _INFLIGHT_CALLS["n"] += 1
     try:
         return await _call_tool_body(name, arguments)
     finally:
         _INFLIGHT_CALLS["n"] -= 1
+
+
+@_low.call_tool(validate_input=False)
+async def _call_tool_entry(name: str, arguments: dict):
+    """MCP tools/call 의 처리기 — 바깥 호출 하나. 결과 손잡이(_res_keep)는 여기서만 건다 — 안쪽 호출이 줄인 결과를 받으면 그것을 읽는 게이트웨이
+    도구(browse_experts · use_experts …)가 빈손이 된다. 박스 스위치와 연결 머리가 둘 다 있을 때만이고, 아니면 _call_tool 의 결과 그대로다."""
+    res = await _call_tool(name, arguments)
+    if RESULT_REFS_ON and _request_result_ref():
+        return await _res_keep(name, arguments, res)
+    return res
 
 
 async def _call_tool_body(name: str, arguments: dict):
@@ -10593,6 +11239,8 @@ async def _call_tool_body(name: str, arguments: dict):
         return await _reliab_conditions(arguments or {})
     if FIG_STORE_ON and name in _FIG_NAMES:
         return await _fig_dispatch(name, arguments or {})
+    if RESULT_REFS_ON and name in _RES_NAMES:
+        return await _res_dispatch(name, arguments or {})
     if name == KIT_GET_TOOL.name:
         return await _kit_dispatch(arguments or {})
     if name == READONLY_ALLOWLIST_TOOL.name:
@@ -10951,6 +11599,9 @@ def _bearer_gate(app, pat_verifier=None):
                 "tools_list_by_view": dict(_VIEW_LISTS),
                 # 서비스 PAT 의 박스 허용 목록 — 작업마다 도구 수 · REST 항목 수(토큰 · jti 는 싣지 않는다, HWAXPortal docs/core-link §3)
                 "service_jobs": _service_health(),
+                # 결과 손잡이(HWAXPortal docs/token-saving offload-v2 B) — 켰나 · 문턱 · 머리 · 보존 · 둔 원문 수. 포털 PC 킷 칸이 '이 박스에서 꺼져 있음' 을
+                # 이것으로 가린다. 수만 싣는다
+                "result_refs": _res_health(),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
@@ -10969,7 +11620,7 @@ def _bearer_gate(app, pat_verifier=None):
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
                         VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL, ONTO_LOOKUP_TOOL, READONLY_ALLOWLIST_TOOL,
-                        GAS_TRANSPORT_TOOL, RELIAB_TOOL, *PROCEDURE_TOOLS,
+                        GAS_TRANSPORT_TOOL, RELIAB_TOOL, *PROCEDURE_TOOLS, *_res_tools(),
                         *([ARTIFACT_TO_STE_TOOL] if STE_UPLOAD_SITE in REST else [])):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
@@ -11196,6 +11847,13 @@ def _bearer_gate(app, pat_verifier=None):
             # 그림 받기 — 주인의 PAT 또는 서명한 표로 스스로 인증한다(_fig_download). 끄면 이 길이 없다(지금처럼 아래 인증으로 간다).
             await _fig_download(scope, send, pat_verifier, expected)
             return
+        if (RESULT_REFS_ON and scope.get("path", "").startswith(RESULT_INTERNAL_PREFIX)
+                and not any(k.lower() in (b"x-forwarded-for", b"x-forwarded-host") for k, _v in (scope.get("headers") or []))):
+            # 결과 손잡이 내부 창구 — 에이전트 서버가 공유 비밀 + 사람 머리로 근거 ref 를 읽는다(_res_internal_http). 박스 안 직접 연결만이다 — nginx 는
+            # X-Forwarded-For · X-Forwarded-Host 를 싣는다(포털 hwax.conf.tmpl 서버 단계). 그것이 있거나 스위치가 꺼지면 이 길이 없다(지금처럼 아래 인증으로
+            # 간다 — 밖에서는 이 창구가 보이지 않는다).
+            await _res_internal_http(scope, send, expected)
+            return
         if scope.get("path", "").startswith("/kit/"):
             # PC 키트 받기 — 그 이름의 서명한 표 또는 MCP 청중 PAT 로 스스로 인증한다(_kit_download). 허용 목록 밖은 같은 404 다.
             await _kit_download(scope, send, pat_verifier, expected)
@@ -11222,7 +11880,7 @@ def _bearer_gate(app, pat_verifier=None):
                      if k.lower() not in (PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
                                           DELEGATE_HEADER.lower().encode(), DELEGATE_SERVICE_HEADER.lower().encode(),
                                           READONLY_HEADER.encode(),
-                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode(),
+                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode(), RESULT_HEADER.encode(),
                                           SERVICE_HEADER.encode())]
             if GROUPS_HEADER.encode() not in headers:
                 _kept.append((GROUPS_HEADER.encode(), SERVICE_GROUP.encode()))
@@ -11268,7 +11926,7 @@ def _bearer_gate(app, pat_verifier=None):
                                           PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
                                           DELEGATE_HEADER.lower().encode(), DELEGATE_SERVICE_HEADER.lower().encode(),
                                           READONLY_HEADER.encode(),
-                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode(),
+                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode(), RESULT_HEADER.encode(),
                                           SERVICE_HEADER.encode(), AUDIT_FOR_HEADER.encode())]
             fresh += [(GROUPS_HEADER.encode(), SERVICE_GROUP.encode()), (SERVICE_HEADER.encode(), _job.encode()),
                       (VIA_HEADER.encode(), b"service")]
@@ -11312,7 +11970,7 @@ def _bearer_gate(app, pat_verifier=None):
                                           PURPOSE_HEADER.encode(), MUTED_HEADER.encode(), VIA_HEADER.encode(),
                                           DELEGATE_HEADER.lower().encode(), DELEGATE_SERVICE_HEADER.lower().encode(),
                                           READONLY_HEADER.encode(),
-                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode(),
+                                          VIEW_HEADER.encode(), VIEW_SRC_HEADER.encode(), PANEL_HEADER.encode(), RESULT_HEADER.encode(),
                                           SERVICE_HEADER.encode(), AUDIT_FOR_HEADER.encode())]
             if is_read_only(claims):
                 fresh.append((READONLY_HEADER.encode(), b"1"))
@@ -11353,6 +12011,12 @@ def _bearer_gate(app, pat_verifier=None):
                 _view, _vsrc = (_hv, "header") if _hv else (("full", ()), "default;bad-header" if _cv else "default")
             fresh.append((VIEW_HEADER.encode(), _view_text(*_view).encode("latin-1")))
             fresh.append((VIEW_SRC_HEADER.encode(), _vsrc.encode()))
+            # 결과 손잡이(HWAXPortal docs/token-saving offload-v2 B · TS-3) — 박스 스위치가 켜졌고 연결이 X-HWAX-Result: ref 로 청한 사람 PAT 만. 웹 챗 ·
+            # 절차 · 패널 PAT 는 늘 원문이다(그 결과는 서버가 읽는다 — 보기 머리와 같은 면제). 머리 없는 개인 PAT(루틴 · 리스크 앱 · MXWP 위키 같은 서버
+            # 쪽 길)도 원문이다. 클라이언트가 보낸 사본은 위에서 버렸다 — 게이트웨이가 정한 'ref' 만 싣는다.
+            if (RESULT_REFS_ON and _panel is None and not _is_chat and str(claims.get("purpose") or "") != PROCEDURE_PURPOSE
+                    and headers.get(RESULT_HEADER.encode(), b"").decode("latin-1").strip().lower() == RESULT_HEADER_REF):
+                fresh.append((RESULT_HEADER.encode(), RESULT_HEADER_REF.encode()))
             fresh.append((VIA_HEADER.encode(), b"mcp-app" if _panel is not None else b"chat" if _is_chat else
                           b"procedure" if str(claims.get("purpose") or "") == PROCEDURE_PURPOSE else b"pat"))
             await app({**scope, "headers": fresh}, receive, send)
@@ -11540,6 +12204,7 @@ def main():
     log.info("starting hwax-mcp-gateway on %s:%d (path /mcp), %d backends", HOST, PORT, len(BACKENDS))
     log.info("%s", _limits_line())
     log.info("%s", _fig_line())
+    log.info("%s", _res_line())
     _GracefulServer(uvicorn.Config(app, host=HOST, port=PORT, log_level="info",
                                    timeout_graceful_shutdown=SHUTDOWN_TAIL_S)).run()
 

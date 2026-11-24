@@ -8386,7 +8386,8 @@ RESULT_GET_TOOL = types.Tool(
 RESULT_ASK_TOOL = types.Tool(
     name="result_ask",
     description=("줄인 도구 결과(결과 손잡이 res_…)의 원문에 서버 LLM 이 답한다 — 원문을 Claude 로 가져오지 않고 묻는다. 답은 "
-                 "{ref, answer, quotes: [{page, start, end, text}], numbers, model} — 인용은 원문 위치이고 원문에 없는 인용은 서버가 버린다. "
+                 "{ref, answer, quotes: [{page, start, end, text}], numbers, model, tokens: {input, output} | null(서버 LLM 토큰)} — 인용은 원문 "
+                 "위치이고 원문에 없는 인용은 서버가 버린다. "
                  "내 결과만 묻는다. 서버의 묻기 창구가 꺼져 있으면 그렇다고 말한다(그때는 result_get)."),
     inputSchema={"type": "object", "properties": {
         "ref": _RES_REF_ARG,
@@ -8493,6 +8494,7 @@ async def _res_ask(ref: str, text: str, a: dict, owner: str) -> dict:
         raise _ResError(f"에이전트 서버 묻기 창구가 거절했다(HTTP {r.status_code})" + (f" — {_clip(why, 300)}" if why else ""))
     if not isinstance(data, dict) or "answer" not in data:
         raise _ResError("에이전트 서버 묻기 창구의 답에 answer 가 없다 — 그 판이 계약(offload-v2 §3-2)과 다르다")
+    # 창구의 답은 칸을 고르지 않고 그대로 넘긴다 — tokens(이 물음이 쓴 서버 LLM 토큰 · 모르면 null — HWAXPortal TS-16)도 비교 테스트셋이 그대로 센다
     return {"ref": ref, **data}
 
 

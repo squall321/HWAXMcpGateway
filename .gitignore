@@ -37,3 +37,6 @@ ingest_routes.local.json
 # 이용 통계 창구(/usage-rollup)가 감사 원장을 날마다 접어 두는 표(HWAXPortal docs/ops-dashboard M2) — 원장이 리포 안에 있는 박스에서만 여기 생긴다
 # (데이터 루트가 있으면 원장 곁). 사람별 줄이 든다. 무시 목록에 없으면 deploy-all · update-all 의 git stash -u 가 치운다
 usage-rollup.sqlite*
+# 상호작용 수집 창고(HWAXPortal docs/interaction-data contract §3) — 기본은 체크아웃 밖(데이터 루트의 interaction_spool · 리포 옆
+# <리포>-interaction_spool)이다. GATEWAY_INTERACTION_SPOOL_DIR 를 리포 안 상대 경로로 잡은 박스에서 원문이 커밋 · stash 되지 않게
+interaction_spool/

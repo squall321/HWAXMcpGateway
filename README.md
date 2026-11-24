@@ -631,8 +631,9 @@ svg 만). 감사 줄에는 그 결과의 `images` · `image_bytes` 가 붙는다
   자유 조회 접두(`_FREE_ALLOW`)에 걸리지 않는다(시험). 같은 이름의 백엔드 도구는 접두를 단다. 읽기 전용 PAT 도 부른다.
 - **내부 창구 `GET /internal/result/<ref>`** — 에이전트 서버(`draft_section`)가 근거 ref 를 읽는다. `Authorization: Bearer <GW_TOKEN>`(한 번만) +
   `x-hwax-user: <그 ref 를 받은 사람 이메일>`. 답 `{ref, tool, chars, sha256, pages, created, expires, text, structured}`. 비밀이 틀리면 401, 사람 머리가
-  없으면 400, 없는 것 · 끝난 것 · 남의 것은 같은 404. **박스 안 직접 연결만** — `X-Forwarded-For` · `X-Forwarded-Host` 가 실린 요청(포털 nginx 의
-  `/mcp-gw/` — 서버 단계에서 싣는다)과 끈 박스에서는 이 길이 없다(지금처럼 아래 인증으로 간다). 감사 한 줄(`GET /internal/result` · `via` gw-token).
+  없으면 400, 없는 것 · 끝난 것 · 남의 것은 같은 404. **박스 안 직접 연결만** — `X-Forwarded-` 로 시작하는 머리가 하나라도 실린 요청(포털 nginx 의
+  `/mcp-gw/` — 서버 단계에서 싣는다)과 끈 박스에서는 이 길이 없다(지금처럼 아래 인증으로 간다). 이 막기와 자격 판정은 상호작용 가져가기 창구와 같은
+  함수다(`_internal_direct` · `_internal_auth_ok`). 감사 한 줄(`GET /internal/result` · `via` gw-token).
 - `/health` 의 `result_refs: {enabled, min_chars, head_chars, ttl_days, stored}` — 포털 PC 킷 칸이 '이 박스에서 꺼져 있음' 을 가린다. 기동 로그에 켬 · 끔
   한 줄(끄면 켜는 법).
 
@@ -645,6 +646,65 @@ svg 만). 감사 줄에는 그 결과의 `images` · `image_bytes` 가 붙는다
 | `GATEWAY_RESULT_REF_DIR` | 데이터 루트의 `results` | 그림 폴더와 같은 규칙(원장이 리포 안이면 리포 옆 `<리포>-results`, 체크아웃 밖이어야 한다). 상대 경로는 리포 루트 기준 |
 | `GATEWAY_RESULT_REF_OWNER_QUOTA` · `GATEWAY_RESULT_REF_TOTAL_CAP` | 1 GiB · 10 GiB | 사람당 · 전체 디스크 몫(4 KiB 블록 + 곁 JSON) — 넘으면 오래된 것부터, 이번 것은 남긴다 |
 | `GATEWAY_RESULT_REF_SWEEP_S` | 3600 | 청소 주기 |
+
+## 상호작용 수집 창고 — 도구 호출 원문을 포털 원장으로(선택, 기본 꺼짐 — HWAXPortal docs/interaction-data contract §3 · §4 · §5 · §7)
+
+이 허브를 거친 도구 호출의 인자 · 결과 원문을 한 줄씩 쌓고, 포털 수집기가 공유 비밀로 가져가 원장(`interactions.sqlite`)에 넣는다(사용자 결정 IX-2 —
+모든 호출을 자동 저장, 수집 사실을 알린다). 저장소 · 수집기 · 화면은 포털 몫이고 계약의 정본은 포털 리포 `docs/interaction-data/contract.md` 다.
+
+- **켜기** — `GATEWAY_INTERACTION_CAPTURE=1`(띄운 셸 환경이 먼저, 비면 곁 `provision.env` 의 마지막 활성 줄 — 결과 손잡이와 같은 읽기, 값은 `1` 만).
+  끄면 결과 · 도구 목록 · 지침 · 경로가 지금과 바이트까지 같다(시험). `/health` 의 `interactions` 칸만 늘 있다.
+- **적는 자리** — 바깥 처리기(`_call_tool_entry`) 하나, 호출이 끝난 뒤. **결과 손잡이로 줄이기 전의 원문**을 본다. 안쪽 호출(`browse_experts` 의
+  `list_agents` · 루틴 단계 …)은 바깥 호출의 일부라 따로 적지 않는다. 모든 자격(pat · chat · procedure · mcp-app · gw-token · service)을 적고 `via` 로
+  가른다 — 웹 챗이 부른 도구의 겹침은 포털이 `corr` 로 거른다.
+- **호출을 막지도 늦추지도 않는다** — 처리기는 요청 문맥의 칸만 모아 대기열에 넣고 곧바로 돌아간다. 가림 · 직렬화 · 쓰기는 일꾼 스레드 하나(파일 잠금은
+  한 줄 쓰는 동안만, 이벤트 루프는 이 잠금을 잡지 않는다 — 긴 글의 가림은 256 K 자씩 끊어 한 번의 정규식이 GIL 을 오래 쥐지 않게). 대기열이 차면
+  (1,024 줄 또는 쥔 결과 글자 합 256 M) 버리고 `dropped` 를 센다. 실패는 `errors` 를 세고 경고 로그(60초에 한 줄)만 — 호출은 그대로다.
+- **한 줄(JSONL — 칸 차례가 계약 §3)** — `ts`(초, 소수 셋째 자리) · `corr` · `rid`(선언 백엔드에 실은 `X-Request-Id` — 감사 `rid` 와 같은 값, 없으면
+  빈 글) · `actor`(검증된 이메일 · 서비스 PAT 는 `system:<작업>` · 없으면 빈 글) · `via` · `client`(initialize 의 clientInfo `이름/판`, 없으면 빈 글) ·
+  `tool`(클라이언트가 부른 노출 이름 — `invoke_tool` 이면 그대로) · `backend` · `orig`(실제로 돈 것 — `invoke_tool` 은 안쪽 도구, 게이트웨이 자체 도구는
+  `_gateway`, 모르는 이름은 빈 글) · `args`(가린 객체 — 직렬화가 1 MB 를 넘으면 앞부분 글 + 그 뒤에 `args_chars`) · `result` · `result_chars` ·
+  `result_sha256` · `is_error` · `ms`. `result` 는 content 글 블록을 줄바꿈으로 이은 것 + `structuredContent` 의 촘촘한 JSON(글 블록 하나가 그것과 같은
+  JSON 이면 한 번만)을 가린 뒤 1 MB(UTF-8)에서 앞부분이다. `result_chars` · `result_sha256` 은 **가린 원문 전체**의 것이다(가리기 전 글의 지문은 짧은
+  비밀을 맞혀 보는 길이 된다). 그림 블록은 싣지 않는다(그림 보관이 켜져 있으면 '그림 저장 —' 글 블록의 `fig_…` 가 남는다). 호출이 예외로 끝났으면
+  `<예외 이름>: <글>` · `is_error: true` 이고 예외는 그대로 올린다.
+- **비밀 가림(계약 §4 — 포털과 같은 시험 벡터, 시험이 부록 다섯 줄을 그대로 쓴다)** — 칸 이름(대소문자 무시)이 `authorization` · `token` ·
+  `access_token` · `refresh_token` · `api_key` · `apikey` · `x-api-key` · `secret` · `client_secret` · `password` · `passwd` · `cookie` · `set-cookie` ·
+  `session` · `private_key` 이거나 그 말로 끝나면(글자 그대로 끝 — `user_password` 는 가리고 `session_id` · `max_tokens` 는 둔다) 값 전체를
+  `<가림:칸 이름 소문자>` 로. 글 안은 PEM 비밀 키 덩어리(`-----BEGIN … PRIVATE KEY-----` 부터 끝 표지까지, 없으면 글 끝까지) → `<가림:pem>`, 그다음
+  `Bearer <글>` → `Bearer <가림:bearer>`, 그다음 JWT(`eyJ` 로 시작하는 세 마디 점 이음) → `<가림:jwt>`. PEM 을 먼저 한다 — Bearer 의 글자 칸이
+  `-----BEGIN` 을 먹으면 덩어리가 남는다. 결과 글 블록이 JSON 객체 · 배열이면 칸 이름까지 가린다(가릴 것이 없으면 원래 글 그대로).
+- **자리** — 그림 · 결과 손잡이와 같은 규칙. 데이터 루트(`GATEWAY_AUDIT` · 리포의 `audit.jsonl` 다리가 가리키는 `/data/svc/mcp-gateway`)의
+  `interaction_spool`, 원장이 리포 안이면 리포 옆 `<리포>-interaction_spool` — 체크아웃 밖(git stash -u). 조각 `ix-<첫 줄의 ms 13자리>.jsonl`(이름 순 =
+  시간 순), 64 MB 에서 새 조각. 전체가 상한을 넘으면 **닫힌** 조각 가운데 오래된 것부터 버리고 그 줄 수를 `dropped` 에 더한다(경고 로그) — 쓰는 조각
+  하나(최대 64 MB)는 남는다. 파일 0600 · 폴더 0700. 기한은 없다 — 포털이 ack 한 조각만 지운다. 쓰다 죽은 조각(끝이 줄바꿈이 아님)에는 잇지 않고 새
+  조각을 연다(읽기는 그 깨진 줄을 건너뛴다).
+- **가져가기 — 포털 수집기가 부른다** — `Authorization: Bearer <GW_TOKEN>` 정확히 한 번, **박스 안 직접 연결만**(`X-Forwarded-` 머리가 하나라도 있거나
+  끈 박스면 이 길이 없다 — 지금처럼 아래 인증으로 간다. 포털 nginx 는 `/mcp-gw/internal` 을 막는다).
+  - `GET /internal/interactions?cursor=<글>&max=500`(`max` 1 ~ 2,000, 기본 500 · 한 번에 16 MB 까지, 적어도 한 줄) → `{events: [한 줄 객체 …],
+    next_cursor, more}`. `cursor` 가 비면 가장 오래된 것부터, 그 조각이 이미 없으면(상한으로 버렸거나 ack 로 지웠다) 남은 조각 가운데 가장 오래된
+    것부터. `cursor` 는 불투명 글이다(지금 꼴 `v1.<조각 ms>.<바이트 자리>` — 읽지 말고 그대로 돌려준다). 창고가 비었고 `cursor` 도 비면 `next_cursor` 는 빈 글.
+  - `POST /internal/interactions/ack` `{cursor}` → `{ok, deleted, segments, spool_bytes}`. 그 자리까지 다 읽힌 조각만 지운다 — `cursor` 의 조각보다
+    오래된 조각 전부, 그리고 `cursor` 의 조각이 닫혔고 끝까지 읽혔으면 그것도(지금 쓰는 조각은 지우지 않는다). 내준 적 없는 자리(가장 새 조각보다 앞 ·
+    조각 끝 너머)는 400 이고 아무것도 지우지 않는다.
+  - 비밀이 틀리면 401, `cursor` · `max` · 본문이 틀리면 400, 메서드가 틀리면 405. 감사는 줄을 준 가져가기(`note` `events:N`) · ack(`deleted:N`) ·
+    거절만 — 빈 가져가기는 적지 않는다(주기 폴링이 원장을 메우지 않게).
+- **`share_conversation`(로컬 도구 — 켰을 때만 목록에)** — 설명 「사람이 '이 대화를 공유해' 라고 청한 때만 부른다 — 이 포털을 거친 대화는 기록되어
+  품질 개선과 지식 정리에 쓰인다」. 인자 `title` · `messages: [{role: user|assistant, content}]` · `session_id?` · `client?`(비우면 initialize 의
+  clientInfo). 호출자 PAT 를 포털 `POST /interactions/share` 로 그대로 넘긴다 — `save_conversation` 과 같은 넘기기 함수 · 정규화(역할이 어긋나면
+  assistant · 글은 문자열 · 객체가 아닌 항목은 뺀다 · 제목 200자) · 실패 꼴(`CONV_UNAVAILABLE:` — 포털 404 는 '포털에서 수집이 꺼져 있다'). 본문이
+  50 MB 를 넘으면 보내지 않고 말한다. 읽기 전용 PAT · 패널 · 서비스 PAT 는 막는다. 같은 이름의 백엔드 도구는 켰을 때 접두를 단다. 이름은 심의 좌석 자유
+  조회 접두(`_FREE_ALLOW`)에 걸리지 않는다(시험).
+- **알림** — 켜면 서버 지침 끝에 14번이 붙는다(아래 '서버 지침').
+- `/health` 의 `interactions: {enabled, spool_bytes, segments, dropped, errors, oldest_ts}` — `oldest_ts` 는 가장 오래된 조각의 첫 줄 때(초, 없으면
+  null). `dropped` · `errors` 는 이 프로세스가 뜬 뒤의 셈이다. 포털 상태판 · update-all 이 '수집이 멈췄다(넘침 · 오래 묵음)' 를 이것으로 본다. 기동 로그에
+  켬 · 끔 한 줄(끄면 켜는 법), 켰거나 폴더가 있으면 조각 수 · 크기 · 가장 오래된 때 한 줄.
+
+| 손잡이 | 기본 | 뜻 |
+|---|---|---|
+| `GATEWAY_INTERACTION_CAPTURE` | 끔 | `1` 이면 켠다. 띄운 셸의 환경이 먼저고, 없으면 곁의 `provision.env` 줄을 읽는다(박스는 거기 한 줄 적고 게이트웨이를 다시 띄운다) |
+| `GATEWAY_INTERACTION_SPOOL_DIR` | 데이터 루트의 `interaction_spool` | 그림 폴더와 같은 규칙(원장이 리포 안이면 리포 옆 `<리포>-interaction_spool`, 체크아웃 밖이어야 한다). 상대 경로는 리포 루트 기준 |
+| `GATEWAY_INTERACTION_SPOOL_MAX_MB` | 2048 | 창고 전체 상한(MB) — 넘으면 닫힌 조각 가운데 오래된 것부터 버리고 `dropped` |
 
 ## PC 키트 — 개인 Claude 가 PC 로 받는 도구 파일(HWAXPortal infra/pc-kit · docs/report-figures RF-22, 사용자 보고 11-02)
 
@@ -672,6 +732,9 @@ Claude Code · Desktop 이 세션마다 읽는 글이다(`_INSTRUCTIONS` + `_ins
 - 본문(1 ~ 10 · 12번)은 늘 실린다. 붙는 항목은 재집계(`_aggregate`)마다 지금 카탈로그로 다시 짓고 뒤에만 붙는다 — 13번(새 심의는 서버 엔진 `deliberate_start`)은 그 도구가 있을 때, 11번(리스크 심사는 `risk_next_step` 부터)은 그 도구가 있을 때. 이미 열린 세션은 그때 받은 글을 쓴다.
 - 서버 엔진을 기본 길로(사용자 결정 11-02, HWAXPortal docs/token-saving TS-5) — 13번 · 11번 끝 문장. Claude 가 좌석 · 판단 과제마다 직접 도는 워크플로(`hwax-*`)는 품질을 따로 잴 때만이다. 13번의 두 문장(`deliberate_status` 는 `wait_s` 로 한 번 기다린다 · 결과는 `deliberate_result(view="summary")` 부터)과 11번 끝 문장(`risk_start_job` 은 `llm=glm`)은 **그 인자가 지금 스키마에 있을 때만** 싣는다 — 에이전트 서버에 `wait_s` · `view` 가 아직 없는 판이면 13번에는 '고리로 되풀이해 묻지 마라' 만 남는다. 그래서 게이트웨이와 에이전트 서버의 배포 차례가 없다.
 - 본문의 토큰 습관 — `search_tools` 는 `detail` 을 필요할 때만, `list_agents` 는 `compact=true`.
+- 14번(상호작용 수집을 켠 박스만 — HWAXPortal docs/interaction-data contract §7, 문구는 초안) — 맨 뒤에 붙는다. 2048자 안에 들면 계약 문구 그대로(「이 포털을
+  거친 대화와 도구 호출은 기록되어 … 언제든 지우기를 청할 수 있습니다.」), 넘으면 짧은 꼴 「14. 호출은 기록된다.」 — 13번 · 11번이 모두 실린 가장 긴
+  조합(2,031자)에는 문구 전체가 들어가지 않는다. 전체 문구는 `share_conversation` 설명에도 있다.
 
 ## 실행
 ```bash

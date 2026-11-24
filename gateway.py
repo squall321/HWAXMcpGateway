@@ -6515,7 +6515,8 @@ ARTIFACT_TO_STE_TOOL = types.Tool(
         "StepForge 산출물 파일을 ste(해석 웹) 업로드로 서버끼리 옮긴다 — 파일 바이트가 모델을 지나지 않는다(download_artifact 의 1 MB 상한 · 공유 경로 "
         "없음을 건넌다). 부르는 사람 명의로 StepForge 파일을 조각으로 받아 그 사람의 ste 업로드에 흘려 넣고 sha256 을 맞댄다. 답의 upload_id 로 ste 잡을 "
         "제출한다(ste submit_job 의 upload_id — 업로드 주인인 이 사람만 · 한 번만 · expires_at 까지). kind · ref 는 StepForge list_artifacts 의 값 그대로 "
-        "준다. 실패하면 ok:false 와 까닭이고, upload_id_broken 이 있으면 그 업로드는 쓰지 않는다."
+        "준다. 실패하면 ok:false 와 까닭이고, upload_id_broken 이 있으면 그 업로드는 쓰지 않는다 · upload_id_reusable 이면 같은 upload_id 로 다시 "
+        "불러도 된다. ste_verified 가 true 면 ste 가 디스크에 쓴 파일의 sha256 까지 맞았다."
     ),
     inputSchema={
         "type": "object",
@@ -6695,6 +6696,16 @@ async def _artifact_to_ste(a: dict) -> types.CallToolResult:
                     r = await cli.put(f"{base}/api/uploads/{upload_id}/{quote(fname, safe='')}", content=body_stream(),
                                       headers={**hdrs, "content-type": "application/octet-stream"})
                 except _SteUploadAbort as e:
+                    # 끊은 뒤 상태를 다시 읽어 가른다(ste 판을 짐작하지 않는다 — SS-9). 고친 ste(4e2bf0b)는 반쯤 쓴 조각을 지워 그 파일도 .part 도
+                    # 목록에 없다 → 같은 upload_id 를 다시 써도 된다. 옛 ste 는 .part 가 남는다 → 쓰지 않는다.
+                    try:
+                        st = await call("GET", f"/api/uploads/{upload_id}")
+                        left = st.json().get("files") if st.status_code == 200 else None
+                    except Exception:  # noqa: BLE001 — 모르면 쓰지 말라고 한다
+                        left = None
+                    if isinstance(left, list) and fname not in left and not any(str(f).endswith(".part") for f in left):
+                        return done(False, error=str(e), upload_id_reusable=upload_id,
+                                    detail="ste 로 올리기를 끊었다 — ste 가 반쯤 쓴 파일을 지웠다. 같은 upload_id 로 다시 불러도 된다")
                     return done(False, error=str(e), upload_id_broken=upload_id,
                                 detail="ste 로 올리기를 끊었다 — 이 업로드는 쓰지 않는다(24시간 뒤 ste 가 지운다)")
                 if r.status_code != 200:
@@ -6710,9 +6721,14 @@ async def _artifact_to_ste(a: dict) -> types.CallToolResult:
     files = put.get("files") if isinstance(put.get("files"), list) else []
     if fname not in files:
         return done(False, error="ste 답의 파일 목록에 올린 파일이 없다", detail=str(files)[:200], upload_id_broken=upload_id)
+    # ste 가 디스크로 흘리며 잰 sha256(4e2bf0b 부터 PUT 답의 {파일 이름: hex})과 맞대 전송 구간까지 본다. 옛 ste 는 칸이 없다 — 그때는 칸을 싣지 않는다
+    ste_sha = put.get("sha256").get(fname) if isinstance(put.get("sha256"), dict) else None
+    if isinstance(ste_sha, str) and ste_sha.lower() != want.lower():
+        return done(False, error="ste 가 받은 파일의 sha256 이 StepForge 의 것과 다르다", detail=f"ste {ste_sha[:16]}… · StepForge {want[:16]}…",
+                    upload_id_broken=upload_id)
     sub = _rt_exposed(STE_UPLOAD_SITE, "submit_job") or "submit_job"
     return done(True, upload_id=upload_id, filename=fname, bytes=sent, sha256=want, expires_at=up.get("expires_at"), files=files,
-                new_upload=created,
+                new_upload=created, **({"ste_verified": True} if isinstance(ste_sha, str) else {}),
                 next=f"ste 잡 제출 — {sub}(upload_id='{upload_id}', app=<앱>) · 업로드 주인(이 사람)만 · 한 번만 · expires_at 까지. "
                      "파일을 더 넣으려면 같은 upload_id 로 다시 부른다")
 

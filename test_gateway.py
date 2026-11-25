@@ -14970,7 +14970,9 @@ _STE_CHUNK = 5000                       # base64 로 6,668자 — full 이 없�
 
 
 def _a2s_kit(monkeypatch, data: bytes = bytes(range(256)) * 48 + b"tail", *, groups=(), user="a@x.com", service=None, ste=None,
-             sf=None, allowed=True):
+             sf=None, allowed=True, ste_ver="old", ste_sha=None):
+    """ste_ver — "old": 끊긴 PUT 이 <이름>.part 를 남기고 PUT 답에 sha256 이 없다(4e2bf0b 전) · "new": 조각을 지우고 PUT 답에 {이름: sha256}.
+    ste_sha — 새 ste 가 답에 실을 sha256 을 바꿔 끼운다(어긋남 시험)."""
     """(부르기, 기록) — 기록은 {sf: [(이름, 인자)], ste: [(메서드, 경로, 머리)], stored: {이름: 바이트}}. sf(args, 기본 답) → 답 바꾸기, ste(요청) → 답 바꾸기."""
     rec = {"sf": [], "ste": [], "stored": {}}
     sha = hashlib.sha256(data).hexdigest()
@@ -15026,12 +15028,20 @@ def _a2s_kit(monkeypatch, data: bytes = bytes(range(256)) * 48 + b"tail", *, gro
                                              "files": [], "bytes": 0, "ticket": "TICKET-SECRET", "put_path": "/api/uploads/u1/{filename}"})
         if request.method == "GET" and request.url.path.startswith("/api/uploads/"):
             return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[1], "owner_id": 7, "expires_at": "E", "used_at": None,
-                                             "files": [], "bytes": 0})
+                                             "files": sorted(rec["stored"]), "bytes": sum(map(len, rec["stored"].values()))})
         if request.method == "PUT":
             uid, fname = request.url.path.split("/")[3:5]
-            body = await request.aread()                               # 본문을 끝까지 — 생성기가 던지면 여기서 끊긴다
+            try:
+                body = await request.aread()                           # 본문을 끝까지 — 생성기가 던지면 여기서 끊긴다
+            except Exception:
+                if ste_ver == "old":
+                    rec["stored"][fname + ".part"] = b""               # 옛 ste — ClientDisconnect 뒤 조각이 남아 목록에 잡힌다
+                raise
             rec["stored"][fname] = body
-            return httpx.Response(200, json={"id": uid, "file": fname, "files": sorted(rec["stored"]), "bytes": len(body)})
+            out = {"id": uid, "file": fname, "files": sorted(rec["stored"]), "bytes": sum(map(len, rec["stored"].values()))}
+            if ste_ver == "new":
+                out["sha256"] = {n: (ste_sha if (ste_sha and n == fname) else hashlib.sha256(b).hexdigest()) for n, b in rec["stored"].items()}
+            return httpx.Response(200, json=out)
         return httpx.Response(404, json={"detail": "없다"})
 
     class _H(httpx.AsyncBaseTransport):
@@ -15081,12 +15091,17 @@ def test_P1_full_을_모르는_StepForge_는_접힌_답이라_ste_를_열지_않
 def test_P1_조각_사이에_파일이_바뀌면_올리기를_끊고_그_업로드는_쓰지_말라고_한다(monkeypatch):
     run, rec, _d, _s = _a2s_kit(monkeypatch, sf=lambda a, o: {**o, "file_sha256": "f" * 64} if a.get("offset") == 5000 else o)
     out, err = run()
-    assert err is True and "바뀌었다" in out["error"] and out["upload_id_broken"] == "u1"
-    assert rec["stored"] == {}, "PUT 본문이 끝나지 않았다 — ste 가 파일을 두지 않는다"
-    run, rec, _d, _s = _a2s_kit(monkeypatch, sf=lambda a, o: "forbidden: heax-step_forge" if a.get("offset") == 10000 else o)
+    assert err is True and "바뀌었다" in out["error"] and out["upload_id_broken"] == "u1" and "upload_id_reusable" not in out
+    assert rec["stored"] == {"part.step.part": b""}, "옛 ste — 끊긴 조각이 목록에 남아 그 업로드는 쓰지 않는다"
+    assert [m for m, *_x in rec["ste"]] == ["POST", "PUT", "GET"], "끊은 뒤 상태를 다시 읽어 가른다"
+    run, rec, _d, _s = _a2s_kit(monkeypatch, ste_ver="new", sf=lambda a, o: {**o, "file_sha256": "f" * 64} if a.get("offset") == 5000 else o)
     out, err = run()
-    assert err is True and "offset 10000" in out["error"] and out["upload_id_broken"] == "u1" and rec["stored"] == {}
-    run, rec, _d, _s = _a2s_kit(monkeypatch, sf=lambda a, o: {**o, "data_base64": o["data_base64"][:-8] + "AAAAAAAA"}
+    assert err is True and out["upload_id_reusable"] == "u1" and "upload_id_broken" not in out, "고친 ste — 조각이 지워져 다시 써도 된다"
+    assert rec["stored"] == {}
+    run, rec, _d, _s = _a2s_kit(monkeypatch, ste_ver="new", sf=lambda a, o: "forbidden: heax-step_forge" if a.get("offset") == 10000 else o)
+    out, err = run()
+    assert err is True and "offset 10000" in out["error"] and out["upload_id_reusable"] == "u1" and rec["stored"] == {}
+    run, rec, _d, _s = _a2s_kit(monkeypatch, ste_ver="new", sf=lambda a, o: {**o, "data_base64": o["data_base64"][:-8] + "AAAAAAAA"}
                                 if a.get("offset") == 10000 else o)
     out, err = run()
     assert err is True and "sha256" in out["error"] and rec["stored"] == {}, "마지막에 바이트 · sha256 을 맞댄다"
@@ -15144,6 +15159,18 @@ def test_P1_도구는_ste_REST_가_있을_때만_보이고_쓰기로_다뤄진�
     assert gw._routine_read(t, "_gateway", t.name) is False, "엔진 좌석 자유 조회 · 루틴 울타리에 걸리지 않는다"
     monkeypatch.delitem(gw.REST, "ste")
     assert "artifact_to_ste_upload" not in {x.name for x in gw._local_tools()}
+
+
+def test_P1_고친_ste_가_준_sha256_과_맞대_전송_구간까지_본다(monkeypatch):
+    run, rec, data, sha = _a2s_kit(monkeypatch, ste_ver="new")
+    out, err = run()
+    assert err is False and out["ste_verified"] is True and out["sha256"] == sha
+    run, rec, data, sha = _a2s_kit(monkeypatch)
+    out, _e = run()
+    assert out["ok"] is True and "ste_verified" not in out, "옛 ste 는 칸이 없다 — 지어내지 않는다"
+    run, rec, data, sha = _a2s_kit(monkeypatch, ste_ver="new", ste_sha="0" * 64)
+    out, err = run()
+    assert err is True and "sha256 이 StepForge 의 것과 다르다" in out["error"] and out["upload_id_broken"] == "u1"
 
 
 # ── 층 재료의 가스 투과 물성 gas_transport_lookup(HWAXPortal docs/ste-stepforge-1117 PT-R1) ──────────────────────────────────────────────

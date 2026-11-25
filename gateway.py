@@ -11134,12 +11134,55 @@ _ROUTINE_NAMES = frozenset(t.name for t in ROUTINE_TOOLS)
 # 진행 중인 CallTool 수 — 재기동 때 이것이 0 이 될 때까지 짧게 기다린다(_GracefulServer, HG-11).
 _INFLIGHT_CALLS = {"n": 0}
 
+# Report Archive 보고서 본문(pages)을 통째로 다시 쓰는 RA MCP 도구. RA v0.186.3 의 ai-draft · ai-draft/rows · versions restore 는 모든 쪽을 읽어
+# 합친 뒤 통째로 쓰고 행 잠금이 없다(services.update_report — 판 비교도 요청 처음에 읽은 행과의 파이썬 비교다). 같은 보고서에 쓰기 둘이 겹치면
+# 나중 쓰기가 먼저 쓰기의 칸을 지운다 — 포털이 이미 「붙였다」 고 답한 그림 칸도(HWAXPortal docs/report-figures RF-6 · F3). 포털은 to-report
+# 끼리만 줄 세우므로 두 길이 다 지나는 여기서 보고서마다 줄을 세운다(RF-42). 게이트웨이는 프로세스 하나라 asyncio 잠금으로 된다.
+_RA_PAGE_WRITERS = frozenset(("update_report_draft", "append_rows", "patch_cells", "remove_rows", "restore_version"))
+_RA_WRITE_LOCKS: dict[str, list] = {}   # 보고서 id → [잠금, 기다리거나 쥔 호출 수] — 0 이 되면 뺀다(쌓이지 않고 다른 이벤트 루프의 잠금이 남지 않는다)
+
+
+def _ra_write_key(name: str, arguments) -> str | None:
+    """이 호출이 RA 보고서 본문을 쓰면 그 보고서 id(정수 글자), 아니면 None. invoke_tool 은 안쪽 이름 · 인자로 본다(같은 쓰기다).
+    figure_to_report 는 포털을 거쳐 같은 보고서의 ai-draft 를 쓴다."""
+    a = arguments if isinstance(arguments, dict) else {}
+    if name == INVOKE_TOOL.name:
+        name, a = str(a.get("name") or "").strip(), a.get("arguments")
+        a = a if isinstance(a, dict) else {}
+    if not (FIG_STORE_ON and name == FIG_REPORT_TOOL.name):
+        r = route.get(name) or alias_route.get(name)
+        if r is None or r[0] != "reportarchive" or r[1] not in _RA_PAGE_WRITERS:
+            return None
+    rid = a.get("report_id")
+    if isinstance(rid, str) and rid.strip().isdecimal():
+        rid = int(rid.strip())
+    return str(rid) if isinstance(rid, int) and not isinstance(rid, bool) else None
+
+
+@asynccontextmanager
+async def _ra_write_lock(rid: str):
+    """그 보고서의 쓰기 줄 — 앞 쓰기가 끝날 때까지 기다린다(기다림의 끝은 앞 호출의 시간 한도다)."""
+    ent = _RA_WRITE_LOCKS.setdefault(rid, [asyncio.Lock(), 0])
+    ent[1] += 1
+    try:
+        async with ent[0]:
+            yield
+    finally:
+        ent[1] -= 1
+        if not ent[1]:
+            _RA_WRITE_LOCKS.pop(rid, None)
+
 
 async def _call_tool(name: str, arguments: dict):
-    """도구 호출 — 바깥 호출(_call_tool_entry)과 게이트웨이 안쪽 호출(browse_experts 의 list_agents 등)이 함께 쓴다. 결과는 원문이다."""
+    """도구 호출 — 바깥 호출(_call_tool_entry)과 게이트웨이 안쪽 호출(browse_experts 의 list_agents 등)이 함께 쓴다. 결과는 원문이다.
+    RA 보고서 본문 쓰기는 보고서마다 한 줄로 부른다(_ra_write_key)."""
     _INFLIGHT_CALLS["n"] += 1
     try:
-        return await _call_tool_body(name, arguments)
+        rid = _ra_write_key(name, arguments)
+        if rid is None:
+            return await _call_tool_body(name, arguments)
+        async with _ra_write_lock(rid):
+            return await _call_tool_body(name, arguments)
     finally:
         _INFLIGHT_CALLS["n"] -= 1
 

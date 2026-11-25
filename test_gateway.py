@@ -12323,6 +12323,123 @@ def test_figure_to_report_는_포털의_거절과_낡음을_그대로_말한다(
     assert _audit_rows()[-1]["ok"] is False
 
 
+class _RaRace:
+    """가짜 RA 보고서 한 건(쪽마다 칸 id 차례). 쓰기는 진짜 RA v0.186.3 처럼 모든 쪽을 읽고 · 합치고 · 통째로 쓴다(routes._apply_ai_draft ·
+    update_ai_draft_rows → services.update_report(pages=…) — 행 잠금 없음). 읽은 뒤 다른 쓰기가 들어올 틈을 0.3초까지 열어 두어, 줄을 세우지
+    않으면 둘이 같은 판을 읽고 먼저 들어온 쪽이 나중에 써서 뒤 쪽의 칸을 지운다(시간에 기대지 않는 재현)."""
+
+    def __init__(self):
+        self.pages = [["background", "results"], ["minutes"]]
+        self.inflight = self.peak = 0
+        self.second = asyncio.Event()
+
+    async def write(self, page: int, ids: list) -> None:
+        self.inflight += 1
+        self.peak = max(self.peak, self.inflight)
+        try:
+            snap = [list(p) for p in self.pages]                  # 읽기
+            if self.inflight == 1:
+                try:
+                    await asyncio.wait_for(self.second.wait(), 0.3)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                self.second.set()
+            for i in ids:
+                if i not in snap[page - 1]:
+                    snap[page - 1].append(i)
+            self.pages = snap                                     # 통째로 쓰기
+        finally:
+            self.inflight -= 1
+
+
+def _ra_race_kit(monkeypatch):
+    """figure_to_report(→ 가짜 포털 → 가짜 RA) 와 RA 쓰기 도구(→ 등록 토큰 길의 단발 세션 → 가짜 RA)가 한 가짜 RA 보고서에 쓴다.
+    포털 · RA 의 전송만 막고 게이트웨이의 _call_tool 은 진짜다."""
+    ra = _RaRace()
+    tools = ["update_report_draft", "append_rows", "get_report"]
+    b = _CallB(tools)
+    b.headers = {"Authorization": "Bearer rat_service", "X-Workspace-Slug": "svc"}
+
+    class _Sess:
+        async def initialize(self): return None
+
+        async def call_tool(self, original, arguments, read_timeout_seconds=None):
+            if original == "update_report_draft":
+                await ra.write(arguments["page"], [x["id"] for x in arguments.get("extra_blocks") or []])
+            return types.CallToolResult(content=[types.TextContent(type="text", text="{}")], isError=False)
+
+    async def portal(req):
+        meta = json.loads(_multipart(req)["meta"][2])
+        sid = f"fig_{meta['sha256'][:16]}"
+        await ra.write(meta["page"] or len(ra.pages), [sid])     # 포털 _to_report 의 진짜 PATCH(RA 안에서 읽고 · 합치고 · 쓴다)
+        return httpx.Response(200, json={"ok": True, "report_id": meta["report_id"], "block_id": sid})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(gw.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(portal), **kw))
+    monkeypatch.setattr(gw, "PORTAL", {"api_base": "http://portal.test"})
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    monkeypatch.setattr(gw, "streamablehttp_client", lambda url, headers=None, **_kw: _StubCM((None, None, "sid")))
+    monkeypatch.setattr(gw, "ClientSession", lambda read, write: _StubCM(_Sess()))
+    gw._RESP_CACHE.clear()
+    monkeypatch.setattr(gw, "backends", {"reportarchive": b})
+    monkeypatch.setattr(gw, "route", {t: ("reportarchive", t) for t in tools})
+    monkeypatch.setattr(gw, "alias_route", {f"reportarchive_{t}": ("reportarchive", t) for t in tools})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "PER_USER_SSO", {})              # RA 는 등록 토큰 길(as-conn) — 포털 연결은 캐시에 둔다
+    monkeypatch.setattr(gw, "_CONN_CACHE", {("reportarchive", "a@corp.com"): ({"token": "rat_a", "workspace": ""}, 1e12)})
+    _set_request_headers(monkeypatch, {gw.USER_HEADER: "a@corp.com", "authorization": "Bearer pat-a"})
+    return ra
+
+
+@pytest.mark.parametrize("call", [
+    ("update_report_draft", {"report_id": 41, "page": 2, "extra_blocks": [{"id": "summary", "type": "markdown"}]}),
+    ("reportarchive_update_report_draft", {"report_id": "41", "page": 2, "extra_blocks": [{"id": "summary", "type": "markdown"}]}),
+    ("invoke_tool", {"name": "update_report_draft",
+                     "arguments": {"report_id": 41, "page": 2, "extra_blocks": [{"id": "summary", "type": "markdown"}]}})])
+def test_같은_보고서의_figure_to_report_와_RA_쓰기는_줄을_서서_그림_칸이_지워지지_않는다(monkeypatch, call):
+    """F3(HWAXPortal docs/report-figures RF-6 · RF-42) — 포털은 to-report 끼리만 보고서마다 줄 세운다. 개인 Claude 가 같은 보고서에 그림 넣기와
+    update_report_draft 를 한꺼번에 부르면 RA 안에서 둘이 같은 판을 읽고, 나중 쓰기가 포털이 이미 「붙였다」 고 답한 그림 칸을 지웠다. 두 길이
+    다 지나는 게이트웨이가 보고서마다 줄을 세운다 — 별칭 · invoke_tool 도 같은 쓰기다."""
+    ra = _ra_race_kit(monkeypatch)
+    ref = _fig_stored()
+    sid = f"fig_{hashlib.sha256(_PNG).hexdigest()[:16]}"
+
+    async def both():
+        return await asyncio.gather(gw._call_tool("figure_to_report", {"ref": ref, "report_id": "41"}), gw._call_tool(*call))
+    fig, upd = asyncio.run(both())
+    assert not fig.isError and not upd.isError, (fig.content[0].text, upd.content[0].text)
+    assert {sid, "summary"} <= set(ra.pages[1]), f"앞 쓰기의 칸이 지워졌다 — {ra.pages[1]}"
+    assert ra.peak == 1, "같은 보고서의 두 쓰기가 RA 안에서 겹쳤다"
+    assert gw._RA_WRITE_LOCKS == {}, "다 쓴 보고서의 잠금은 남기지 않는다"
+
+
+def test_RA_쓰기_줄은_보고서마다이고_읽기_다른_백엔드_다른_보고서는_서지_않는다(monkeypatch):
+    """줄의 열쇠 — RA 본문을 통째로 쓰는 다섯(RA v0.186.3 의 ai-draft · ai-draft/rows · restore)과 figure_to_report 만, 보고서 id 로.
+    읽기 · 다른 앱의 같은 이름 · id 를 모르는 호출은 줄을 서지 않는다(지금처럼 바로 간다)."""
+    w = sorted(gw._RA_PAGE_WRITERS)
+    monkeypatch.setattr(gw, "route", {**{t: ("reportarchive", t) for t in [*w, "get_report", "add_report_tags"]},
+                                      "patch_cells_x": ("reportarchive", "patch_cells"), "list_x": ("other", "update_report_draft")})
+    monkeypatch.setattr(gw, "alias_route", {"reportarchive_append_rows": ("reportarchive", "append_rows")})
+    monkeypatch.setattr(gw, "FIG_STORE_ON", True)
+    k = gw._ra_write_key
+    assert w == ["append_rows", "patch_cells", "remove_rows", "restore_version", "update_report_draft"]
+    assert [k(t, {"report_id": 41}) for t in w] == ["41"] * 5
+    assert k("figure_to_report", {"ref": "fig_x", "report_id": " 41 "}) == "41", "포털을 거친 같은 보고서의 ai-draft 쓰기다"
+    assert (k("patch_cells_x", {"report_id": "007"}), k("reportarchive_append_rows", {"report_id": 7})) == ("7", "7"), "겹쳐 접두가 붙은 이름 · 별칭"
+    assert k("invoke_tool", {"name": "restore_version", "arguments": {"report_id": 9, "version_id": 3}}) == "9"
+    assert k("update_report_draft", {"report_id": 42}) != k("update_report_draft", {"report_id": 41}), "다른 보고서는 다른 줄"
+    for name, args in (("get_report", {"report_id": 41}), ("add_report_tags", {"report_id": 41}), ("list_x", {"report_id": 41}),
+                       ("create_report_draft", {"report_id": 41}), ("update_report_draft", {}), ("update_report_draft", {"report_id": "r-1"}),
+                       ("update_report_draft", {"report_id": True}), ("invoke_tool", {"name": "get_report", "arguments": {"report_id": 41}}),
+                       ("invoke_tool", {"name": "update_report_draft", "arguments": "41"}), ("update_report_draft", None)):
+        assert k(name, args) is None, (name, args)
+    monkeypatch.setattr(gw, "FIG_STORE_ON", False)
+    assert k("figure_to_report", {"report_id": 41}) is None, "그림 저장을 끈 박스에는 그 도구가 없다"
+
+
 def test_감사_줄은_그림_수와_바이트를_싣고_그림이_없으면_종전_줄이다(monkeypatch):
     gw._audit("render_3d", "heax-step_forge", True, None, 3, caller="a@corp.com", res=_fig_result())
     gw._audit("get_x", "b", True, None, 3, caller="a@corp.com",

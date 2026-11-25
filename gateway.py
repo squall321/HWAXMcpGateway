@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import os
+import queue
 import re
 import secrets
 import stat
@@ -1473,7 +1474,8 @@ async def _aggregate():
         # 그림 도구(로컬)와 같은 이름의 백엔드 도구는 접두를 단다 — 맨 이름이면 tools/list 에 같은 이름이 둘이고 그 이름의 호출은 늘 로컬로 가서
         # 백엔드 도구에 닿지 못했다(반대 검토 7). 그림 저장 · PC 키트가 새로 맡은 이름만이다 — 다른 로컬 이름은 지금 그대로다.
         clash = (clash or (FIG_STORE_ON and t.name in _FIG_NAMES) or t.name == KIT_GET_TOOL.name
-                 or t.name == READONLY_ALLOWLIST_TOOL.name or (RESULT_REFS_ON and t.name in _RES_NAMES))
+                 or t.name == READONLY_ALLOWLIST_TOOL.name or (RESULT_REFS_ON and t.name in _RES_NAMES)
+                 or (INTERACTION_CAPTURE_ON and t.name == SHARE_CONV_TOOL.name))
         if clash or key in family:
             prefix = key.replace("-", "")  # mx-white-paper -> mxwhitepaper
             exposed_name = f"{prefix}_{t.name}"
@@ -1974,9 +1976,20 @@ async def _backends_lifespan():
             # 결과 손잡이 원문 — 켰으면 표를 짓고 끝난 것을 치운다. 끈 뒤에도 폴더가 남아 있으면 돈다(켜 두었던 동안의 원문이 기한 뒤 지워지게)
             _RES_LIMITER["lim"] = anyio.CapacityLimiter(4)
             tg.start_soon(_res_sweep_loop)
+        if INTERACTION_CAPTURE_ON or IX_DIR.is_dir():
+            # 상호작용 수집 창고 — 디스크에서 조각 표를 지어 /health 가 곧바로 맞는 수를 보이게 한다(끈 뒤에도 남은 조각이 있으면 보인다)
+            try:
+                got = await anyio.to_thread.run_sync(_ix_scan)
+                log.info("상호작용 수집 창고 — 조각 %d개 · %s · 가장 오래된 %s", got["segments"], _fig_size(got["spool_bytes"]),
+                         _fig_iso(got["oldest_ts"]) if got["oldest_ts"] else "-")
+            except Exception as exc:  # noqa: BLE001 — 기동을 막지 않는다(첫 쓰기가 다시 짓는다)
+                log.warning("상호작용 수집 창고를 읽지 못했다(%s): %r", IX_DIR, exc)
         try:
             yield
         finally:
+            # 상호작용 수집 대기열을 비운다 — 내리는 중이라 막아 기다려도 된다(3초까지, 취소 범위 밖에서 await 하지 않게 동기로)
+            if INTERACTION_CAPTURE_ON and not _ix_flush(3.0):
+                log.warning("내리기 — 상호작용 수집 대기열의 줄 %d개를 쓰지 못하고 내린다", _IX_Q.unfinished_tasks)
             for b in backends.values():
                 b._stop.set()
             tg.cancel_scope.cancel()
@@ -2033,6 +2046,11 @@ _INSTR_DELIB_WAIT = " `deliberate_status` 는 고리로 묻지 말고 `wait_s` �
 _INSTR_DELIB_NOWAIT = " `deliberate_status` 를 고리로 되풀이해 묻지 마라."
 _INSTR_DELIB_VIEW = ' 결과는 `deliberate_result(view="summary")` 부터.'
 _INSTR_RISK_LLM = " `risk_start_job` 은 `llm=glm`(Claude 로 품질을 잴 때만 `claude`)."
+# 14번 — 상호작용 수집을 켠 박스만(HWAXPortal docs/interaction-data contract §7 — 문구는 초안, 사람이 확정한다). 맨 뒤에 붙는다. 2048자 안에 들면 계약
+# 문구 그대로, 넘으면 짧은 꼴 — 13번 · 11번이 모두 실린 가장 긴 조합(2,031자)에는 문구 전체가 들어가지 않는다. 전체 문구는 share_conversation 설명에 있다.
+_INSTR_IX = "14. 이 포털을 거친 대화와 도구 호출은 기록되어 품질 개선과 지식 정리에 쓰입니다. 원문은 본인과 지정 분석가만 보며, 언제든 지우기를 청할 수 있습니다.\n"
+_INSTR_IX_SHORT = "14. 호출은 기록된다.\n"
+_INSTR_MAX = 2048                          # Claude Code 가 서버 지침을 자르는 자리 — 이것보다 짧아야 한다
 
 
 def _tool_props(name: str) -> set[str]:
@@ -2049,6 +2067,8 @@ def _instructions() -> str:
                 + (_INSTR_DELIB_VIEW if "view" in _tool_props("deliberate_result") else "") + "\n")
     if "risk_next_step" in route:
         out += _INSTR_RISK_NEXT.rstrip("\n") + (_INSTR_RISK_LLM if "llm" in _tool_props("risk_start_job") else "") + "\n"
+    if INTERACTION_CAPTURE_ON:
+        out += _INSTR_IX if len(out) + len(_INSTR_IX) < _INSTR_MAX else _INSTR_IX_SHORT
     return out
 
 
@@ -2530,28 +2550,41 @@ def _portal_api_base() -> str | None:
     return m.group(1) if m else None
 
 
-async def _save_conversation(arguments: dict) -> types.CallToolResult:
-    """로컬 도구 실행: 호출자 PAT 를 포워딩해 포털 /agent/conversations 에 일괄 생성."""
-    t0 = time.monotonic()
-
-    def _fail(reason: str) -> types.CallToolResult:
-        _audit("save_conversation", "portal", False, reason,
-               round((time.monotonic() - t0) * 1000))
-        return types.CallToolResult(
-            content=[types.TextContent(type="text", text=f"CONV_UNAVAILABLE: {reason}")],
-            isError=True,
-        )
-
+def _portal_forward_auth() -> tuple[str | None, str | None, str]:
+    """호출자 PAT 를 포털로 그대로 넘기는 로컬 도구(save_conversation · share_conversation)의 (포털 REST base, 넘길 Authorization, 못 넘기는
+    까닭). 까닭이 비지 않으면 넘기지 않는다 — 게이트웨이는 신원을 지어내지 않는다(주인은 포털이 PAT sub 로 정한다)."""
     base = _portal_api_base()
     if not base:
-        return _fail("portal api base not configured")
+        return None, None, "portal api base not configured"
     try:
         req = _low.request_context.request
         auth = req.headers.get("authorization") if req is not None else None
     except LookupError:
         auth = None
     if not auth:
-        return _fail("no caller authorization to forward")
+        return base, None, "no caller authorization to forward"
+    return base, auth, ""
+
+
+def _portal_forward_fail(tool: str, t0: float, reason: str) -> types.CallToolResult:
+    """포털 넘기기 로컬 도구의 실패 꼴 — 감사 한 줄 + `CONV_UNAVAILABLE: <까닭>`(isError)."""
+    _audit(tool, "portal", False, reason, round((time.monotonic() - t0) * 1000))
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=f"CONV_UNAVAILABLE: {reason}")],
+        isError=True,
+    )
+
+
+async def _save_conversation(arguments: dict) -> types.CallToolResult:
+    """로컬 도구 실행: 호출자 PAT 를 포워딩해 포털 /agent/conversations 에 일괄 생성."""
+    t0 = time.monotonic()
+
+    def _fail(reason: str) -> types.CallToolResult:
+        return _portal_forward_fail("save_conversation", t0, reason)
+
+    base, auth, why = _portal_forward_auth()
+    if why:
+        return _fail(why)
     # 포털 검증 한도(CONV_*)에 맞춰 사전 정규화 — 항목 하나가 길면 포털이 배치 전체를 422 로 거부해 심의 대화가 통째로
     # 유실된다(전기박리 심의 사고). ⚠ 맞추되 **버리지 않는다.** 종전엔 발언을 20,000자에서 표지 없이 자르고 200건을 넘으면 첫 항목 +
     # 꼬리 199 만 남겼다 — 1백만 토큰 창의 발언·결정문과 20석 다회차 심의에서 이어하기가 잘린 글을 정본으로 읽었다.
@@ -2677,6 +2710,96 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
                      "저장됐을 수 있으니 다시 보내기 전에 대화 목록을 확인하라")
     except Exception as e:  # noqa: BLE001 — 포털 미가용은 비치명적(폴백 계약)
         return _fail(repr(e))
+
+
+# ── 게이트웨이 로컬 도구: share_conversation(HWAXPortal docs/interaction-data contract §5 · IX-3) ───────────────────────────────────────
+# 개인 Claude 의 대화 원문은 구조상 이 허브로 오지 않는다 — 사람이 「이 대화를 공유해」 라고 청하면 Claude 가 메시지를 다시 적어 이 도구로 보낸다.
+# 수집 스위치(GATEWAY_INTERACTION_CAPTURE)가 켜졌을 때만 목록에 오른다. 넘기기는 save_conversation 과 같은 길이다 — 호출자 PAT 를 포털
+# POST /interactions/share 로 그대로 넘기고(주인 = PAT sub), 실패는 같은 CONV_UNAVAILABLE 꼴이다. 비밀 가림은 포털이 저장 전에 한다(계약 §4 —
+# 이 호출의 수집 줄은 게이트웨이가 따로 가린다). 읽기 전용 PAT 는 막는다(_readonly_denial).
+SHARE_MAX_BYTES = 50 * 1024 * 1024        # 포털 공유 창구의 본문 상한(계약 §5) — 넘으면 보내기 전에 말한다
+SHARE_ID_MAX = 200                         # session_id · client 의 글자 상한
+SHARE_CONV_TOOL = types.Tool(
+    name="share_conversation",
+    description=(
+        "사람이 '이 대화를 공유해' 라고 청한 때만 부른다 — 이 포털을 거친 대화는 기록되어 품질 개선과 지식 정리에 쓰인다. "
+        "지금 대화의 메시지를 순서대로 [{role: user|assistant, content}] 로 싣는다(다시 적어 보내는 글이라 긴 대화는 빠질 수 있다 — Claude Code 는 "
+        "PC 킷의 /hwax-share 가 기록 파일 원문을 올린다). 같은 session_id 를 다시 보내면 포털이 덮어쓴다. 주인은 이 토큰의 사람이고, 포털이 비밀을 "
+        "가려 저장한다. 원문은 본인과 지정 분석가만 보며 언제든 지우기를 청할 수 있다. 포털 미가용 · 인증 불가 · 수집 꺼짐이면 CONV_UNAVAILABLE."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "대화 제목(무엇을 나눈 대화인지 한 줄)"},
+            "messages": {
+                "type": "array",
+                "description": "대화 메시지 — 순서대로",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role": {"type": "string", "enum": ["user", "assistant"]},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["role", "content"],
+                },
+            },
+            "session_id": {"type": "string", "description": f"이 대화(세션)의 id — 주면 같은 id 의 앞선 공유를 덮어쓴다({SHARE_ID_MAX}자까지)"},
+            "client": {"type": "string", "description": "클라이언트 이름 · 판(비우면 게이트웨이가 initialize 의 clientInfo 로 채운다)"},
+        },
+        "required": ["title", "messages"],
+    },
+)
+
+
+async def _share_conversation(arguments: dict) -> types.CallToolResult:
+    """로컬 도구 실행: 호출자 PAT 를 넘겨 포털 POST /interactions/share 에 대화 하나를 둔다(save_conversation 과 같은 넘기기 · 실패 꼴)."""
+    t0 = time.monotonic()
+
+    def _fail(reason: str) -> types.CallToolResult:
+        return _portal_forward_fail("share_conversation", t0, reason)
+
+    base, auth, why = _portal_forward_auth()
+    if why:
+        return _fail(why)
+    # 포털 입력에 맞춰 사전 정규화 — save_conversation 과 같다(역할이 어긋나면 assistant · 글은 문자열 · 객체가 아닌 항목은 뺀다)
+    raw_msgs = arguments.get("messages")
+    msgs = [{"role": m.get("role") if m.get("role") in ("user", "assistant") else "assistant", "content": str(m.get("content") or "")}
+            for m in (raw_msgs if isinstance(raw_msgs, list) else []) if isinstance(m, dict)]
+    if not msgs:
+        return _fail("messages 가 비었다 — 공유할 대화의 메시지를 [{role, content}] 로 싣는다")
+    title = str(arguments.get("title") or "공유한 대화")
+    body: dict = {"title": title[:CONV_TITLE_MAX], "messages": msgs}
+    sid = str(arguments.get("session_id") or "").strip()
+    if sid:
+        body["session_id"] = sid[:SHARE_ID_MAX]
+    client = str(arguments.get("client") or "").strip() or _ix_client()
+    if client:
+        body["client"] = client[:SHARE_ID_MAX]
+    raw = json.dumps(body, ensure_ascii=False).encode("utf-8", "replace")
+    if len(raw) > SHARE_MAX_BYTES:
+        return _fail(f"본문이 {SHARE_MAX_BYTES // (1024 * 1024)} MB 를 넘는다({len(raw):,} 바이트) — 대화를 나눠 보내거나(나눈 몫마다 다른 "
+                     "session_id) Claude Code 면 PC 킷 /hwax-share 로 기록 파일을 올린다")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(PORTAL_SAVE_TIMEOUT_S, connect=8.0)) as cli:
+            r = await cli.post(f"{base}/interactions/share", content=raw,
+                               headers={"Authorization": auth, "content-type": "application/json"})
+    except httpx.ReadTimeout:
+        # 본문은 다 보냈고 답만 못 받았다 — 포털이 이미 저장했을 수 있다
+        return _fail(f"포털이 {PORTAL_SAVE_TIMEOUT_S:g}초 안에 저장을 확인하지 않았다(GATEWAY_PORTAL_SAVE_TIMEOUT) — 저장됐을 수 있다"
+                     + (" — 같은 session_id 로 다시 보내면 덮어쓴다" if sid else " — session_id 없이 다시 보내면 두 벌이 생길 수 있다"))
+    except Exception as e:  # noqa: BLE001 — 포털 미가용은 비치명적(폴백 계약)
+        return _fail(repr(e))
+    if r.status_code not in (200, 201):
+        return _fail(f"portal {r.status_code}" + (" — 포털에서 상호작용 수집이 꺼져 있다(INTERACTIONS_ENABLED)" if r.status_code == 404 else ""))
+    try:
+        data = r.json()
+    except ValueError:
+        data = None
+    out: dict = {"ok": True, "messages": len(msgs)}
+    if isinstance(data, dict):
+        out.update(data)
+    _audit("share_conversation", "portal", True, None, round((time.monotonic() - t0) * 1000), note=f"messages:{len(msgs)}")
+    return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(out, ensure_ascii=False))])
 
 
 # ── 게이트웨이 로컬 도구: search_conversations ──────────────────────────────
@@ -8534,6 +8657,18 @@ async def _res_dispatch(name: str, arguments: dict) -> types.CallToolResult:
         return types.CallToolResult(content=[types.TextContent(type="text", text=f"RESULT_ERROR: {exc}")], isError=True)
 
 
+def _internal_direct(scope) -> bool:
+    """박스 안 직접 연결인가 — 내부 창구(결과 손잡이 /internal/result/ · 상호작용 /internal/interactions)의 문. nginx 를 거친 요청은 X-Forwarded-*
+    를 싣는다(포털 hwax.conf.tmpl 서버 단계) — 하나라도 있으면 아니다(그 요청은 내부 창구로 가지 않고 지금처럼 아래 인증으로 간다)."""
+    return not any(k.lower().startswith(b"x-forwarded-") for k, _v in (scope.get("headers") or []))
+
+
+def _internal_auth_ok(hdrs, gw_auth: str) -> bool:
+    """내부 창구의 자격 — Authorization 이 정확히 한 번이고 그것이 게이트웨이 공유 비밀(Bearer GW_TOKEN)일 때만. 두 번 실리면 없는 것이다."""
+    auths = [v.decode("latin-1") for k, v in hdrs if k.lower() == b"authorization"]
+    return len(auths) == 1 and bool(GW_TOKEN) and _secret_eq(auths[0], gw_auth)
+
+
 async def _res_internal_http(scope, send, gw_auth: str) -> None:
     """GET /internal/result/<ref> — 에이전트 서버(draft_section)가 근거 ref 의 원문을 읽는다. 자격은 게이트웨이 공유 비밀(Authorization: Bearer
     GW_TOKEN — 한 번만) 하나이고, 사람 머리 x-hwax-user(그 ref 를 받은 사람의 이메일, %-인코딩 가능)가 ref 주인일 때만 준다. 비밀이 틀리면 401,
@@ -8556,8 +8691,7 @@ async def _res_internal_http(scope, send, gw_auth: str) -> None:
     if scope.get("method") != "GET":
         await _reply(405, {"error": "method not allowed"}, [(b"allow", b"GET")])
         return
-    auths = [v.decode("latin-1") for k, v in hdrs if k.lower() == b"authorization"]
-    if len(auths) != 1 or not GW_TOKEN or not _secret_eq(auths[0], gw_auth):
+    if not _internal_auth_ok(hdrs, gw_auth):
         _aud(False, "unauthorized")
         await _reply(401, {"error": "unauthorized"})
         return
@@ -8586,6 +8720,551 @@ async def _res_internal_http(scope, send, gw_auth: str) -> None:
                 "headers": [(b"content-type", b"application/json"), (b"cache-control", b"no-store")]})
     await send({"type": "http.response.body", "body": body})
     _aud(True, None, caller=email, size=len(body))
+
+
+# ── 상호작용 수집 창고 — 도구 호출 원문을 포털 수집기가 가져갈 JSONL 로(HWAXPortal docs/interaction-data contract §3 · §4 · IX-2 · IX-8 · IX-9) ──
+# 이 허브를 거친 도구 호출의 인자 · 결과 원문을 한 줄씩 쌓고, 포털 수집기가 공유 비밀로 가져가 원장(interactions.sqlite)에 넣는다.
+#  · 켜기 — GATEWAY_INTERACTION_CAPTURE=1(띄운 셸의 환경이 먼저, 비면 곁 provision.env 의 마지막 활성 줄 — 결과 손잡이 TS-9 와 같은 읽기). 끄면
+#    결과 · 도구 목록 · 지침 · 경로가 지금과 바이트까지 같다(/health 의 interactions 칸만 늘 있다).
+#  · 덧붙이는 자리 — 바깥 처리기(_call_tool_entry) 하나, 호출이 끝난 뒤. 결과 손잡이로 줄이기 전의 원문을 본다. 안쪽 호출(browse_experts 의 list_agents
+#    · 루틴 단계 …)은 바깥 호출의 일부라 따로 적지 않는다. 모든 자격(pat · chat · procedure · mcp-app · gw-token · service)을 적고 via 로 가른다.
+#  · 호출을 막지도 늦추지도 않는다 — 처리기는 요청 문맥의 칸(누가 · 어디서 · 무엇)만 모아 대기열에 넣고 곧바로 돌아간다. 가림 · 직렬화 · 쓰기는 일꾼
+#    스레드 하나가 한다(파일 잠금은 한 줄 쓰는 동안만 — 이벤트 루프는 이 잠금을 잡지 않는다). 대기열이 차면(줄 수 · 쥔 결과 글자 합) 버리고 dropped
+#    를 센다. 실패는 errors 를 세고 로그(60초에 한 줄)만 — 둘 다 /health 의 interactions 에 보인다(무음 실패 금지).
+#  · 비밀 가림(계약 §4 — 포털과 같은 시험 벡터)은 넣기 전에. 결과는 content 글 블록을 이은 것 + structuredContent JSON(글 블록 하나가 그것과 같은
+#    JSON 이면 한 번만), 1 MB 상한(UTF-8 — 넘으면 앞부분). result_chars · result_sha256 은 가린 원문 전체의 것이다(가리기 전 글의 지문은 짧은 비밀을
+#    맞혀 보는 길이 된다). 인자도 직렬화가 1 MB 를 넘으면 앞부분 글 + args_chars 로.
+#  · 자리 — 그림 · 결과 손잡이 저장소와 같은 규칙(데이터 루트의 interaction_spool, 원장이 리포 안이면 리포 옆 <리포>-interaction_spool — 체크아웃 밖,
+#    git stash -u). GATEWAY_INTERACTION_SPOOL_DIR 이 덮는다. 조각 ix-<첫 줄의 ms 13자리>.jsonl(이름 순 = 시간 순), 64 MB 에서 새 조각, 전체가
+#    GATEWAY_INTERACTION_SPOOL_MAX_MB(기본 2048)를 넘으면 닫힌 조각 가운데 오래된 것부터 버리고 그 줄 수를 dropped 에 더한다. 파일 0600 · 폴더 0700.
+#    기한은 없다 — 포털이 ack 한 조각만 지운다.
+#  · 가져가기 — GET /internal/interactions?cursor=&max=500 · POST /internal/interactions/ack {cursor}(_ix_internal_http). 공유 비밀 한 번 + 박스 안
+#    직접 연결만(결과 손잡이 내부 창구와 같은 막기 — _internal_direct · _internal_auth_ok). cursor 는 불투명 글 v1.<조각 ms>.<바이트 자리>.
+INTERACTION_CAPTURE_ON = (os.environ.get("GATEWAY_INTERACTION_CAPTURE", "").strip()
+                          or _provision_env_value("GATEWAY_INTERACTION_CAPTURE")) == "1"
+IX_SPOOL_MAX_BYTES = _fig_env_int("GATEWAY_INTERACTION_SPOOL_MAX_MB", 2048, 1) * 1024 * 1024   # 전체 상한 — 넘으면 오래된 조각부터
+IX_SEGMENT_BYTES = 64 * 1024 * 1024        # 조각 하나 — 넘으면 새 조각
+IX_FIELD_MAX_BYTES = 1024 * 1024           # 결과 · 인자 한 칸(UTF-8) — 넘으면 앞부분
+IX_QUEUE_MAX = 1024                        # 쓰기를 기다리는 줄 — 차면 버리고 dropped
+IX_QUEUE_MAX_CHARS = 256 * 1024 * 1024     # 기다리는 줄이 쥔 결과 글자 합 — 넘으면 버리고 dropped(큰 결과가 몰려도 메모리가 붓지 않게)
+IX_READ_DEFAULT, IX_READ_MAX = 500, 2000   # 가져가기 한 번의 줄 수(기본 · 하늘)
+IX_READ_MAX_BYTES = 16 * 1024 * 1024       # 가져가기 한 번의 바이트 상한(적어도 한 줄은 준다)
+IX_GET_PATH = "/internal/interactions"
+IX_ACK_PATH = "/internal/interactions/ack"
+_IX_CHUNK = 256 * 1024                     # 긴 글의 가림은 이만큼씩 끊어서 — 한 번의 정규식이 GIL 을 오래 쥐어 이벤트 루프를 세우지 않게
+
+
+def _ix_dir_setting() -> Path:
+    """감사 원장이 사는 데이터 루트의 interaction_spool — 원장이 리포 안이면 리포 옆 <리포>-interaction_spool. GATEWAY_INTERACTION_SPOOL_DIR 이
+    덮는다(상대 경로는 리포 루트 기준). 체크아웃 밖이어야 한다(git stash -u — 그림 · 결과 손잡이 폴더와 같은 까닭)."""
+    repo = Path(__file__).resolve().parent
+    raw = (os.environ.get("GATEWAY_INTERACTION_SPOOL_DIR") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        return p if p.is_absolute() else repo / p
+    root = Path(AUDIT_PATH).expanduser().resolve().parent
+    if root == repo or repo in root.parents:
+        return repo.with_name(repo.name + "-interaction_spool")
+    return root / "interaction_spool"
+
+
+IX_DIR = _ix_dir_setting()
+_IX_SEG_RE = re.compile(r"ix-(\d{13})\.jsonl")
+_IX_CURSOR_RE = re.compile(r"v1\.(\d{13})\.(\d{1,15})")
+_IX_LOCK = threading.Lock()                # 조각 표 · 파일(쓰기 · 회전 · 지우기) — 일꾼 스레드에서만 잡는다
+_IX_CNT_LOCK = threading.Lock()            # 셈(dropped · errors)과 일꾼 띄우기 — 파일 일 동안 쥐지 않는다(이벤트 루프도 잡는다)
+# ready — 디스크에서 조각 표를 지었나 · segs — 조각 ms → 바이트 · cur — 지금 쓰는 조각(None 이면 다음 줄이 새 조각) · bytes — 합
+_IX: dict = {"ready": False, "segs": {}, "cur": None, "bytes": 0, "dropped": 0, "errors": 0, "last_log": -1e9, "qchars": 0}
+_IX_Q: queue.Queue = queue.Queue(maxsize=IX_QUEUE_MAX)
+_IX_WORKER: dict = {"t": None}
+# 선언 백엔드에 실은 요청 ID(X-Request-Id) — 바깥 처리기가 호출마다 비우고, _call_tool_body 의 외부 연결 길이 적는다(감사 rid 와 같은 값)
+_IX_RID: ContextVar = ContextVar("ix_rid", default=None)
+
+# 비밀 가림(계약 §4) — 칸 이름(대소문자 무시)이 이 말이거나 이 말로 끝나면 값 전체를 <가림:칸>(칸 이름 소문자)으로. 글 안의 꼴은 PEM 비밀 키 덩어리 →
+# Bearer 뒤 글 → JWT 차례다 — PEM 을 먼저 한다(Bearer 의 글자 칸이 '-----BEGIN' 을 먹으면 덩어리가 남는다).
+_IX_SECRET_KEYS = ("authorization", "token", "access_token", "refresh_token", "api_key", "apikey", "x-api-key", "secret", "client_secret",
+                   "password", "passwd", "cookie", "set-cookie", "session", "private_key")
+_IX_PEM_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.S)
+_IX_BEARER_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])(bearer)([ \t]+)[A-Za-z0-9\-._~+/]+=*")
+_IX_JWT_RE = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+_IX_CUT_RE = re.compile(r"[\n,\"']")       # 긴 글을 끊는 자리 — Bearer · JWT 꼴에 들지 않는 글자
+_IX_JSONISH_RE = re.compile(r"\s*[\[{]")
+
+
+def _ix_mask_piece(s: str) -> str:
+    return _IX_JWT_RE.sub("<가림:jwt>", _IX_BEARER_RE.sub(r"\1\2<가림:bearer>", s))
+
+
+def _ix_mask_text(s: str) -> str:
+    """글 안의 비밀 꼴을 가린다(계약 §4). 긴 글은 Bearer · JWT 꼴에 들지 않는 글자(줄바꿈 · 쉼표 · 따옴표)에서 _IX_CHUNK 씩 끊어 가린다."""
+    if "PRIVATE KEY-----" in s:
+        s = _IX_PEM_RE.sub("<가림:pem>", s)
+    if len(s) <= _IX_CHUNK:
+        return _ix_mask_piece(s)
+    out, i, n = [], 0, len(s)
+    while i < n:
+        m = _IX_CUT_RE.search(s, min(n, i + _IX_CHUNK))
+        j = n if m is None else m.end()
+        out.append(_ix_mask_piece(s[i:j]))
+        i = j
+    return "".join(out)
+
+
+def _ix_mask(v):
+    """JSON 값의 비밀을 가린다(계약 §4) — 칸 이름이 비밀 말(로 끝나)면 값 전체, 글은 글 안의 꼴. 원래 값은 건드리지 않고 새 값을 준다."""
+    if isinstance(v, dict):
+        return {k: (f"<가림:{str(k).lower()}>" if str(k).lower().endswith(_IX_SECRET_KEYS) else _ix_mask(x)) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_ix_mask(x) for x in v]
+    if isinstance(v, str):
+        return _ix_mask_text(v)
+    return v
+
+
+def _ix_mask_block(t: str) -> tuple[str, object]:
+    """도구 결과 글 블록 하나 — (가린 글, 읽은 JSON 또는 None). JSON 객체 · 배열이면 칸 이름까지 가리고(가릴 것이 없으면 원래 글 그대로), 아니면 글
+    안의 꼴만."""
+    if _IX_JSONISH_RE.match(t):
+        try:
+            obj = json.loads(t)
+        except ValueError:
+            obj = None
+        if isinstance(obj, (dict, list)):
+            masked = _ix_mask(obj)
+            return (t if masked == obj else json.dumps(masked, ensure_ascii=False)), obj
+    return _ix_mask_text(t), None
+
+
+def _ix_cut(s: str) -> str:
+    """UTF-8 로 IX_FIELD_MAX_BYTES 를 넘으면 앞부분(글자 경계)."""
+    b = s.encode("utf-8", "replace")
+    return s if len(b) <= IX_FIELD_MAX_BYTES else b[:IX_FIELD_MAX_BYTES].decode("utf-8", "ignore")
+
+
+def _ix_result_text(res, exc) -> tuple[str, bool]:
+    """(가린 결과 글, 실패인가) — content 글 블록을 줄바꿈으로 이은 것 + structuredContent 의 촘촘한 JSON(글 블록 하나가 그것과 같은 JSON 이면 싣지
+    않는다). 그림 블록은 싣지 않는다(그림 보관이 켜져 있으면 '그림 저장 —' 글 블록에 ref 가 있다). 호출이 예외로 끝났으면 그 까닭."""
+    if exc is not None:
+        return _ix_mask_text(f"{type(exc).__name__}: {exc}"), True
+    if not isinstance(res, types.CallToolResult):
+        return _ix_mask_block(json.dumps(res, ensure_ascii=False, default=str))[0], False
+    texts, parsed = [], []
+    for c in res.content or []:
+        t = getattr(c, "text", None)
+        if getattr(c, "type", None) == "text" and isinstance(t, str):
+            got, obj = _ix_mask_block(t)
+            texts.append(got)
+            parsed.append(obj)
+    text = "\n".join(texts)
+    sc = res.structuredContent
+    if sc is not None and not (len(parsed) == 1 and parsed[0] is not None and parsed[0] == sc):
+        sj = json.dumps(_ix_mask(sc), ensure_ascii=False, separators=(",", ":"), default=str)
+        text = f"{text}\n{sj}" if text else sj
+    return text, bool(res.isError)
+
+
+def _ix_line(ev: dict) -> bytes:
+    """한 줄(계약 §3 칸 차례) — 가림 · 상한 뒤. 일꾼 스레드에서 돈다."""
+    args = ev["args"]
+    a = _ix_mask(args if args is not None else {})
+    aj = json.dumps(a, ensure_ascii=False, separators=(",", ":"), default=str)
+    rec = {k: ev[k] for k in ("ts", "corr", "rid", "actor", "via", "client", "tool", "backend", "orig")}
+    if len(aj.encode("utf-8", "replace")) > IX_FIELD_MAX_BYTES:
+        rec["args"], rec["args_chars"] = _ix_cut(aj), len(aj)
+    else:
+        rec["args"] = a
+    text, is_err = _ix_result_text(ev["res"], ev["exc"])
+    raw = text.encode("utf-8", "replace")
+    rec.update(result=_ix_cut(text), result_chars=len(text), result_sha256=hashlib.sha256(raw).hexdigest(), is_error=is_err, ms=ev["ms"])
+    return (json.dumps(rec, ensure_ascii=False, separators=(",", ":"), default=str) + "\n").encode("utf-8", "replace")
+
+
+def _ix_fail(what: str, exc: BaseException) -> None:
+    """수집 실패 — 셈(errors)과 로그(60초에 한 줄)만. 호출은 그대로다."""
+    with _IX_CNT_LOCK:
+        _IX["errors"] += 1
+        n, now = _IX["errors"], time.monotonic()
+        loud = now - _IX["last_log"] >= 60
+        if loud:
+            _IX["last_log"] = now
+    if loud:
+        log.warning("상호작용 수집 실패(%s) — 이 줄은 버린다, 호출은 그대로다(누적 %d · /health interactions.errors): %r", what, n, exc)
+
+
+def _ix_drop(n: int) -> None:
+    with _IX_CNT_LOCK:
+        _IX["dropped"] += n
+
+
+def _ix_client() -> str:
+    """이 세션의 initialize clientInfo — 'name/version'(판이 없으면 이름만), 모르면 ''."""
+    try:
+        ci = getattr(getattr(getattr(_low.request_context, "session", None), "client_params", None), "clientInfo", None)
+        name, ver = str(getattr(ci, "name", "") or "").strip(), str(getattr(ci, "version", "") or "").strip()
+    except Exception:  # noqa: BLE001 — LookupError(문맥 없음) 포함
+        return ""
+    return (f"{name}/{ver}" if name and ver else name)[:120]
+
+
+def _ix_actor() -> str:
+    """누가 — 검증된 사람 이메일, 서비스 PAT 면 system:<작업>(감사 caller 와 같은 규칙), 없으면 ''."""
+    try:
+        who = _request_user()
+        if who:
+            return who
+        svc = _request_service()
+        return f"system:{svc['job'] or '?'}" if svc is not None else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _ix_enqueue(name: str, arguments, res, exc, ms: int, rid) -> None:
+    """요청 문맥의 칸을 모아 대기열에 넣는다 — 던지지 않는다. tool 은 클라이언트가 부른 노출 이름이고, backend · orig 는 실제로 돈 것이다
+    (invoke_tool 이면 안쪽 도구)."""
+    try:
+        inner = _res_inner_name(name, arguments)
+        hit = route.get(inner) or alias_route.get(inner)
+        if hit:
+            backend, orig = hit
+        else:
+            backend = "_gateway" if inner in ({t.name for t in _local_tools()} | {READONLY_ALLOWLIST_TOOL.name}) else ""
+            orig = inner
+        ev = {"ts": round(time.time(), 3), "corr": _request_corr(), "rid": rid or "", "actor": _ix_actor(), "via": _request_via(),
+              "client": _ix_client(), "tool": name, "backend": backend, "orig": orig, "args": arguments, "res": res, "exc": exc, "ms": ms,
+              "qchars": _res_chars(res) if res is not None else 0}
+    except Exception as e:  # noqa: BLE001 — 수집이 호출을 막으면 안 된다
+        _ix_fail("호출 칸을 모으지 못했다", e)
+        return
+    with _IX_CNT_LOCK:
+        if _IX["qchars"] and _IX["qchars"] + ev["qchars"] > IX_QUEUE_MAX_CHARS:
+            _IX["dropped"] += 1
+            return
+        _IX["qchars"] += ev["qchars"]
+    try:
+        _IX_Q.put_nowait(ev)
+    except queue.Full:
+        with _IX_CNT_LOCK:
+            _IX["qchars"] -= ev["qchars"]
+            _IX["dropped"] += 1
+        return
+    _ix_worker_start()
+
+
+def _ix_worker_start() -> None:
+    t = _IX_WORKER["t"]
+    if t is not None and t.is_alive():
+        return
+    with _IX_CNT_LOCK:
+        t = _IX_WORKER["t"]
+        if t is None or not t.is_alive():
+            t = threading.Thread(target=_ix_worker, name="ix-spool", daemon=True)
+            t.start()
+            _IX_WORKER["t"] = t
+
+
+def _ix_worker() -> None:
+    while True:
+        ev = _IX_Q.get()
+        try:
+            _ix_append(_ix_line(ev), ev["ts"])
+        except Exception as exc:  # noqa: BLE001 — 한 줄의 실패가 일꾼을 죽이지 않는다
+            _ix_fail("한 줄을 쓰지 못했다", exc)
+        finally:
+            with _IX_CNT_LOCK:
+                _IX["qchars"] -= ev.get("qchars", 0)
+            _IX_Q.task_done()
+
+
+def _ix_flush(timeout: float = 5.0) -> bool:
+    """대기열이 빌 때까지 기다린다(시험 · 내리기) — 시간 안에 비면 참."""
+    end = time.monotonic() + timeout
+    while _IX_Q.unfinished_tasks:
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def _ix_seg_path(ms: int) -> Path:
+    return IX_DIR / f"ix-{ms:013d}.jsonl"
+
+
+def _ix_ready_locked() -> None:
+    """처음 한 번 디스크에서 조각 표를 짓는다(잠금 안에서). 마지막 조각이 가득 찼거나 끝이 줄바꿈이 아니면(쓰다 죽음) 거기 잇지 않고 다음 줄이 새
+    조각을 연다."""
+    if _IX["ready"]:
+        return
+    segs: dict[int, int] = {}
+    try:
+        entries = list(os.scandir(IX_DIR))
+    except FileNotFoundError:
+        entries = []
+    for e in entries:
+        m = _IX_SEG_RE.fullmatch(e.name)
+        if m and e.is_file(follow_symlinks=False):
+            segs[int(m.group(1))] = e.stat(follow_symlinks=False).st_size
+    cur = max(segs) if segs else None
+    if cur is not None and segs[cur]:
+        with _fig_open(_ix_seg_path(cur)) as f:
+            f.seek(segs[cur] - 1)
+            tail = f.read(1)
+        if segs[cur] >= IX_SEGMENT_BYTES or tail != b"\n":
+            cur = None
+    _IX.update(ready=True, segs=segs, cur=cur, bytes=sum(segs.values()))
+
+
+def _ix_count_lines(path: Path) -> int:
+    n = 0
+    with _fig_open(path) as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            n += chunk.count(b"\n")
+    return n
+
+
+def _ix_append(line: bytes, ts: float) -> None:
+    """한 줄 덧붙이기 — 지금 조각이 없거나 넘치면 새 조각, 전체 상한을 넘으면 닫힌 조각 가운데 오래된 것부터 버린다(그 줄 수만큼 dropped). 쓰다
+    실패하면 그 조각을 닫는다(반쯤 쓴 줄 뒤에 다음 줄을 잇지 않게 — 읽기는 깨진 줄을 건너뛴다)."""
+    victims: list[int] = []
+    with _IX_LOCK:
+        _ix_ready_locked()
+        segs = _IX["segs"]
+        cur = _IX["cur"]
+        if cur is None or (segs.get(cur, 0) and segs[cur] + len(line) > IX_SEGMENT_BYTES):
+            cur = max(int(ts * 1000), max(segs, default=0) + 1)
+            segs[cur] = 0
+            _IX["cur"] = cur
+        try:
+            IX_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(_ix_seg_path(cur), os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                view = memoryview(line)
+                while view:
+                    view = view[os.write(fd, view):]
+            finally:
+                os.close(fd)
+        except OSError:
+            _IX["cur"] = None
+            try:
+                size = os.stat(_ix_seg_path(cur), follow_symlinks=False).st_size
+            except OSError:
+                size = 0
+            _IX["bytes"] += size - segs[cur]
+            if size:
+                segs[cur] = size
+            else:
+                segs.pop(cur, None)
+            raise
+        segs[cur] += len(line)
+        _IX["bytes"] += len(line)
+        while _IX["bytes"] > IX_SPOOL_MAX_BYTES:
+            old = min((s for s in segs if s != cur), default=None)
+            if old is None:
+                break
+            _IX["bytes"] -= segs.pop(old)
+            victims.append(old)
+    for old in victims:
+        p = _ix_seg_path(old)
+        try:
+            n = _ix_count_lines(p)
+            p.unlink()
+        except OSError as exc:
+            _ix_fail(f"넘친 조각 {p.name} 을 지우지 못했다", exc)
+            continue
+        _ix_drop(n)
+        log.warning("상호작용 창고가 상한 %s 를 넘어 가져가지 않은 조각 %s 를 버렸다 — %d줄(포털 수집기가 멈췄나 본다 · /health interactions.dropped)",
+                    _fig_size(IX_SPOOL_MAX_BYTES), p.name, n)
+
+
+def _ix_cursor(ms: int, off: int) -> str:
+    return f"v1.{ms:013d}.{off}"
+
+
+def _ix_parse_cursor(s: str) -> tuple[int, int]:
+    m = _IX_CURSOR_RE.fullmatch(s or "")
+    if not m:
+        raise ValueError("cursor 꼴이 틀렸다 — 가져가기 답의 next_cursor 를 그대로 준다(비우면 가장 오래된 것부터)")
+    return int(m.group(1)), int(m.group(2))
+
+
+def _ix_read_body(cursor: str, max_n: int) -> tuple[bytes, int]:
+    """가져가기 — (답 본문 {events, next_cursor, more}, 줄 수). 일꾼 스레드에서 돈다. 조각 크기는 잠금 안에서 보고 그만큼만 읽는다(쓰기는 잠금 안에서
+    줄 단위라 그 크기까지는 온전한 줄이다). cursor 의 조각이 없으면(상한으로 버렸거나 ack 로 지웠다) 남은 조각 가운데 가장 오래된 것부터 준다.
+    줄은 다시 짓지 않고 원래 바이트를 잇는다(깨진 줄 — 쓰다 죽은 끝 — 은 건너뛰고 로그)."""
+    pos = _ix_parse_cursor(cursor) if cursor else None
+    with _IX_LOCK:
+        _ix_ready_locked()
+        segs = sorted(_IX["segs"].items())
+    sizes = dict(segs)
+    if pos is not None and pos[0] in sizes and pos[1] > sizes[pos[0]]:
+        raise ValueError("cursor 가 조각 끝을 넘는다 — 내준 적 없는 자리다")
+    if not segs:
+        start = pos or (0, 0)
+    elif pos is None or pos[0] not in sizes:
+        start = (segs[0][0], 0)
+    else:
+        start = pos
+    lines: list[bytes] = []
+    total = 0
+    nxt = start
+    for ms, size in segs:
+        if ms < start[0]:
+            continue
+        o = start[1] if ms == start[0] else 0
+        if o < size:
+            with _fig_open(_ix_seg_path(ms)) as f:
+                f.seek(o)
+                while o < size and len(lines) < max_n and (total < IX_READ_MAX_BYTES or not lines):
+                    ln = f.readline(size - o)
+                    if not ln:
+                        break
+                    o += len(ln)
+                    try:
+                        ok = ln.endswith(b"\n") and isinstance(json.loads(ln), dict)
+                    except ValueError:
+                        ok = False
+                    if not ok:
+                        log.warning("상호작용 창고 %s 의 깨진 줄(%d 바이트)을 건너뛴다", _ix_seg_path(ms).name, len(ln))
+                        continue
+                    lines.append(ln[:-1])
+                    total += len(ln)
+        nxt = (ms, min(o, size))
+        if len(lines) >= max_n or (total >= IX_READ_MAX_BYTES and lines):
+            break
+    more = (nxt[0] in sizes and nxt[1] < sizes[nxt[0]]) or any(ms > nxt[0] and size > 0 for ms, size in segs)
+    nc = _ix_cursor(*nxt) if (segs or pos) else ""
+    body = (b'{"events":[' + b",".join(lines) + b'],"next_cursor":' + json.dumps(nc).encode() + b',"more":'
+            + (b"true" if more else b"false") + b"}")
+    return body, len(lines)
+
+
+def _ix_ack(cursor: str) -> dict:
+    """ack — cursor 자리까지 다 읽힌 조각을 지운다: cursor 의 조각보다 오래된 조각 전부, 그리고 cursor 의 조각이 닫혔고 끝까지 읽혔으면 그것도.
+    지금 쓰는 조각은 지우지 않는다. 내준 적 없는 자리(가장 새 조각보다 앞 · 조각 끝 너머)는 거절한다 — 읽지 않은 줄을 지우지 않게."""
+    ms, off = _ix_parse_cursor(cursor)
+    gone = 0
+    with _IX_LOCK:
+        _ix_ready_locked()
+        segs, cur = _IX["segs"], _IX["cur"]
+        if segs and ms > max(segs):
+            raise ValueError("cursor 가 창고의 가장 새 조각보다 앞선다 — 내준 적 없는 자리다")
+        if ms in segs and off > segs[ms]:
+            raise ValueError("cursor 가 조각 끝을 넘는다 — 내준 적 없는 자리다")
+        for s in sorted(segs):
+            if s < ms or (s == ms and s != cur and off >= segs[s]):
+                try:
+                    _ix_seg_path(s).unlink()
+                except FileNotFoundError:
+                    pass
+                _IX["bytes"] -= segs.pop(s)
+                gone += 1
+        return {"ok": True, "deleted": gone, "segments": len(segs), "spool_bytes": _IX["bytes"]}
+
+
+def _ix_scan() -> dict:
+    """기동 때 한 번 — 디스크에서 조각 표를 짓는다(/health 가 곧바로 맞는 수를 보이게)."""
+    with _IX_LOCK:
+        _IX["ready"] = False
+        _ix_ready_locked()
+    return _ix_health()
+
+
+def _ix_health() -> dict:
+    """/health 의 interactions — 수만 싣는다(주인 · 내용은 싣지 않는다). 잠금 없이 읽는다(이벤트 루프)."""
+    keys = list(_IX["segs"])
+    return {"enabled": INTERACTION_CAPTURE_ON, "spool_bytes": _IX["bytes"], "segments": len(keys), "dropped": _IX["dropped"],
+            "errors": _IX["errors"], "oldest_ts": round(min(keys) / 1000, 3) if keys else None}
+
+
+def _ix_log_line() -> str:
+    """기동 로그 한 줄 — 켰는지 · 어디에. 끈 것도 남긴다(안 켠 기능도 로그에)."""
+    if not INTERACTION_CAPTURE_ON:
+        return ("상호작용 수집 끔(GATEWAY_INTERACTION_CAPTURE) — 도구 호출 원문을 모으지 않는다. 켜려면 GATEWAY_INTERACTION_CAPTURE=1 을 띄운 셸 환경이나 "
+                "곁 provision.env 에 적고 재기동한다(HWAXPortal docs/interaction-data)")
+    repo = Path(__file__).resolve().parent
+    inside = IX_DIR.resolve() == repo or repo in IX_DIR.resolve().parents
+    return (f"상호작용 수집 켬 — 도구 호출 원문(인자 · 결과, 비밀 가림 · 한 칸 {_fig_size(IX_FIELD_MAX_BYTES)})을 {IX_DIR} 에 · 조각 "
+            f"{_fig_size(IX_SEGMENT_BYTES)} · 전체 {_fig_size(IX_SPOOL_MAX_BYTES)} · 가져가기 {IX_GET_PATH} · share_conversation 등록"
+            + (" · ⚠ 체크아웃 안이다 — git stash -u 가 쓸어 갈 수 있다(GATEWAY_INTERACTION_SPOOL_DIR 를 리포 밖으로)" if inside else ""))
+
+
+def _ix_tools() -> tuple:
+    """도구 목록에 싣는 공유 도구 — 수집 스위치가 켜졌을 때만."""
+    return (SHARE_CONV_TOOL,) if INTERACTION_CAPTURE_ON else ()
+
+
+async def _ix_call(name: str, arguments: dict):
+    """수집을 켠 바깥 호출 — _call_tool 을 그대로 돌리고, 끝난 뒤(예외 · 취소여도) 한 줄을 대기열에 넣는다. 결과 · 예외는 그대로 돌려준다."""
+    t0 = time.monotonic()
+    tok = _IX_RID.set(None)
+    res = exc = None
+    try:
+        res = await _call_tool(name, arguments)
+        return res
+    except BaseException as e:  # 취소도 — 줄은 남기고 그대로 올린다
+        exc = e
+        raise
+    finally:
+        rid = _IX_RID.get()
+        _IX_RID.reset(tok)
+        _ix_enqueue(name, arguments, res, exc, round((time.monotonic() - t0) * 1000), rid)
+
+
+async def _ix_internal_http(scope, receive, send, gw_auth: str) -> None:
+    """GET /internal/interactions?cursor=&max= · POST /internal/interactions/ack {cursor} — 포털 수집기가 공유 비밀(Authorization: Bearer GW_TOKEN —
+    한 번만)로 부른다. 비밀이 틀리면 401, cursor · max · 본문이 틀리면 400, 메서드가 틀리면 405. 가져가기 답은 {events: [한 줄 객체 …], next_cursor,
+    more}, ack 답은 {ok, deleted, segments, spool_bytes}. nginx 를 거친 요청은 호출부가 이리 보내지 않는다. 감사는 줄을 준 가져가기 · ack · 거절만
+    (빈 가져가기는 적지 않는다 — 주기 폴링이 원장을 메우지 않게)."""
+    t0 = time.monotonic()
+    path, method = scope.get("path"), scope.get("method")
+    ip = (scope.get("client") or (None,))[0]
+    label = f"{method if method in ('GET', 'POST') else 'OTHER'} {path}"
+
+    def _aud(ok: bool, err: str | None, note=None, size=None):
+        _audit(label, "_gateway", ok, err, round((time.monotonic() - t0) * 1000), via="gw-token", ip=ip, note=note, size=size)
+
+    async def _reply(status: int, body: bytes, extra=()):
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"application/json"), (b"cache-control", b"no-store"), *extra]})
+        await send({"type": "http.response.body", "body": body})
+
+    def _j(obj: dict) -> bytes:
+        return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+    if not _internal_auth_ok(scope.get("headers") or [], gw_auth):
+        _aud(False, "unauthorized")
+        await _reply(401, _j({"error": "unauthorized"}))
+        return
+    want = "GET" if path == IX_GET_PATH else "POST"
+    if method != want:
+        await _reply(405, _j({"error": "method not allowed"}), [(b"allow", want.encode())])
+        return
+    try:
+        if path == IX_GET_PATH:
+            q = parse_qs((scope.get("query_string") or b"").decode("utf-8"))
+            cursor = (q.get("cursor") or [""])[0].strip()
+            raw_max = (q.get("max") or [""])[0].strip()
+            if raw_max and not raw_max.isdigit():
+                raise ValueError(f"max 는 1 ~ {IX_READ_MAX} 의 정수다")
+            mx = max(1, min(IX_READ_MAX, int(raw_max) if raw_max else IX_READ_DEFAULT))
+            body, n = await anyio.to_thread.run_sync(_ix_read_body, cursor, mx)
+            if n:
+                _aud(True, None, note=f"events:{n}", size=len(body))
+            await _reply(200, body)
+        else:
+            d = await _read_json_body(receive)
+            cursor = str(d.get("cursor") or "").strip()
+            if not cursor:
+                raise ValueError("cursor 를 준다 — 가져가기 답의 next_cursor")
+            out = await anyio.to_thread.run_sync(_ix_ack, cursor)
+            _aud(True, None, note=f"deleted:{out['deleted']}")
+            await _reply(200, _j(out))
+    except ValueError as exc:
+        _aud(False, f"bad-request: {_clip(exc, 160)}")
+        await _reply(400, _j({"error": str(exc)[:300]}))
+    except Exception as exc:  # noqa: BLE001 — 창구의 실패가 게이트웨이를 죽이면 안 된다
+        log.warning("%s 실패: %r", label, exc)
+        _aud(False, _clip(repr(exc), 160))
+        await _reply(500, _j({"error": _clip(exc, 200)}))
 
 
 # ── PC 키트 — 개인 Claude 가 PC 로 받아 쓰는 도구 파일(HWAXPortal infra/pc-kit · docs/report-figures RF-19 ~, 사용자 보고 11-02 '표칸그림 필요해') ──
@@ -9340,7 +10019,7 @@ def _local_tools() -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
              BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL,
-             ONTO_LOOKUP_TOOL, GAS_TRANSPORT_TOOL, RELIAB_TOOL, *PROCEDURE_TOOLS, *_res_tools()]
+             ONTO_LOOKUP_TOOL, GAS_TRANSPORT_TOOL, RELIAB_TOOL, *PROCEDURE_TOOLS, *_res_tools(), *_ix_tools()]
     # REST 다리는 **등록된 사이트가 있을 때만** 낸다 — 쓸 수 없는 도구를 목록에 두면
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
@@ -9879,6 +10558,9 @@ def _readonly_denial(name: str, arguments: dict) -> str:
         return "" if m in ("GET", "HEAD") else f"read_only: rest_call {m[:10]} — {_RO_WHY}은 GET · HEAD 만 부른다."
     if name == SAVE_CONV_TOOL.name:
         return f"read_only: save_conversation — {_RO_WHY}은 대화를 저장할 수 없다."
+    if INTERACTION_CAPTURE_ON and name == SHARE_CONV_TOOL.name:
+        # 공유 도구는 경로에 없는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸린다 — 포털에 쓰므로 여기서 막는다. 끄면 이 이름은 게이트웨이 도구가 아니다
+        return f"read_only: share_conversation — {_RO_WHY}은 대화를 공유할 수 없다."
     if name in _ROUTINE_NAMES:
         # 루틴 도구는 경로(route)에 없는 로컬 도구라 아래 '해석 안 됨 → 통과' 에 걸린다 — 실행 · 원장 쓰기는 여기서 막는다(목록 · 계획은 _LOCAL_READ)
         return f"read_only: {name} — {_RO_WHY}은 루틴을 돌리지 못한다(원장에 쓴다). routine_list · routine_get 만 된다."
@@ -11190,8 +11872,9 @@ async def _call_tool(name: str, arguments: dict):
 @_low.call_tool(validate_input=False)
 async def _call_tool_entry(name: str, arguments: dict):
     """MCP tools/call 의 처리기 — 바깥 호출 하나. 결과 손잡이(_res_keep)는 여기서만 건다 — 안쪽 호출이 줄인 결과를 받으면 그것을 읽는 게이트웨이
-    도구(browse_experts · use_experts …)가 빈손이 된다. 박스 스위치와 연결 머리가 둘 다 있을 때만이고, 아니면 _call_tool 의 결과 그대로다."""
-    res = await _call_tool(name, arguments)
+    도구(browse_experts · use_experts …)가 빈손이 된다. 박스 스위치와 연결 머리가 둘 다 있을 때만이고, 아니면 _call_tool 의 결과 그대로다.
+    상호작용 수집(_ix_call)도 여기서만 — 줄이기 전의 원문을 적는다. 수집 스위치가 꺼지면 _call_tool 을 그대로 부른다."""
+    res = await (_ix_call(name, arguments) if INTERACTION_CAPTURE_ON else _call_tool(name, arguments))
     if RESULT_REFS_ON and _request_result_ref():
         return await _res_keep(name, arguments, res)
     return res
@@ -11278,6 +11961,8 @@ async def _call_tool_body(name: str, arguments: dict):
             return types.CallToolResult(content=[types.TextContent(type="text", text=_ro)], isError=True)
     if name == SAVE_CONV_TOOL.name:  # 게이트웨이 로컬 도구(백엔드 라우팅 없음)
         return await _save_conversation(arguments or {})
+    if INTERACTION_CAPTURE_ON and name == SHARE_CONV_TOOL.name:
+        return await _share_conversation(arguments or {})
     if name == SEARCH_CONV_TOOL.name:
         return await _search_conversations(arguments or {})
     if name == LIST_APPS_TOOL.name:
@@ -11514,6 +12199,8 @@ async def _call_tool_body(name: str, arguments: dict):
                 if _cm.get("request_id", True):
                     _rid = uuid.uuid4().hex
                     extra[CONN_REQUEST_ID_HEADER] = _rid
+                    if INTERACTION_CAPTURE_ON:
+                        _IX_RID.set(_rid)      # 수집 줄의 rid — 바깥 처리기(_ix_call)가 읽는다(감사 rid 와 같은 값)
             # 선언 키는 토큰 지문을 단다 — 토큰 없이도 포털 사용자와 그쪽 토큰 주인을 잇는다(주인 확인을 안 하는 길이라, GW14).
             _tok_note = f"tok:{hashlib.sha256(conn['token'].encode('utf-8')).hexdigest()[:10]}" if _declared else None
             try:
@@ -11669,6 +12356,9 @@ def _bearer_gate(app, pat_verifier=None):
                 # 결과 손잡이(HWAXPortal docs/token-saving offload-v2 B) — 켰나 · 문턱 · 머리 · 보존 · 둔 원문 수. 포털 PC 킷 칸이 '이 박스에서 꺼져 있음' 을
                 # 이것으로 가린다. 수만 싣는다
                 "result_refs": _res_health(),
+                # 상호작용 수집 창고(HWAXPortal docs/interaction-data contract §3) — 켰나 · 쌓인 바이트 · 조각 수 · 버린 줄 · 실패 · 가장 오래된 조각의 때(초).
+                # 포털 상태판 · update-all 이 '수집이 멈췄다(넘침 · 오래 묵음)' 를 이것으로 본다. 수만 싣는다
+                "interactions": _ix_health(),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
@@ -11687,7 +12377,7 @@ def _bearer_gate(app, pat_verifier=None):
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
                         VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL, ONTO_LOOKUP_TOOL, READONLY_ALLOWLIST_TOOL,
-                        GAS_TRANSPORT_TOOL, RELIAB_TOOL, *PROCEDURE_TOOLS, *_res_tools(),
+                        GAS_TRANSPORT_TOOL, RELIAB_TOOL, *PROCEDURE_TOOLS, *_res_tools(), *_ix_tools(),
                         *([ARTIFACT_TO_STE_TOOL] if STE_UPLOAD_SITE in REST else [])):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
@@ -11914,12 +12604,16 @@ def _bearer_gate(app, pat_verifier=None):
             # 그림 받기 — 주인의 PAT 또는 서명한 표로 스스로 인증한다(_fig_download). 끄면 이 길이 없다(지금처럼 아래 인증으로 간다).
             await _fig_download(scope, send, pat_verifier, expected)
             return
-        if (RESULT_REFS_ON and scope.get("path", "").startswith(RESULT_INTERNAL_PREFIX)
-                and not any(k.lower() in (b"x-forwarded-for", b"x-forwarded-host") for k, _v in (scope.get("headers") or []))):
+        if RESULT_REFS_ON and scope.get("path", "").startswith(RESULT_INTERNAL_PREFIX) and _internal_direct(scope):
             # 결과 손잡이 내부 창구 — 에이전트 서버가 공유 비밀 + 사람 머리로 근거 ref 를 읽는다(_res_internal_http). 박스 안 직접 연결만이다 — nginx 는
-            # X-Forwarded-For · X-Forwarded-Host 를 싣는다(포털 hwax.conf.tmpl 서버 단계). 그것이 있거나 스위치가 꺼지면 이 길이 없다(지금처럼 아래 인증으로
+            # X-Forwarded-* 를 싣는다(포털 hwax.conf.tmpl 서버 단계). 그것이 있거나 스위치가 꺼지면 이 길이 없다(지금처럼 아래 인증으로
             # 간다 — 밖에서는 이 창구가 보이지 않는다).
             await _res_internal_http(scope, send, expected)
+            return
+        if INTERACTION_CAPTURE_ON and scope.get("path") in (IX_GET_PATH, IX_ACK_PATH) and _internal_direct(scope):
+            # 상호작용 수집 창고 가져가기 — 포털 수집기가 공유 비밀로 부른다(_ix_internal_http). 결과 손잡이 내부 창구와 같은 막기 — 박스 안 직접 연결만,
+            # 끄면 이 길이 없다(지금처럼 아래 인증으로 간다).
+            await _ix_internal_http(scope, receive, send, expected)
             return
         if scope.get("path", "").startswith("/kit/"):
             # PC 키트 받기 — 그 이름의 서명한 표 또는 MCP 청중 PAT 로 스스로 인증한다(_kit_download). 허용 목록 밖은 같은 404 다.
@@ -12272,6 +12966,7 @@ def main():
     log.info("%s", _limits_line())
     log.info("%s", _fig_line())
     log.info("%s", _res_line())
+    log.info("%s", _ix_log_line())
     _GracefulServer(uvicorn.Config(app, host=HOST, port=PORT, log_level="info",
                                    timeout_graceful_shutdown=SHUTDOWN_TAIL_S)).run()
 

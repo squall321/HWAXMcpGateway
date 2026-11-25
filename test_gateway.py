@@ -67,6 +67,20 @@ def _no_prod_audit(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_interaction_spool(monkeypatch, tmp_path):
+    """상호작용 수집 창고 격리(HWAXPortal docs/interaction-data) — 기본은 꺼짐 · 창고 폴더는 시험마다 새것이다.
+
+    ⚠ 안 걸면 박스의 provision.env 에 GATEWAY_INTERACTION_CAPTURE=1 이 있을 때 시험 전체가 켠 채로 돌고(도구 목록 · 지침이 달라진다), 켠 시험이
+    박스의 데이터 루트(/data/svc/mcp-gateway/interaction_spool)나 리포 옆 폴더에 시험 호출 원문을 쌓는다. 일꾼 스레드가 남은 줄을 다음 시험의 폴더에
+    쓰지 않게 끝에 대기열을 비운다(monkeypatch 가 되돌리기 전에)."""
+    monkeypatch.setattr(gw, "INTERACTION_CAPTURE_ON", False)
+    monkeypatch.setattr(gw, "IX_DIR", tmp_path / "interaction_spool")
+    monkeypatch.setattr(gw, "_IX", {"ready": False, "segs": {}, "cur": None, "bytes": 0, "dropped": 0, "errors": 0, "last_log": -1e9, "qchars": 0})
+    yield
+    assert gw._ix_flush(10.0), "상호작용 수집 대기열이 비지 않았다"
+
+
+@pytest.fixture(autouse=True)
 def _no_ra_formats(monkeypatch, tmp_path):
     """RA 템플릿 박스 파일(형제 포털 리포 infra/ra-formats.local.json) 격리 — 기본은 '없음'(종전 'deliberation' v1)이다. 안 걸면 등록을 마친
     박스에서 루틴 보고서 시험의 초안 인자가 달라진다. 파일을 보는 시험은 본문에서 다시 건다."""
@@ -16323,3 +16337,484 @@ def test_결과_손잡이_켜짐은_환경이_먼저고_없으면_파일이다()
     seg = ast.get_source_segment(src, node)
     assert 'os.environ.get("GATEWAY_RESULT_REFS"' in seg and '_provision_env_value("GATEWAY_RESULT_REFS")' in seg, seg
     assert seg.index("os.environ.get") < seg.index("_provision_env_value"), "환경이 먼저다"
+
+
+# ── 상호작용 수집 창고(HWAXPortal docs/interaction-data contract §3 · §4 · §5 · §7) ─────────────────────────────────────────────────────────
+# 스위치(GATEWAY_INTERACTION_CAPTURE)가 꺼지면 결과 · 목록 · 지침 · 경로가 지금과 바이트까지 같다. 켜면 바깥 처리기(_call_tool_entry)가 호출이 끝난 뒤 한 줄을
+# 대기열에 넣고 일꾼 스레드가 가려 쓴다. 시험은 _call_tool_entry(또는 SDK 처리기)를 실제로 태우고 창고 파일을 읽는다.
+import hashlib as _hashlib  # noqa: E402
+import queue as _queue  # noqa: E402
+import stat as _stat  # noqa: E402
+import threading as _threading  # noqa: E402
+
+_IX_KEYS = ["ts", "corr", "rid", "actor", "via", "client", "tool", "backend", "orig", "args", "result", "result_chars", "result_sha256",
+            "is_error", "ms"]
+_IX_FRESH_HEALTH = {"enabled": False, "spool_bytes": 0, "segments": 0, "dropped": 0, "errors": 0, "oldest_ts": None}
+
+
+def _ix_rows():
+    assert gw._ix_flush(10.0)
+    rows = []
+    for p in sorted(gw.IX_DIR.glob("ix-*.jsonl")):
+        rows += [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines()]
+    return rows
+
+
+def _ix_sec_result():
+    sec = {"rows": [1, 2], "api_key": "k-zz", "note": "Bearer abc123"}
+    return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(sec, ensure_ascii=False))], structuredContent=sec)
+
+
+def _ix_kit(monkeypatch, results=None, *, on=True, headers=None, user="a@corp.com", client=("claude-code", "2.1.0")):
+    """수집 스위치(on) · 요청 문맥(신원 · 머리 · initialize clientInfo)에 StepForge 꼴 백엔드 하나 — 바깥 처리기를 실제로 태운다."""
+    from types import SimpleNamespace as NS
+    monkeypatch.setattr(gw, "INTERACTION_CAPTURE_ON", on)
+    _inner, b = _fig_kit(monkeypatch, user=user, headers=headers,
+                         results=results or {"get_rows": _ix_sec_result, "small": lambda: _res_text_result(_RES_SMALL)})
+    if client:
+        gw._low.request_context.session = NS(client_params=NS(clientInfo=NS(name=client[0], version=client[1])))
+
+    def call(name, args=None):
+        return asyncio.run(gw._call_tool_entry(name, args or {}))
+    return call, b
+
+
+def _ix_health():
+    sent = []
+
+    async def send(m): sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/health", "headers": []}, None, send))
+    return json.loads(sent[1]["body"])["interactions"]
+
+
+def _ix_http(monkeypatch, method, path, headers, body=None, query=b""):
+    """내부 창구를 인증 미들웨어째 태운다 — (상태, 몸, 앱으로 넘어간 경로)."""
+    sent, seen = [], []
+
+    async def app(scope, receive, send):
+        seen.append(scope["path"])
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body).encode() if body is not None else b"", "more_body": False}
+
+    async def send(m): sent.append(m)
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    asyncio.run(gw._bearer_gate(app, None)({"type": "http", "method": method, "path": path, "headers": headers, "query_string": query,
+                                            "client": ("127.0.0.1", 0)}, receive, send))
+    status = next((m["status"] for m in sent if m["type"] == "http.response.start"), None)
+    out = next((json.loads(m["body"]) for m in sent if m["type"] == "http.response.body"), None)
+    return status, out, seen
+
+
+def test_상호작용_수집을_끄면_결과_목록_지침_경로가_지금과_바이트까지_같다(monkeypatch):
+    want = _ix_sec_result().model_dump_json()
+    call, _b = _ix_kit(monkeypatch, on=False)
+    assert call("get_rows", {"token": "t"}).model_dump_json() == want
+    assert not gw.IX_DIR.exists() and gw._IX_Q.unfinished_tasks == 0, "끄면 아무것도 두지 않는다"
+    assert "share_conversation" not in {t.name for t in gw._local_tools()}, "끄면 도구 목록도 지금과 같다"
+    assert call("share_conversation", {"title": "t", "messages": []}).content[0].text == "unknown tool: share_conversation"
+    monkeypatch.setattr(gw, "route", {"risk_next_step": ("heax-hwax_risk", "risk_next_step")})
+    assert "14. " not in gw._instructions(), "끄면 지침도 지금과 같다"
+    # 끄면 가져가기 길이 없다 — 공유 비밀로 와도 지금처럼 앱(라우트 없음)으로 간다
+    st, _out, seen = _ix_http(monkeypatch, "GET", gw.IX_GET_PATH, [(b"authorization", b"Bearer gw-secret")])
+    assert seen == [gw.IX_GET_PATH] and st is None
+    assert _ix_health() == _IX_FRESH_HEALTH
+    # 켜도 호출자에게 가는 결과는 같다(수집은 옆에서 적기만 한다)
+    call, _b = _ix_kit(monkeypatch, on=True)
+    assert call("get_rows", {"token": "t"}).model_dump_json() == want
+
+
+def test_상호작용_수집을_켜면_바깥_호출마다_계약_칸으로_한_줄을_가려_쌓는다(monkeypatch):
+    call, _b = _ix_kit(monkeypatch, headers={gw.VIA_HEADER: "pat", gw.CORR_HEADER: "conv-9"})
+    call("get_rows", {"part": "하우징", "token": "t-1"})
+    rows = _ix_rows()
+    assert len(rows) == 1 and list(rows[0]) == _IX_KEYS, list(rows[0])
+    r = rows[0]
+    assert (r["actor"], r["via"], r["corr"], r["client"], r["rid"]) == ("a@corp.com", "pat", "conv-9", "claude-code/2.1.0", "")
+    assert (r["tool"], r["backend"], r["orig"]) == ("get_rows", "heax-step_forge", "get_rows")
+    assert r["args"] == {"part": "하우징", "token": "<가림:token>"}
+    masked = json.dumps({"rows": [1, 2], "api_key": "<가림:api_key>", "note": "Bearer <가림:bearer>"}, ensure_ascii=False)
+    assert r["result"] == masked, "글 블록 하나가 structuredContent 와 같은 JSON 이면 한 번만 싣는다"
+    assert r["result_chars"] == len(masked) and r["result_sha256"] == _hashlib.sha256(masked.encode()).hexdigest(), "가린 원문의 지문"
+    assert r["is_error"] is False and isinstance(r["ms"], int) and abs(r["ts"] - _ptime.time()) < 60
+    raw = "".join(p.read_text(encoding="utf-8") for p in gw.IX_DIR.glob("ix-*.jsonl"))
+    for secret in ("k-zz", "abc123", "t-1"):
+        assert secret not in raw, secret
+    seg = next(gw.IX_DIR.glob("ix-*.jsonl"))
+    assert _stat.S_IMODE(gw.IX_DIR.stat().st_mode) == 0o700 and _stat.S_IMODE(seg.stat().st_mode) == 0o600
+    # 신원 · 클라이언트가 없으면 비운다
+    call, _b = _ix_kit(monkeypatch, user="", client=None)
+    call("small")
+    r = _ix_rows()[-1]
+    assert (r["actor"], r["client"], r["via"], r["corr"]) == ("", "", "", "")
+
+
+def test_상호작용_수집_결과는_글_블록과_structuredContent_를_잇고_그림은_싣지_않고_한_칸_1MB_에서_자른다(monkeypatch):
+    big = "가" * 600_000                                   # UTF-8 1.8 MB
+    long_q = "x" * (gw.IX_FIELD_MAX_BYTES + 10)
+
+    def mixed():
+        return types.CallToolResult(content=[types.TextContent(type="text", text="첫 줄"), types.TextContent(type="text", text=big)],
+                                    structuredContent={"n": 1})
+    call, _b = _ix_kit(monkeypatch, {"get_rows": mixed, "render_3d": _fig_result})
+    call("get_rows", {"q": long_q})
+    r = _ix_rows()[0]
+    full = "첫 줄\n" + big + '\n{"n":1}'
+    assert r["result_chars"] == len(full) and r["result_sha256"] == _hashlib.sha256(full.encode()).hexdigest()
+    assert full.startswith(r["result"]) and gw.IX_FIELD_MAX_BYTES - 3 < len(r["result"].encode()) <= gw.IX_FIELD_MAX_BYTES
+    aj = json.dumps({"q": long_q}, separators=(",", ":"))
+    assert list(r) == _IX_KEYS[:10] + ["args_chars"] + _IX_KEYS[10:], "인자가 1 MB 를 넘으면 앞부분 글 + args_chars"
+    assert r["args"] == aj[:gw.IX_FIELD_MAX_BYTES] and r["args_chars"] == len(aj)
+    # 그림 블록은 싣지 않는다 — 그림 보관이 켜져 있으면 '그림 저장 —' 글 블록의 ref 가 남는다
+    call("render_3d")
+    r = _ix_rows()[-1]
+    assert r["result"].startswith('{"view": "iso"}\n') and "\n그림 저장 — fig_" in r["result"]
+    assert base64.b64encode(_PNG).decode()[:40] not in r["result"]
+
+
+def test_상호작용_수집은_결과_손잡이로_줄이기_전의_원문을_적는다(monkeypatch):
+    call, _b = _res_kit(monkeypatch)
+    monkeypatch.setattr(gw, "INTERACTION_CAPTURE_ON", True)
+    out = call("get_rows")
+    assert _RES_RE.fullmatch(_res_handle_of(out)["ref"]), "호출자에게는 줄인 결과"
+    r = _ix_rows()[0]
+    assert r["result"] == _RES_TXT and r["result_chars"] == len(_RES_TXT), "창고에는 원문"
+
+
+def test_상호작용_수집_invoke_tool_은_부른_이름과_실제로_돈_도구를_함께_적고_예외와_로컬_도구도_한_줄이다(monkeypatch):
+    call, _b = _ix_kit(monkeypatch)
+    call("invoke_tool", {"name": "small", "arguments": {"password": "p"}})
+    r = _ix_rows()[-1]
+    assert (r["tool"], r["backend"], r["orig"]) == ("invoke_tool", "heax-step_forge", "small")
+    assert r["args"] == {"name": "small", "arguments": {"password": "<가림:password>"}} and r["result"] == _RES_SMALL
+    call("save_conversation", {"title": "t", "messages": []})                     # 포털 없음 → 로컬 도구의 실패
+    r = _ix_rows()[-1]
+    assert (r["backend"], r["orig"], r["is_error"]) == ("_gateway", "save_conversation", True) and r["result"].startswith("CONV_UNAVAILABLE")
+    call("no_such_tool")
+    r = _ix_rows()[-1]
+    assert (r["backend"], r["orig"], r["is_error"], r["result"]) == ("", "no_such_tool", True, "unknown tool: no_such_tool")
+
+    async def raising(name, args):
+        raise RuntimeError("터졌다 Bearer zzz")
+    monkeypatch.setattr(gw, "_call_tool", raising)
+    with pytest.raises(RuntimeError):
+        call("small")
+    r = _ix_rows()[-1]
+    assert r["is_error"] is True and r["result"] == "RuntimeError: 터졌다 Bearer <가림:bearer>", "예외는 그대로 올리고 줄은 남긴다"
+
+
+def test_상호작용_수집_rid_는_선언_백엔드에_실은_요청_ID_다(monkeypatch):
+    _res, _svc, one, _row = _decl_call_kit(monkeypatch)
+    monkeypatch.setattr(gw, "INTERACTION_CAPTURE_ON", True)
+    asyncio.run(gw._call_tool_entry("get_fmea", {}))
+    r = _ix_rows()[-1]
+    assert re.fullmatch(r"[0-9a-f]{32}", r["rid"]) and r["rid"] == one["headers"]["X-Request-Id"] and r["actor"] == "u@corp.com"
+    assert _rows()[-1]["rid"] == r["rid"], "감사 rid 와 같은 값"
+    asyncio.run(gw._call_tool_entry("no_such_tool", {}))
+    assert _ix_rows()[-1]["rid"] == "", "호출마다 비운다"
+
+
+def test_상호작용_수집_SDK_의_tools_call_처리기가_바깥_처리기를_부른다(monkeypatch):
+    real = gw.fm._mcp_server
+    monkeypatch.setattr(real, "_tool_cache", {})
+    handler = real.request_handlers[types.CallToolRequest]
+    _ix_kit(monkeypatch)
+    out = asyncio.run(handler(types.CallToolRequest(params=types.CallToolRequestParams(name="small", arguments={"q": 1})))).root
+    assert out.content[0].text == _RES_SMALL
+    assert [(r["tool"], r["args"]) for r in _ix_rows()] == [("small", {"q": 1})]
+
+
+def test_상호작용_수집은_호출을_막지도_늦추지도_않고_넘침과_실패는_셈과_health_로_보인다(monkeypatch, caplog):
+    call, _b = _ix_kit(monkeypatch)
+    gate = _threading.Event()
+    real_line = gw._ix_line
+
+    def slow_line(ev):
+        gate.wait(15)
+        return real_line(ev)
+    monkeypatch.setattr(gw, "_ix_line", slow_line)
+    t0 = _ptime.monotonic()
+    out = call("small")
+    assert _ptime.monotonic() - t0 < 3 and out.content[0].text == _RES_SMALL, "쓰기를 기다리지 않는다"
+    for _ in range(300):                              # 일꾼이 첫 줄을 집을 때까지
+        if gw._IX_Q.qsize() == 0:
+            break
+        _ptime.sleep(0.01)
+    # 대기열이 차면 버리고 센다 — 호출은 그대로다
+    for _ in range(gw.IX_QUEUE_MAX + 75):
+        gw._ix_enqueue("small", {}, _res_text_result(_RES_SMALL), None, 1, None)
+    assert gw._IX["dropped"] == 75 and _ix_health()["dropped"] == 75
+    # 쥔 결과 글자 합이 넘쳐도 버린다(줄 수는 남아도) — 큰 결과가 몰려도 메모리가 붓지 않게
+    monkeypatch.setattr(gw, "IX_QUEUE_MAX_CHARS", gw._IX["qchars"])
+    gw._IX_Q.get_nowait()
+    gw._IX_Q.task_done()
+    with gw._IX_CNT_LOCK:
+        gw._IX["qchars"] -= len(_RES_SMALL)
+    gw._ix_enqueue("small", {}, _res_text_result(_RES_SMALL * 2), None, 1, None)
+    assert gw._IX["dropped"] == 76 and gw._IX_Q.qsize() == gw.IX_QUEUE_MAX - 1
+    gate.set()
+    assert len(_ix_rows()) == gw.IX_QUEUE_MAX and gw._IX["qchars"] == 0, "쓴 뒤에는 쥔 글자를 돌려놓는다"
+    # 쓰기 실패 — 셈과 로그(한 줄)만, 호출은 그대로다
+    monkeypatch.setattr(gw, "_ix_line", real_line)
+    blocker = gw.IX_DIR.parent / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setattr(gw, "IX_DIR", blocker / "spool")
+    monkeypatch.setattr(gw, "_IX", {**gw._IX, "ready": False, "segs": {}, "cur": None, "bytes": 0})
+    with caplog.at_level("WARNING"):
+        assert call("small").content[0].text == _RES_SMALL and call("small").content[0].text == _RES_SMALL
+        assert gw._ix_flush(10.0)
+    h = _ix_health()
+    assert h["errors"] == 2 and h["dropped"] == 76
+    assert sum("상호작용 수집 실패" in rec.message for rec in caplog.records) == 1, "로그는 60초에 한 줄"
+
+
+@pytest.mark.parametrize("given,want", [
+    ({"Authorization": "Bearer abc.def"}, {"Authorization": "<가림:authorization>"}),
+    ({"args": {"api_key": "k-123", "q": "응력"}}, {"args": {"api_key": "<가림:api_key>", "q": "응력"}}),
+    ("curl -H 'Authorization: Bearer x1y2z3'", "curl -H 'Authorization: Bearer <가림:bearer>'"),
+    ("토큰 eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln 끝", "토큰 <가림:jwt> 끝"),
+    ({"user_password": "p@ss", "count": 3}, {"user_password": "<가림:user_password>", "count": 3}),
+])
+def test_상호작용_가림은_계약_부록의_시험_벡터를_그대로_통과한다(given, want):
+    assert gw._ix_mask(given) == want
+
+
+def test_상호작용_가림_칸_이름_PEM_긴_글():
+    assert gw._ix_mask({"X-Api-Key": 1, "session_id": "s", "Set-Cookie": ["a"], "max_tokens": 5, "Private_Key": {"k": 1}}) == {
+        "X-Api-Key": "<가림:x-api-key>", "session_id": "s", "Set-Cookie": "<가림:set-cookie>", "max_tokens": 5, "Private_Key": "<가림:private_key>"}
+    pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nabc\n-----END RSA PRIVATE KEY-----"
+    assert gw._ix_mask_text(f"키 {pem} 끝") == "키 <가림:pem> 끝"
+    assert gw._ix_mask_text(f"Bearer {pem}") == "Bearer <가림:pem>", "PEM 을 먼저 — Bearer 의 글자 칸이 '-----BEGIN' 을 먹지 않게"
+    assert gw._ix_mask_text("앞 -----BEGIN PRIVATE KEY-----\nMIIE 잘린") == "앞 <가림:pem>", "끝 표지가 없으면 끝까지"
+    tok = "Authorization: Bearer tok.en_1=="
+    long = "a," * ((gw._IX_CHUNK - 10) // 2) + tok + ", 끝" * 1000          # 토큰이 끊는 자리(_IX_CHUNK)에 걸친다
+    out = gw._ix_mask_text(long)
+    assert "tok.en_1" not in out and out == long.replace("tok.en_1==", "<가림:bearer>")
+    assert gw._ix_mask_text("이미 Bearer <가림:bearer>") == "이미 Bearer <가림:bearer>", "두 번 가려도 같다"
+    assert gw._ix_mask_block('{"password": "p", "n": 1}')[0] == '{"password": "<가림:password>", "n": 1}', "JSON 글 블록은 칸 이름까지"
+    assert gw._ix_mask_block('{"n":  1}')[0] == '{"n":  1}', "가릴 것이 없으면 원래 글 그대로"
+
+
+def test_상호작용_창고는_조각을_돌리고_상한을_넘으면_닫힌_조각부터_버리고_그_줄_수를_센다(monkeypatch, caplog):
+    monkeypatch.setattr(gw, "IX_SEGMENT_BYTES", 1000)
+    monkeypatch.setattr(gw, "IX_SPOOL_MAX_BYTES", 3000)
+    line = (json.dumps({"x": "y" * 180}) + "\n").encode()
+    with caplog.at_level("WARNING"):
+        for i in range(40):
+            gw._ix_append(line, 1700000000.0 + i)
+    segs = sorted(gw.IX_DIR.glob("ix-*.jsonl"))
+    sizes = [p.stat().st_size for p in segs]
+    assert all(s <= 1000 for s in sizes) and sum(sizes) <= 3000 and gw._IX["bytes"] == sum(sizes)
+    kept = sum(s // len(line) for s in sizes)
+    assert gw._IX["dropped"] == 40 - kept > 0, "버린 조각의 줄 수"
+    assert any("상한" in r.message and "버렸다" in r.message for r in caplog.records)
+    names = [int(p.stem[3:]) for p in segs]
+    assert names == sorted(names) and segs[-1].stem[3:] == f"{gw._IX['cur']:013d}"
+    h = _ix_health()
+    assert (h["segments"], h["spool_bytes"], h["oldest_ts"]) == (len(segs), sum(sizes), names[0] / 1000)
+
+
+def test_상호작용_창고_쓰다_죽은_조각에는_잇지_않고_읽기는_깨진_줄을_건너뛴다():
+    gw.IX_DIR.mkdir(parents=True)
+    (gw.IX_DIR / "ix-1700000000000.jsonl").write_bytes(b'{"a":1}\n{"broken":')
+    gw._ix_append(b'{"b":2}\n', 1700000001.0)
+    files = sorted(gw.IX_DIR.glob("ix-*.jsonl"))
+    assert len(files) == 2 and files[0].read_bytes() == b'{"a":1}\n{"broken":', "반쯤 쓴 줄 뒤에 잇지 않는다"
+    body, n = gw._ix_read_body("", 100)
+    d = json.loads(body)
+    assert d["events"] == [{"a": 1}, {"b": 2}] and n == 2 and d["more"] is False
+    assert gw._ix_scan()["segments"] == 2
+
+
+def test_상호작용_가져가기는_공유_비밀_한_번_박스_안_직접_연결만_받고_cursor_로_이어_읽고_ack_는_다_읽힌_조각만_지운다(monkeypatch):
+    monkeypatch.setattr(gw, "INTERACTION_CAPTURE_ON", True)
+    monkeypatch.setattr(gw, "IX_SEGMENT_BYTES", 20)                          # 줄 9바이트 — 조각마다 두 줄
+    for i in range(5):
+        gw._ix_append((json.dumps({"i": i}) + "\n").encode(), 1700000000.0 + i)
+    a, b, c = sorted(gw._IX["segs"])
+    ok = [(b"authorization", b"Bearer gw-secret")]
+    get = gw.IX_GET_PATH
+    st, body, seen = _ix_http(monkeypatch, "GET", get, ok, query=b"max=3")
+    assert st == 200 and not seen and [e["i"] for e in body["events"]] == [0, 1, 2] and body["more"] is True
+    c1 = body["next_cursor"]
+    assert c1 == f"v1.{b:013d}.9"
+    row = [r for r in _rows() if r["tool"] == f"GET {get}"][-1]
+    assert row["ok"] and row["via"] == "gw-token" and row["note"] == "events:3"
+    st, body, _ = _ix_http(monkeypatch, "GET", get, ok, query=f"cursor={c1}".encode())
+    assert [e["i"] for e in body["events"]] == [3, 4] and body["more"] is False
+    c2 = body["next_cursor"]
+    n_rows = len(_rows())
+    st, body, _ = _ix_http(monkeypatch, "GET", get, ok, query=f"cursor={c2}".encode())
+    assert (st, body) == (200, {"events": [], "next_cursor": c2, "more": False})
+    assert len(_rows()) == n_rows, "빈 가져가기는 감사에 적지 않는다(주기 폴링)"
+    # ack — cursor 의 조각보다 오래된 조각만(c1 은 b 의 중간이다)
+    st, out, _ = _ix_http(monkeypatch, "POST", gw.IX_ACK_PATH, ok, body={"cursor": c1})
+    assert st == 200 and out["deleted"] == 1 and sorted(gw._IX["segs"]) == [b, c]
+    assert [r for r in _rows() if r["tool"] == f"POST {gw.IX_ACK_PATH}"][-1]["note"] == "deleted:1"
+    # 지운 조각의 cursor 로 오면 남은 것 가운데 가장 오래된 것부터
+    st, body, _ = _ix_http(monkeypatch, "GET", get, ok, query=f"cursor=v1.{a:013d}.0".encode())
+    assert [e["i"] for e in body["events"]] == [2, 3, 4]
+    # 지금 쓰는 조각(c)은 끝까지 읽었어도 지우지 않는다
+    st, out, _ = _ix_http(monkeypatch, "POST", gw.IX_ACK_PATH, ok, body={"cursor": c2})
+    assert out["deleted"] == 1 and sorted(gw._IX["segs"]) == [c] and gw._IX["cur"] == c
+    gw._ix_append(b'{"i":5}\n', 1700000009.0)
+    st, body, _ = _ix_http(monkeypatch, "GET", get, ok, query=f"cursor={c2}".encode())
+    assert [e["i"] for e in body["events"]] == [5]
+    # 거절
+    assert _ix_http(monkeypatch, "GET", get, [(b"authorization", b"Bearer wrong")])[:2] == (401, {"error": "unauthorized"})
+    assert _ix_http(monkeypatch, "GET", get, ok + ok)[0] == 401, "Authorization 이 두 번이면 없는 것"
+    assert _ix_http(monkeypatch, "POST", get, ok)[0] == 405 and _ix_http(monkeypatch, "GET", gw.IX_ACK_PATH, ok)[0] == 405
+    assert _ix_http(monkeypatch, "GET", get, ok, query=b"cursor=zzz")[0] == 400
+    assert _ix_http(monkeypatch, "GET", get, ok, query=b"max=abc")[0] == 400
+    assert _ix_http(monkeypatch, "POST", gw.IX_ACK_PATH, ok, body={})[0] == 400
+    assert _ix_http(monkeypatch, "POST", gw.IX_ACK_PATH, ok, body={"cursor": "v1.9999999999999.0"})[0] == 400, "내준 적 없는 자리"
+    assert _ix_http(monkeypatch, "POST", gw.IX_ACK_PATH, ok, body={"cursor": f"v1.{c:013d}.99999"})[0] == 400, "조각 끝 너머"
+    assert sorted(gw._IX["segs"]) == [c], "거절한 ack 는 아무것도 지우지 않는다"
+    # nginx(/mcp-gw/)를 거친 요청 — X-Forwarded-* 가 하나라도 있으면 이 길이 없다(지금처럼 아래 인증으로 간다)
+    for fwd in ((b"x-forwarded-for", b"203.0.113.9"), (b"X-Forwarded-Proto", b"https")):
+        st, _out, seen = _ix_http(monkeypatch, "GET", get, [*ok, fwd])
+        assert seen == [get] and st is None
+
+
+def test_내부_창구의_막기는_공유_함수_하나다_결과_손잡이도_X_Forwarded_로_시작하는_머리면_받지_않는다(monkeypatch):
+    assert gw._internal_direct({"headers": []}) and not gw._internal_direct({"headers": [(b"X-Forwarded-Proto", b"https")]})
+    monkeypatch.setattr(gw, "GW_TOKEN", "")
+    assert gw._internal_auth_ok([(b"authorization", b"Bearer gw-secret")], "Bearer gw-secret") is False, "GW_TOKEN 이 비면 없다"
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    assert gw._internal_auth_ok([(b"Authorization", b"Bearer gw-secret")], "Bearer gw-secret")
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", True)
+    ref, _sha = gw._res_store_sync("a@corp.com", "get_rows", _RES_TXT, None)
+    path = f"/internal/result/{ref}"
+    ok = [(b"authorization", b"Bearer gw-secret"), (b"x-hwax-user", b"a%40corp.com")]
+    assert _res_internal(monkeypatch, path, ok)[0] == 200
+    st, _b2, seen = _res_internal(monkeypatch, path, [*ok, (b"x-forwarded-proto", b"https")])
+    assert seen == [path] and st is None
+
+
+def _share_kit(monkeypatch, status=200, reply=None, auth="Bearer pat-1", extra=None):
+    from types import SimpleNamespace as NS
+    sent = []
+
+    def handler(req):
+        sent.append(req)
+        return httpx.Response(status, json=reply if reply is not None else {"id": "sh-1", "session_id": "s-1"})
+    real = httpx.AsyncClient
+    monkeypatch.setattr(gw.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(gw, "PORTAL", {"api_base": "http://portal.test"})
+    monkeypatch.setattr(gw, "INTERACTION_CAPTURE_ON", True)
+    headers = {gw.USER_HEADER: "a@corp.com", **({"authorization": auth} if auth else {}), **(extra or {})}
+    monkeypatch.setattr(gw, "_low", NS(request_context=NS(request=NS(headers=headers),
+                                                          session=NS(client_params=NS(clientInfo=NS(name="claude-code", version="2.1.0"))))))
+    return sent
+
+
+_SHARE_ARGS = {"title": "응력 대화", "session_id": "s-1",
+               "messages": [{"role": "user", "content": "질문"}, {"role": "tool", "content": 3}, "x", {"role": "assistant", "content": "답"}]}
+
+
+def test_share_conversation_은_켰을_때만_등록되고_호출자_PAT_를_포털_공유_창구로_넘긴다(monkeypatch):
+    assert "share_conversation" not in {t.name for t in gw._local_tools()}
+    sent = _share_kit(monkeypatch)
+    assert gw.SHARE_CONV_TOOL in gw._local_tools() and gw.SHARE_CONV_TOOL.name not in gw._LOCAL_READ
+    assert "사람이 '이 대화를 공유해' 라고 청한 때만 부른다" in gw.SHARE_CONV_TOOL.description
+    assert "품질 개선과 지식 정리" in gw.SHARE_CONV_TOOL.description
+    res = asyncio.run(gw._call_tool("share_conversation", _SHARE_ARGS))
+    assert not res.isError and json.loads(res.content[0].text) == {"ok": True, "messages": 3, "id": "sh-1", "session_id": "s-1"}
+    req = sent[0]
+    assert str(req.url) == "http://portal.test/interactions/share" and req.method == "POST" and req.headers["authorization"] == "Bearer pat-1"
+    assert json.loads(req.content) == {"title": "응력 대화", "session_id": "s-1", "client": "claude-code/2.1.0", "messages": [
+        {"role": "user", "content": "질문"}, {"role": "assistant", "content": "3"}, {"role": "assistant", "content": "답"}]}, "save_conversation 과 같은 정규화"
+    assert _rows()[-1]["tool"] == "share_conversation" and _rows()[-1]["ok"] and _rows()[-1]["backend"] == "portal"
+    asyncio.run(gw._call_tool("share_conversation", {**_SHARE_ARGS, "client": "claude-desktop/0.9", "session_id": ""}))
+    got = json.loads(sent[1].content)
+    assert got["client"] == "claude-desktop/0.9" and "session_id" not in got, "준 클라이언트가 이기고, 빈 session_id 는 싣지 않는다"
+
+
+def test_share_conversation_의_실패는_save_conversation_과_같은_꼴이고_읽기_전용_PAT_와_패널은_막는다(monkeypatch):
+    sent = _share_kit(monkeypatch, status=404, reply={"detail": "Not Found"})
+    res = asyncio.run(gw._call_tool("share_conversation", _SHARE_ARGS))
+    assert res.isError and res.content[0].text == "CONV_UNAVAILABLE: portal 404 — 포털에서 상호작용 수집이 꺼져 있다(INTERACTIONS_ENABLED)"
+    assert not _rows()[-1]["ok"]
+    sent = _share_kit(monkeypatch, auth=None)
+    assert asyncio.run(gw._call_tool("share_conversation", _SHARE_ARGS)).content[0].text == "CONV_UNAVAILABLE: no caller authorization to forward"
+    assert not sent
+    sent = _share_kit(monkeypatch)
+    assert "messages 가 비었다" in asyncio.run(gw._call_tool("share_conversation", {"title": "t", "messages": "no"})).content[0].text and not sent
+    sent = _share_kit(monkeypatch, extra={gw.READONLY_HEADER: "1"})
+    res = asyncio.run(gw._call_tool("share_conversation", _SHARE_ARGS))
+    assert res.isError and res.content[0].text.startswith("read_only: share_conversation") and not sent
+    assert gw._panel_denial("share_conversation", {"app": "heax-step_forge"}) == "gateway-tool"
+    monkeypatch.setattr(gw, "INTERACTION_CAPTURE_ON", False)
+    assert gw._readonly_denial("share_conversation", {}) == "", "끄면 게이트웨이 도구가 아니다(같은 이름의 백엔드 도구는 지금 판정 그대로)"
+
+
+def test_share_conversation_과_같은_이름의_백엔드_도구는_켰을_때만_접두를_단다(monkeypatch):
+    monkeypatch.setattr(gw, "POLICY", {})
+    _aggregate_tools(monkeypatch, {"heax-step_forge": [_tool("share_conversation")]})
+    assert "share_conversation" in gw.route
+    monkeypatch.setattr(gw, "INTERACTION_CAPTURE_ON", True)
+    _aggregate_tools(monkeypatch, {"heax-step_forge": [_tool("share_conversation")]})
+    assert "share_conversation" not in gw.route and gw.route["heaxstep_forge_share_conversation"] == ("heax-step_forge", "share_conversation")
+    sent = []
+
+    async def send(m): sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/tools-map", "headers": []}, None, send))
+    assert json.loads(sent[1]["body"])["map"]["share_conversation"] == "_gateway"
+
+
+def test_share_conversation_이름은_심의_좌석_자유_조회_접두에_걸리지_않는다():
+    """게이트웨이 로컬 도구 이름이 엔진의 _FREE_ALLOW 접두로 시작하면 심의 · 리스크 심사 좌석에 저절로 열린다(D-18) — 형제 리포 원문(AST)으로 본다."""
+    import ast
+    root = gw.Path(gw.__file__).resolve().parent.parent / "HWAXAgentServer"
+    if not (root / "deliberation.py").exists():
+        pytest.skip("형제 HWAXAgentServer 리포가 없다")
+    allow = next(ast.literal_eval(n.value) for n in ast.parse((root / "deliberation.py").read_text(encoding="utf-8")).body
+                 if isinstance(n, ast.Assign) and any(getattr(x, "id", "") == "_FREE_ALLOW" for x in n.targets))
+    assert len(allow) > 20, "추출이 깨졌다"
+    name = gw.SHARE_CONV_TOOL.name
+    assert not name.startswith(tuple(allow)) and not name.split("_", 1)[1].startswith(tuple(allow)), name
+
+
+def test_지침_14번은_수집을_켰을_때만_맨_뒤에_붙고_가장_긴_조합에서도_2048자_안이다(monkeypatch):
+    monkeypatch.setattr(gw._low, "instructions", gw._low.instructions)
+    monkeypatch.setattr(gw, "POLICY", {})
+    full = {"hwax-deliberation": [_schema_tool("deliberate_start", "question"), _schema_tool("deliberate_status", "job_id", "wait_s"),
+                                  _schema_tool("deliberate_result", "job_id", "view")],
+            "heax-hwax_risk": [_schema_tool("risk_next_step"), _schema_tool("risk_start_job", "target_key", "llm")]}
+
+    def served(spec):
+        _aggregate_tools(monkeypatch, spec)
+        return gw._low.create_initialization_options().instructions
+    off = served(full)
+    assert "14. " not in off
+    monkeypatch.setattr(gw, "INTERACTION_CAPTURE_ON", True)
+    on = served(full)
+    assert on == off + gw._INSTR_IX_SHORT and len(on) < 2048, len(on)
+    small = served({})
+    assert small == gw._INSTRUCTIONS + gw._INSTR_IX and "언제든 지우기를 청할 수 있습니다" in small, "자리가 있으면 계약 문구 그대로"
+    assert len(gw._INSTRUCTIONS + gw._INSTR_DELIB + gw._INSTR_DELIB_WAIT + gw._INSTR_DELIB_VIEW + "\n" + gw._INSTR_RISK_NEXT.rstrip("\n")
+               + gw._INSTR_RISK_LLM + "\n" + gw._INSTR_IX_SHORT) < 2048, "가장 긴 조합 + 짧은 꼴"
+
+
+def test_상호작용_수집_켜짐은_환경이_먼저고_없으면_provision_env_다(tmp_path):
+    import ast
+    from pathlib import Path as _P
+    src = _P(gw.__file__).read_text(encoding="utf-8")
+    node = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Assign)
+                and any(getattr(t, "id", "") == "INTERACTION_CAPTURE_ON" for t in n.targets))
+    seg = ast.get_source_segment(src, node)
+    assert 'os.environ.get("GATEWAY_INTERACTION_CAPTURE"' in seg and '_provision_env_value("GATEWAY_INTERACTION_CAPTURE")' in seg, seg
+    assert seg.index("os.environ.get") < seg.index("_provision_env_value") and seg.rstrip().endswith('== "1"'), "환경이 먼저 · 값은 '1' 만"
+    p = tmp_path / "provision.env"
+    p.write_text("GATEWAY_INTERACTION_CAPTURE=0\nexport GATEWAY_INTERACTION_CAPTURE=1  # 켬\n", encoding="utf-8")
+    assert gw._provision_env_value("GATEWAY_INTERACTION_CAPTURE", p) == "1"
+
+
+def test_상호작용_수집_health_와_기동_로그는_켬_끔을_말한다(monkeypatch):
+    assert _ix_health() == _IX_FRESH_HEALTH
+    assert gw._ix_log_line().startswith("상호작용 수집 끔") and "켜려면" in gw._ix_log_line(), "안 켠 기능도 로그에"
+    monkeypatch.setattr(gw, "INTERACTION_CAPTURE_ON", True)
+    gw._ix_append(b'{"a":1}\n', 1700000000.5)
+    assert _ix_health() == {"enabled": True, "spool_bytes": 8, "segments": 1, "dropped": 0, "errors": 0, "oldest_ts": 1700000000.5}
+    line = gw._ix_log_line()
+    assert line.startswith("상호작용 수집 켬") and str(gw.IX_DIR) in line and gw.IX_GET_PATH in line

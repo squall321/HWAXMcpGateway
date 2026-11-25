@@ -16225,6 +16225,18 @@ def test_result_ask_는_원문을_에이전트_서버_묻기_창구에_서비스
     assert "question 을 준다" in call("result_ask", {"ref": ref, "question": "  "}).content[0].text and len(sent) == 2
 
 
+@pytest.mark.parametrize("tokens", [{"input": 1234, "output": 56}, None])
+def test_result_ask_는_창구_답의_tokens_를_고치지_않고_그대로_넘긴다(monkeypatch, tokens):
+    """서버 LLM 토큰 칸(HWAXPortal docs/token-saving TS-16) — 비교 테스트셋이 result_ask 답의 tokens 를 센다. 모르면 null 인 것도 그대로(빼거나 0 으로 바꾸지 않는다)."""
+    call, _b = _res_kit(monkeypatch)
+    ref = _res_handle_of(call("get_rows"))["ref"]
+    answer = {"answer": "있다", "quotes": [], "numbers": {"checked": 0, "mismatched": []}, "model": "qwen", "tokens": tokens}
+    _res_agent(monkeypatch, lambda req: httpx.Response(200, json=answer))
+    got = json.loads(call("result_ask", {"ref": ref, "question": "q"}).content[0].text)
+    assert "tokens" in got and got["tokens"] == tokens and got == {"ref": ref, **answer}
+    assert "tokens: {input, output} | null" in gw.RESULT_ASK_TOOL.description
+
+
 @pytest.mark.parametrize("status,body,want", [
     (404, {"detail": "Not Found"}, "RESULT_ASK_ENABLED"),
     (401, {"error": "unauthorized"}, "공유 비밀"),

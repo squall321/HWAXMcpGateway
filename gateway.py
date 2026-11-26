@@ -3804,6 +3804,64 @@ def _ra_formats_health() -> dict:
                       for k in sorted(_RA_FORMAT_DEFAULTS)}}
 
 
+# ── 심의 보고서의 RA 형식 · 게시판 알려 주기(HWAXPortal docs/ra-delib-standard RS-6) ──────────────────────────────────────
+# 사람의 Claude Code 워크플로(hwax-deliberate.js)는 사용자 PC 에서 돌아 박스 파일을 못 읽는다. 이 박스의 심의 보고서 형식(위 _ra_format_args 와
+# 같은 값)과 시스템 공간 게시판(같은 줄의 board — 포털 app/agent/ra_post.py 와 같은 꼴만)을 준다. 읽기만 한다. 게시는 RA 표준 흐름 그대로다
+# (preview_publish → 사람 확인 → publish_report — 확인 없이 게시하지 않는다, 사용자 결정 11-26). 이름은 심의 좌석 자유 조회 접두에 걸리지 않게
+# 짓는다(ra_ — 좌석에 새 길을 열지 않는다, D-18).
+_RA_BOARD_RE = re.compile(r"(?!\.{1,2}$)[A-Za-z0-9._-]{1,64}")
+RA_REPORT_FORMAT_TOOL = types.Tool(
+    name="ra_report_format",
+    description=(
+        "이 박스가 심의 보고서를 Report Archive 에 올릴 때 쓰는 형식과 게시판 — create_report_draft 에 넣을 template_id · template_version, "
+        "그리고 심의 보고서를 모으는 RA 시스템 공간(board — 이 박스가 정하지 않았으면 null)을 준다. 심의 결과를 RA 에 저장하기 전에 부르고 그 값을 그대로 "
+        "쓴다(형식을 짐작해 박지 않는다). board 가 있으면 저장한 뒤 preview_publish(report_id, boards=[board]) 로 어디에 몇 명이 보는지 사용자에게 "
+        "보여 주고 확인받은 다음에만 publish_report 로 게시한다 — 확인 없이 게시하지 않는다. 읽기만 한다."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": sorted(_RA_FORMAT_DEFAULTS),
+                     "description": "보고서 종류 — 지금은 deliberation(심의 보고서) 하나다. 비우면 deliberation"},
+        },
+    },
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+
+
+def _ra_format_board(kind: str) -> str | None:
+    """박스 파일의 그 종류 줄의 board — 형식 줄이 맞을 때만(포털 ra_post.deliberation_board 와 같은 규칙). 작은 파일이라 부를 때 읽는다."""
+    if kind not in _ra_formats_load()["map"]:
+        return None
+    try:
+        row = json.loads(RA_FORMATS_PATH.read_text(encoding="utf-8")).get(kind)
+    except (OSError, ValueError, AttributeError):
+        return None
+    b = row.get("board") if isinstance(row, dict) else None
+    return b if isinstance(b, str) and _RA_BOARD_RE.fullmatch(b) else None
+
+
+async def _ra_report_format(a: dict) -> types.CallToolResult:
+    t0 = time.monotonic()
+    kind = str(a.get("kind") or "deliberation").strip()
+
+    def done(ok: bool, **kw) -> types.CallToolResult:
+        _audit(RA_REPORT_FORMAT_TOOL.name, "_gateway", ok, None if ok else str(kw.get("error") or "")[:200],
+               round((time.monotonic() - t0) * 1000), caller=_request_user() or None, note=kind[:40] or None)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps({"ok": ok, **kw}, ensure_ascii=False))],
+                                    isError=not ok)
+
+    if kind not in _RA_FORMAT_DEFAULTS:
+        return done(False, error=f"모르는 종류 — {', '.join(sorted(_RA_FORMAT_DEFAULTS))} 가운데 하나")
+    board = _ra_format_board(kind)
+    out = {"kind": kind, **_ra_format_args(kind), "source": "box" if kind in _ra_formats_load()["map"] else "default", "board": board}
+    if board:
+        out["how_to_post"] = (f"create_report_draft 로 저장한 뒤, 올리려면 preview_publish(report_id, boards=[\"{board}\"]) 의 게시판 이름 · audience(볼 사람 수)를 "
+                              "사용자에게 보여 주고 확인받은 다음 publish_report(report_id, boards, confirm_token) — 확인 없이 게시하지 않는다. 게시한 뒤에는 "
+                              "작성자가 직접 내릴 수 없다(게시판 매니저 승인).")
+    return done(True, **out)
+
+
 # ── 코어 어휘표(HWAXPortal docs/request-1029 B-1 · C-11) ──────────────────────────────────────────────
 # 정본은 포털 리포의 backend/config/core_vocab.json 이다. 게이트웨이 · 포털은 늘 한 박스에 형제 리포로 있어(dev ~/claude · cae00 ~/Projects)
 # 그 파일을 직접 읽는다 — 새 통로가 없고 포털이 내려가 있어도 표가 산다. 바뀐 시각이 다르면 다시 읽는다. 없거나 꼴이 틀리면 지금 동작
@@ -10037,7 +10095,7 @@ def _local_tools() -> list[types.Tool]:
     # 로컬 도구는 전 그룹 노출 — 실제 게이트는 포털 인증(PAT 포워딩)이 담당.
     local = [SAVE_CONV_TOOL, SEARCH_CONV_TOOL, LIST_APPS_TOOL, SEARCH_TOOLS_TOOL, INVOKE_TOOL,
              BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL, VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL,
-             ONTO_LOOKUP_TOOL, GAS_TRANSPORT_TOOL, RELIAB_TOOL, *PROCEDURE_TOOLS, *_res_tools(), *_ix_tools()]
+             ONTO_LOOKUP_TOOL, GAS_TRANSPORT_TOOL, RELIAB_TOOL, RA_REPORT_FORMAT_TOOL, *PROCEDURE_TOOLS, *_res_tools(), *_ix_tools()]
     # REST 다리는 **등록된 사이트가 있을 때만** 낸다 — 쓸 수 없는 도구를 목록에 두면
     # 모델이 그것을 고르고 매번 빈손으로 돌아온다.
     if REST:
@@ -11827,6 +11885,7 @@ _LOCAL_READ = frozenset({SEARCH_CONV_TOOL.name, LIST_APPS_TOOL.name, SEARCH_TOOL
                          ONTO_LOOKUP_TOOL.name,                            # 온톨로지 조회 — 안쪽 허브 호출은 그 이름으로 다시 판정된다
                          GAS_TRANSPORT_TOOL.name,                          # 가스 투과 물성 — 안쪽 MaterialTwin 읽기도 그 이름으로 다시 판정된다
                          RELIAB_TOOL.name,                                 # 신뢰성 시험 조건 — 안쪽 TestScope 읽기는 그 사람 토큰으로 다시 판정된다
+                         RA_REPORT_FORMAT_TOOL.name,                       # 심의 보고서 RA 형식 · 게시판 — 박스 파일을 읽기만 한다
                          READONLY_ALLOWLIST_TOOL.name})                    # 읽기 전용 허용 목록 보기(관리자) — 고치기는 REST PATCH 뿐이다
 _ROUTINE_NAMES = frozenset(t.name for t in ROUTINE_TOOLS)
 
@@ -12007,6 +12066,8 @@ async def _call_tool_body(name: str, arguments: dict):
         return await _gas_transport(arguments or {})
     if name == RELIAB_TOOL.name:
         return await _reliab_conditions(arguments or {})
+    if name == RA_REPORT_FORMAT_TOOL.name:
+        return await _ra_report_format(arguments or {})
     if FIG_STORE_ON and name in _FIG_NAMES:
         return await _fig_dispatch(name, arguments or {})
     if RESULT_REFS_ON and name in _RES_NAMES:
@@ -12395,7 +12456,7 @@ def _bearer_gate(app, pat_verifier=None):
             # tool_count 와 list_tool_apps 가 서로 다른 수를 말해 클라이언트 카탈로그가 어긋난다.
             for _lt in (SEARCH_TOOLS_TOOL, INVOKE_TOOL, BROWSE_EXPERTS_TOOL, USE_EXPERTS_TOOL,
                         VERIFY_TOOL, *ROUTINE_TOOLS, *INSIGHT_TOOLS, *_fig_tools(), KIT_GET_TOOL, ONTO_LOOKUP_TOOL, READONLY_ALLOWLIST_TOOL,
-                        GAS_TRANSPORT_TOOL, RELIAB_TOOL, *PROCEDURE_TOOLS, *_res_tools(), *_ix_tools(),
+                        GAS_TRANSPORT_TOOL, RELIAB_TOOL, RA_REPORT_FORMAT_TOOL, *PROCEDURE_TOOLS, *_res_tools(), *_ix_tools(),
                         *([ARTIFACT_TO_STE_TOOL] if STE_UPLOAD_SITE in REST else [])):
                 _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가

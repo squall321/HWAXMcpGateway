@@ -158,7 +158,7 @@ def test_visible_tools(monkeypatch):
                               gw.BROWSE_EXPERTS_TOOL, gw.USE_EXPERTS_TOOL, gw.VERIFY_TOOL,
                               gw.REST_CATALOG_TOOL, gw.REST_CALL_TOOL, *gw.ROUTINE_TOOLS, *gw.INSIGHT_TOOLS,
                               *gw.FIGURE_TOOLS, gw.KIT_GET_TOOL, gw.ONTO_LOOKUP_TOOL, gw.ARTIFACT_TO_STE_TOOL,
-                              gw.GAS_TRANSPORT_TOOL, gw.RELIAB_TOOL, *gw.PROCEDURE_TOOLS)}
+                              gw.GAS_TRANSPORT_TOOL, gw.RELIAB_TOOL, gw.RA_REPORT_FORMAT_TOOL, *gw.PROCEDURE_TOOLS)}
 
     def seen(groups):
         return {t.name for t in gw._visible_tools(groups)} - local
@@ -6436,8 +6436,8 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     assert body["backends"] == ["_gateway", "reportarchive"]
     # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 관리자 읽기 목록 보기 1(GW-02 — tools/list 는 관리자에게만)
     # + 가스 투과 물성 1(PT-R1) + 신뢰성 시험 조건 1(PT-R2) + 절차 4(목록 · 계약 · 실행 시작 · 상태 — HWAXPortal docs/procedures W-116) —
-    # ste 업로드 옮기기(P-1)는 rest.ste 가 있을 때만이라 여기(REST 없음)엔 없다
-    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 29, "reportarchive": 2}
+    # ste 업로드 옮기기(P-1)는 rest.ste 가 있을 때만이라 여기(REST 없음)엔 없다. + 심의 보고서 RA 형식 1(HWAXPortal docs/ra-delib-standard RS-6)
+    assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 30, "reportarchive": 2}
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
     assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
@@ -6505,8 +6505,9 @@ def test_게이트웨이_로컬_도구는_제_앱으로_센다(monkeypatch, _fre
     """로컬 도구는 route 에 없다 — `_gateway` 앱으로 세고, tools/list 가 붙이는 것과 같은 목록이다(REST 다리는 사이트가 있을
     때만). 목록이 따로 있으면 점수판이 모델이 보는 것과 어긋난다."""
     # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 가스 투과 물성 1 + 신뢰성 시험 조건 1(+ REST 다리 둘, rest.ste 면 ste 업로드 옮기기 하나 더)
-    # 절차 도구 넷(목록 · 계약 · 실행 시작 · 상태 — HWAXPortal docs/procedures W-116)이 늘 붙는다 — 24 · 26 · 27 에서 넷씩 늘었다
-    for rest, n_local in (({}, 28), ({"s": {"base": "http://x"}}, 30), ({"ste": {"base": "http://x", "per_user": "ste"}}, 31)):
+    # 절차 도구 넷(목록 · 계약 · 실행 시작 · 상태 — HWAXPortal docs/procedures W-116)이 늘 붙는다 — 24 · 26 · 27 에서 넷씩 늘었다.
+    # 심의 보고서 RA 형식 ra_report_format 하나(HWAXPortal docs/ra-delib-standard RS-6) — 28 · 30 · 31 에서 하나씩 늘었다
+    for rest, n_local in (({}, 29), ({"s": {"base": "http://x"}}, 31), ({"ste": {"base": "http://x", "per_user": "ste"}}, 32)):
         monkeypatch.setattr(gw, "REST", rest)
         _aggregate_tools(monkeypatch, {"sf": [_stool("sf_q", {"q": None})]})
         row = {r["app"]: r for r in gw._ARG_SCORE["apps"]}["_gateway"]
@@ -10125,7 +10126,8 @@ def test_E9_검색_기록_보기는_새것_먼저_뒤이은_호출과_박스_표
     assert st == 200 and [r["q"] for r in body["searches"]] == ["요약", "report digest"], "새것 먼저"
     first, second = body["searches"]
     assert first["mark"]["gold"] == ["signalforge:digest"] and first["boost_only"] == ["signalforge:digest"]
-    assert second["outcomes"] == [{"t": "signalforge:list", "r": 2, "ok": True}] and "mark" not in second
+    # r 은 그 검색의 순위다 — 로컬 도구 ra_report_format(이름에 report, HWAXPortal docs/ra-delib-standard RS-6)이 'report digest' 에서 앞에 서서 2 → 3
+    assert second["outcomes"] == [{"t": "signalforge:list", "r": 3, "ok": True}] and "mark" not in second
     st, body = _gate_call(monkeypatch, "/search-log", qs=b"q=DIGEST")
     assert [r["q"] for r in body["searches"]] == ["report digest"], "q 는 대소문자 없이 부분 일치로 거른다"
 
@@ -15444,6 +15446,58 @@ def test_RA_템플릿_박스_파일이_틀리면_버리고_기본으로_돈다(m
     assert gw._ra_format_args() == {"template_id": "deliberation", "template_version": 1}
     h = gw._ra_formats_health()
     assert h["file"] is True and h["error"], h
+
+
+# ── 심의 보고서의 RA 형식 · 게시판 ra_report_format(HWAXPortal docs/ra-delib-standard RS-6) ──────────────────────────────
+def _rarf(**a):
+    r = asyncio.run(gw._ra_report_format(a))
+    return json.loads(r.content[0].text), r.isError
+
+
+def test_RARF_박스_파일이_없으면_기본_형식이고_게시판은_없다():
+    out, err = _rarf()
+    assert err is False and out == {"ok": True, "kind": "deliberation", "template_id": "deliberation", "template_version": 1,
+                                    "source": "default", "board": None}
+
+
+def test_RARF_박스_파일의_형식과_게시판을_주고_게시는_확인_뒤라고_안내한다(monkeypatch, tmp_path):
+    f = tmp_path / "ra-formats.local.json"
+    f.write_text(json.dumps({"deliberation": {"template_id": "sys.hwax.deliberation", "template_version": 3, "board": "sys-hwax"}}),
+                 encoding="utf-8")
+    monkeypatch.setattr(gw, "RA_FORMATS_PATH", f)
+    out, err = _rarf(kind="deliberation")
+    assert err is False and (out["template_id"], out["template_version"], out["source"], out["board"]) == (
+        "sys.hwax.deliberation", 3, "box", "sys-hwax")
+    assert "preview_publish" in out["how_to_post"] and "확인" in out["how_to_post"]
+    assert gw._ra_format_args() == {"template_id": "sys.hwax.deliberation", "template_version": 3}, "board 칸이 있어도 형식 읽기는 그대로"
+
+
+@pytest.mark.parametrize("row", [{"template_id": "sys.hwax.deliberation", "template_version": 3, "board": "../x"},
+                                 {"template_id": "sys.hwax.deliberation", "template_version": 3, "board": ".."},
+                                 {"template_id": "sys.hwax.deliberation", "template_version": 3, "board": 7},
+                                 {"template_id": "../x", "template_version": 3, "board": "sys-hwax"}])
+def test_RARF_꼴이_틀린_게시판이나_틀린_형식_줄이면_게시판을_주지_않는다(monkeypatch, tmp_path, row):
+    f = tmp_path / "ra-formats.local.json"
+    f.write_text(json.dumps({"deliberation": row}), encoding="utf-8")
+    monkeypatch.setattr(gw, "RA_FORMATS_PATH", f)
+    out, err = _rarf()
+    assert err is False and out["board"] is None and "how_to_post" not in out
+
+
+def test_RARF_모르는_종류는_거절하고_읽기_도구다():
+    out, err = _rarf(kind="routine")
+    assert err is True and out["ok"] is False
+    t = next(x for x in gw._local_tools() if x.name == "ra_report_format")
+    assert t.annotations.readOnlyHint is True and t.name in gw._LOCAL_READ
+
+
+def test_RARF_포털_리더와_같은_게시판_꼴이다():
+    src = gw.Path(gw.__file__).resolve().parent.parent / "HWAXPortal" / "backend" / "app" / "agent" / "ra_post.py"
+    if not src.exists():
+        pytest.skip("형제 HWAXPortal 리포에 ra_post.py 가 없다")
+    import re as _re
+    m = _re.search(r'_BOARD_RE = re\.compile\(r"([^"]+)"\)', src.read_text(encoding="utf-8"))
+    assert m and m.group(1) == gw._RA_BOARD_RE.pattern, "포털이 게시하는 게시판과 워크플로가 안내받는 게시판의 꼴이 갈리면 안 된다"
 
 
 def test_루틴_보고서_초안은_글자로_박힌_템플릿_id_없이_박스_파일을_따른다():

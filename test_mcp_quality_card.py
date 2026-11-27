@@ -34,7 +34,8 @@ TMAP = {
     "map": {"search_reports": "reportarchive", "laminate_check": "heax-lam", "heaxlam_delete_case": "heax-lam"},
     "write": ["heaxlam_delete_case"], "routine_read": ["laminate_check"], "panel_read": [], "unclassified": ["search_reports"],
     "orig": {"heaxlam_delete_case": "delete_case"},
-    "apps": [{"key": "heax-lam", "label": "Laminate"}, {"key": "reportarchive", "label": "RA"}],
+    "apps": [{"app": "heax-lam", "label": "Laminate", "tool_count": 2, "reachable": True},    # 실제 /tools-map 꼴 — 열쇠는 app
+             {"app": "reportarchive", "label": "RA", "tool_count": 1, "reachable": True}],
 }
 
 
@@ -107,3 +108,25 @@ def test_build_card_offline_files_and_no_description_text(tmp_path: Path):
     assert [a["app"] for a in card["apps"]][0] == "heax-lam"            # 도구 수가 많은 앱 먼저
     assert {a["app"]: a["label"] for a in card["apps"]}["heax-lam"] == "Laminate"
     assert "보고서를 찾는다" not in out.read_text(encoding="utf-8")        # 설명 원문을 싣지 않는다
+
+
+def test_label_reads_the_real_tools_map_key_app_and_old_key_shape():
+    card = qc.build_card(TOOLS, TMAP, {})
+    assert {a["app"]: a["label"] for a in card["apps"]} == {"heax-lam": "Laminate", "reportarchive": "RA", "_gateway": None}
+    old = {**TMAP, "apps": [{"key": "heax-lam", "label": "Laminate"}]}
+    assert {a["app"]: a["label"] for a in qc.build_card(TOOLS, old, {})["apps"]}["heax-lam"] == "Laminate", "옛 꼴(key)도 읽는다"
+
+
+def test_gateway_filled_annotations_and_args_are_not_counted_as_the_apps_own():
+    tools = [{"name": "query_voc", "description": "d", "annotations": {"readOnlyHint": True},
+              "inputSchema": {"type": "object", "properties": {"product": {"type": "string", "description": "제품 코드"},
+                                                               "limit": {"type": "integer", "description": "앱이 쓴 설명"}}}}]
+    tmap = {"map": {"query_voc": "signalforge"}, "apps": [{"app": "signalforge", "label": "SignalForge"}],
+            "gateway_annotated": ["query_voc"], "gateway_filled": {"query_voc": ["product"]},
+            "tool_class": {"query_voc": {"class": "read", "source": "confirmed_list"}}}
+    sf = qc.catalog_card(tools, tmap)["signalforge"]
+    assert (sf["ro_true"], sf["ro_none"], sf["ro_gateway"]) == (0, 1, 1), "게이트웨이가 실은 표지는 앱 표지 없음으로 센다"
+    assert (sf["args"], sf["args_described"], sf["args_gateway_filled"]) == (2, 1, 1)
+    assert sf["nested_described"] == 1 and sf["cls_read"] == 1 and sf["cls_unknown"] == 0
+    total = qc.build_card(tools, tmap, {})["total"]
+    assert total["args_gateway_filled"] == 1 and total["ro_gateway"] == 1 and total["arg_described_ratio"] == 0.5

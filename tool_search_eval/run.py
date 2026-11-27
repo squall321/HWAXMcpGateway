@@ -71,7 +71,9 @@ async def _snapshot(args) -> None:
             local.append(t.name)
             continue
         rows.append({"name": t.name, "app": app, "original": _original(t.name, app),
-                     "description": t.description or "", "inputSchema": t.inputSchema or {"type": "object"}})
+                     "description": t.description or "", "inputSchema": t.inputSchema or {"type": "object"},
+                     # 표지 — 쓰기 감점이 읽기 · 쓰기 한 판정(앱 표지 먼저)을 본다(HWAXPortal docs/mcp-modernize M2). tools/list 사본의 표지다
+                     **({"annotations": t.annotations.model_dump(exclude_none=True)} if getattr(t, "annotations", None) else {})})
     out = {"taken_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "gateway": base,
            "apps": {a["app"]: {"label": a.get("label") or "", "description": a.get("description") or "",
                                "reachable": a.get("reachable"), "tool_count": a.get("tool_count")}
@@ -101,8 +103,9 @@ def _import_gateway(tmp: Path):
 def _install(gw, cat: dict) -> dict:
     """스냅샷을 카탈로그로 앉힌다 — 돌려주는 것은 노출 이름 → 정답 열쇠(`앱키:원래 이름`)."""
     import mcp.types as types
-    gw.exposed_tools[:] = [types.Tool(name=r["name"], description=r["description"], inputSchema=r["inputSchema"])
-                           for r in cat["tools"]]
+    gw.exposed_tools[:] = [types.Tool(name=r["name"], description=r["description"], inputSchema=r["inputSchema"],
+                                      **({"annotations": types.ToolAnnotations(**r["annotations"])} if r.get("annotations") else {}))
+                           for r in cat["tools"]]                         # 표지가 없는 옛 스냅숏은 이름 꼴 · 읽기 목록으로만 가른다
     gw.route.clear()
     gw.route.update({r["name"]: (r["app"], r["original"]) for r in cat["tools"]})
     gw.DISCOVERED_META.update({k: {"label": a["label"], "description": a["description"]}

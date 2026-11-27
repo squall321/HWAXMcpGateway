@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import hmac
+import inspect
 import ipaddress
 import json
 import logging
@@ -78,6 +79,36 @@ logging.getLogger("uvicorn.access").addFilter(_MaskAccessQuery())     # uvicorn 
 for _noisy in ("httpx", "httpcore"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("hwax-mcp-gateway")
+
+
+def _provision_env_value(key: str, path: Path | None = None) -> str:
+    """게이트웨이 곁 provision.env(박스 파일 · gitignore)의 마지막 활성 줄 값 — 없거나 못 읽으면 ''. 이 리포의 start.sh 는 그 파일을 프로세스 환경으로
+    싣지 않아(provision-config.sh 가 설정 파일을 지을 때만 읽는다) 박스 스위치를 거기 적어도 먹지 않았다. 포털 update-all 이 같은 파일 · 같은 키를 읽어
+    「안 켠 것」 을 알리고, 그 파일이 바뀌면 게이트웨이를 다시 띄운다(지문 목록 identity). 줄 읽기는 포털 _envfile_value 와 같은 규칙 — `export ` 머리 ·
+    줄 끝 `#` 주석 · 따옴표를 뗀다."""
+    p = path or Path(__file__).with_name("provision.env")
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    val = ""
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("export "):
+            s = s[len("export "):].lstrip()
+        if not s.startswith(f"{key}="):
+            continue
+        v = s[len(key) + 1:]
+        v = re.sub(r"\s+#.*$", "", v).strip().strip("\"'")
+        val = v
+    return val
+
+
+def _env_knob(name: str, default: str) -> str:
+    """박스 손잡이 값 — 띄운 셸의 환경(비어 있지 않으면)이 먼저, 없으면 곁의 provision.env 줄(_provision_env_value — start.sh 는 그 파일을 환경으로
+    싣지 않는다), 그것도 없으면 기본값. 결과 손잡이(GATEWAY_RESULT_REFS)와 같은 규칙이다(HWAXPortal docs/mcp-modernize M2 의 손잡이들이 쓴다)."""
+    return os.environ.get(name, "").strip() or _provision_env_value(name) or default
+
 
 CONFIG_PATH = os.environ.get("GATEWAY_CONFIG", str(Path(__file__).with_name("gateway_config.json")))
 
@@ -1340,12 +1371,16 @@ def _arg_schema_range(prop: dict) -> bool:
 
 
 def _arg_counts(tool: types.Tool) -> tuple[int, int, int]:
-    """도구 하나의 (인자, 설명 있는 인자, 단위·범위가 든 인자) — 세는 법은 위 머리말."""
+    """도구 하나의 (인자, 설명 있는 인자, 단위·범위가 든 인자) — 세는 법은 위 머리말. 게이트웨이가 채운 인자(_GW_FILLED)는 설명 없음으로 센다
+    (앱의 실제 상태 — 채운 수는 gateway_filled 로 따로)."""
     props = tool.inputSchema.get("properties") if isinstance(tool.inputSchema, dict) else None
     if not isinstance(props, dict):
         return 0, 0, 0
+    filled = _GW_FILLED.get(tool.name) or ()
     described = unit_range = 0
-    for p in props.values():
+    for k, p in props.items():
+        if k in filled:
+            continue
         desc = p.get("description") if isinstance(p, dict) else None
         if not isinstance(desc, str) or not desc.strip():
             continue
@@ -1353,6 +1388,64 @@ def _arg_counts(tool: types.Tool) -> tuple[int, int, int]:
         if _ARG_UNIT_RANGE_RE.search(desc) or _arg_schema_range(p):
             unit_range += 1
     return len(props), described, unit_range
+
+
+# 중첩 인자(HWAXPortal docs/mcp-modernize M2 · audit/contract 8-1) — 맨 위만 세면 자유형 객체가 '설명 있음' 하나로 구조 공백을 가리고(Laminate 90),
+# 객체 · 배열 항목 · $defs 안의 필드는 아예 안 보인다. 맨 위 수는 그대로 두고 nested 칸을 더한다 — 맨 위 아래(객체 속성 · 배열 항목의 속성 · anyOf
+# 갈래 · $ref 가 가리키는 $defs)의 인자 수 · 설명 있는 수, 그리고 맨 위를 포함한 자유형 객체(type object 인데 properties 없음) 수. 깊이 4 까지.
+# 끄기 GATEWAY_ARG_SCORE_NESTED=0 — 점수판 · /tools-map 이 종전과 같다(도구 수 칸도 — 아래 _toolmap_locals).
+ARG_SCORE_NESTED = _env_knob("GATEWAY_ARG_SCORE_NESTED", "1") != "0"
+
+
+def _schema_ref(node, root: dict):
+    """'#/…' $ref 를 푼다 — 못 풀면 그대로."""
+    ref = node.get("$ref") if isinstance(node, dict) else None
+    if isinstance(ref, str) and ref.startswith("#/"):
+        cur = root
+        for part in ref[2:].split("/"):
+            cur = cur.get(part) if isinstance(cur, dict) else None
+        return cur if isinstance(cur, dict) else node
+    return node
+
+
+def _arg_nested(tool: types.Tool) -> tuple[int, int, int]:
+    """도구 하나의 (중첩 인자, 그 가운데 설명 있는 것, 자유형 객체 — 맨 위 포함). 세는 법은 위 머리말."""
+    root = tool.inputSchema if isinstance(tool.inputSchema, dict) else {}
+    top = root.get("properties") if isinstance(root.get("properties"), dict) else {}
+    acc = {"n": 0, "d": 0, "free": 0}
+    seen: set[int] = set()
+
+    def kids(sch) -> list[dict]:
+        """한 속성 스키마 아래의 속성 묶음들 — 객체 속성 · 배열 항목 · anyOf/oneOf/allOf 갈래(각각 $ref 를 푼다)."""
+        out, s = [], _schema_ref(sch, root)
+        for node in [s, _schema_ref(s.get("items") or {}, root)] + [_schema_ref(a, root) for k in ("anyOf", "oneOf", "allOf")
+                                                                    for a in (s.get(k) or []) if isinstance(a, dict)]:
+            if isinstance(node, dict) and isinstance(node.get("properties"), dict) and id(node) not in seen:
+                seen.add(id(node))
+                out.append(node["properties"])
+        return out
+
+    def free(sch) -> bool:
+        s = _schema_ref(sch, root)
+        ty = s.get("type")
+        types_ = set(ty) if isinstance(ty, list) else {ty}
+        alts = [_schema_ref(a, root) for a in (s.get("anyOf") or []) if isinstance(a, dict)]
+        return ("object" in types_ and not s.get("properties")) or (
+            any(a.get("type") == "object" for a in alts) and not any(a.get("properties") for a in alts))
+
+    def visit(props: dict, depth: int):
+        for v in props.values():
+            if not isinstance(v, dict):
+                continue
+            acc["free"] += free(v)
+            if depth:
+                acc["n"] += 1
+                acc["d"] += bool(str(v.get("description") or _schema_ref(v, root).get("description") or "").strip())
+            if depth < 4:
+                for sub in kids(v):
+                    visit(sub, depth + 1)
+    visit(top, 0)
+    return acc["n"], acc["d"], acc["free"]
 
 
 def _arg_ratio(part: int, whole: int) -> float | None:
@@ -1366,17 +1459,29 @@ def _arg_scoreboard(pairs) -> dict:
     · 앱마다 가장 나쁜 도구 다섯 — 설명 없는 인자가 많은 순, 같으면 인자가 많은 순. 설명이 다 있는 도구는 싣지 않는다.
     """
     acc: dict[str, dict] = {}
+    fill = ARG_DOC_FILL is not False                  # 대신 채우기를 켠 게이트웨이만 gateway_filled 칸을 싣는다(끄면 점수판이 종전과 같다)
     for app, tool in pairs:
         n, d, u = _arg_counts(tool)
-        a = acc.setdefault(app, {"tools": 0, "args": 0, "described": 0, "unit_or_range": 0, "bad": []})
+        a = acc.setdefault(app, {"tools": 0, "args": 0, "described": 0, "unit_or_range": 0, **({"gateway_filled": 0} if fill else {}),
+                                 "bad": []})
         a["tools"] += 1
         a["args"] += n
         a["described"] += d
         a["unit_or_range"] += u
+        if fill:
+            a["gateway_filled"] += len(_GW_FILLED.get(tool.name) or ())
+        if ARG_SCORE_NESTED:
+            nn, nd, nf = _arg_nested(tool)
+            nest = a.setdefault("nested", {"args": 0, "described": 0, "free_objects": 0})
+            nest["args"] += nn
+            nest["described"] += nd
+            nest["free_objects"] += nf
         if n > d:
             a["bad"].append({"tool": tool.name, "args": n, "described": d})
     rows = []
     for app, a in acc.items():
+        if "nested" in a:
+            a["nested"]["described_ratio"] = _arg_ratio(a["nested"]["described"], a["nested"]["args"])
         worst = sorted(a.pop("bad"), key=lambda w: (w["described"] - w["args"], -w["args"], w["tool"]))[:5]
         rows.append({"app": app, **a,
                      "described_ratio": _arg_ratio(a["described"], a["args"]),
@@ -1384,12 +1489,14 @@ def _arg_scoreboard(pairs) -> dict:
                      "worst": worst})
     rows.sort(key=lambda r: (r["args"] == 0, r["described"] / r["args"] if r["args"] else 0,
                              r["described"] - r["args"], r["app"]))
-    tot = {k: sum(r[k] for r in rows) for k in ("tools", "args", "described", "unit_or_range")}
-    return {"threshold": ARG_DESC_WARN_RATIO,
-            "total": {"apps": len(rows), **tot,
-                      "described_ratio": _arg_ratio(tot["described"], tot["args"]),
-                      "unit_or_range_ratio": _arg_ratio(tot["unit_or_range"], tot["args"])},
-            "apps": rows}
+    tot = {k: sum(r[k] for r in rows) for k in ("tools", "args", "described", "unit_or_range") + (("gateway_filled",) if fill else ())}
+    total = {"apps": len(rows), **tot,
+             "described_ratio": _arg_ratio(tot["described"], tot["args"]),
+             "unit_or_range_ratio": _arg_ratio(tot["unit_or_range"], tot["args"])}
+    if ARG_SCORE_NESTED:
+        nt = {k: sum((r.get("nested") or {}).get(k, 0) for r in rows) for k in ("args", "described", "free_objects")}
+        total["nested"] = {**nt, "described_ratio": _arg_ratio(nt["described"], nt["args"])}
+    return {"threshold": ARG_DESC_WARN_RATIO, "total": total, "apps": rows}
 
 
 def _arg_score_refresh() -> None:
@@ -1420,6 +1527,118 @@ def _arg_score_refresh() -> None:
                     "inputSchema.properties[].description 을 채우면 오른다(GATEWAY_ARG_DESC_WARN_RATIO · /tools-map 의 arg_scores)",
                     row["app"], row["args"], row["described"], 100 * row["described"] / row["args"],
                     100 * ARG_DESC_WARN_RATIO, w["tool"], w["args"], w["described"])
+
+
+# ── 노출 설명 들여쓰기 걷기(HWAXPortal docs/mcp-modernize M2 · 게이트웨이 일괄 B) ─────────────────────────────────────────────
+# 앱 docstring 은 함수 안 들여쓰기(4 · 8칸)를 줄마다 그대로 싣는다 — dev 11-27 카탈로그 설명 51만 자 가운데 23,399자(4.5%)가 그 앞 공백이다(StepForge
+# 13,120 · RA 3,891). 노출 사본(exposed_tools)의 설명을 inspect.cleandoc 꼴로 걷는다 — 첫 줄 앞 공백 · 둘째 줄부터의 **공통** 들여쓰기 · 앞뒤 빈 줄만
+# 뗀다(상대 들여쓰기 — 목록 · 코드 블록 — 는 그대로). 낱말은 그대로라 검색 점수는 바뀌지 않는다(빈칸이 든 손 동의어가 줄머리 공백에 걸치지 않는 한 —
+# 평가셋으로 잰다). 앱 원문은 앱에 그대로다. 끄기 GATEWAY_DESC_CLEANDOC=0(설명이 앱 글 그대로). 값 · 걷은 글자 수는 /health 의 contract.desc_cleandoc.
+DESC_CLEANDOC = _env_knob("GATEWAY_DESC_CLEANDOC", "1") != "0"
+_DESC_CLEAN_STAT = {"tools": 0, "saved_chars": 0}          # 마지막 재집계에서 걷은 도구 수 · 글자 수
+
+
+def _desc_clean(desc):
+    """노출 설명 — 켜면 inspect.cleandoc 꼴(글이 아니거나 비면 그대로), 끄면 그대로."""
+    if not DESC_CLEANDOC or not isinstance(desc, str) or not desc:
+        return desc
+    out = inspect.cleandoc(desc)
+    if out != desc:
+        _DESC_CLEAN_STAT["tools"] += 1
+        _DESC_CLEAN_STAT["saved_chars"] += len(desc) - len(out)
+    return out
+
+
+# ── docstring 인자 설명 대신 채우기(HWAXPortal docs/mcp-modernize M2 · MM-3 · 게이트웨이 일괄 A — 임시) ──────────────────────────────────
+# 공식 SDK 1.x FastMCP 는 docstring 의 「Args:」 를 inputSchema 로 옮기지 않는다 — SignalForge · 웹 리서치처럼 Google 꼴로 인자 뜻을 정성껏 써도 스키마의
+# 인자 설명은 비어, 인자 설명만 보는 클라이언트 · 웹 챗(설명을 자른다)에서 뜻이 사라진다. 앱이 Field(description=) 로 옮기는 것이 정답이고(공통 계약 C2),
+# 그때까지 노출 사본만 채운다. 엄격하게만 — ① 인자의 스키마 설명이 비었을 때 ② 도구 설명에 「Args:」 · 「Arguments:」 · 「Parameters:」 · 「인자:」 절이 있고
+# ③ 그 절의 항목 줄(절보다 들여쓴 첫 깊이)이 `이름:` 또는 `이름 (꼴):` 로 그 인자 이름과 정확히 맞을 때(백틱 감싼 이름도). 더 들여쓴 줄은 그 항목의
+# 이어짐이다. 채우지 않는 것 — 한 항목에 다른 인자 이름이 `이름:` 꼴로 섞이면(한 줄에 둘 — DocForge 'vlm: … llm: …'), 같은 이름이 두 번 나오면,
+# 글이 비면, 돌려주는 칸(Returns · Raises · 반환 … 절은 들여쓰기가 절 머리와 같아 절이 끝난다). 맨 위 인자만 본다. enum 은 넣지 않는다(MM-3).
+# 점수판은 앱의 실제 상태를 가리지 않는다 — 채운 인자는 '설명 있음' 에 세지 않고 gateway_filled 로 따로 센다(_GW_FILLED).
+# 손잡이 GATEWAY_ARG_DOC_FILL — 1(기본, 모든 앱) · 0(끔 — 스키마가 앱 그대로) · 백엔드 키 쉼표 목록(그 앱만). 값 · 채운 수는 /health 의 contract.arg_doc_fill.
+_ARG_FILL_RAW = _env_knob("GATEWAY_ARG_DOC_FILL", "1")
+ARG_DOC_FILL: frozenset | bool = (False if _ARG_FILL_RAW in ("0", "") else True if _ARG_FILL_RAW == "1"
+                                  else frozenset(x.strip() for x in _ARG_FILL_RAW.split(",") if x.strip()))
+_GW_FILLED: dict[str, frozenset] = {}                     # 노출 이름 → 게이트웨이가 채운 맨 위 인자 이름(마지막 재집계)
+_ARG_SECTION_RE = re.compile(r"^(?P<ind>[ \t]*)(?:Args|Arguments|Parameters|인자)\s*:\s*$", re.I)
+_ARG_ENTRY_RE = re.compile(r"^`?(?P<name>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s*\([^()]*\))?\s*:(?:\s+(?P<text>.*))?$")
+
+
+def _arg_fill_on(backend: str) -> bool:
+    return ARG_DOC_FILL is True or (isinstance(ARG_DOC_FILL, frozenset) and backend in ARG_DOC_FILL)
+
+
+def _docstring_args(desc: str) -> dict[str, str]:
+    """도구 설명의 인자 절에서 {인자 이름: 글} — 두 번 나온 이름은 빼고, 글이 빈 항목도 뺀다. 절의 경계는 위 머리말."""
+    lines = inspect.cleandoc(desc or "").splitlines()
+    found: dict[str, list[str]] = {}
+    dup: set[str] = set()
+    i = 0
+    while i < len(lines):
+        m = _ARG_SECTION_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        head = len(m.group("ind").expandtabs())
+        body = []
+        i += 1
+        while i < len(lines) and (not lines[i].strip() or len(lines[i]) - len(lines[i].lstrip()) > head):
+            body.append(lines[i].expandtabs())
+            i += 1
+        filled = [ln for ln in body if ln.strip()]
+        if not filled:
+            continue
+        depth = min(len(ln) - len(ln.lstrip()) for ln in filled)
+        cur = None
+        for ln in body:
+            if not ln.strip():
+                continue                                     # 빈 줄은 항목을 끊지 않는다(다음 줄이 더 들여쓰였으면 이어짐)
+            ind = len(ln) - len(ln.lstrip())
+            if ind == depth:
+                e = _ARG_ENTRY_RE.match(ln.strip())
+                if e is None:
+                    cur = None                               # 항목 꼴이 아닌 줄 — 앞 항목을 닫고 이 줄은 버린다
+                    continue
+                cur = e.group("name")
+                if cur in found:
+                    dup.add(cur)
+                found[cur] = [e.group("text") or ""]
+            elif cur is not None:
+                found[cur].append(ln.strip())
+    out = {}
+    for name, parts in found.items():
+        text = " ".join(x for x in parts if x).strip()
+        if name not in dup and text:
+            out[name] = text
+    return out
+
+
+def _arg_fill(backend: str, desc, schema) -> tuple[dict, frozenset]:
+    """(노출 inputSchema, 채운 인자 이름) — 채울 것이 없거나 끄면 (앱 스키마 그대로, 빈 집합). 앱 스키마 객체는 바꾸지 않는다(새 dict)."""
+    if not _arg_fill_on(backend) or not isinstance(desc, str) or not isinstance(schema, dict):
+        return schema, frozenset()
+    props = schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return schema, frozenset()
+    empty = [n for n, p in props.items() if isinstance(p, dict) and not str(p.get("description") or "").strip()]
+    if not empty:
+        return schema, frozenset()
+    docs = _docstring_args(desc)
+    new_props, done = dict(props), set()
+    for n in empty:
+        text = docs.get(n)
+        if not text:
+            continue
+        # 한 항목에 다른 인자가 '이름:' 꼴로 섞였다(한 줄에 둘) — 경계를 믿을 수 없어 채우지 않는다
+        if any(re.search(rf"(?<![\w`]){re.escape(o)}`?\s*:", text) for o in props if o != n):
+            continue
+        new_props[n] = {**props[n], "description": text}
+        done.add(n)
+    if not done:
+        return schema, frozenset()
+    return {**schema, "properties": new_props}, frozenset(done)
 
 
 async def _aggregate():
@@ -1475,7 +1694,8 @@ async def _aggregate():
     # MaterialTwin · SignalForge 의 맨 이름(get_material 등)이 사라져 그 이름을 부르던 절차 · 핀 · 클라이언트가 unknown tool 이 된다.
     base_counts = Counter(t.name for k, t in collected if k not in _CONN_ACTIVE)
     tool_readonly_hint.clear()
-    declared_read: set[tuple[str, str]] = set()
+    declared_read = _DECLARED_READ                     # 한 판정(_tool_class)이 근거를 가른다 — 재집계마다 새로 채운다
+    declared_read.clear()
     for key, t in collected:
         app_hint = getattr(getattr(t, "annotations", None), "readOnlyHint", None)
         hint = bool(app_hint)
@@ -1503,6 +1723,8 @@ async def _aggregate():
     # 가족은 마지막으로 온전히 읽은 표의 것이다(_core_family) — 표를 잠깐 못 읽는 사이에 이름이 맨 이름으로 뒤집히지 않게(그동안 빠지는 것은 소개 줄뿐이다).
     family = frozenset(_core_family())
     fam_renamed: dict[str, tuple[str, str]] = {}          # 옛 맨 이름 → (백엔드, 원래 이름)
+    _DESC_CLEAN_STAT.update(tools=0, saved_chars=0)
+    _GW_FILLED.clear()
     for key, t in collected:
         # 충돌 여부와 **무관하게** 별칭을 등록한다(호출 전용).
         _alias = f"{key.replace('-', '')}_{t.name}"
@@ -1527,14 +1749,17 @@ async def _aggregate():
         else:
             exposed_name = t.name
         ann = getattr(t, "annotations", None)
+        in_schema, filled = _arg_fill(key, t.description, t.inputSchema)      # docstring 인자 설명 대신 채우기(A — 임시, 노출 사본만)
+        if filled:
+            _GW_FILLED[exposed_name] = filled
         if (key, t.name) in declared_read:
             # 선언된 읽기 도구 — 노출 사본에 readOnlyHint 를 단다(클라이언트도 읽기로 보게). 앱이 단 다른 표지는 그대로 둔다.
             ann = ann.model_copy(update={"readOnlyHint": True}) if ann is not None else types.ToolAnnotations(readOnlyHint=True)
         exposed_tools.append(
             types.Tool(
                 name=exposed_name,
-                description=_core_tagged(key, t.description, tags),
-                inputSchema=t.inputSchema,
+                description=_core_tagged(key, _desc_clean(t.description), tags),
+                inputSchema=in_schema,
                 **({"outputSchema": t.outputSchema} if getattr(t, "outputSchema", None) else {}),
                 **({"annotations": ann} if ann else {}),
                 **({"title": t.title} if getattr(t, "title", None) else {}),
@@ -1554,6 +1779,7 @@ async def _aggregate():
                     "닿는다(호출 별칭 — 목록에는 접두 이름만). 그 이름을 외운 클라이언트 · 허용 규칙은 접두 이름으로 고친다: %s%s", len(renamed),
                     ", ".join(renamed[:20]), " …" if len(renamed) > 20 else "")
     _CORE_VOCAB["family_prefixed"] = renamed
+    _AGG_GEN[0] += 1                                   # 판정을 쥐어 두는 셈(_would_close)이 새로 센다
     _CORE_VOCAB["tag_applied"] = core_tag
     _CORE_VOCAB["sib_tags_applied"] = sib_tags
     _CORE_VOCAB["agg_applied"] = _core_agg_sig(cv)
@@ -2132,6 +2358,15 @@ _low = fm._mcp_server
 # 세션 번호에 기대던 것 — 근거 원장 열쇠(_request_session) · 재기동 막기(_bearer_gate 의 비우기)는 이 값을 보고 갈린다. 되돌리기 GATEWAY_STATELESS=0
 # (세션을 쥐는 종전 꼴 — 재기동 막기 · 근거 원장도 종전대로). 지금 값은 /health 의 stateless 와 기동 로그 한 줄에 보인다.
 STATELESS_HTTP = os.environ.get("GATEWAY_STATELESS", "1").strip() != "0"
+# 읽기 · 쓰기 한 판정(HWAXPortal docs/mcp-modernize M2 · MM-5 · MM-8 — 설명은 _tool_class 머리말). 값 셋 — shadow(기본) · 1(엄격) · 0(끔).
+#  · shadow — 한 판정을 노출 표지 · /tools-map tool_class · write · 검색 쓰기 감점에 쓰고, 여는 판정(루틴 단계 · 위임 · 상태 기다림 · 패널 · 읽기 전용
+#    PAT)은 옛 판정 그대로다(이름 낱말로도 연다). 엄격이었으면 닫혔을 도구를 센다(/health contract.would_close · /tools-map would_close — 막지 않는다).
+#  · 1 — 여는 판정까지 한 판정(이름으로 읽기를 열지 않는다). · 0 — 모두 옛 판정(종전과 바이트까지 같다).
+# 넘어가는 동안 그림자로 둔다 — 사용자 결정 11-27 MM-8(엄격으로 바로 켜면 dev 에서만 190개가 루틴 · 위임 · 상태 기다림에서 닫힌다).
+_TOOL_CLASS_RAW = _env_knob("GATEWAY_TOOL_CLASS_UNIFIED", "shadow").lower()
+TOOL_CLASS_MODE = "0" if _TOOL_CLASS_RAW in ("0", "off") else "1" if _TOOL_CLASS_RAW in ("1", "strict", "on") else "shadow"
+TOOL_CLASS_UNIFIED = TOOL_CLASS_MODE != "0"        # 한 판정을 노출 · 지도 · write · 검색 감점에(shadow · 1)
+TOOL_CLASS_STRICT = TOOL_CLASS_MODE == "1"         # 여는 판정까지 한 판정으로(1 만)
 
 
 def _mcp_http_app():
@@ -3675,7 +3910,11 @@ _COPY_LABEL = re.compile(r"[(\[](?:시험|사본|테스트|test|copy|staging|dev
 SEARCH_TUNING_PATH = Path(__file__).with_name("search_tuning.json")
 SEARCH_TUNING_LOCAL_PATH = Path(__file__).with_name("search_tuning.local.json")
 _TUNING_SWITCHES = ("synonyms", "core_vocab", "delib_narrow", "quality", "write_penalty", "copy_fold", "noncore_demote", "onto_first",
-                    "onto_lookup_first")
+                    "onto_lookup_first", "space_fold")
+# space_fold(HWAXPortal docs/mcp-modernize M2 · M3 검색 작은 고침 — 기본 켬) — 질의 낱말을 빈칸을 뺀 설명 · 앱 라벨에서도 센다. '지식카드 찾기' 가 설명의
+# '지식 카드' 를 못 맞혀 AIDataHub 지식카드 도구가 20위 밖이었다(11-27 조사). 띄어 쓴 질의('지식 카드')는 낱말 둘로 이미 맞는다. 끄면 순위가 바이트까지 같다.
+# 접는 것은 SPACE_FOLD_MIN_CHARS 자 이상인 낱말만이다 — 짧은 낱말까지 접으면 낱말 경계를 넘어 맞아 평가셋 쌍이 나빠졌다(11-27, 길이 상한 없음 — 나빠짐 2).
+SPACE_FOLD_MIN_CHARS = 4
 # 기본이 끔인 손잡이 — 칸이 없으면(덧씌우기가 null 로 지웠거나 기본값 파일을 못 읽었다) 끔으로 읽는다. 나머지는 칸이 없으면 켬이다.
 # noncore_demote(E2-5) 는 cae00 검색 평가(+noncore_demote 판)를 본 뒤 박스 덧씌우기로 켠다(결정 Q-1).
 # onto_first(HWAXPortal docs/ontology-first OF-7 · M3) — 질의가 앱 이름을 부른 줄에서 그 앱의 온톨로지 입구(코어 어휘표 ontology 의 entry)에 가중치 onto 를
@@ -4138,6 +4377,8 @@ def _named(names: set[str], v: str, q_flat: str) -> bool:
 
 
 def _tool_is_write(t, original: str, backend: str | None = None) -> bool:
+    if TOOL_CLASS_UNIFIED:
+        return _tool_class(t, backend, original)[0] == "write"       # 한 판정(MM-5) — 아래는 끈 박스의 종전 판정 그대로
     ann = getattr(t, "annotations", None)
     if getattr(ann, "readOnlyHint", None) is True:
         return False
@@ -4281,6 +4522,11 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     obj_apps = (frozenset(app for app, _t, _a, typs in (vocab or {}).get("onto_lookup") or () if not typs or obj_m.group(1) in typs)
                 | frozenset((vocab or {}).get("family") or ())) if obj_m else frozenset()
     w_name, w_app, cap, w_cov = wt["name"], wt["app"], wt["desc_cap"], wt["coverage"]
+    fold = bool(sw.get("space_fold"))
+    # 접는 낱말 — 빈칸을 뺀 꼴이 SPACE_FOLD_MIN_CHARS 자 이상인 것만 빈칸을 뺀 설명에서 센다(짧은 낱말은 낱말 경계를 넘어 엉뚱하게 맞는다 — '다른' ·
+    # '재서'). 짧은 낱말은 종전대로 설명 그대로에서 센다. 값 쌍 (센 꼴, 빈칸 뺀 글에서 세나).
+    expand_f = {w: tuple((f, True) if len(f) >= SPACE_FOLD_MIN_CHARS else (v, False)
+                         for v in vs for f in (re.sub(r"\s+", "", v),)) for w, vs in expand.items()} if fold else {}
     groups = _request_groups() if groups is None else groups
     visible = _visible_tools(groups)
     # 형제 소개 줄(E2-4 · S-B)은 순위를 바꾸지 않는다 — 점수는 줄을 뗀 설명으로 낸다. 줄의 낱말이 점수에 들면 형제 줄이 오르고, 아래 접기가 그 줄을
@@ -4298,14 +4544,20 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
         label = str(meta.get("label") or "")
         hay_app = (label + " " + str(meta.get("description") or "")).lower()
         names = _label_names(label)
+        if fold:
+            desc_f, hay_app_f = re.sub(r"\s+", "", desc), re.sub(r"\s+", "", hay_app)   # 빈칸을 뺀 설명 · 앱 라벨(space_fold)
         score, covered = 0, 0
         base, base_cov = 0, 0             # 보정 없이 — 질의 낱말 그 자체만으로 낸 점수(귀속 · boost_only 판정)
         via: set[str] = set()
         row_named = False                 # 질의가 이 줄의 앱 이름을 불렀나(비코어 낮추기를 비켜 간다)
         for w, variants in expand.items():
             name_hit = any(v in name for v in variants)
-            desc_freq = max(min(desc.count(v), cap) for v in variants)
-            app_hit = any(v in hay_app for v in variants)
+            if fold:
+                desc_freq = max(min((desc_f if fl else desc).count(v), cap) for v, fl in expand_f[w])
+                app_hit = any(v in (hay_app_f if fl else hay_app) for v, fl in expand_f[w])
+            else:
+                desc_freq = max(min(desc.count(v), cap) for v in variants)
+                app_hit = any(v in hay_app for v in variants)
             # 질의가 앱 이름을 불렀으면(진짜 앱 라벨 적중) 이름 적중과 같은 가중이다 — 종전엔 라벨 · 설명 어디에 맞든 1점이었다(HG-01).
             named = any(_named(names, v, q_flat) for v in variants)
             if named:
@@ -4314,12 +4566,16 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
             if name_hit or desc_freq or app_hit or named:
                 covered += 1
                 score += w_name * (name_hit or named) + desc_freq + w_app * app_hit
-                b_name, b_desc, b_app, b_named = w in name, min(desc.count(w), cap), w in hay_app, _named(names, w, q_flat)
+                b_name, b_named = w in name, _named(names, w, q_flat)
+                fw = fold and len(w) >= SPACE_FOLD_MIN_CHARS
+                b_desc, b_app = (min(desc_f.count(w), cap), w in hay_app_f) if fw else (min(desc.count(w), cap), w in hay_app)
                 if b_name or b_desc or b_app or b_named:
                     base_cov += 1
                     base += w_name * (b_name or b_named) + b_desc + w_app * b_app
-                for v in variants[1:]:
-                    if v in name or v in desc or v in hay_app or _named(names, v, q_flat):
+                for i, v in enumerate(variants[1:], 1):
+                    fv, fl = expand_f[w][i] if fold else (v, False)
+                    if (v in name or fv in (desc_f if fl else desc) or fv in (hay_app_f if fl else hay_app)
+                            or _named(names, v, q_flat)):
                         via.update(src[w].get(v, ()))
         if app in demote and not row_named:
             # 낮추기를 비켜 갈 이름 — 게이트웨이 라벨의 이름에 더해 어휘표의 앱 라벨 · 백엔드 키. 외부 연결 앱의 라벨은 포털 플랫폼 라벨(FMEA Agent)이라
@@ -6065,7 +6321,8 @@ ROUTINE_RUN_START_TOOL = _routine_tool(
 ROUTINE_CALL_TOOL = _routine_tool(
     "routine_call",
     "실행 중인 단계의 도구 하나를 부른다 — 그 단계의 플랫폼 · 허용 도구(계획의 allowed)만 된다(울타리 밖은 거절). 단계 안에서는 쓰지 않는다(v1) — "
-    "읽기로 확인된 도구(readOnlyHint · 읽기 목록 · 이름 꼴)만 부르고 나머지와 박스가 닫은 도구(deny)는 거절한다(심의 단계의 deliberate_start · "
+    f"읽기로 확인된 도구({'readOnlyHint · 읽기 목록' if TOOL_CLASS_STRICT else 'readOnlyHint · 읽기 목록 · 이름 꼴'})만 부르고 나머지와 박스가 "
+    "닫은 도구(deny)는 거절한다(심의 단계의 deliberate_start · "
     "deliberate_status · deliberate_result 는 예외). 호출과 결과는 원장에 "
     "call_id 로 남는다 — 단계 요약 · 보고서는 [call_id] 로 인용한다. 결과가 60,000자를 넘으면 앞쪽만 오고 나머지는 routine_get(run_id, "
     "call_id, page). 심의 단계의 차례는 셋이다 — 시작은 routine_call 로 deliberate_start(evidence 를 비워 두면 앞 단계(uses)의 원 근거를 "
@@ -8229,27 +8486,7 @@ async def _fig_download(scope, send, pat_verifier, gw_auth: str) -> None:
 #    GATEWAY_RESULT_REF_TTL_DAYS(7일) · 사람당 · 전체 상한(넘으면 오래된 것부터), 청소는 주기마다 디스크에서 다시 짓는다. 비밀이 원문 그대로 남는
 #    것은 지금 결과도 같다 — 새로 가리지 않고 주인만 · 기한 뒤 지운다.
 #  · 내부 창구 GET /internal/result/<ref> — 에이전트 서버(draft_section)가 근거 ref 를 읽는다(_res_internal_http).
-def _provision_env_value(key: str, path: Path | None = None) -> str:
-    """게이트웨이 곁 provision.env(박스 파일 · gitignore)의 마지막 활성 줄 값 — 없거나 못 읽으면 ''. 이 리포의 start.sh 는 그 파일을 프로세스 환경으로
-    싣지 않아(provision-config.sh 가 설정 파일을 지을 때만 읽는다) 박스 스위치를 거기 적어도 먹지 않았다. 포털 update-all 이 같은 파일 · 같은 키를 읽어
-    「안 켠 것」 을 알리고, 그 파일이 바뀌면 게이트웨이를 다시 띄운다(지문 목록 identity). 줄 읽기는 포털 _envfile_value 와 같은 규칙 — `export ` 머리 ·
-    줄 끝 `#` 주석 · 따옴표를 뗀다."""
-    p = path or Path(__file__).with_name("provision.env")
-    try:
-        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return ""
-    val = ""
-    for ln in lines:
-        s = ln.strip()
-        if s.startswith("export "):
-            s = s[len("export "):].lstrip()
-        if not s.startswith(f"{key}="):
-            continue
-        v = s[len(key) + 1:]
-        v = re.sub(r"\s+#.*$", "", v).strip().strip("\"'")
-        val = v
-    return val
+# _provision_env_value 는 파일 앞쪽(log 곁)에 있다 — 앞쪽의 박스 손잡이(_env_knob)도 import 때 그것을 읽는다(HWAXPortal docs/mcp-modernize M2).
 
 
 # 켜짐 — 띄운 셸의 환경이 먼저(비어 있지 않으면), 없으면 provision.env 의 줄. 값은 '1' 만 켬(계약 offload-v2 §2).
@@ -8641,6 +8878,124 @@ async def _res_keep(name: str, arguments, res):
                                       "structuredContent": None if sc is None else {**handle, "head": head}})
     except Exception as exc:  # noqa: BLE001 — 결과 손잡이가 도구 결과를 막으면 안 된다
         log.warning("결과 손잡이 실패(%s) — 원문을 그대로 준다: %r", name, exc)
+        return res
+
+
+# ── 구조 결과 두 벌 정리(HWAXPortal docs/mcp-modernize M2 · contract C7) ─────────────────────────────────────────────────────────
+# SDK(FastMCP 1.x)는 구조 결과(structuredContent)를 내는 도구의 결과에 같은 값을 글 블록으로도 싣는다 — dict 는 들여쓴 JSON(indent=2), 감싼 값
+# ({"result": X})은 X 그대로. 바깥으로 두 벌이 나가 응답이 두 배를 넘는다(글은 JSON 문자열 안에서 따옴표 · 줄바꿈이 한 번 더 escape 된다). 어느 쪽을
+# 모델에 넘기는지는 클라이언트마다 다르다(글만 · 구조 먼저 · 구조만 오면 버림 — 11-27 조사). 그래서 **글은 늘 남긴다**(모든 클라이언트가 읽는다).
+#  · 1(기본, compact) — 글 블록이 structuredContent 와 같은 JSON 이면 그 글을 촘촘한 JSON 으로 다시 쓴다(같은 값 · 들여쓰기 없음). 구조 · 출력 스키마는
+#    그대로라 스펙(출력 스키마가 있으면 구조 결과를 낸다)과 클라이언트 검증이 그대로다. 감싼 값(글이 X 그대로)은 줄일 것이 없다.
+#  · drop — 그에 더해 출력 스키마가 '빈 껍데기'(필드 이름이 없는 FastMCP 자동 스키마 — 빈 객체 · result 하나)인 도구는 tools/list 에서 출력 스키마를
+#    떼고(_schema_listed) 결과에서 구조를 뗀다(촘촘한 글만 — 스키마가 없으니 구조는 선택이다). 필드가 있는 출력 스키마는 떼지 않는다(구조 · 촘촘한 글).
+#    어림(11-27 — /tools-map 같은 지도형 JSON) — 전송 바이트(글은 JSON 문자열로 한 번 더 escape)가 1 은 13 ~ 30%, drop 은 그보다 더(구조 한 벌).
+#    ⚠ 옮기는 날의 위험 — stateless 라 재기동 뒤에도 클라이언트는 목록을 다시 받지 않는다. 그 전에 받은 목록(출력 스키마 있음)을 쥔 Claude Code(MCP TS
+#    SDK)는 구조 없는 결과를 'has an output schema but did not return structured content' 로 거절한다 — 세션을 다시 열 때까지. 그래서 기본은 1 이다.
+#  · 결과 손잡이를 청한 연결(X-HWAX-Result: ref)도 모드대로다 — 큰 결과는 결과 손잡이가 글 · 구조를 머리 + 손잡이로 바꾼다(_res_keep — 이 정리 뒤).
+#  · 건드리지 않는 것 — 실패 결과 · 구조와 글이 다른 결과(요약 글 + 데이터 구조) · 패널 PAT 호출 · 패널 도구(_meta.ui — 패널이 구조를 읽는다) ·
+#    게이트웨이 안쪽 호출(바깥 호출 _call_tool_entry 에서만 — 감사 · 근거 원장 · 응답 캐시 · 상호작용 수집은 원문). 끄기 GATEWAY_RESULT_DEDUP=0.
+RESULT_DEDUP = {"0": "0", "drop": "drop"}.get(_env_knob("GATEWAY_RESULT_DEDUP", "1").lower(), "1")
+_DEDUP_STAT = {"compacted": 0, "dropped": 0, "saved_chars": 0}      # 기동 뒤 — /health contract.result_dedup
+
+
+def _schema_has_fields(node) -> bool:
+    """스키마 나무 어딘가에 필드 이름(비지 않은 properties · $ref · $defs)이 있나."""
+    if isinstance(node, dict):
+        if node.get("properties") or node.get("$ref") or node.get("$defs") or node.get("definitions"):
+            return True
+        return any(_schema_has_fields(v) for k, v in node.items() if isinstance(v, (dict, list)))
+    if isinstance(node, list):
+        return any(_schema_has_fields(v) for v in node)
+    return False
+
+
+def _schema_bare(sch) -> bool:
+    """출력 스키마가 빈 껍데기인가 — 필드 이름이 없는 FastMCP 자동 스키마(빈 객체 {type: object, additionalProperties: true} · 감싼 값
+    {properties: {result: <필드 없는 꼴>}}). 11-27 dev 카탈로그의 출력 스키마 107개가 모두 이 꼴이다."""
+    if not isinstance(sch, dict):
+        return True
+    props = sch.get("properties") or {}
+    if set(props) - {"result"} or sch.get("$defs") or sch.get("definitions") or sch.get("$ref"):
+        return False
+    return not _schema_has_fields(props.get("result")) and not any(
+        _schema_has_fields(sch.get(k)) for k in ("items", "anyOf", "oneOf", "allOf", "additionalProperties", "patternProperties"))
+
+
+def _schema_listed(tools: list) -> list:
+    """drop 모드의 tools/list 사본 — 빈 껍데기 출력 스키마를 뗀다. 다른 모드 · 필드 있는 스키마는 그대로(같은 객체)."""
+    if RESULT_DEDUP != "drop":
+        return tools
+    return [t.model_copy(update={"outputSchema": None}) if getattr(t, "outputSchema", None) and _schema_bare(t.outputSchema) else t
+            for t in tools]
+
+
+def _sc_dup_kind(texts: list[str], sc) -> tuple[str, object] | None:
+    """글 블록들이 structuredContent 와 같은 값의 두 번째 벌인가 — ('json', 글을 읽은 값) · ('wrap', None) · None(다르다)."""
+    def parsed(t):
+        try:
+            return json.loads(t)
+        except ValueError:
+            return _NO_JSON
+
+    def same(a, b) -> bool:
+        # 파이썬 == 은 true 와 1 을 같다고 본다 — 값이 같아 보이면 정렬한 촘촘한 JSON 으로 한 번 더 견준다(JSON 값이 같아야 두 번째 벌이다)
+        if a is _NO_JSON or a != b:
+            return False
+        dump = lambda o: json.dumps(o, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)   # noqa: E731
+        return dump(a) == dump(b)
+    if len(texts) == 1:
+        v = parsed(texts[0])
+        if same(v, sc):
+            return "json", v
+    if isinstance(sc, dict) and set(sc) == {"result"}:
+        x = sc["result"]
+        if len(texts) == 1 and (texts[0] == x if isinstance(x, str) else same(parsed(texts[0]), x)):
+            return "wrap", None
+        if isinstance(x, list) and texts and len(texts) == len(x) and all(
+                (t == e if isinstance(e, str) else same(parsed(t), e)) for t, e in zip(texts, x)):
+            return "wrap", None
+    return None
+
+
+_NO_JSON = object()
+
+
+def _res_dedup(name: str, arguments, res):
+    """바깥 호출 결과의 두 벌을 정리한 **사본** — 위 머리말. 바꿀 것이 없으면 그대로(같은 객체). ⚠ 던지지 않는다(정리가 결과를 막으면 안 된다)."""
+    if RESULT_DEDUP == "0" or not isinstance(res, types.CallToolResult) or res.isError or res.structuredContent is None:
+        return res
+    try:
+        if _request_panel() is not None:
+            return res
+        tool = _res_inner_name(name, arguments)
+        resolved = route.get(tool) or alias_route.get(tool)
+        t = _tool_by_route(*resolved) if resolved else None
+        if t is not None and _ui_uri(t):
+            return res
+        blocks = list(res.content or [])
+        idx = [i for i, c in enumerate(blocks) if getattr(c, "type", None) == "text" and isinstance(getattr(c, "text", None), str)
+               and not (FIG_STORE_ON and c.text.startswith(_FIG_NOTE_HEADS))]
+        texts = [blocks[i].text for i in idx]
+        kind = _sc_dup_kind(texts, res.structuredContent)
+        if kind is None:
+            return res
+        upd: dict = {}
+        if kind[0] == "json":
+            compact = json.dumps(kind[1], ensure_ascii=False, separators=(",", ":"))
+            if len(compact) < len(texts[0]):
+                _DEDUP_STAT["compacted"] += 1
+                _DEDUP_STAT["saved_chars"] += len(texts[0]) - len(compact)
+                blocks[idx[0]] = blocks[idx[0]].model_copy(update={"text": compact})
+                upd["content"] = blocks
+        if RESULT_DEDUP == "drop" and (t is None or _schema_bare(getattr(t, "outputSchema", None))):
+            # 구조를 뗀다 — 남는 글(촘촘히 다시 쓴 것)과 같은 값이다. 뗀 몫은 그 글의 길이로 어림한다
+            _DEDUP_STAT["dropped"] += 1
+            _DEDUP_STAT["saved_chars"] += sum(len(getattr(blocks[i], "text", "")) for i in idx)
+            upd["structuredContent"] = None
+        return res.model_copy(update=upd) if upd else res
+    except Exception as exc:  # noqa: BLE001 — 정리가 도구 결과를 막으면 안 된다
+        log.warning("구조 결과 두 벌 정리 실패(%s) — 원문을 그대로 준다: %r", name, exc)
         return res
 
 
@@ -9807,6 +10162,13 @@ def _routine_read_deny() -> frozenset:
 
 
 def _routine_read(t, backend: str, original: str, *, by_name: bool = True) -> bool:
+    """루틴 단계에서 부를 수 있는 읽기 도구인가 — 엄격(GATEWAY_TOOL_CLASS_UNIFIED=1)이면 한 판정의 read, 그림자 · 끔이면 옛 판정(_routine_read_legacy)."""
+    if TOOL_CLASS_STRICT:
+        return _tool_class(t, backend, original)[0] == "read"
+    return _routine_read_legacy(t, backend, original, by_name=by_name)
+
+
+def _routine_read_legacy(t, backend: str, original: str, *, by_name: bool = True) -> bool:
     """루틴 단계에서 부를 수 있는 읽기 도구인가 — 확인된 것만 참이다(모르면 거짓). 닫기 목록(deny)이 맨 먼저다 — 거기 있으면 표지와 무관하게
     거짓. 다음은 destructiveHint 면 거짓, 그다음 덧씌우기(read_tools.json override — 앱이 readOnlyHint=False 를 적었어도 포털이 읽기로
     다루는 도구, 사용자 결정으로만)면 참. 다음은 앱 표지 — readOnlyHint=False 면 거짓, readOnlyHint=True 면 참. 다음은 읽기 목록
@@ -9814,7 +10176,8 @@ def _routine_read(t, backend: str, original: str, *, by_name: bool = True) -> bo
     원래 이름의 조회 낱말(밑줄로 가른 조각) — 쓰기 동사(_WRITE_NAME)가 없을 때만이다. _tool_is_write 의 안내 · 미리보기 예외(_READ_NAME_HINT —
     status · history · preview …)는 쓰지 않는다 — update_status · delete_history · apply_preview 같은 쓰기가 읽기로 열렸다(R3 리뷰 2차 #5). 그 예외로만
     열리던 진짜 읽기(upload_instructions · report_upload_instructions · preview_publish — 소스로 확인)는 읽기 목록에 있다.
-    by_name 이 거짓이면 마지막 갈래(이름의 조회 낱말)를 건너뛴다 — 패널 첫 쓰기 확인의 판정이다(_panel_read)."""
+    by_name 이 거짓이면 마지막 갈래(이름의 조회 낱말)를 건너뛴다 — 패널 첫 쓰기 확인의 판정이다(_panel_read).
+    옛 판정이다 — 그림자(기본)와 끔이 쓰고(MM-8 — 넘어가는 동안 여는 판정은 그대로), 그림자의 would_close 셈이 견준다."""
     key = f"{backend}:{original}"
     if key in _routine_read_deny():
         return False
@@ -9838,6 +10201,159 @@ def _panel_read(t, backend: str, original: str) -> bool:
     쓰지 않는다 — 이름 규칙은 울타리가 아니다(job_info_cleanup · case_detail_archive 같은 쓰기 꼴이 조회 낱말로 읽기가 됐다 — 반대 검토 10-31).
     읽기가 아니면 포털은 그 패널 세션의 첫 호출에 확인을 묻는다(모르면 묻는다)."""
     return _routine_read(t, backend, original, by_name=False)
+
+
+# ── 읽기 · 쓰기 한 판정(HWAXPortal docs/mcp-modernize M2 · MM-3 · MM-5) ─────────────────────────────────────────────────────
+# 종전에는 같은 도구를 세 판정이 따로 갈랐다 — _tool_is_write(검색 감점 · /tools-map write · 운영자 알림)는 이름의 쓰기 동사, _routine_read(루틴 단계 ·
+# 위임 · 상태 기다림)는 이름의 조회 낱말로도 열고, _panel_read 는 이름을 보지 않았다. 그래서 한 도구가 쓰기이면서 읽기였고(11-27 조사 모순 6),
+# 이름의 조회 낱말만으로 루틴 · 위임에 열린 도구가 193개였다(앱 표지도 읽기 목록도 없이). 이제 부류 하나를 정하고 셋은 그 위에 선다.
+# 차례 — ① 닫기 목록(read_tools.json deny ∪ 박스 덧씌우기 deny — 박스가 쓰기로 닫은 것) ② 앱의 destructiveHint ③ override(앱이 readOnlyHint=False 를
+# 적었어도 포털이 읽기로 다루는 도구 — 사용자 결정 RF-29 · RF-39 · R-14, destructiveHint 와 deny 는 못 이긴다) ④ 앱의 readOnlyHint(거짓 · 참)
+# ⑤ 확인된 읽기 목록(read_tools.json tools ∪ 박스 덧씌우기 tools ∪ 선언 백엔드의 read_tools, 게이트웨이 자체 도구는 _LOCAL_READ) ⑥ 이름의 쓰기
+# 동사(_WRITE_NAME, 안내 · 미리보기 꼴 _READ_NAME_HINT 은 뺀다) — 쓰기로만 가른다 ⑦ 모름. **이름은 읽기로 열지 않는다** — 모르는 도구는 읽기가
+# 아니다(루틴 · 위임 · 패널 · 읽기 전용 PAT 이 닫는다). 쓰는 쪽마다의 정책(D-18 · 확인 카드 · 루틴 울타리 · 패널은 선언 백엔드만 …)은 이 부류
+# 위에 그대로다. 근거(source) — deny · app_annotation · override · confirmed_list · name_heuristic · none.
+# 노출 — tools/list 사본의 annotations 에 부류를 싣는다(_exposed_ann): 앱이 readOnlyHint 를 적었으면 앱 값 그대로(느슨하게 바꾸지 않는다 — override ·
+# deny 도 노출 표지는 앱 값), 안 적었으면 read → readOnlyHint=True · write → readOnlyHint=False(destructiveHint 는 모르면 싣지 않는다) · 모름 → 그대로.
+# 손잡이 GATEWAY_TOOL_CLASS_UNIFIED — shadow(기본 — 여는 판정은 옛 판정, 엄격이면 닫혔을 것을 센다) · 1(엄격) · 0(끔 — 판정 셋 · tools/list · /tools-map 이
+# 종전과 바이트까지 같다). 사용자 결정 MM-8. 값은 /health 의 contract.tool_class_unified.
+# (손잡이 TOOL_CLASS_UNIFIED 는 앞쪽 STATELESS_HTTP 곁에 둔다 — 도구 설명(routine_call)이 import 때 그 값을 읽는다)
+# 선언 백엔드(박스 권한표 connect:)의 read_tools 로 읽기가 된 (백엔드, 원래 이름) — _aggregate 가 채운다. 노출 사본에는 readOnlyHint=True 가 이미
+# 붙어 있어(앱 표지와 꼴이 같다) 근거를 confirmed_list 로 가르려고 따로 쥔다.
+_DECLARED_READ: set[tuple[str, str]] = set()
+
+
+def _read_lists() -> tuple[frozenset, frozenset]:
+    """(확인된 읽기 목록, 닫기 목록) — 한 번에 여러 도구를 가르는 쪽(/tools-map · tools/list)이 파일 시각을 도구마다 보지 않게 한 번 읽는다."""
+    return _routine_read_tools(), _routine_read_deny()
+
+
+def _tool_class(t, backend: str | None, original: str, lists: tuple | None = None) -> tuple[str, str]:
+    """도구의 부류와 근거 — ('read' | 'write' | 'unknown', 'deny' | 'app_annotation' | 'override' | 'confirmed_list' | 'name_heuristic' | 'none').
+    차례는 위 머리말. t 는 노출 도구(없으면 None — 표지 없음), backend 가 None 이면 목록을 보지 않는다(표지와 이름만). lists 는 _read_lists() 의 값."""
+    ann = getattr(t, "annotations", None)
+    key = f"{backend}:{original}" if backend else None
+    if key is not None and backend != "_gateway":
+        _read_base_sync()
+        reads, deny = lists or _read_lists()
+        if key in deny:
+            return "write", "deny"
+    else:
+        reads = deny = frozenset()
+    if getattr(ann, "destructiveHint", None) is True:
+        return "write", "app_annotation"
+    if key is not None and key in READ_OVERRIDE:
+        return "read", "override"
+    hint = getattr(ann, "readOnlyHint", None)
+    if hint is False:
+        return "write", "app_annotation"
+    if key is not None and (backend, original) in _DECLARED_READ:
+        return "read", "confirmed_list"          # 노출 사본의 readOnlyHint=True 는 게이트웨이가 선언을 보고 단 것이다(_aggregate)
+    if hint is True:
+        return "read", "app_annotation"
+    if key is not None and (key in reads or (backend == "_gateway" and original in _LOCAL_READ)):
+        return "read", "confirmed_list"
+    if _WRITE_NAME.search(original) and not _READ_NAME_HINT.search(original):
+        return "write", "name_heuristic"
+    return "unknown", "none"
+
+
+def _exposed_ann(t, backend: str, original: str, lists: tuple | None = None):
+    """노출 사본에 실을 annotations — 바꿀 것이 없으면 None. 앱이 readOnlyHint 를 적었으면 늘 None(앱 값 그대로 — MM-5 '느슨하게 바꾸지 않는다')."""
+    ann = getattr(t, "annotations", None)
+    if getattr(ann, "readOnlyHint", None) is not None:
+        return None
+    cls = _tool_class(t, backend, original, lists)[0]
+    if cls == "unknown":
+        return None
+    flag = cls == "read"
+    return ann.model_copy(update={"readOnlyHint": flag}) if ann is not None else types.ToolAnnotations(readOnlyHint=flag)
+
+
+def _class_listed(tools: list) -> list:
+    """tools/list 사본 — 부류를 annotations 에 싣는다(_exposed_ann). 끈 박스는 목록 그대로(같은 객체). 백엔드 도구는 (백엔드, 원래 이름)으로,
+    게이트웨이 자체 도구는 ('_gateway', 이름)으로 가른다. 사본만 바꾼다 — 집계 목록(exposed_tools)의 표지는 앱 값 그대로다(판정이 앱 값을 본다)."""
+    if not TOOL_CLASS_UNIFIED:
+        return tools
+    lists = _read_lists()
+    out = []
+    for t in tools:
+        bk, orig = route.get(t.name, ("_gateway", t.name))[:2]
+        ann = _exposed_ann(t, bk, orig, lists)
+        out.append(t if ann is None else t.model_copy(update={"annotations": ann}))
+    return out
+
+
+_AGG_GEN = [0]                                     # 재집계 차례 — 판정을 쥐어 두는 셈(_would_close)의 열쇠
+
+
+def _readonly_legacy_ok(t, backend: str, original: str) -> bool:
+    """옛(그림자 · 끔) 읽기 전용 PAT 판정이 이 백엔드 도구를 여나 — _readonly_denial 의 옛 갈래와 같은 차례(닫기 → 파괴 → 추적 목록 → 박스 덧씌우기
+    (앱이 readOnlyHint=False 를 적지 않았을 때) → 앱 표지 · 선언 읽기)."""
+    k = f"{backend}:{original}"
+    if k in _routine_read_deny():
+        return False
+    ann = getattr(t, "annotations", None)
+    if getattr(ann, "destructiveHint", None) is True:
+        return False
+    if k in READ_TOOLS:
+        return True
+    if k in _read_tools_local()["tools"]:
+        return getattr(ann, "readOnlyHint", None) is not False
+    return bool(tool_readonly_hint.get((backend, original)))
+
+
+_WOULD_CLOSE: dict = {"key": None, "val": ([], {})}
+
+
+def _would_close() -> tuple[list, dict]:
+    """그림자(MM-8)에서 엄격이었으면 닫혔을 백엔드 도구 — (노출 이름 정렬 목록, {앱: 수}). 옛 판정(루틴 단계 · 패널 · 읽기 전용 PAT)이 여는데 한 판정이
+    read 가 아닌 것이다. 카탈로그 · 읽기 목록 · 닫기 목록 · 박스 덧씌우기가 같으면 쥐어 둔 값을 준다(/health 가 자주 묻는다)."""
+    _read_base_sync()
+    loc = _read_tools_local()
+    key = (_AGG_GEN[0], id(exposed_tools), len(exposed_tools), id(route), len(route), id(READ_TOOLS), id(READ_DENY), id(READ_OVERRIDE),
+           id(loc["tools"]), id(loc["deny"]), id(_DECLARED_READ), len(_DECLARED_READ), id(tool_readonly_hint), len(tool_readonly_hint))
+    if key == _WOULD_CLOSE["key"]:
+        return _WOULD_CLOSE["val"]
+    lists = _read_lists()
+    tool_of = {t.name: t for t in exposed_tools}
+    names = []
+    for n, (bk, orig) in route.items():
+        t = tool_of.get(n)
+        if _tool_class(t, bk, orig, lists)[0] == "read":
+            continue
+        if (_routine_read_legacy(t, bk, orig) or _routine_read_legacy(t, bk, orig, by_name=False) or _readonly_legacy_ok(t, bk, orig)):
+            names.append(n)
+    names.sort()
+    by_app = dict(sorted(Counter(route[n][0] for n in names).items(), key=lambda kv: (-kv[1], kv[0])))
+    _WOULD_CLOSE.update(key=key, val=(names, by_app))
+    return names, by_app
+
+
+def _contract_health() -> dict:
+    """/health 의 contract — MCP 현대화 M2(계약 정밀화)의 손잡이 값. 무인증 칸이라 값 · 수만 싣는다."""
+    wc = {}
+    if TOOL_CLASS_MODE == "shadow":
+        names, by_app = _would_close()
+        wc = {"would_close": {"total": len(names), "by_app": by_app}}       # 이름 목록은 /tools-map 의 would_close
+    return {"tool_class_unified": TOOL_CLASS_MODE, **wc,
+            "result_dedup": {"mode": RESULT_DEDUP, **_DEDUP_STAT},
+            "desc_cleandoc": {"on": DESC_CLEANDOC, **_DESC_CLEAN_STAT},
+            "arg_doc_fill": {"on": sorted(ARG_DOC_FILL) if isinstance(ARG_DOC_FILL, frozenset) else ARG_DOC_FILL,
+                             "tools": len(_GW_FILLED), "args": sum(len(v) for v in _GW_FILLED.values())},
+            "arg_score_nested": ARG_SCORE_NESTED,
+            "tool_counts": _tool_counts()}
+
+
+def _tool_counts() -> dict:
+    """도구 수 셋의 뜻(M0 — 11-27 dev 에서 /health 765 · /tools-map 796 · tools/list 797 로 갈렸다). 시야(그룹 · 끈 앱 · 시험 사본 · 보기)를 타지 않는
+    최대 수다 — 사람마다의 tools/list 는 이보다 적다."""
+    b, loc = len(exposed_tools), len(_local_tools())
+    return {"backend": b, "gateway_local": loc, "admin_only": 1, "tools_list_max": b + loc, "tools_list_max_admin": b + loc + 1,
+            "tools_map": b + loc + 1 if ARG_SCORE_NESTED else None,
+            "meaning": ("tools(/health) = backend — 백엔드 도구만. tools/list = backend + gateway_local(관리자는 admin_only 하나 더 — 읽기 전용 허용 "
+                        "목록 보기), 그 사람의 그룹 · 끈 앱 · 시험 사본 · 개인 보기로 준다. /tools-map 의 map = backend + gateway_local + admin_only"
+                        "(무인증 지도는 모든 도구를 싣는다 — GATEWAY_ARG_SCORE_NESTED=0 이면 종전 손 목록이라 REST 다리 둘이 빠진다)")}
 
 
 async def _routine_call(a: dict) -> types.CallToolResult:
@@ -9895,7 +10411,9 @@ async def _routine_call(a: dict) -> types.CallToolResult:
                                 "(read_tools.json · read_tools.local.json 의 deny)")
         if not _routine_read(next((t for t in exposed_tools if t.name == exposed), None), *resolved):
             raise _RoutineError(f"단계 안에서는 읽기로 확인된 도구만 부른다(v1) — '{resolved[0]}:{resolved[1]}' 는 읽기로 확인되지 않았다"
-                                "(readOnlyHint · 읽기 목록 · 이름 꼴). 읽기 도구라면 앱이 readOnlyHint 를 달거나 박스의 read_tools.local.json 에 "
+                                + ("(readOnlyHint · 읽기 목록 — 이름 꼴로는 열지 않는다). " if TOOL_CLASS_STRICT else
+                                   "(readOnlyHint · 읽기 목록 · 이름 꼴). ")
+                                + "읽기 도구라면 앱이 readOnlyHint 를 달거나 박스의 read_tools.local.json 에 "
                                 "더한다")
     if spent and resolved != ("hwax-deliberation", "deliberate_result"):
         raise _RoutineError(spent_msg)          # 심의 단계 — 결과 읽기만 예산 밖이다(위)
@@ -10737,7 +11255,20 @@ def _readonly_denial(name: str, arguments: dict) -> str:
     if k in _routine_read_deny():
         return (f"read_only: '{name}' — {_RO_WHY}이 부를 수 없다 — 이 박스가 읽기 목록의 닫기(deny)에 '{k}' 를 적었다(게이트웨이 "
                 "read_tools.json · read_tools.local.json).")
-    ann = getattr(_tool_by_route(key, orig), "annotations", None)
+    tb = _tool_by_route(key, orig)
+    ann = getattr(tb, "annotations", None)
+    if TOOL_CLASS_STRICT:
+        # 엄격한 한 판정(MM-5 · MM-8 — 그림자 · 끔은 아래 옛 판정) — 부류가 read 면 연다. 종전 차례와 다른 것 하나: 추적 읽기 목록(read_tools.json tools)에 있어도 앱이 readOnlyHint=False 를
+        # 적었으면 막는다(앱 표지보다 느슨하게 바꾸지 않는다 — 루틴 · 패널 판정과 같다). override 는 그대로 연다(사용자 결정).
+        if _tool_class(tb, key, orig)[0] == "read":
+            return ""
+        if getattr(ann, "destructiveHint", None) is True:
+            return f"read_only: '{name}' — {_RO_WHY}은 부를 수 없다 — 앱이 이 도구에 destructiveHint(되돌리기 어려운 쓰기)를 달았다."
+        if getattr(ann, "readOnlyHint", None) is False and k in (READ_TOOLS | _read_tools_local()["tools"]):
+            return (f"read_only: '{name}' — {_RO_WHY}은 부를 수 없다 — 읽기 목록에 '{k}' 가 있지만 앱이 이 도구에 readOnlyHint=False(쓰기)를 "
+                    "달았다. 앱 표지가 이긴다 — 앱이 표지를 고치거나, 사용자 결정으로 추적 read_tools.json 의 override 에 둔다.")
+        return (f"read_only: '{name}' — {_RO_WHY}은 조회 도구만 부른다. 이 도구가 조회라면 운영자가 게이트웨이 "
+                f"read_tools.json(또는 박스 덧씌우기 read_tools.local.json — 재기동 없이 먹는다)에 '{k}' 를 더하거나, 앱이 그 도구에 readOnlyHint 를 단다.")
     if getattr(ann, "destructiveHint", None) is True:
         return f"read_only: '{name}' — {_RO_WHY}은 부를 수 없다 — 앱이 이 도구에 destructiveHint(되돌리기 어려운 쓰기)를 달았다."
     if k in READ_TOOLS:
@@ -10783,7 +11314,7 @@ def _readonly_allowlist_view(q: str = "") -> dict:
         # 앱 표지가 막으면 적는다 — destructiveHint 는 어느 출처든, readOnlyHint=False 는 박스 덧씌우기에만 있는 항목만(추적 항목은 지금 그대로 연다)
         bk, _sep, orig = k.partition(":")
         lb = _label_block(bk, orig)
-        if lb == "destructiveHint" or (lb and k not in READ_TOOLS):
+        if lb == "destructiveHint" or (lb and k not in (READ_OVERRIDE if TOOL_CLASS_STRICT else READ_TOOLS)):
             row["blocked_by_label"] = lb
         rows.append(row)
     drows = [{"tool": k, "source": (["read_tools.json"] if k in READ_DENY else []) + (["read_tools.local.json"] if k in ldeny else [])}
@@ -10801,9 +11332,13 @@ def _readonly_allowlist_view(q: str = "") -> dict:
                     "loaded_at": loc.get("loaded_at"), "error": loc.get("error"), "tools": len(ltools), "deny": len(ldeny)},
         "entries": rows, "deny": drows,
         "hinted_read_only": sum(1 for v in tool_readonly_hint.values() if v),
-        "rule": ("닫기(deny)가 맨 먼저다 — 거기 있으면 읽기 목록 · 앱 표지와 무관하게 막는다. 앱의 destructiveHint 도 막는다. 그다음 추적 읽기 목록"
-                 "(read_tools.json · override) · 박스 덧씌우기(앱이 readOnlyHint=False 를 적지 않았을 때만) · 앱의 readOnlyHint 면 연다. 두 파일은 바뀐 "
-                 "시각으로 다시 읽는다(재기동 없음) — 못 읽으면 마지막 값 그대로다."),
+        "rule": (("닫기(deny)가 맨 먼저다 — 거기 있으면 읽기 목록 · 앱 표지와 무관하게 막는다. 앱의 destructiveHint 도 막는다. 그다음 override 면 연다. "
+                  "앱이 readOnlyHint=False 를 적었으면 막고(추적 · 박스 목록 모두 — 앱 표지가 이긴다), 선언 읽기 · 앱의 readOnlyHint · 읽기 목록"
+                  "(read_tools.json · 박스 덧씌우기)이면 연다. 이름 꼴로는 열지 않는다(엄격한 한 판정 — GATEWAY_TOOL_CLASS_UNIFIED=1). 두 파일은 바뀐 시각으로 다시 "
+                  "읽는다(재기동 없음) — 못 읽으면 마지막 값 그대로다.") if TOOL_CLASS_STRICT else
+                 ("닫기(deny)가 맨 먼저다 — 거기 있으면 읽기 목록 · 앱 표지와 무관하게 막는다. 앱의 destructiveHint 도 막는다. 그다음 추적 읽기 목록"
+                  "(read_tools.json · override) · 박스 덧씌우기(앱이 readOnlyHint=False 를 적지 않았을 때만) · 앱의 readOnlyHint 면 연다. 두 파일은 바뀐 "
+                  "시각으로 다시 읽는다(재기동 없음) — 못 읽으면 마지막 값 그대로다.")),
         "scope": ("이 목록은 읽기 전용 PAT 만이 아니다 — 같은 항목이 분석 루틴 단계의 읽기 판정(routine_call)에도 열리고, MCP Apps 패널의 첫 쓰기 확인도 "
                   "읽기로 보아 묻지 않는다. 더하면 세 곳에 함께 열린다 — 읽기를 확인한 것만 더한다."),
     }
@@ -11935,16 +12470,17 @@ async def _list_tools(req: types.ListToolsRequest):
     # 얹지 않고 세지도 않는다. 보기는 목록만 줄이고 호출은 지금 그대로여야 한다(목록 밖 도구를 이름으로 부를 때 출력 검증도 그대로다).
     # 패널 PAT 면 그 앱의 도구에서 막음 목록을 뺀 것만 보인다(HA-20) — 호출 관문(_panel_denial)과 같은 판정이다. 패널은 그 앱 안만 보므로
     # 개인 보기(E-4)는 얹지 않는다. 서비스 PAT 면 그 작업의 허용 목록만 보인다(호출 관문 _service_denial 과 같은 판정, HWAXPortal docs/core-link §3).
+    # 바깥 목록(서비스 · 패널 · 사람)에는 부류를 annotations 에 실은 사본을 낸다(_class_listed — MM-5, 끄면 같은 목록). 호출 검증용(req None)은 그대로다.
     svc = _request_service()
     if svc is not None:
-        return _service_listed(svc)
+        return _schema_listed(_class_listed(_service_listed(svc)))
     pnl = _request_panel()
     if pnl is not None:
-        return [t for t in _visible_tools(_request_groups()) if _panel_denial(t.name, pnl) is None]
+        return _class_listed([t for t in _visible_tools(_request_groups()) if _panel_denial(t.name, pnl) is None])
     if req is None:
         return _visible_tools(_request_groups())
     _VIEW_LISTS[_request_view()[0]] += 1
-    listed = _listed_tools(_request_groups())
+    listed = _schema_listed(_class_listed(_listed_tools(_request_groups())))     # drop 모드면 빈 껍데기 출력 스키마를 뗀다(C7 — _res_dedup)
     if RESULT_REFS_ON and _request_result_ref():
         # 결과 손잡이를 청한 연결 — 출력 스키마를 뗀다. 줄인 structuredContent({ref, chars, …, head})는 도구의 출력 스키마에 맞지 않아 Claude Code(MCP
         # TS SDK)가 결과를 거절한다. 떼면 클라이언트가 검증하지 않는다. 사본만 바꾼다 — 집계 목록 · 다른 연결의 목록은 그대로다.
@@ -12030,6 +12566,8 @@ async def _call_tool_entry(name: str, arguments: dict):
     도구(browse_experts · use_experts …)가 빈손이 된다. 박스 스위치와 연결 머리가 둘 다 있을 때만이고, 아니면 _call_tool 의 결과 그대로다.
     상호작용 수집(_ix_call)도 여기서만 — 줄이기 전의 원문을 적는다. 수집 스위치가 꺼지면 _call_tool 을 그대로 부른다."""
     res = await (_ix_call(name, arguments) if INTERACTION_CAPTURE_ON else _call_tool(name, arguments))
+    if RESULT_DEDUP != "0":
+        res = _res_dedup(name, arguments, res)          # 구조 결과 두 벌 정리(C7) — 결과 손잡이보다 먼저(줄일 글이 촘촘한 한 벌이다)
     if RESULT_REFS_ON and _request_result_ref():
         return await _res_keep(name, arguments, res)
     return res
@@ -12562,6 +13100,8 @@ def _bearer_gate(app, pat_verifier=None):
                 "interactions": _ix_health(),
                 # MCP 전송이 세션을 쥐나(GATEWAY_STATELESS — 기본 켬, HWAXPortal docs/mcp-modernize MM-6). 박스마다 지금 어느 꼴로 도는지 이것으로 본다
                 "stateless": STATELESS_HTTP,
+                # MCP 현대화 M2(계약 정밀화)의 손잡이 — 읽기 · 쓰기 한 판정(MM-5) 등. 박스마다 어느 꼴로 도는지 이것으로 본다(값 · 수만)
+                "contract": _contract_health(),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
@@ -12583,6 +13123,11 @@ def _bearer_gate(app, pat_verifier=None):
                         GAS_TRANSPORT_TOOL, RELIAB_TOOL, RA_REPORT_FORMAT_TOOL, *PROCEDURE_TOOLS, *_res_tools(), *_ix_tools(),
                         *([ARTIFACT_TO_STE_TOOL] if STE_UPLOAD_SITE in REST else [])):
                 _map.setdefault(_lt.name, "_gateway")
+            if ARG_SCORE_NESTED:
+                # 도구 수 맞추기(M0) — tools/list 가 내는 로컬 도구 전부(_local_tools — REST 다리 rest_catalog · rest_call 포함)를 싣는다. 손 목록에서
+                # 둘이 빠져 /tools-map 796 · tools/list 797 로 갈렸다(11-27). 뜻은 /health 의 contract.tool_counts.
+                for _lt in _local_tools():
+                    _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서
             # 통째로 사라진다. backends 를 먼저 채워 '앱은 있는데 지금 불통'을 보이게 한다.
@@ -12614,6 +13159,29 @@ def _bearer_gate(app, pat_verifier=None):
             _areas = {n: _area_of(n, bk) for n, bk in _map.items()}
             _acnt = Counter(a for a in _areas.values() if a)
             _tool_of = {_t.name: _t for _t in exposed_tools}       # 노출 이름 → 도구(쓰기 판정이 표지를 본다)
+            # 한 판정(MM-5) — 도구마다 부류를 한 번 가르고 write · routine_read · panel_read 를 그 위에 세운다(한 도구가 쓰기이면서 읽기일 수 없다).
+            # 도구별 부류 · 근거(tool_class)는 백엔드 도구와 게이트웨이 자체 도구 모두다. 끄면 종전 판정 셋 그대로이고 tool_class 칸이 없다.
+            if TOOL_CLASS_UNIFIED:
+                _lists = _read_lists()
+                _cls = {_n: _tool_class(_tool_of.get(_n), _bk, _orig, _lists) for _n, (_bk, _orig) in route.items()}
+                _loc = {_t.name: _t for _t in _local_tools() + [READONLY_ALLOWLIST_TOOL]}
+                _cls_all = {**{_n: _tool_class(_t, "_gateway", _n) for _n, _t in _loc.items() if _map.get(_n) == "_gateway"}, **_cls}
+                _judged = {"write": sorted(_n for _n, _c in _cls.items() if _c[0] == "write")}
+                if TOOL_CLASS_STRICT:
+                    _judged["routine_read"] = sorted(_n for _n, _c in _cls.items() if _c[0] == "read")
+                    _judged["panel_read"] = _judged["routine_read"]
+                else:
+                    # 그림자(MM-8) — 여는 판정은 옛 판정 그대로다(루틴 · 위임 · 상태 기다림 · 패널이 이 두 칸을 읽는다). 엄격이면 닫혔을 것은 would_close
+                    _judged["routine_read"] = sorted(_n for _n, (_bk, _orig) in route.items() if _routine_read(_tool_of.get(_n), _bk, _orig))
+                    _judged["panel_read"] = sorted(_n for _n, (_bk, _orig) in route.items() if _panel_read(_tool_of.get(_n), _bk, _orig))
+                # tools/list 사본에 게이트웨이가 readOnlyHint 를 실은 도구(앱은 표지를 안 적었다) — 품질 카드가 앱의 실제 표지 상태를 가리지 않게 뺀다
+                _gw_ann = sorted(_n for _n, _t in list(_tool_of.items()) + [(_k, _v) for _k, _v in _loc.items() if _map.get(_k) == "_gateway"]
+                                 if _exposed_ann(_t, *(route.get(_n) or ("_gateway", _n))[:2], _lists) is not None)
+            else:
+                _judged = {
+                    "write": sorted(_n for _n, (_bk, _orig) in route.items() if _tool_is_write(_tool_of.get(_n), _orig, _bk)),
+                    "routine_read": sorted(_n for _n, (_bk, _orig) in route.items() if _routine_read(_tool_of.get(_n), _bk, _orig)),
+                    "panel_read": sorted(_n for _n, (_bk, _orig) in route.items() if _panel_read(_tool_of.get(_n), _bk, _orig))}
             body = json.dumps({
                 "map": _map,
                 "backends": sorted(set(_map.values())),
@@ -12625,21 +13193,33 @@ def _bearer_gate(app, pat_verifier=None):
                 "arg_scores": _ARG_SCORE or _arg_scoreboard([]),
                 # 쓰기 도구의 노출 이름(정렬, 백엔드 도구만) — _tool_is_write(readOnlyHint · destructiveHint → 이름 낱말)로 가른다. routine_read 를
                 # 모르는 옛 포털이 이것을 뺀다(HWAXPortal docs/analysis-routines R3-D6). 위 칸들은 그대로다.
-                "write": sorted(_n for _n, (_bk, _orig) in route.items() if _tool_is_write(_tool_of.get(_n), _orig, _bk)),
+                "write": _judged["write"],
                 # 루틴 단계에서 부를 수 있는 읽기 도구의 노출 이름(정렬, 백엔드 도구만) — 닫힌 쪽 판정 _routine_read(표지 · 읽기 목록 · 조회 낱말),
                 # routine_call 과 같은 판정이다. 포털 계획은 이것과 겹치는 도구만 단계에 묶는다(R3 리뷰 #0 — 모르는 도구는 쓰기로 본다).
-                "routine_read": sorted(_n for _n, (_bk, _orig) in route.items() if _routine_read(_tool_of.get(_n), _bk, _orig)),
+                "routine_read": _judged["routine_read"],
                 # 이 게이트웨이가 아는 개인 보기(E-4) — 포털이 보기를 저장 · 보일 때 본다. 이 칸이 없는 옛 게이트웨이는 보기를 읽지 않아 늘 전체로 돈다
                 # (포털 화면이 '저장했습니다' 만 말하던 것을 막는다, 검토 10-31). 위 칸들은 그대로다.
                 "views": ["full", "bundle", "light"],
                 # 패널 첫 쓰기 확인이 읽기로 보는 도구의 노출 이름(정렬, 백엔드 도구만) — _panel_read(표지 · 읽기 목록, 이름 낱말 없이). 포털 패널 창구는
                 # routine_read 가 아니라 이것을 본다 — 이것 밖이면 그 패널 세션의 첫 호출에 확인을 묻는다(HWAXPortal docs/request-1027 HA-20 B-2).
-                "panel_read": sorted(_n for _n, (_bk, _orig) in route.items() if _panel_read(_tool_of.get(_n), _bk, _orig)),
+                "panel_read": _judged["panel_read"],
                 # 노출 이름 → 원래 이름(둘이 다른 것만 — 겹침 접두 · 허브 가족 접두, 백엔드 도구만). 원래 이름은 게이트웨이만 확실히 안다 — 노출 이름에서
                 # 접두를 떼어 짐작하면 원래 이름이 그 앱 키로 시작하는 도구에서 틀린다. 에이전트 서버의 좌석 자유 조회가 겹침 때문에 접두가 붙은 읽기를
                 # 원래 이름으로 판정하고(선언 백엔드 · 허브 가족 · 리스크 심사는 빼고), 챗 고정 몫이 (백엔드, 원래 이름)으로 노출 이름을 찾는다
                 # (HWAXPortal docs/ontology-first F0 · OF-4 · OF-5). 이 칸이 있으면 이 게이트웨이가 declared 를 안다. 위 칸들은 그대로다.
                 "orig": {_n: _orig for _n, (_bk, _orig) in sorted(route.items()) if _n != _orig},
+                # 도구별 읽기 · 쓰기 부류와 근거(한 판정 — HWAXPortal docs/mcp-modernize MM-5) — {노출 이름: {class, source}}. class 는 read · write ·
+                # unknown, source 는 deny · app_annotation · override · confirmed_list · name_heuristic · none. 쓰는 쪽은 이것(또는 위 셋)을 읽고 제 정책을
+                # 얹는다. 끈 게이트웨이(GATEWAY_TOOL_CLASS_UNIFIED=0)에는 이 칸이 없다. 위 칸들은 그대로다.
+                **({"tool_class": {_n: {"class": _c[0], "source": _c[1]} for _n, _c in sorted(_cls_all.items())},
+                    # 위 부류를 tools/list 사본의 readOnlyHint 로 실은 도구(앱이 표지를 안 적은 것만) — 품질 카드는 이것을 '앱 표지 없음' 으로 센다
+                    "gateway_annotated": _gw_ann} if TOOL_CLASS_UNIFIED else {}),
+                # 그림자(MM-8)에서 엄격이었으면 닫혔을 도구의 노출 이름(정렬, 백엔드 도구만) — 옛 판정이 루틴 단계 · 패널 · 읽기 전용 PAT 에 여는데 한 판정은
+                # read 가 아닌 것. 막지 않는다(그림자). 엄격 · 끔에는 칸이 없다. 앱별 수는 /health 의 contract.would_close.
+                **({"would_close": _would_close()[0]} if TOOL_CLASS_MODE == "shadow" else {}),
+                # 게이트웨이가 docstring 「Args:」 로 채운 인자 — {노출 이름: [인자 이름]}(대신 채우기 A — 임시). 품질 카드 · 점수판이 앱의 실제 상태를
+                # 가리지 않게 이것을 빼고 센다. 끈 게이트웨이(GATEWAY_ARG_DOC_FILL=0)에는 칸이 없다.
+                **({"gateway_filled": {_n: sorted(_v) for _n, _v in sorted(_GW_FILLED.items())}} if ARG_DOC_FILL is not False else {}),
             }, ensure_ascii=False).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

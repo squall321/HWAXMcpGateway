@@ -90,22 +90,25 @@ def _has_enum(s: dict) -> bool:
     return "enum" in s or "const" in s or any(isinstance(a, dict) and ("enum" in a or "const" in a) for a in (s.get("anyOf") or []))
 
 
-def walk_args(schema: dict) -> dict:
-    """인자 수 — 맨 위와 중첩(객체 속성 · 배열 항목 · $defs 참조)까지. 설명 · enum · 숫자 경계 · 자유형 객체를 함께 센다."""
+def walk_args(schema: dict, filled=()) -> dict:
+    """인자 수 — 맨 위와 중첩(객체 속성 · 배열 항목 · $defs 참조)까지. 설명 · enum · 숫자 경계 · 자유형 객체를 함께 센다.
+    filled 는 게이트웨이가 docstring 으로 채운 맨 위 인자(/tools-map gateway_filled) — 설명 없음으로 센다(앱의 실제 상태)."""
     root = schema or {}
     c = collections.Counter()
     top = (root.get("properties") or {}) if isinstance(root, dict) else {}
     c["args"] = len(top)
-    c["args_described"] = sum(1 for v in top.values() if isinstance(v, dict) and str(_resolve(v, root).get("description") or v.get("description") or "").strip())
+    c["args_described"] = sum(1 for k, v in top.items() if k not in filled and isinstance(v, dict)
+                              and str(_resolve(v, root).get("description") or v.get("description") or "").strip())
+    c["args_gateway_filled"] = sum(1 for k in top if k in filled)
     seen: set[int] = set()
 
     def visit(props: dict, depth: int):
-        for v in props.values():
+        for k, v in props.items():
             if not isinstance(v, dict):
                 continue
             s = _resolve(v, root)
             c["nested_args"] += 1
-            c["nested_described"] += bool(str(v.get("description") or s.get("description") or "").strip())
+            c["nested_described"] += bool(not (depth == 0 and k in filled) and str(v.get("description") or s.get("description") or "").strip())
             ty = _types(s) or _types(v)
             if ty & _NUM_TYPES:
                 c["numeric_args"] += 1
@@ -147,9 +150,13 @@ def _q(vals: list, p: float):
 
 
 def catalog_card(tools: list[dict], tmap: dict) -> dict[str, dict]:
+    """앱별 카탈로그 셈. 게이트웨이가 노출 사본에 채운 것(MM-5 표지 gateway_annotated · docstring 인자 gateway_filled)은 앱의 실제 상태로 세지
+    않고 ro_gateway · args_gateway_filled 로 따로 센다. 부류(tool_class)가 있으면 cls_read · cls_write · cls_unknown 을 센다."""
     own = tmap.get("map") or {}
     write, rr = set(tmap.get("write") or []), set(tmap.get("routine_read") or [])
     panel, uncl, orig = set(tmap.get("panel_read") or []), set(tmap.get("unclassified") or []), tmap.get("orig") or {}
+    gw_ann, gw_fill = set(tmap.get("gateway_annotated") or []), tmap.get("gateway_filled") or {}
+    tclass = tmap.get("tool_class") or {}
     digest = lambda d: hashlib.sha1(d.encode("utf-8")).hexdigest()
     apps_of_desc: dict[str, set] = collections.defaultdict(set)
     for t in tools:
@@ -161,10 +168,14 @@ def catalog_card(tools: list[dict], tmap: dict) -> dict[str, dict]:
     for t in tools:
         a, d = own.get(t["name"], "_gateway"), t.get("description") or ""
         ann = t.get("annotations") or {}
-        ro = ann.get("readOnlyHint")
+        ro = None if t["name"] in gw_ann else ann.get("readOnlyHint")     # 게이트웨이가 실은 표지는 앱 표지가 아니다
         c = per[a]
         c["tools"] += 1
         c["ro_true" if ro is True else "ro_false" if ro is False else "ro_none"] += 1
+        c["ro_gateway"] += t["name"] in gw_ann
+        cls = (tclass.get(t["name"]) or {}).get("class")
+        if cls in ("read", "write", "unknown"):
+            c["cls_" + cls] += 1
         c["destructive"] += ann.get("destructiveHint") is True
         c["idempotent"] += ann.get("idempotentHint") is True
         c["gw_write"] += t["name"] in write
@@ -179,16 +190,17 @@ def catalog_card(tools: list[dict], tmap: dict) -> dict[str, dict]:
         c["desc_history"] += bool(_HISTORY_RE.search(d))
         c["desc_shared_other_app"] += bool(d.strip()) and len(apps_of_desc[digest(d)]) > 1
         c["output_schema_real"] += _real_output_schema(t)
-        w = walk_args(t.get("inputSchema") or {})
+        w = walk_args(t.get("inputSchema") or {}, frozenset(gw_fill.get(t["name"]) or ()))
         for k, v in w.items():
             c[k] += v
         missing = w["args"] - w["args_described"]
         if missing:
             worst[a].append((missing, t["name"]))
         lens[a].append(len(d))
-    keys = ("tools", "ro_true", "ro_false", "ro_none", "destructive", "idempotent", "gw_write", "routine_read", "panel_read",
+    keys = ("tools", "ro_true", "ro_false", "ro_none", "ro_gateway", "destructive", "idempotent", "gw_write", "routine_read", "panel_read",
+            "cls_read", "cls_write", "cls_unknown",
             "unclassified", "prefixed", "desc_empty", "desc_lt100", "desc_gt1000", "desc_gt2400", "desc_history",
-            "desc_shared_other_app", "output_schema_real", "args", "args_described", "nested_args", "nested_described",
+            "desc_shared_other_app", "output_schema_real", "args", "args_described", "args_gateway_filled", "nested_args", "nested_described",
             "numeric_args", "numeric_bounded", "enum_args", "free_objects")
     out = {}
     for a, c in per.items():
@@ -239,13 +251,15 @@ def audit_card(path: Path, days: int, now: datetime | None = None) -> dict[str, 
 
 def build_card(tools: list[dict], tmap: dict, audit: dict[str, dict]) -> dict:
     cat = catalog_card(tools, tmap)
-    labels = {a.get("key") or a.get("backend"): a.get("label") for a in (tmap.get("apps") or []) if isinstance(a, dict)}
+    # /tools-map 의 apps 열쇠는 app 이다(옛 받아 둔 파일 · 다른 꼴은 key · backend 도 본다) — key 로만 읽어 label 이 늘 null 이었다
+    labels = {a.get("app") or a.get("key") or a.get("backend"): a.get("label") for a in (tmap.get("apps") or []) if isinstance(a, dict)}
     apps = []
     for a in sorted(set(cat) | set(audit), key=lambda k: -(cat.get(k, {}).get("tools") or 0)):
         apps.append({"app": a, "label": labels.get(a), **cat.get(a, {}), "audit": audit.get(a)})
     tot = collections.Counter()
     for r in cat.values():
-        for k in ("tools", "args", "args_described", "ro_true", "ro_false", "nested_args", "nested_described"):
+        for k in ("tools", "args", "args_described", "args_gateway_filled", "ro_true", "ro_false", "ro_gateway", "nested_args",
+                  "nested_described", "cls_read", "cls_write", "cls_unknown"):
             tot[k] += r.get(k) or 0
     summary = dict(tot)
     summary["arg_described_ratio"] = round(tot["args_described"] / tot["args"], 3) if tot["args"] else None

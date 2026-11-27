@@ -3273,6 +3273,282 @@ def _area_meta() -> list[dict]:
             for a in (_tool_areas().get("areas") or []) if a.get("key")]
 
 
+# ── 목적 묶음 정본 — tool_purposes.json(추적) + 박스 덧씌우기(HWAXPortal docs/mcp-modernize M3) ─────────────────────────────────────────
+# 영역(tool_areas.json)은 도구 하나에 하나뿐인 '무슨 종류의 일' 이고 사실상 앱과 1:1 이다. 목적은 '어떤 업무를 끝내는 길' — 여러 앱을 가로지르는 차례 ·
+# 입구 도구 · 확인할 쓰기다. 도구 하나가 여러 목적에 든다. cae00 은 도구가 2,000개 가까이라 낱말 순위만으로는 첫 걸음을 못 맞힌다(11-27 조사 — 낙하 해석
+# 준비 · 보고서 쓰기 · 설계 리스크 심사의 입구가 20위 밖) — 목적으로 먼저 좁힌다. 한 표에서 짓는 것(각 손잡이 — 끄면 그 표면이 종전과 바이트까지 같다).
+#   · list_tool_apps(by='purpose') 와 앱 줄의 입구 entry(GATEWAY_PURPOSE_LIST)
+#   · search_tools 목적 층 · 앱 입구 먼저(검색 손잡이 switches.purpose_boost · app_entry_first — search_tuning.json, 평가에서 나빠진 쌍 0 일 때만 기본 켬)
+#   · 보기 purpose:<key>(GATEWAY_PURPOSE_VIEW) · MCP prompts purpose-<key>(GATEWAY_PURPOSE_PROMPTS) · skill://hwax/<key>/SKILL.md 자원(GATEWAY_PURPOSE_SKILLS)
+#   · /tools-map 의 purposes · /health 의 purposes(목적 수 · 이 박스에 없는 단계 · 채택 셈)
+# 표는 (백엔드 키, 원래 이름)으로 적는다 — 노출 이름(겹침 접두 · 허브 가족 접두)은 박스마다 달라 경로표(route)로 푼다. 이 박스에 없는 앱의 단계는 빼고
+# missing 에 센다(cae00 전용 앱은 그 박스에서만 산다). 박스 덧씌우기는 검색 손잡이 · 코어 어휘표와 같은 꼴 — JSON merge patch(목적 키로 묶은 객체는
+# 합치고 목록은 통째로 바뀌며 null 은 지운다) · 깨지면 통째로 버리고 기본 표 · 바뀐 시각을 보고 재기동 없이 다시 읽는다. 기본 표가 깨지면(리포의 결함)
+# 마지막으로 읽은 표, 그것도 없으면 빈 표다(그때 모든 표면은 목적이 없는 것처럼 돈다 — 까닭은 /health purposes.error).
+# 손잡이는 띄운 셸의 환경이 먼저, 없으면 곁의 provision.env 줄(_env_knob — M2 손잡이와 같은 규칙). GATEWAY_PURPOSES=0 이면 표를 읽지 않고 모든 표면이 꺼진다.
+PURPOSES_ON = _env_knob("GATEWAY_PURPOSES", "1") != "0"
+PURPOSE_LIST_ON = PURPOSES_ON and _env_knob("GATEWAY_PURPOSE_LIST", "1") != "0"
+PURPOSE_VIEW_ON = PURPOSES_ON and _env_knob("GATEWAY_PURPOSE_VIEW", "1") != "0"
+PURPOSE_PROMPTS_ON = PURPOSES_ON and _env_knob("GATEWAY_PURPOSE_PROMPTS", "1") != "0"
+PURPOSE_SKILLS_ON = PURPOSES_ON and _env_knob("GATEWAY_PURPOSE_SKILLS", "1") != "0"
+TOOL_PURPOSES_PATH = Path(__file__).with_name("tool_purposes.json")
+TOOL_PURPOSES_LOCAL_PATH = Path(__file__).with_name("tool_purposes.local.json")
+_PURPOSES: dict = {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None}
+_PURPOSE_KEY_RE = re.compile(r"[a-z][a-z0-9-]{1,31}")        # 보기 글(_VIEW_AREA_RE) · prompt · skill 이름에 그대로 쓴다
+_PURPOSE_TOOL_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,120}")
+_PURPOSE_FIELDS = frozenset({"title", "summary", "triggers", "entry", "steps", "confirm_writes", "samples", "apps", "source", "_doc"})
+_PURPOSE_LIMITS = {"title": 80, "summary": 600, "why": 300, "trigger": 60, "sample": 200, "source": 400}
+PURPOSE_MATCH_MIN = 2                  # 목적 층이 맞았다고 보는 트리거 조각 글자 수 합의 바닥(질의 '단면' · '좌굴' 같은 두 글자 낱말까지)
+PURPOSE_PROMPT_PREFIX = "purpose-"
+SKILL_URI_PREFIX = "skill://hwax/"
+SKILL_FILE = "SKILL.md"
+_EMPTY_PURPOSES = {"version": None, "purposes": {}, "apps": {}}
+
+
+def _pstr(v, what: str, limit: int, *, required: bool = True) -> str:
+    if v is None and not required:
+        return ""
+    if not isinstance(v, str) or not v.strip() or len(v) > limit:
+        raise TypeError(f"{what} 는 비지 않은 글({limit}자 안)이어야 한다")
+    return v.strip()
+
+
+def _pstrs(v, what: str, limit: int, *, required: bool) -> tuple[str, ...]:
+    if v is None and not required:
+        return ()
+    if not isinstance(v, list) or (required and not v):
+        raise TypeError(f"{what} 는 {'비지 않은 ' if required else ''}글 목록이어야 한다")
+    return tuple(_pstr(x, f"{what}[]", limit) for x in v)
+
+
+def _purpose_pair(v, what: str) -> tuple[str, str]:
+    """[백엔드 키, 원래 이름] — 게이트웨이 자체 도구는 백엔드 '_gateway'."""
+    if not (isinstance(v, list) and len(v) == 2 and all(isinstance(x, str) for x in v)):
+        raise TypeError(f"{what} 는 [백엔드 키, 원래 이름] 이어야 한다")
+    bk, tool = v
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", bk) or not _PURPOSE_TOOL_RE.fullmatch(tool):
+        raise ValueError(f"{what} 의 백엔드 · 이름 꼴이 틀렸다")
+    return bk, tool
+
+
+def _purposes_parse(d) -> dict:
+    """목적 표 꼴 → 표면이 쓰는 값. 꼴이 틀리면 예외(그 판을 통째로 버린다 — 덧씌우기면 기본 표로 돈다). 칸 뜻은 tool_purposes.json 의 _doc."""
+    if not isinstance(d, dict):
+        raise TypeError("목적 표는 객체여야 한다")
+    raw = d.get("purposes")
+    if not isinstance(raw, dict):
+        raise TypeError("purposes 는 {목적 키: …} 객체여야 한다")
+    out = {}
+    for key, p in raw.items():
+        if not isinstance(key, str) or not _PURPOSE_KEY_RE.fullmatch(key):
+            raise ValueError(f"목적 키 꼴이 틀렸다: {str(key)[:40]}")
+        if not isinstance(p, dict):
+            raise TypeError(f"{key} 는 객체여야 한다")
+        extra = sorted(set(p) - _PURPOSE_FIELDS)
+        if extra:
+            raise ValueError(f"{key} 에 모르는 칸: {', '.join(extra)[:80]}")
+        steps = []
+        if not isinstance(p.get("steps"), list) or not p["steps"]:
+            raise TypeError(f"{key}.steps 는 비지 않은 목록이어야 한다")
+        for i, st in enumerate(p["steps"]):
+            if not isinstance(st, dict) or set(st) - {"backend", "tool", "why"}:
+                raise TypeError(f"{key}.steps[{i}] 는 {{backend, tool, why}} 다")
+            bk, tool = _purpose_pair([st.get("backend"), st.get("tool")], f"{key}.steps[{i}]")
+            steps.append((bk, tool, _pstr(st.get("why"), f"{key}.steps[{i}].why", _PURPOSE_LIMITS["why"])))
+        keys = {(bk, tool) for bk, tool, _w in steps}
+        if len(keys) != len(steps):
+            raise ValueError(f"{key}.steps 에 같은 도구가 두 번 있다")
+        entry = _purpose_pair(p.get("entry"), f"{key}.entry")
+        if entry not in keys:
+            raise ValueError(f"{key}.entry 는 steps 안의 도구여야 한다")
+        confirm = frozenset(_purpose_pair(c, f"{key}.confirm_writes[]") for c in (p.get("confirm_writes") or []))
+        if not isinstance(p.get("confirm_writes", []), list) or not confirm <= keys:
+            raise ValueError(f"{key}.confirm_writes 는 steps 안의 [백엔드, 원래 이름] 목록이어야 한다")
+        apps = _pstrs(p.get("apps"), f"{key}.apps", 80, required=False)       # 게이트웨이 자체 도구만 쓰는 목적(루틴 · 절차)은 빈 목록
+        lost = sorted({bk for bk, _t, _w in steps if bk != "_gateway"} - set(apps))
+        if lost:
+            raise ValueError(f"{key}.apps 가 단계의 백엔드를 다 담지 않는다: {', '.join(lost)[:80]}")
+        triggers = _pstrs(p.get("triggers"), f"{key}.triggers", _PURPOSE_LIMITS["trigger"], required=True)
+        trig = tuple(t for t in (tuple(w for w in tr.lower().split() if w) for tr in triggers) if t)
+        out[key] = {"key": key, "title": _pstr(p.get("title"), f"{key}.title", _PURPOSE_LIMITS["title"]),
+                    "summary": _pstr(p.get("summary"), f"{key}.summary", _PURPOSE_LIMITS["summary"]),
+                    "triggers": triggers, "trig": trig, "entry": entry, "steps": tuple(steps), "confirm": confirm,
+                    "samples": _pstrs(p.get("samples"), f"{key}.samples", _PURPOSE_LIMITS["sample"], required=False),
+                    "apps": apps, "source": _pstr(p.get("source"), f"{key}.source", _PURPOSE_LIMITS["source"], required=False),
+                    "kind": "multi" if len({bk for bk, _t, _w in steps if bk != "_gateway"}) >= 2 else "app"}
+    apps_raw = d.get("apps") or {}
+    if not isinstance(apps_raw, dict):
+        raise TypeError("apps 는 {백엔드 키: {entry, why}} 객체여야 한다")
+    entries = {}
+    for bk, a in apps_raw.items():
+        if not isinstance(a, dict) or set(a) - {"entry", "why", "_doc"}:
+            raise TypeError(f"apps.{str(bk)[:40]} 는 {{entry, why}} 다")
+        b, tool = _purpose_pair([bk, a.get("entry")], f"apps.{str(bk)[:40]}")
+        entries[b] = (tool, _pstr(a.get("why"), f"apps.{b}.why", _PURPOSE_LIMITS["why"], required=False))
+    return {"version": d.get("version"), "purposes": out, "apps": entries}
+
+
+def _purposes() -> dict:
+    """지금 쓰는 목적 표 — 기본 표에 박스 덧씌우기를 얹은 것. 두 파일의 바뀐 시각이 같으면 다시 읽지 않는다. 끈 박스(GATEWAY_PURPOSES=0)는 빈 표다."""
+    if not PURPOSES_ON:
+        return _EMPTY_PURPOSES
+
+    def mt(p: Path):
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return None
+    key = (mt(TOOL_PURPOSES_PATH), mt(TOOL_PURPOSES_LOCAL_PATH))
+    if key == _PURPOSES["key"] and _PURPOSES["data"] is not None:
+        return _PURPOSES["data"]
+    try:
+        base_raw = json.loads(TOOL_PURPOSES_PATH.read_text(encoding="utf-8"))
+        base = _purposes_parse(base_raw)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        error = f"기본 표를 못 읽음({type(exc).__name__}: {str(exc)[:120]})"
+        log.warning("목적 표 기본값(%s)을 못 읽었다 — %s: %r", TOOL_PURPOSES_PATH, "마지막 표로 돈다" if _PURPOSES["data"] else "목적 없이 돈다", exc)
+        if _PURPOSES["data"] is None:
+            _PURPOSES["data"] = {**_EMPTY_PURPOSES, "fingerprint": None, "base_fingerprint": None}
+        _PURPOSES.update(key=key, error=error)
+        return _PURPOSES["data"]
+    data, eff_raw, overlay = base, base_raw, {"present": key[1] is not None}
+    if key[1] is not None:
+        try:
+            patch = json.loads(TOOL_PURPOSES_LOCAL_PATH.read_text(encoding="utf-8"))
+            if not isinstance(patch, dict):
+                raise TypeError("덧씌우기는 객체여야 한다")
+            eff_raw = _merge_patch(base_raw, patch)
+            data = _purposes_parse(eff_raw)
+            overlay.update(fingerprint=_json_fp(patch), changed=_patch_paths(patch)[:40])
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            data, eff_raw = base, base_raw
+            overlay["error"] = f"덧씌우기를 버렸다({type(exc).__name__}: {str(exc)[:120]})"
+            log.warning("목적 표 덧씌우기(%s)를 버리고 기본 표로 돈다: %r", TOOL_PURPOSES_LOCAL_PATH, exc)
+    data = {**data, "fingerprint": _json_fp(eff_raw), "base_fingerprint": _json_fp(base_raw)}
+    _PURPOSES.update(key=key, data=data, error=None, overlay=overlay)
+    return data
+
+
+def _purpose_index() -> dict[tuple[str, str], str]:
+    """(백엔드 키, 원래 이름) → 이 박스의 노출 이름 — 백엔드 도구(경로표)와 게이트웨이 자체 도구. 없는 도구는 열쇠가 없다."""
+    idx: dict[tuple[str, str], str] = {}
+    for name, val in route.items():
+        idx.setdefault((val[0], val[1]), name)
+    for t in _local_tools():
+        idx[("_gateway", t.name)] = t.name
+    return idx
+
+
+def _purpose_live(p: dict, idx: dict, vis: set | None) -> dict:
+    """목적 하나를 이 박스 · 이 호출자에게 푼다 — 단계마다 노출 이름, 없는 단계(missing — 이 박스에 그 앱 · 도구가 없다), 가린 단계(hidden — 권한 ·
+    끈 앱 · 시험 사본으로 이 호출자 시야 밖). 입구가 없거나 가려졌으면 살아 있는 첫 단계가 입구다(entry_live 가 거짓). vis 가 None 이면 시야를 보지 않는다."""
+    steps, missing, hidden = [], [], 0
+    for bk, tool, why in p["steps"]:
+        name = idx.get((bk, tool))
+        if name is None:
+            missing.append((bk, tool))
+        elif vis is not None and name not in vis:
+            hidden += 1
+        else:
+            steps.append({"backend": bk, "tool": tool, "name": name, "why": why, "confirm": (bk, tool) in p["confirm"]})
+    entry = next((s for s in steps if (s["backend"], s["tool"]) == p["entry"]), steps[0] if steps else None)
+    return {"steps": steps, "missing": missing, "hidden": hidden, "entry": entry,
+            "entry_live": entry is not None and (entry["backend"], entry["tool"]) == p["entry"]}
+
+
+def _purposes_for(vis: set | None, idx: dict | None = None) -> list[tuple[dict, dict]]:
+    """살아 있는 목적(단계가 하나라도 보이는 것) — [(목적, 푼 값)], 표의 차례. vis 는 호출자 시야의 노출 이름 셋(None 이면 시야를 보지 않는다)."""
+    d = _purposes()
+    if not d["purposes"]:
+        return []
+    idx = _purpose_index() if idx is None else idx
+    out = []
+    for p in d["purposes"].values():
+        lv = _purpose_live(p, idx, vis)
+        if lv["steps"]:
+            out.append((p, lv))
+    return out
+
+
+def _app_entry_name(app: str, idx: dict, vis: set | None) -> tuple[str, str] | None:
+    """앱 입구(표 apps.<키>.entry)의 (노출 이름, 까닭) — 이 박스에 없거나 호출자 시야 밖이면 None."""
+    e = _purposes()["apps"].get(app)
+    if not e:
+        return None
+    name = idx.get((app, e[0]))
+    if name is None or (vis is not None and name not in vis):
+        return None
+    return name, e[1]
+
+
+def _purpose_write(name: str, bk: str, tool: str, tool_of: dict) -> bool:
+    """단계 도구가 쓰기인가 — 게이트웨이의 읽기 · 쓰기 한 판정(_tool_is_write). 표의 confirm 과 따로 싣는다(쓰는 쪽이 둘을 함께 본다)."""
+    return _tool_is_write(tool_of.get(name), tool, None if bk == "_gateway" else bk)
+
+
+def _purposes_health() -> dict:
+    """/health 의 purposes — 표를 읽었나 · 지문(덧씌운 값 · 기본값) · 덧씌우기 · 목적 수(다앱 · 앱) · 이 박스에서 산 목적 · 없는 단계(앱별) · 입구가 없는 목적 ·
+    입구가 쓰기인 목적 · 손잡이 · 채택 셈. 수와 키만 싣는다(경로 · 사람은 싣지 않는다 — 무인증 칸이다)."""
+    d = _purposes()
+    ps = d["purposes"]
+    idx = _purpose_index()
+    tool_of = {t.name: t for t in list(exposed_tools) + _local_tools()}
+    live = inactive = 0
+    by_bk: Counter = Counter()
+    no_entry, entry_write = [], []
+    for p in ps.values():
+        lv = _purpose_live(p, idx, None)
+        for bk, _t in lv["missing"]:
+            by_bk[bk] += 1
+        if not lv["steps"]:
+            inactive += 1
+            continue
+        live += 1
+        if not lv["entry_live"]:
+            no_entry.append(p["key"])
+        elif _purpose_write(lv["entry"]["name"], lv["entry"]["backend"], lv["entry"]["tool"], tool_of):
+            entry_write.append(p["key"])
+    app_missing = sorted(bk for bk, (tool, _w) in d["apps"].items() if bk in backends and (bk, tool) not in idx)
+    tun = _tuning()["switches"]
+    out = {"loaded": _PURPOSES["error"] is None, "version": d.get("version"), "fingerprint": d.get("fingerprint"), "base": d.get("base_fingerprint"),
+           "overlay": dict(_PURPOSES.get("overlay") or {"present": False}), "count": len(ps),
+           "by_kind": dict(Counter(p["kind"] for p in ps.values())), "live": live, "inactive": inactive,
+           "missing": {"steps": sum(by_bk.values()), "by_backend": dict(sorted(by_bk.items()))},
+           "app_entries": len(d["apps"]),
+           "knobs": {"list": PURPOSE_LIST_ON, "view": PURPOSE_VIEW_ON, "prompts": PURPOSE_PROMPTS_ON, "skills": PURPOSE_SKILLS_ON,
+                     "purpose_boost": bool(tun.get("purpose_boost")), "app_entry_first": bool(tun.get("app_entry_first"))}}
+    if no_entry:
+        out["entry_missing"] = no_entry           # 입구 도구가 이 박스에 없어 살아 있는 첫 단계가 입구 노릇을 하는 목적
+    if entry_write:
+        out["entry_write"] = entry_write          # 입구가 쓰기로 판정된 목적 — 앱의 R2 가 그 쓰기를 입구로 정했으면 그대로 둔다(부르기 전에 확인), 아니면 표를 고친다
+    if app_missing:
+        out["app_entry_missing"] = app_missing    # 앱은 붙었는데 그 앱 입구 도구가 없다(앱 판이 바뀌었다)
+    if _PURPOSES["error"]:
+        out["error"] = _PURPOSES["error"]
+    return out
+
+
+def _purposes_map() -> dict:
+    """/tools-map 의 purposes — 쓰는 쪽(에이전트 서버 웹 챗 · 좌석 · 포털 PC 킷)이 같은 표를 읽게 한다. 목적마다 단계의 (백엔드, 원래 이름) · 이 박스의
+    노출 이름(없으면 null) · 까닭 · 표의 확인 표지 · 게이트웨이 쓰기 판정, 트리거 · 질의 예. 시야는 보지 않는다(무인증 칸 — 도구 지도와 같은 범위)."""
+    d = _purposes()
+    idx = _purpose_index()
+    tool_of = {t.name: t for t in list(exposed_tools) + _local_tools()}
+    items = []
+    for p in d["purposes"].values():
+        lv = _purpose_live(p, idx, None)
+        steps = []
+        for bk, tool, why in p["steps"]:
+            name = idx.get((bk, tool))
+            steps.append({"backend": bk, "tool": tool, "name": name, "why": why, "confirm": (bk, tool) in p["confirm"],
+                          **({"write": _purpose_write(name, bk, tool, tool_of)} if name else {})})
+        items.append({"key": p["key"], "title": p["title"], "summary": p["summary"], "kind": p["kind"], "apps": list(p["apps"]),
+                      "entry": {"backend": p["entry"][0], "tool": p["entry"][1], "name": idx.get(p["entry"])},
+                      "live": bool(lv["steps"]), "steps": steps, "triggers": list(p["triggers"]), "samples": list(p["samples"])})
+    return {"fingerprint": d.get("fingerprint"), "items": items,
+            "app_entries": {bk: {"tool": tool, "name": idx.get((bk, tool)), "why": why} for bk, (tool, why) in d["apps"].items()}}
+
+
 LIST_APPS_TOOL = types.Tool(
     name="list_tool_apps",
     description=(
@@ -13102,6 +13378,8 @@ def _bearer_gate(app, pat_verifier=None):
                 "stateless": STATELESS_HTTP,
                 # MCP 현대화 M2(계약 정밀화)의 손잡이 — 읽기 · 쓰기 한 판정(MM-5) 등. 박스마다 어느 꼴로 도는지 이것으로 본다(값 · 수만)
                 "contract": _contract_health(),
+                # 목적 묶음(MCP 현대화 M3) — 표 지문 · 덧씌우기 · 목적 수 · 이 박스에 없는 단계 · 손잡이 · 채택 셈. 끈 박스(GATEWAY_PURPOSES=0)에는 칸이 없다
+                **({"purposes": _purposes_health()} if PURPOSES_ON else {}),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
@@ -13220,6 +13498,9 @@ def _bearer_gate(app, pat_verifier=None):
                 # 게이트웨이가 docstring 「Args:」 로 채운 인자 — {노출 이름: [인자 이름]}(대신 채우기 A — 임시). 품질 카드 · 점수판이 앱의 실제 상태를
                 # 가리지 않게 이것을 빼고 센다. 끈 게이트웨이(GATEWAY_ARG_DOC_FILL=0)에는 칸이 없다.
                 **({"gateway_filled": {_n: sorted(_v) for _n, _v in sorted(_GW_FILLED.items())}} if ARG_DOC_FILL is not False else {}),
+                # 목적 묶음(MCP 현대화 M3) — 목적마다 단계의 (백엔드, 원래 이름) · 노출 이름 · 까닭 · 확인 · 쓰기 판정과 앱 입구. 웹 챗 · 좌석 · PC 킷이 이 표를 읽는다.
+                # 끈 박스(GATEWAY_PURPOSES=0)에는 칸이 없다. 위 칸들은 그대로다.
+                **({"purposes": _purposes_map()} if PURPOSES_ON else {}),
             }, ensure_ascii=False).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

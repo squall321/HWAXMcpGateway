@@ -64,6 +64,12 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "_INGEST_CHECK", {})
     # 이용 통계 창구가 감사 원장을 접어 두는 표도 같다 — 안 걸면 /usage-rollup 시험이 박스의 데이터 루트(원장 곁 usage-rollup.sqlite)에 시험 줄을 접는다
     monkeypatch.setattr(gw, "USAGE_ROLLUP_PATH", tmp_path / "usage-rollup.sqlite")
+    # 목적 묶음 표의 박스 덧씌우기 · 손잡이도 같다(HWAXPortal docs/mcp-modernize M3) — 박스에 tool_purposes.local.json 이 있거나 provision.env 가 손잡이를
+    # 꺼 두면 목적 시험이 그 박스 값으로 돈다. 기본 표(추적)와 코드 기본값(모두 켬)만 보게 건다
+    monkeypatch.setattr(gw, "TOOL_PURPOSES_LOCAL_PATH", tmp_path / "tool_purposes.local.json")
+    monkeypatch.setattr(gw, "_PURPOSES", {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None})
+    for _k in ("PURPOSES_ON", "PURPOSE_LIST_ON", "PURPOSE_VIEW_ON", "PURPOSE_PROMPTS_ON", "PURPOSE_SKILLS_ON"):
+        monkeypatch.setattr(gw, _k, True)
 
 
 @pytest.fixture(autouse=True)
@@ -6435,9 +6441,9 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read", "views",
                           "panel_read", "orig"] + (["tool_class", "gateway_annotated"] if gw.TOOL_CLASS_UNIFIED else []) + (
                           ["would_close"] if gw.TOOL_CLASS_MODE == "shadow" else []) + (
-                          ["gateway_filled"] if gw.ARG_DOC_FILL is not False else []), \
+                          ["gateway_filled"] if gw.ARG_DOC_FILL is not False else []) + (["purposes"] if gw.PURPOSES_ON else []), \
         "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4) · 패널 확인용 읽기 목록(HA-20 B-2) · 원래 이름" \
-        "(ontology-first F0)은 맨 뒤에 덧붙는다"
+        "(ontology-first F0) · 목적 묶음(mcp-modernize M3)은 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
     # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 관리자 읽기 목록 보기 1(GW-02 — tools/list 는 관리자에게만)
@@ -17772,3 +17778,145 @@ def test_그림자의_would_close_는_엄격_모드의_닫힘과_같고_health_�
     assert gw._would_close() is first, "카탈로그 · 목록이 같으면 쥐어 둔 값"
     monkeypatch.setattr(gw, "READ_TOOLS", gw.READ_TOOLS | {"sf:get_x"})
     assert "get_x" not in gw._would_close()[0], "읽기 목록을 고치면 다시 센다"
+
+
+# ── 목적 묶음 정본 tool_purposes.json(HWAXPortal docs/mcp-modernize M3) ───────────────────────────────────────────────────────────────────
+_P_TABLE = {"version": 1,
+            "apps": {"sf": {"entry": "guide", "why": "처음 부른다"}, "ra": {"entry": "ra_guide", "why": "작업 전에"},
+                     "ghost": {"entry": "nope", "why": "없는 앱"}},
+            "purposes": {
+                "drop-prep": {"title": "낙하 해석 준비", "summary": "CAD 를 점검하고 덱을 만든 뒤 낸다.",
+                              "triggers": ["낙하 해석 준비", "낙하 준비"], "entry": ["sf", "list_projects"],
+                              "steps": [{"backend": "sf", "tool": "list_projects", "why": "과제 특정"},
+                                        {"backend": "sf", "tool": "run_job", "why": "잡"},
+                                        {"backend": "st", "tool": "submit", "why": "제출"},
+                                        {"backend": "cluster", "tool": "smarttwin_submit", "why": "클러스터(그 박스에서만)"},
+                                        {"backend": "_gateway", "tool": "figure_list", "why": "그림"}],
+                              "confirm_writes": [["sf", "run_job"], ["st", "submit"]],
+                              "samples": ["STEP 으로 낙하 해석 돌리려면?"], "apps": ["sf", "st", "cluster"], "source": "시험"},
+                "report-write": {"title": "보고서 쓰기", "summary": "초안을 만들고 게시한다.", "triggers": ["보고서 쓰", "보고서 작성"],
+                                 "entry": ["ra", "ra_guide"],
+                                 "steps": [{"backend": "ra", "tool": "ra_guide", "why": "규칙"},
+                                           {"backend": "ra", "tool": "create_report_draft", "why": "초안"}],
+                                 "confirm_writes": [], "samples": [], "apps": ["ra"]},
+                "box-only": {"title": "박스 전용", "summary": "그 앱이 붙은 박스에서만.", "triggers": ["박스 전용"], "entry": ["cluster", "x"],
+                             "steps": [{"backend": "cluster", "tool": "x", "why": "없다"}], "confirm_writes": [], "samples": [],
+                             "apps": ["cluster"]}}}
+
+
+def _p_table(monkeypatch, tmp_path, table=None, overlay=None):
+    p = tmp_path / "tool_purposes.json"
+    p.write_text(json.dumps(table or _P_TABLE, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(gw, "TOOL_PURPOSES_PATH", p)
+    if overlay is not None:
+        gw.TOOL_PURPOSES_LOCAL_PATH.write_text(overlay if isinstance(overlay, str) else json.dumps(overlay, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(gw, "_PURPOSES", {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None})
+
+
+def _p_catalog(monkeypatch, groups=(), policy=None, ann=None):
+    """목적 시험의 카탈로그 — sf(StepForge 꼴) · st · ra 와 겹침 접두 하나(sf 의 list_projects 를 다른 앱도 내서 접두가 붙었다)."""
+    specs = [("sf", "heaxsf_list_projects", "list_projects", "과제 목록 — 과제를 찾는다."), ("sf", "guide", "guide", "처음 부를 안내."),
+             ("sf", "run_job", "run_job", "무거운 잡을 건다."), ("st", "submit", "submit", "해석을 낸다."),
+             ("other", "other_list_projects", "list_projects", "다른 앱의 같은 이름."),
+             ("ra", "ra_guide", "ra_guide", "보고서 쓰기 안내."), ("ra", "create_report_draft", "create_report_draft", "보고서 초안을 만든다.")]
+    tools = [types.Tool(name=n, description=d, inputSchema={"type": "object", "properties": {}},
+                        **({"annotations": types.ToolAnnotations(**(ann or {}).get(n))} if (ann or {}).get(n) else {})) for _b, n, _o, d in specs]
+    monkeypatch.setattr(gw, "exposed_tools", tools)
+    monkeypatch.setattr(gw, "route", {n: (b, o) for b, n, o, _d in specs})
+    monkeypatch.setattr(gw, "backends", {b: type("B", (), {"session": object()})() for b in ("sf", "st", "ra", "other")})
+    monkeypatch.setattr(gw, "POLICY", policy or {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: list(groups))
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    return tools
+
+
+def test_M3_목적_표를_읽고_노출_이름은_경로표로_푼다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch)
+    d = gw._purposes()
+    assert list(d["purposes"]) == ["drop-prep", "report-write", "box-only"], "표의 차례"
+    p = d["purposes"]["drop-prep"]
+    assert p["entry"] == ("sf", "list_projects") and p["kind"] == "multi" and d["purposes"]["report-write"]["kind"] == "app"
+    assert p["trig"] == (("낙하", "해석", "준비"), ("낙하", "준비")) and p["confirm"] == {("sf", "run_job"), ("st", "submit")}
+    lv = gw._purpose_live(p, gw._purpose_index(), None)
+    assert [s["name"] for s in lv["steps"]] == ["heaxsf_list_projects", "run_job", "submit", "figure_list"], "겹침 접두 이름 · 게이트웨이 도구"
+    assert lv["missing"] == [("cluster", "smarttwin_submit")] and lv["entry_live"] and lv["entry"]["name"] == "heaxsf_list_projects"
+    assert [p["key"] for p, _lv in gw._purposes_for(None)] == ["drop-prep", "report-write"], "단계가 하나도 없는 목적은 이 박스에 없다"
+
+
+def test_M3_목적_표_꼴이_틀리면_통째로_버리고_덧씌우기는_합치거나_버린다(monkeypatch, tmp_path, caplog):
+    _p_catalog(monkeypatch)
+    for bad, why in (({**_P_TABLE, "purposes": {"Bad Key": _P_TABLE["purposes"]["box-only"]}}, "목적 키"),
+                     ({**_P_TABLE, "purposes": {"x1": {**_P_TABLE["purposes"]["box-only"], "entry": ["cluster", "y"]}}}, "entry"),
+                     ({**_P_TABLE, "purposes": {"x1": {**_P_TABLE["purposes"]["box-only"], "stepz": []}}}, "모르는 칸"),
+                     ({**_P_TABLE, "purposes": {"x1": {**_P_TABLE["purposes"]["drop-prep"], "apps": ["sf"]}}}, "apps"),
+                     ({**_P_TABLE, "purposes": {"x1": {**_P_TABLE["purposes"]["drop-prep"], "confirm_writes": [["ra", "z"]]}}}, "confirm")):
+        _p_table(monkeypatch, tmp_path, bad)
+        with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+            d = gw._purposes()
+        assert d["purposes"] == {} and why in (gw._PURPOSES["error"] or ""), (why, gw._PURPOSES["error"])
+    # 덧씌우기 — 목적 하나를 고치고(merge patch) · 하나를 더하고 · 하나를 지운다(null)
+    _p_table(monkeypatch, tmp_path, overlay={"purposes": {"report-write": {"title": "보고서 쓰기(박스)"}, "box-only": None,
+                                                         "extra": {"title": "더함", "summary": "박스가 더했다.", "triggers": ["더함"],
+                                                                   "entry": ["ra", "ra_guide"], "steps": [{"backend": "ra", "tool": "ra_guide", "why": "w"}],
+                                                                   "apps": ["ra"]}}})
+    d = gw._purposes()
+    assert list(d["purposes"]) == ["drop-prep", "report-write", "extra"] and d["purposes"]["report-write"]["title"] == "보고서 쓰기(박스)"
+    assert d["fingerprint"] != d["base_fingerprint"] and gw._PURPOSES["overlay"]["changed"] == ["purposes.report-write", "purposes.box-only",
+                                                                                                 "purposes.extra"]
+    # 깨진 덧씌우기는 통째로 버리고 기본 표 — 까닭을 남긴다
+    _p_table(monkeypatch, tmp_path, overlay={"purposes": {"report-write": {"entry": ["ra", "없는것"]}}})
+    d = gw._purposes()
+    assert list(d["purposes"]) == ["drop-prep", "report-write", "box-only"] and "덧씌우기를 버렸다" in gw._PURPOSES["overlay"]["error"]
+    _p_table(monkeypatch, tmp_path, overlay="{not json")
+    assert len(gw._purposes()["purposes"]) == 3 and "덧씌우기를 버렸다" in gw._PURPOSES["overlay"]["error"]
+    # 끈 박스는 빈 표
+    monkeypatch.setattr(gw, "PURPOSES_ON", False)
+    assert gw._purposes()["purposes"] == {}
+
+
+def test_M3_health_와_tools_map_에_목적이_실리고_끄면_칸이_없다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, ann={"run_job": {"readOnlyHint": False}})
+    h = _health_body()["purposes"]
+    assert (h["loaded"], h["count"], h["live"], h["inactive"], h["by_kind"]) == (True, 3, 2, 1, {"multi": 1, "app": 2})
+    assert h["missing"] == {"steps": 2, "by_backend": {"cluster": 2}} and h["app_entries"] == 3
+    assert h["knobs"]["list"] and h["knobs"]["prompts"] and h["knobs"]["purpose_boost"] is False
+    assert "app_entry_missing" not in h, "붙지 않은 앱(ghost)의 입구는 없는 것이 맞다 — 붙은 앱의 입구가 사라졌을 때만 센다"
+    sent = []
+
+    async def send(m):
+        sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/tools-map", "headers": []}, None, send))
+    tm = json.loads(sent[1]["body"])["purposes"]
+    item = next(i for i in tm["items"] if i["key"] == "drop-prep")
+    assert item["entry"] == {"backend": "sf", "tool": "list_projects", "name": "heaxsf_list_projects"} and item["live"]
+    assert [(s["tool"], s["name"], s["confirm"], s.get("write")) for s in item["steps"]] == [
+        ("list_projects", "heaxsf_list_projects", False, False), ("run_job", "run_job", True, True), ("submit", "submit", True, True),
+        ("smarttwin_submit", None, False, None), ("figure_list", "figure_list", False, False)]
+    assert tm["app_entries"]["sf"] == {"tool": "guide", "name": "guide", "why": "처음 부른다"} and tm["app_entries"]["ghost"]["name"] is None
+    monkeypatch.setattr(gw, "PURPOSES_ON", False)
+    assert "purposes" not in _health_body()
+    sent.clear()
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/tools-map", "headers": []}, None, send))
+    assert "purposes" not in json.loads(sent[1]["body"])
+
+
+def test_M3_실제_목적_표는_꼴이_맞고_dev_카탈로그의_이름만_쓴다():
+    """추적하는 표(tool_purposes.json)가 읽히고, 단계 · 입구 · 앱 입구가 dev 카탈로그 이름표(tool_search_eval/purpose_catalog.json)의 이름이다 — 이 박스에 없는
+    앱(cae00 전용)의 단계는 이름표에 그 백엔드가 없어 대조하지 않는다. 앱 새 판의 도구는 expected_missing 에 까닭과 함께 적는다."""
+    d = gw._purposes_parse(json.loads(gw.TOOL_PURPOSES_PATH.read_text(encoding="utf-8")))
+    cat = json.loads((gw.Path(gw.__file__).with_name("tool_search_eval") / "purpose_catalog.json").read_text(encoding="utf-8"))
+    have = {(b, n) for b, ns in cat["tools"].items() for n in ns} | {("_gateway", n) for n in cat["local_tools"]}
+    later = {(b, n) for b, e in cat["expected_missing"].items() for n in e["tools"]}
+    known = set(cat["tools"]) | {"_gateway"}
+    bad = [(k, bk, t) for k, p in d["purposes"].items() for bk, t, _w in p["steps"] if bk in known and (bk, t) not in have | later]
+    assert bad == [], bad
+    assert [(bk, t) for bk, (t, _w) in d["apps"].items() if bk in known and (bk, t) not in have] == []
+    assert len(d["purposes"]) >= 60 and sum(p["kind"] == "multi" for p in d["purposes"].values()) >= 10
+    for k, p in d["purposes"].items():
+        assert gw._VIEW_AREA_RE.fullmatch(k) and len(f"hwax-{k}") <= 64, k     # 보기 글 · skill 이름에 그대로 쓴다
+        assert p["samples"] and p["triggers"], k
+    used = {(b, n) for p in d["purposes"].values() for b, n, _w in p["steps"]}
+    assert later <= used, "expected_missing 은 표가 쓰는 도구만 적는다"

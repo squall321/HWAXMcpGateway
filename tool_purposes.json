@@ -1,0 +1,1404 @@
+{
+  "_doc": [
+      "목적 묶음 정본(HWAXPortal docs/mcp-modernize M3) — '목적 → 묶음 → 기능 MCP' 로 좁히는 표다. 게이트웨이가 한 표에서 search_tools 목적 층 · list_tool_apps(by='purpose') · 앱 입구 · 보기 purpose:<key> · MCP prompts purpose-<key> · skill://hwax/<key>/SKILL.md · /tools-map purposes 를 짓는다.",
+      "purposes — {목적 키: {title(한국어) · summary · triggers(질의 낱말 — 띄어 쓴 조각이 모두 질의에 들면 맞는다) · entry([백엔드 키, 원래 이름] — steps 안) · steps([{backend, tool(원래 이름), why}] 차례) · confirm_writes([[백엔드, 원래 이름]] — 사람에게 확인한 뒤 부를 쓰기, steps 안) · samples(질의 예) · apps(관련 앱 — 단계의 백엔드를 모두 담는다) · source(씨앗)}}. 목적 키는 [a-z][a-z0-9-]{1,31}.",
+      "apps — {백엔드 키: {entry: 원래 이름, why}} — 앱 입구(처음 부를 읽기 도구). list_tool_apps 앱 줄의 entry 와 검색 손잡이 app_entry_first 가 읽는다.",
+      "도구는 노출 이름이 아니라 (백엔드 키, 원래 이름)으로 적는다 — 겹침 접두 · 허브 가족 접두는 박스마다 다르고 게이트웨이가 경로표로 푼다. 게이트웨이 자체 도구는 백엔드 '_gateway'.",
+      "이 박스에 없는 앱(cae00 전용 — 정본 허브 · ECAD 허브 · ARP · 클러스터 앱)의 단계는 그 앱이 붙은 박스에서만 산다 — 없으면 그 단계를 빼고 /health purposes.missing 에 센다. 단계가 하나도 없는 목적은 그 박스에서 보이지 않는다.",
+      "박스 덧씌우기 — 같은 자리의 tool_purposes.local.json(gitignore)에 바꿀 칸만 적는다(JSON merge patch — 목적 키로 묶은 객체는 합치고 목록은 통째로 바뀌며 null 은 지운다). 깨지면 통째로 버리고 기본 표로 돈다(까닭은 /health purposes.overlay.error). 바뀐 시각을 보고 재기동 없이 다시 읽는다.",
+      "씨앗 — HWAXPortal infra/personas/he-team.json 운영자 19명의 workflow · key_tools · samples · writes · confirm, 앱 세션의 R2 길 안내(ReportArchive · WebDesignAgents · LaminateAnalyzer · MX 백서 · DocForge · ste mcp-contract 6장 · DynaForge skill/kooremapper SKILL.md), 다앱 흉내 다섯(HWAXPortal docs/mcp-modernize/audit/discovery.md 2.2). 고칠 때는 앱의 입구 · 길 안내가 정본이다 — 어긋나면 앱 쪽이 맞다."
+    ],
+  "version": 1,
+  "apps": {
+    "reportarchive": {"entry": "get_guide", "why": "작업 전에 부른다 — '하려는 일 → 도구' 표와 기본 습관(서버가 최신본을 쥔다, R3)"},
+    "ste": {"entry": "list_apps", "why": "실행 가능한 솔버와 쓸 수 있는지(R3)"},
+    "heax-laminate_analyzer_mcp": {"entry": "analyze_laminate", "why": "적층안을 처음 볼 때(처음이면 get_reference_cases 의 예시 꼴을 따른다, R2)"},
+    "mx-white-paper": {"entry": "search_documents", "why": "주제로 문서를 찾는 1차 진입점(위키 질문은 wiki_ask)"},
+    "heax-doc_forge": {"entry": "docforge_list_inputs", "why": "입력 상자에서 시작한다(R2)"},
+    "heax-kooremapper_mcp": {"entry": "list_operations", "why": "오퍼레이션 이름 · 인자를 추측하지 않는다 — 여기서 고른다(리포트는 report_facets)"},
+    "heax-step_forge": {"entry": "what_next", "why": "판을 받아 놓고 어디서 시작할지 모를 때 · 도구가 거절하거나 빈 응답일 때"},
+    "smart-twin-mcp": {"entry": "smarttwin_capabilities", "why": "어떤 도구를 쓸지 모를 때 먼저 — 전처리 · 후처리 기능과 도구 이름"},
+    "ai-data-hub": {"entry": "discover", "why": "처음이면 허브 규모부터(compact)"},
+    "signalforge": {"entry": "resolve_product_keyword", "why": "제품을 묻는 질문은 코드부터 확정한다(표기마다 결과가 흔들린다)"},
+    "heax-materialtwin_web": {"entry": "list_property_definitions", "why": "물성 key 를 먼저 얻는다"},
+    "heax-thermal_shock_mcp": {"entry": "get_model_info", "why": "활성 모델 · 피처 범위부터"},
+    "heax-hwax_risk": {"entry": "risk_next_step", "why": "단계 · 막힌 곳 · 다음 도구를 한 번에(서버 지침 11번)"},
+    "hwax-deliberation": {"entry": "deliberate_jobs", "why": "심의 종류 · 대기열부터"},
+    "heax-web_research_mcp": {"entry": "describe_search_status", "why": "켜진 소스부터(꺼진 소스는 결과가 비는 까닭)"},
+    "heax-paper_ingest": {"entry": "inbox_status", "why": "대기 건수와 게이트 준비부터"},
+    "heax-web_design_agents": {"entry": "meeting_personas", "why": "회의에 넣을 페르소나 id 부터(보고서 → 발표자료는 RA 보고서의 '발표자료로' 단추가 먼저)"},
+    "rootdesigndatahub": {"entry": "object_resolve", "why": "이름 · 코드를 정본 개체로 먼저 푼다"},
+    "odb-hub": {"entry": "list_jobs", "why": "대상 설계(보드)를 목록에서 먼저 특정한다"},
+    "arp": {"entry": "search_data", "why": "대상 데이터를 먼저 찾는다"}
+  },
+  "purposes": {
+    "drop-prep": {
+      "title": "낙하 해석 준비",
+      "summary": "StepForge 과제의 CAD 를 위생 점검하고 재질 · 메시 · 덱을 갖춘 뒤 SmartTwin 으로 낙하 해석을 낸다. 앞 단계를 건너뛰면 덱이 LS-DYNA 에서 멈추거나 셀 수가 폭증한다.",
+      "triggers": ["낙하 해석 준비", "낙하해석 준비", "낙하 준비", "낙하 해석 돌리", "낙하 해석 걸", "낙하 시뮬 준비", "step 낙하 해석", "낙하 해석 셋업", "전각도 낙하 준비"],
+      "entry": ["heax-step_forge", "list_projects"],
+      "steps": [
+        {"backend": "heax-step_forge", "tool": "list_projects", "why": "과제부터 특정한다 — 이름 · 코드로 찾고 진행 카운트(어디까지 왔나)를 본다"},
+        {"backend": "heax-step_forge", "tool": "what_next", "why": "이 판에서 지금 부를 것과 아직인 것을 가린다(선행 잡이 없으면 다음 도구가 거절한다)"},
+        {"backend": "heax-step_forge", "tool": "inspect_report", "why": "메시를 굽기 전에 침투 · 단위 의심 · 고아 파트를 본다"},
+        {"backend": "heax-step_forge", "tool": "geometry_health", "why": "굽기 전에 실패 · 셀 폭증 원인(자유곡면 · 짧은 엣지 · 슬리버)을 형상에서 읽는다"},
+        {"backend": "heax-step_forge", "tool": "drop_check", "why": "정밀 해석 전에 어느 낙하 방향이 가혹한지 · 무엇이 먼저 닿는지 고른다(해석을 대체하지 않는다)"},
+        {"backend": "heax-step_forge", "tool": "resolve_materials", "why": "파트 재질이 덱에서 어떤 카드가 될지 미리 본다"},
+        {"backend": "heax-materialtwin_web", "tool": "export_dyna_cards", "why": "덱에 빠진 재료가 있으면 MaterialTwin 에서 LS-DYNA 재료 카드를 낸다"},
+        {"backend": "heax-step_forge", "tool": "job_params_guide", "why": "run_job 에 줄 수 있는 키를 확인한다(모르는 키는 거절된다)"},
+        {"backend": "heax-step_forge", "tool": "mesh_forecast", "why": "굽기 전에 셀 수 예산을 센다"},
+        {"backend": "heax-step_forge", "tool": "run_job", "why": "메시 · 덱 잡을 건다 — 무거운 쓰기라 범위를 사람에게 확인한 뒤"},
+        {"backend": "heax-step_forge", "tool": "job_status", "why": "잡 진행을 본다(잃은 id 는 list_jobs)"},
+        {"backend": "heax-step_forge", "tool": "check_deck", "why": "덱이 LS-DYNA 에 들어가는지(SECID · MID 참조 · 빠진 절점) 검사한다"},
+        {"backend": "heax-step_forge", "tool": "contact_preview", "why": "규칙이 어떤 접촉 카드를 낼지 본다"},
+        {"backend": "smart-twin-mcp", "tool": "fullangle_drop_simulation", "why": "전각도 낙하를 낸다 — dry_run 으로 먼저 보이고 사람이 확인하면 제출"},
+        {"backend": "smart-twin-mcp", "tool": "single_drop_simulation", "why": "한 방향 낙하를 낸다(roll · pitch · yaw) — 제출은 확인 뒤"},
+        {"backend": "smart-twin-mcp", "tool": "list_recent_jobs", "why": "제출한 잡이 레지스트리에 올랐는지 본다"},
+        {"backend": "smart-twin-cluster", "tool": "smarttwin_scenario_options", "why": "클러스터 시나리오의 키 · 단위 · 기본값 · 각도 프리셋을 본다(그 앱이 붙은 박스)"},
+        {"backend": "smart-twin-cluster", "tool": "smarttwin_submit", "why": "클러스터에 낙하 시나리오를 낸다 — dry_run 먼저 · 제출은 확인 뒤(그 앱이 붙은 박스)"}
+      ],
+      "confirm_writes": [["heax-step_forge", "run_job"], ["smart-twin-mcp", "fullangle_drop_simulation"], ["smart-twin-mcp", "single_drop_simulation"], ["smart-twin-cluster", "smarttwin_submit"]],
+      "samples": ["STEP 파일로 낙하 해석 돌리려면 뭐부터 해야 해?", "이 과제 낙하 해석 준비해 줘", "DV2 판으로 전각도 낙하 걸기 전에 점검할 것 알려줘"],
+      "apps": ["heax-step_forge", "heax-materialtwin_web", "smart-twin-mcp", "smart-twin-cluster"],
+      "source": "다앱 흉내(audit/discovery.md 2.2 낙하 해석 준비) · HE he-cad-stepforge workflow · he-sim-smarttwin"
+    },
+    "drop-result": {
+      "title": "낙하 결과 분석",
+      "summary": "SmartTwin 이 만든 낙하 · 충격 리포트를 DynaForge 에 들이고, 무엇이 있는지 훑은 뒤 최악 방향 · 파트 위험 · 리비전 비교로 좁힌다.",
+      "triggers": ["낙하 결과", "낙하 리포트", "충격 리포트", "최악 방향", "최악 각도", "파트 위험", "낙하 해석 결과", "전각도 결과"],
+      "entry": ["heax-kooremapper_mcp", "report_facets"],
+      "steps": [
+        {"backend": "smart-twin-mcp", "tool": "get_job_details", "why": "끝난 SmartTwin 잡의 출력 폴더 · 리포트 파일이 있는지 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_upload_instructions", "why": "큰 리포트(수백 MB)는 MCP 가 아니라 REST intake 로 올린다 — 그 명령을 받는다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "ingest_report", "why": "작은 리포트 HTML 을 들인다(쓰기 — 확인 뒤)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_facets", "why": "어떤 과제 · 방향 컨셉 · 심각도 · 높이의 리포트가 있는지 먼저 훑는다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "find_reports", "why": "목표에 맞는 리포트를 서버 필터로 특정한다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_summary", "why": "kind · 전역 최악값 · findings 를 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_worst_cases", "why": "최악 방향(sphere) · 최악 위치(impact)를 고른다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_part_risk", "why": "어느 파트가 어느 방향에서 위험한지 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_findings", "why": "소견을 심각도로 거른다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_angle_stats", "why": "방향 범주 · 각도 근처 통계로 민감도를 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_hotspots", "why": "공간 핫스팟 군집(어디가 뜨거운가)을 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_image", "why": "결과 그림을 직접 본다(번들로 들인 리포트만)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "compare_reports", "why": "조건 · 리비전 사이 파트별 최악값을 나란히 견준다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "recipe_search", "why": "새 분석 코드를 쓰기 전에 쌓인 레시피가 있는지 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "publish_report_to_datahub", "why": "구조화 요약을 AI 데이터 허브에 올린다(쓰기 — 확인 뒤)"}
+      ],
+      "confirm_writes": [["heax-kooremapper_mcp", "ingest_report"], ["heax-kooremapper_mcp", "publish_report_to_datahub"]],
+      "samples": ["최근 전각도 낙하 리포트에서 최악 방향 5개 알려줘", "배터리 파트가 가장 위험한 낙하 각도는?", "DV1 과 DV2 리포트 파트별 최악 응력 비교해줘"],
+      "apps": ["smart-twin-mcp", "heax-kooremapper_mcp"],
+      "source": "KooRemapper skill/kooremapper SKILL.md 「낙하/충격 리포트 분석」 · HE he-sim-dynaforge"
+    },
+    "design-risk-review": {
+      "title": "설계 리스크 심사",
+      "summary": "리스크 앱 과제의 단계와 막힌 곳을 보고, 변경 · 선례를 살핀 뒤 심사 잡을 열고, 쟁점 · 종합 보고서를 읽는다. 단면이 필요하면 리스크 항목 자리로 StepForge 짝 단면을 그린다.",
+      "triggers": ["설계 리스크", "리스크 심사", "위험 심사", "변경 심사", "리스크 검토", "설계 변경 위험", "risk review"],
+      "entry": ["heax-hwax_risk", "risk_next_step"],
+      "steps": [
+        {"backend": "heax-hwax_risk", "tool": "risk_next_step", "why": "과제가 어느 단계인지 · 무엇이 막혔는지 · 다음에 부를 도구와 인자를 한 번에 받는다(이것부터)"},
+        {"backend": "heax-hwax_risk", "tool": "risk_list_projects", "why": "볼 수 있는 심사 과제와 target_key 를 얻는다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_find_projects_by_subject", "why": "과제 주제(SP 과제 key · 차수)로 리스크 과제를 찾는다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_get_coverage", "why": "도메인별 진행 · 미착석 · 잡 상태를 본다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_get_diff", "why": "변경 요약(summary)부터 본다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_get_precedents", "why": "같은 변경이 전에도 문제였나(선례)를 본다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_similar_projects", "why": "비슷한 과제를 경로별로 본다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_find_ecad_boards", "why": "ECAD 보드를 심사에 실을 때 고를 후보를 본다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_open_target", "why": "무엇을 어느 방식으로 심사할지 확인받고 심사 대상을 연다(쓰기)"},
+        {"backend": "heax-hwax_risk", "tool": "risk_start_job", "why": "범위와 비용(패널 수 · LLM 호출)을 확인받고 심사 잡을 시작한다(쓰기 · 기본 llm=glm)"},
+        {"backend": "heax-hwax_risk", "tool": "risk_get_issues", "why": "쟁점 목록(등급 · 결과)을 읽는다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_get_report", "why": "종합 보고서를 쪽으로 읽는다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_get_registry", "why": "등록부에서 심각도 높은 항목을 거른다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_locate_for_section", "why": "리스크 항목의 자리를 MCAD 점 · 단면 평면으로 바꾼다"},
+        {"backend": "heax-step_forge", "tool": "section_pair_view", "why": "그 자리에서 두 개정을 같은 평면으로 자른 짝 단면 그림을 낸다(그림 · 측정 파일을 남긴다)"}
+      ],
+      "confirm_writes": [["heax-hwax_risk", "risk_open_target"], ["heax-hwax_risk", "risk_start_job"]],
+      "samples": ["이 과제 설계 리스크 심사 어디까지 됐어?", "최근 변경 diff 요약하고 선례 있나 봐줘", "리스크 항목 자리 단면 비교 그림 만들어줘"],
+      "apps": ["heax-hwax_risk", "heax-step_forge"],
+      "source": "다앱 흉내(audit/discovery.md 2.2 설계 리스크 심사 — 지침 11번 risk_next_step) · HE he-expert-risk · report-figures F2 → F1"
+    },
+    "material-find": {
+      "title": "재료 물성 찾기",
+      "summary": "물성 키를 먼저 얻고 조건으로 재료를 찾거나 재료의 값을 읽은 뒤, 비교표 · 측정 방법 · 해석 카드로 잇는다. 정본 코어 물성 객체는 그 허브가 붙은 박스에서 함께 본다.",
+      "triggers": ["재료 물성", "물성 찾", "물성 값", "물성 비교", "재료 찾", "물성 조회", "영률", "열팽창", "흡습률", "재료 카드", "재질 물성"],
+      "entry": ["heax-materialtwin_web", "list_property_definitions"],
+      "steps": [
+        {"backend": "heax-materialtwin_web", "tool": "list_property_definitions", "why": "물성 key 를 먼저 얻는다(예 thermal.expansion_linear) — key 없이 찾으면 빗나간다"},
+        {"backend": "heax-materialtwin_web", "tool": "search_catalog_property", "why": "'이 조건을 만족하는 재료' — key 와 min · max 로 찾는다"},
+        {"backend": "heax-materialtwin_web", "tool": "find_materials_by_metadata", "why": "이름 · 제조사 · 분류로 재료를 찾는다"},
+        {"backend": "heax-materialtwin_web", "tool": "get_material", "why": "재료 하나의 요약 · 시험 · 피팅을 본다"},
+        {"backend": "heax-materialtwin_web", "tool": "get_material_properties", "why": "재료의 화 · 물리 물성값을 도메인으로 좁혀 읽는다(단위 · 조건 · 신뢰등급 · 출처)"},
+        {"backend": "heax-materialtwin_web", "tool": "compare_materials", "why": "여러 재료의 대표값 비교표를 만든다"},
+        {"backend": "heax-materialtwin_web", "tool": "how_to_measure", "why": "그 물성을 무슨 기법으로 재는지 본다"},
+        {"backend": "heax-materialtwin_web", "tool": "test_plan_for_material", "why": "빠진 물성을 확보할 시험(사내 · 외주)을 본다"},
+        {"backend": "heax-materialtwin_web", "tool": "export_dyna_cards", "why": "해석에 쓸 LS-DYNA 재료 카드를 낸다"},
+        {"backend": "heax-step_forge", "tool": "material_lookup", "why": "StepForge 덱에 어떤 카드가 들어갈지 재질 이름 하나로 본다"},
+        {"backend": "_gateway", "tool": "gas_transport_lookup", "why": "층 재료의 가스 투과 물성(D · S · P)을 기체별로 한 번에 받는다"},
+        {"backend": "rootdesigndatahub", "tool": "object_resolve", "why": "정본 코어 물성 객체를 이름 · 코드로 푼다(그 허브가 붙은 박스)"}
+      ],
+      "confirm_writes": [],
+      "samples": ["흡습률 0.1% 이하 폴리머 재료 찾아줘", "APEL 5014CL 이랑 Kapton 물성 비교표 만들어줘", "알루미늄 영률 알려줘", "이 재료 5종 LS-DYNA 카드로 뽑아줘"],
+      "apps": ["heax-materialtwin_web", "heax-step_forge", "rootdesigndatahub"],
+      "source": "다앱 흉내(audit/discovery.md 2.2 재료 물성 찾기) · HE he-calc-materialtwin"
+    },
+    "quality-root-cause": {
+      "title": "품질 불량 원인 규명",
+      "summary": "VOC 의 결함 프로파일 · 원문 근거로 현상을 굳히고, 사내 지식카드와 앞선 인사이트를 모은 뒤 원인 규명 심의(diagnosis)로 수렴한다.",
+      "triggers": ["원인 규명", "불량 원인", "결함 원인", "고장 원인", "원인 분석", "root cause", "왜 불량", "불량 분석"],
+      "entry": ["signalforge", "defect_profile"],
+      "steps": [
+        {"backend": "signalforge", "tool": "resolve_product_keyword", "why": "제품명을 제품 코드로 먼저 확정한다(표기마다 결과가 흔들린다)"},
+        {"backend": "signalforge", "tool": "defect_profile", "why": "제품 · 부품 · 증상별 결함 프로파일(삼중항 집계)을 본다"},
+        {"backend": "signalforge", "tool": "defect_onset", "why": "결함이 언제 시작됐는지 본다"},
+        {"backend": "signalforge", "tool": "defect_evidence", "why": "실제 사용자 발언(직접 겪은 증상) 원문을 근거로 모은다"},
+        {"backend": "ai-data-hub", "tool": "recommend_agents", "why": "질문에 맞는 전문가(에이전트)를 고른다"},
+        {"backend": "ai-data-hub", "tool": "agent_search", "why": "고른 전문가의 사내 지식카드를 찾는다"},
+        {"backend": "_gateway", "tool": "insight_find", "why": "같은 과제 · 차수의 앞선 심의 인사이트가 있는지 본다"},
+        {"backend": "hwax-deliberation", "tool": "deliberate_jobs", "why": "심의 종류와 지금 대기열을 본다(원인 불명은 diagnosis)"},
+        {"backend": "hwax-deliberation", "tool": "deliberate_start", "why": "원인 규명 심의를 서버 엔진으로 맡긴다(쓰기 — 확인 뒤, job_id 를 바로 받는다)"},
+        {"backend": "hwax-deliberation", "tool": "deliberate_status", "why": "진행을 한 번 본다(wait_s 가 있으면 그것으로 기다린다)"},
+        {"backend": "hwax-deliberation", "tool": "deliberate_result", "why": "결정문을 view=summary 로 먼저 받는다"}
+      ],
+      "confirm_writes": [["hwax-deliberation", "deliberate_start"]],
+      "samples": ["폴드 힌지 먼지 유입 불량 원인 규명해줘", "이 결함이 왜 생겼는지 VOC 랑 지식카드로 원인 분석 심의 열어줘"],
+      "apps": ["signalforge", "ai-data-hub", "hwax-deliberation"],
+      "source": "audit/discovery.md 4.2 · 2.2 VOC 분석 · HE he-data-signalforge · he-expert-deliberation"
+    },
+    "knowledge-search": {
+      "title": "사내 지식 찾기",
+      "summary": "사내 문서 · 지식카드 · 보고서 · 위키를 뜻과 낱말로 찾는다. 앱마다 담은 것이 다르다 — 지식카드는 AI 데이터 허브, 보고서는 Report Archive, 백서 · 위키는 MX 백서, 수집해 둔 웹 문서는 웹 리서치다.",
+      "triggers": ["사내 문서 찾", "사내 지식", "지식카드 찾", "지식 카드 찾", "관련 문서 찾", "사내 자료 찾", "문서 검색", "자료 검색", "지식 검색"],
+      "entry": ["ai-data-hub", "hybrid_search"],
+      "steps": [
+        {"backend": "ai-data-hub", "tool": "hybrid_search", "why": "뜻과 낱말을 함께 찾는다(약어 · 모델 코드가 섞인 질의에 강하다)"},
+        {"backend": "ai-data-hub", "tool": "agent_search", "why": "전문가 지식카드 안에서 찾는다(점수 미달이면 refused)"},
+        {"backend": "ai-data-hub", "tool": "list_records", "why": "조건(팀 · 문서 종류 · 태그 · 해)으로 나열한다"},
+        {"backend": "ai-data-hub", "tool": "get_record_sections", "why": "찾은 레코드의 본문을 절로 읽는다"},
+        {"backend": "reportarchive", "tool": "search_reports", "why": "보고서 본문을 찾는다(최대 25건 · snippet)"},
+        {"backend": "reportarchive", "tool": "get_reports_digest", "why": "찾은 보고서 여럿을 한 번에 줄여 읽는다"},
+        {"backend": "mx-white-paper", "tool": "wiki_ask", "why": "위키에 묻는다 — 근거 각주가 붙은 답(없으면 '아직 없다')"},
+        {"backend": "mx-white-paper", "tool": "search_documents", "why": "백서 문서를 주제로 찾는다"},
+        {"backend": "heax-web_research_mcp", "tool": "search_internal", "why": "이미 수집해 둔 웹 · 논문 문서를 찾는다(바깥으로 안 나간다)"}
+      ],
+      "confirm_writes": [],
+      "samples": ["배터리 스웰링 관련 사내 문서 찾아줘", "힌지 먼지 유입 관련 지식카드 찾아줘", "이 주제로 사내에 정리된 자료 있어?"],
+      "apps": ["ai-data-hub", "reportarchive", "mx-white-paper", "heax-web_research_mcp"],
+      "source": "audit/discovery.md 4.2 문서 · 지식 검색(경쟁 4앱) · HE he-data-aidatahub · he-doc-mxwhitepaper"
+    },
+    "drop-report": {
+      "title": "낙하 결과로 보고서 쓰기",
+      "summary": "DynaForge 낙하 리포트의 숫자를 묶음으로 짓고 그림을 모아 Report Archive 초안을 만든 뒤 점검 · 게시한다. 숫자는 손으로 옮기지 않는다(묶음의 source_path 로 거슬러 간다).",
+      "triggers": ["낙하 보고서", "낙하 결과 보고서", "해석 결과 보고서", "리포트로 보고서", "결과 보고서 써", "낙하 리포트 보고서"],
+      "entry": ["heax-kooremapper_mcp", "find_reports"],
+      "steps": [
+        {"backend": "heax-kooremapper_mcp", "tool": "find_reports", "why": "보고서에 쓸 리포트를 특정한다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_summary", "why": "전역 최악값 · findings 를 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_worst_cases", "why": "보고서의 핵심 방향 · 위치를 고른다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "build_report_bundle", "why": "표 · 그림 재료를 묶음으로 짓는다(쓰기 — 숫자마다 출처 경로)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_image", "why": "결과 그림을 받는다 — 게이트웨이가 그림을 보관한다"},
+        {"backend": "_gateway", "tool": "figure_list", "why": "보관한 그림의 ref 를 본다"},
+        {"backend": "reportarchive", "tool": "get_guide", "why": "RA 보고서 쓰기 규칙(topic=write)을 받는다"},
+        {"backend": "reportarchive", "tool": "create_report_draft", "why": "초안을 만든다(dry_run 먼저)"},
+        {"backend": "_gateway", "tool": "figure_to_report", "why": "그림을 그 사람 명의로 보고서에 넣는다(쓰기)"},
+        {"backend": "reportarchive", "tool": "get_report_outline", "why": "빈 블록 · 깨진 파일을 점검한다"},
+        {"backend": "reportarchive", "tool": "preview_publish", "why": "게시판 · 볼 사람 수를 미리 본다"},
+        {"backend": "reportarchive", "tool": "publish_report", "why": "사람이 확인한 confirm_token 으로만 게시한다(쓰기)"}
+      ],
+      "confirm_writes": [["heax-kooremapper_mcp", "build_report_bundle"], ["reportarchive", "create_report_draft"], ["_gateway", "figure_to_report"], ["reportarchive", "publish_report"]],
+      "samples": ["전각도 낙하 리포트로 보고서 초안 써줘", "이 낙하 결과 그림이랑 최악값 표로 RA 보고서 만들어줘"],
+      "apps": ["heax-kooremapper_mcp", "reportarchive"],
+      "source": "KooRemapper SKILL.md(build_report_bundle) · RA R2 ② · 게이트웨이 그림 보관(report-figures)"
+    },
+    "expert-consult": {
+      "title": "전문가 고르고 묻기",
+      "summary": "조직도에서 전문가를 고르고 그 역할 · 입구 도구 · 지식카드로 답한다. 주 전문가 하나에 보조 넷까지 — 관점이 갈리면 '이견' 으로 밝힌다.",
+      "triggers": ["전문가 고르", "전문가 찾", "누구한테 물", "전문가 추천", "조직도", "전문가에게 물"],
+      "entry": ["_gateway", "browse_experts"],
+      "steps": [
+        {"backend": "_gateway", "tool": "browse_experts", "why": "조직도(분류 → 분야 → 사람)를 훑거나 이름으로 찾는다"},
+        {"backend": "ai-data-hub", "tool": "recommend_agents", "why": "질문 글로 맞는 전문가를 순위로 받는다"},
+        {"backend": "_gateway", "tool": "use_experts", "why": "고른 전문가의 역할 문서 · 운영 앱 · 입구 도구를 받는다(첫 명이 주 전문가)"},
+        {"backend": "ai-data-hub", "tool": "get_agent_session", "why": "그 전문가의 페르소나 · 검색 설정을 받는다"},
+        {"backend": "ai-data-hub", "tool": "agent_search", "why": "그 전문가의 지식카드로 근거를 찾는다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["이 문제 누구한테 물어보면 돼?", "힌지 설계 전문가 추천해줘", "열 해석 전문가로 답해줘"],
+      "apps": ["ai-data-hub"],
+      "source": "게이트웨이 browse_experts · use_experts · HE he-data-aidatahub"
+    },
+    "ste-condensation": {
+      "title": "StepForge 형상으로 ste 결로 · 레디쉬 해석",
+      "summary": "StepForge 파트 산출물을 서버끼리 ste 업로드로 옮기고, 층 재료의 가스 투과 물성과 신뢰성 시험 조건을 받아 ste 앱 스키마대로 잡을 낸다.",
+      "triggers": ["결로 해석", "레디쉬", "reddish", "결로", "가스 투과 해석", "투습 해석", "ste 결로"],
+      "entry": ["ste", "list_apps"],
+      "steps": [
+        {"backend": "ste", "tool": "list_apps", "why": "실행 가능한 솔버(앱)와 쓸 수 있는지를 본다"},
+        {"backend": "ste", "tool": "get_app_schema", "why": "앱의 입력 파일 패턴 · 파라미터 스키마를 제출 전에 본다"},
+        {"backend": "heax-step_forge", "tool": "export_part_step", "why": "파트 하나를 STEP 산출물로 낸다(쓰기 — 산출물을 남긴다)"},
+        {"backend": "heax-step_forge", "tool": "list_artifacts", "why": "산출물 kind · ref 를 확인한다"},
+        {"backend": "_gateway", "tool": "artifact_to_ste_upload", "why": "산출물을 그 사람의 ste 업로드로 서버끼리 옮겨 upload_id 를 받는다(쓰기)"},
+        {"backend": "_gateway", "tool": "gas_transport_lookup", "why": "층 재료의 확산계수 · 용해도 · 투과도를 받는다"},
+        {"backend": "_gateway", "tool": "reliability_test_conditions", "why": "TestScope 시험 조건(온도 · 습도 · 시간)을 해석 값으로 받는다"},
+        {"backend": "ste", "tool": "submit_job", "why": "upload_id 와 파라미터로 잡을 낸다(쓰기 — 확인 뒤)"},
+        {"backend": "ste", "tool": "get_job_status", "why": "잡 상태를 본다"},
+        {"backend": "ste", "tool": "ste_job_summary", "why": "판정과 핵심 숫자를 받는다"}
+      ],
+      "confirm_writes": [["heax-step_forge", "export_part_step"], ["_gateway", "artifact_to_ste_upload"], ["ste", "submit_job"]],
+      "samples": ["이 파트로 ste 결로 해석 돌려줘", "레디쉬 해석에 쓸 층 재료 투과도랑 시험 조건 모아줘"],
+      "apps": ["ste", "heax-step_forge"],
+      "source": "HWAXPortal docs/ste-stepforge-1117(레디쉬 · 결로 연계 — artifact_to_ste_upload · gas_transport_lookup · reliability_test_conditions) · ste R2"
+    },
+    "figures-to-report": {
+      "title": "도구 그림을 보고서 · 문서로",
+      "summary": "도구 결과의 그림은 게이트웨이가 fig_… 로 7일 둔다. 목록에서 골라 Report Archive 보고서나 MX 백서 섹션에 그 사람 명의로 넣거나, PC 로 받아 docx 로 묶는다.",
+      "triggers": ["그림 보고서", "그림 넣", "그림을 보고서", "그림 문서", "그림 붙", "이미지 보고서", "그림 받"],
+      "entry": ["_gateway", "figure_list"],
+      "steps": [
+        {"backend": "_gateway", "tool": "figure_list", "why": "내 최근 그림의 ref · 도구 · 형식을 본다"},
+        {"backend": "_gateway", "tool": "figure_get", "why": "그림 하나를 PC 로 받는 주소(1시간)를 받는다"},
+        {"backend": "reportarchive", "tool": "get_report_outline", "why": "넣을 보고서의 쪽 · 블록을 본다"},
+        {"backend": "_gateway", "tool": "figure_to_report", "why": "그림을 RA 보고서에 넣는다(쓰기 — 내가 고칠 수 있는 보고서만)"},
+        {"backend": "mx-white-paper", "tool": "get_document_outline", "why": "넣을 백서 문서의 섹션 id 를 본다"},
+        {"backend": "_gateway", "tool": "figure_to_doc", "why": "그림을 MX 백서 섹션에 그림 블록으로 넣는다(쓰기)"},
+        {"backend": "_gateway", "tool": "kit_get", "why": "보고서 md → Word 변환기(표 칸 그림 포함)를 PC 로 받는다"}
+      ],
+      "confirm_writes": [["_gateway", "figure_to_report"], ["_gateway", "figure_to_doc"]],
+      "samples": ["방금 그린 단면 그림 보고서에 넣어줘", "이 그림들 백서 문서 3장에 붙여줘"],
+      "apps": ["reportarchive", "mx-white-paper"],
+      "source": "HWAXPortal docs/report-figures(그림 보관 · figure_to_report · figure_to_doc · kit_get)"
+    },
+    "core-object-lookup": {
+      "title": "코어 정본 객체 조회",
+      "summary": "과제 · 개발모델 · 고장모드 · 시험항목 · 관리 기준 같은 코어 개체를 정본 허브에서 먼저 푼다. 후보가 여럿이면 고르지 말고 묻는다. 다른 허브 · 앱으로 건널 때는 key 로 다시 푼다.",
+      "triggers": ["정본 조회", "코어 객체", "온톨로지 조회", "고장모드 찾", "시험항목 찾", "관리 기준", "과제 코드", "개발모델"],
+      "entry": ["_gateway", "ontology_lookup"],
+      "steps": [
+        {"backend": "_gateway", "tool": "ontology_lookup", "why": "이름 · 코드를 정본 개체로 풀고 앱마다 다음 호출을 받는다(exact 면 next 를 따른다)"},
+        {"backend": "rootdesigndatahub", "tool": "object_resolve", "why": "정본 허브에서 이름 · 코드를 푼다(candidates 면 묻는다)"},
+        {"backend": "rootdesigndatahub", "tool": "objects_list", "why": "개수는 목록을 세지 말고 total 로 답한다"},
+        {"backend": "rootdesigndatahub", "tool": "objects_summary", "why": "타입별 개수를 받는다"},
+        {"backend": "rootdesigndatahub", "tool": "graph_neighbors", "why": "무엇이 무엇과 이어졌는지 본다"},
+        {"backend": "rootdesigndatahub", "tool": "object_get", "why": "객체 하나의 칸을 읽는다"},
+        {"backend": "failuretrace", "tool": "object_resolve", "why": "불량 추적 허브에서 같은 객체를 key 로 다시 푼다"},
+        {"backend": "failuretrace", "tool": "graph_neighbors", "why": "이어진 불량을 본다"},
+        {"backend": "heax-step_forge", "tool": "find_plm_task", "why": "StepForge 에서 PLM 과제를 찾는다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "list_tasks", "why": "DynaForge 에서 과제를 찾는다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["이 부품 코드가 정본 허브에서 어떤 객체야?", "이 모델에 이어진 과제랑 불량 몇 건이야?", "이 과제명으로 FailureTrace 에 있는 불량 찾아줘"],
+      "apps": ["rootdesigndatahub", "failuretrace", "heax-step_forge", "heax-kooremapper_mcp"],
+      "source": "HE he-data-coreontology · core_vocab ontology(정본 · 형제 허브) · 게이트웨이 ontology_lookup(docs/ontology-first OL-1)"
+    },
+    "project-history": {
+      "title": "과제의 앞선 심의 · 인사이트 찾기",
+      "summary": "같은 과제 · 차수에서 앞서 내린 심의 결정 카드와 리스크 심사 · 보고서를 모아 이번 일의 출발점으로 삼는다. 앞선 인사이트는 검증 대상이지 독립 근거가 아니다.",
+      "triggers": ["과제 인사이트", "앞선 심의", "이전 심의", "지난 심의 결과", "과제 이력", "예전 결정"],
+      "entry": ["_gateway", "insight_find"],
+      "steps": [
+        {"backend": "_gateway", "tool": "insight_find", "why": "과제(SP 허브 key) · 차수로 앞선 결정 카드를 찾는다"},
+        {"backend": "_gateway", "tool": "insight_get", "why": "카드 하나의 주장 · 표결 · 근거 표지 · 낡음 표지를 읽는다"},
+        {"backend": "hwax-deliberation", "tool": "deliberate_list", "why": "내 심의 목록에서 그 일을 찾는다"},
+        {"backend": "hwax-deliberation", "tool": "deliberate_result", "why": "결정문을 view=summary 로 읽는다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_find_projects_by_subject", "why": "같은 과제의 리스크 심사 과제를 찾는다"},
+        {"backend": "reportarchive", "tool": "search_reports", "why": "그 과제의 보고서를 찾는다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["이 과제 예전에 심의한 거 있어?", "지난 심의 결과 다시 보여줘"],
+      "apps": ["hwax-deliberation", "heax-hwax_risk", "reportarchive"],
+      "source": "HWAXPortal docs/project-insight-graph(insight_find · insight_get) · HE he-expert-deliberation"
+    },
+    "risk-panel-submit": {
+      "title": "심의 결과를 리스크 원장에 제출",
+      "summary": "리스크 패널 브리프의 근거로 돈 HWAX 심의의 결정문 · 좌석 발언을 리스크 원장에 제출하고 finding 을 넣는다. taxonomy 의 허용값만 쓴다(추측한 값은 422).",
+      "triggers": ["패널 제출", "원장에 제출", "심의 결과 제출", "finding 넣", "리스크 원장"],
+      "entry": ["heax-hwax_risk", "risk_get_brief"],
+      "steps": [
+        {"backend": "heax-hwax_risk", "tool": "risk_get_brief", "why": "브리프 토큰으로 패널 근거(E0 ~ E9)를 받는다"},
+        {"backend": "hwax-deliberation", "tool": "deliberate_transcript", "why": "좌석 발언을 full=true 로 받는다(화면용 글은 뒤쪽 인용이 빠진다)"},
+        {"backend": "heax-hwax_risk", "tool": "risk_taxonomy", "why": "finding 의 허용값을 확인한다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_submit_panel_result", "why": "결정문 · 좌석 발언을 패널 결과로 낸다(쓰기 — 확인 뒤)"},
+        {"backend": "heax-hwax_risk", "tool": "risk_add_finding", "why": "finding 을 더한다(쓰기 — 확인 뒤)"}
+      ],
+      "confirm_writes": [["heax-hwax_risk", "risk_submit_panel_result"], ["heax-hwax_risk", "risk_add_finding"]],
+      "samples": ["지난 심의 결과를 이 패널에 제출해줘"],
+      "apps": ["heax-hwax_risk", "hwax-deliberation"],
+      "source": "HE he-expert-risk workflow · 스킬 hwax-risk-review"
+    },
+    "cad-project-status": {
+      "title": "CAD 과제 찾기 · 진행 보기",
+      "summary": "StepForge 과제를 이름 · 코드로 찾고, 어디까지 왔는지와 지금 부를 수 있는 도구 · 걸린 잡을 본다.",
+      "triggers": ["과제 진행", "어디까지 진행", "과제 찾", "cad 과제", "stepforge 과제", "파트 몇 개"],
+      "entry": ["heax-step_forge", "list_projects"],
+      "steps": [
+        {"backend": "heax-step_forge", "tool": "list_projects", "why": "과제를 이름 · 코드 · 목적으로 찾고 진행 카운트를 본다"},
+        {"backend": "heax-step_forge", "tool": "resolve_project", "why": "id · 이름 · 코드가 어느 과제로 풀리는지와 사본 단계를 본다"},
+        {"backend": "heax-step_forge", "tool": "get_project_meta", "why": "과제 정보 · 진행 현황을 읽는다"},
+        {"backend": "heax-step_forge", "tool": "what_next", "why": "이 단계에서 부를 것과 아직인 것을 본다"},
+        {"backend": "heax-step_forge", "tool": "project_tree", "why": "어셈블리 하이라키를 처음 파악한다(parse 뒤)"},
+        {"backend": "heax-step_forge", "tool": "list_jobs", "why": "걸린 잡과 잃은 job_id 를 찾는다"},
+        {"backend": "heax-step_forge", "tool": "job_status", "why": "잡 진행을 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["DV2 낙하해석 과제 파트 몇 개고 어디까지 진행됐어?", "이 과제 지금 뭐부터 하면 돼?"],
+      "apps": ["heax-step_forge"],
+      "source": "HE he-cad-stepforge workflow · key_tools"
+    },
+    "cad-upload": {
+      "title": "CAD 파일 올리기 · 반입",
+      "summary": "PC 의 STEP 은 MCP 로 나르지 않는다 — upload_instructions 가 그 자리의 방법을 준다. 서버 경로의 STEP · zip 은 intake 로 한 번에 반입한다.",
+      "triggers": ["step 올리", "cad 올리", "파일 업로드", "step 업로드", "cad 반입", "stp 올리"],
+      "entry": ["heax-step_forge", "upload_instructions"],
+      "steps": [
+        {"backend": "heax-step_forge", "tool": "upload_instructions", "why": "PC 파일을 올리는 방법(포털 · REST)을 받는다"},
+        {"backend": "heax-step_forge", "tool": "intake", "why": "서버 · 공유 경로의 STEP · zip 을 과제 만들기부터 잡까지 한 번에 반입한다(쓰기)"},
+        {"backend": "heax-step_forge", "tool": "upload_step", "why": "서버 경로 STEP 을 기존 과제에 등록한다(쓰기)"},
+        {"backend": "heax-step_forge", "tool": "job_status", "why": "반입 잡 진행을 본다"},
+        {"backend": "heax-step_forge", "tool": "what_next", "why": "반입 뒤 무엇을 부를지 본다"}
+      ],
+      "confirm_writes": [["heax-step_forge", "intake"], ["heax-step_forge", "upload_step"]],
+      "samples": ["PC 에 있는 STEP 파일 어떻게 올려?", "공유 폴더 STEP 으로 새 과제 만들어줘"],
+      "apps": ["heax-step_forge"],
+      "source": "HE he-cad-stepforge(upload_instructions · intake)"
+    },
+    "cad-geometry-hygiene": {
+      "title": "CAD 형상 위생 점검",
+      "summary": "처음 받은 판은 메시를 굽기 전에 침투 · 단위 · 이름 불일치 · 조립 좌표 · 위상 결함을 본다. 형상이 틀리면 메시는 무의미하다.",
+      "triggers": ["형상 위생", "형상 점검", "cad 점검", "침투 검사", "단위 의심", "조립 확인", "형상 결함"],
+      "entry": ["heax-step_forge", "inspect_report"],
+      "steps": [
+        {"backend": "heax-step_forge", "tool": "inspect_report", "why": "침투 · 고아 파트 · 단위 불일치 · 빈 형상을 집계한다"},
+        {"backend": "heax-step_forge", "tool": "identify_parts", "why": "이름과 형상이 안 맞는 파트부터 낸다"},
+        {"backend": "heax-step_forge", "tool": "assembly_check", "why": "로컬 좌표로 내보낸 판인지 간섭 패턴으로 잡는다"},
+        {"backend": "heax-step_forge", "tool": "file_distances", "why": "다중 STEP 판의 파일 사이 거리를 본다"},
+        {"backend": "heax-step_forge", "tool": "geometry_health", "why": "위상 유효성 · 자유곡면 · 짧은 엣지 · 슬리버를 읽는다"},
+        {"backend": "heax-step_forge", "tool": "duplicate_shapes", "why": "겹쳐 놓인 같은 형상을 찾는다"},
+        {"backend": "heax-step_forge", "tool": "free_bodies", "why": "어디에도 안 붙은 떠 있는 바디를 찾는다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["이 판 처음 받았는데 형상 문제 있는지 봐줘", "STEP 단위가 이상한 파트 있어?"],
+      "apps": ["heax-step_forge"],
+      "source": "HE he-cad-stepforge workflow(inspect_report → identify_parts → assembly_check → file_distances → geometry_health)"
+    },
+    "cad-measure": {
+      "title": "치수 · 간극 재기",
+      "summary": "무엇을 잴지 헷갈리면 measurement_guide 를 먼저 본다 — 비슷한 값이 나와도 답하는 질문이 다르다. 스택업 층간 간극은 axis_gap, 방향 없는 최소거리는 measure_distance 다.",
+      "triggers": ["간극 재", "거리 재", "치수 재", "두께 재", "간격 재", "측정", "축방향 간극", "최소 거리"],
+      "entry": ["heax-step_forge", "measurement_guide"],
+      "steps": [
+        {"backend": "heax-step_forge", "tool": "measurement_guide", "why": "질문에 맞는 지표 · 도구 · 한계를 먼저 고른다"},
+        {"backend": "heax-step_forge", "tool": "find_parts", "why": "잴 파트를 이름 글롭 · 재질 · 태그로 찾는다"},
+        {"backend": "heax-step_forge", "tool": "part_info", "why": "파트의 형상 · 재질 · 관계를 본다(이름이 겹치면 후보만 준다)"},
+        {"backend": "heax-step_forge", "tool": "axis_gap", "why": "축 방향 층간 간극을 잰다"},
+        {"backend": "heax-step_forge", "tool": "measure_distance", "why": "방향 없는 최소 거리를 잰다"},
+        {"backend": "heax-step_forge", "tool": "clearance_field", "why": "간극 분포(장)를 본다"},
+        {"backend": "heax-step_forge", "tool": "thickness_report", "why": "두께 분포를 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["쉴드캔과 PCB 사이 축방향 간극 재 줘", "이 브래킷 최소 두께 얼마야?"],
+      "apps": ["heax-step_forge"],
+      "source": "HE he-cad-stepforge workflow(measurement_guide · axis_gap · measure_distance)"
+    },
+    "cad-mesh-deck": {
+      "title": "메시 · 덱 만들기",
+      "summary": "잡을 걸기 전에 받는 키와 셀 규모를 확인하고, 메시 · 덱 잡을 건 뒤 덱을 넘기기 전에 형식 · 재질 · 접촉을 검사한다.",
+      "triggers": ["메시 굽", "메시 만들", "덱 만들", "덱 검사", "셀 수", "메시 잡", "격자 크기", "k파일 만들"],
+      "entry": ["heax-step_forge", "job_params_guide"],
+      "steps": [
+        {"backend": "heax-step_forge", "tool": "job_params_guide", "why": "run_job 종류별 키 · 기본값 · 실패 모드를 본다"},
+        {"backend": "heax-step_forge", "tool": "mesh_forecast", "why": "셀 수 예산을 굽기 전에 센다"},
+        {"backend": "heax-step_forge", "tool": "mesh_size_advice", "why": "파트별 권장 격자 크기와 근거를 본다(기본은 읽기)"},
+        {"backend": "heax-step_forge", "tool": "run_job", "why": "메시 · 덱 잡을 건다(쓰기 — 범위 확인 뒤)"},
+        {"backend": "heax-step_forge", "tool": "job_status", "why": "진행을 본다"},
+        {"backend": "heax-step_forge", "tool": "job_log", "why": "실패하면 로그를 본다"},
+        {"backend": "heax-step_forge", "tool": "mesh_report", "why": "메시 품질을 본다"},
+        {"backend": "heax-step_forge", "tool": "check_deck", "why": "덱이 LS-DYNA 에 들어가는지 검사한다"},
+        {"backend": "heax-step_forge", "tool": "resolve_materials", "why": "덱 재질을 확인한다"},
+        {"backend": "heax-step_forge", "tool": "contact_preview", "why": "접촉 카드를 미리 본다"}
+      ],
+      "confirm_writes": [["heax-step_forge", "run_job"]],
+      "samples": ["이 판 메시 굽기 전에 셀 수 얼마나 나올지 봐 줘", "덱이 LS-DYNA 에 들어가는지 검사해 줘"],
+      "apps": ["heax-step_forge"],
+      "source": "HE he-cad-stepforge workflow(job_params_guide · mesh_forecast · check_deck · resolve_materials · contact_preview)"
+    },
+    "cad-section": {
+      "title": "단면 · 적층 비교 그림",
+      "summary": "평면으로 잘라 층 · 간극 · 간섭을 한 장으로 보고, 두 개정을 같은 자리에서 자른 짝 단면이나 적층 견주기 그림을 낸다. 그림은 게이트웨이가 보관해 보고서로 넘길 수 있다.",
+      "triggers": ["단면", "짝 단면", "단면 그림", "단면 비교", "적층 비교", "스택업", "단면 지도"],
+      "entry": ["heax-step_forge", "section_atlas"],
+      "steps": [
+        {"backend": "heax-step_forge", "tool": "section_atlas", "why": "파싱 뒤 미리 그려 둔 단면 지도를 찾는다"},
+        {"backend": "heax-step_forge", "tool": "section_view", "why": "한 평면 단면 그림을 낸다"},
+        {"backend": "heax-step_forge", "tool": "section_pair_view", "why": "두 개정을 같은 자리에서 자른 짝 단면 한 장(그림 · 측정 파일을 남긴다)"},
+        {"backend": "heax-step_forge", "tool": "section_batch", "why": "여러 자리의 짝 단면을 한 잡으로 낸다"},
+        {"backend": "heax-step_forge", "tool": "section_batch_result", "why": "묶음 잡의 결과를 받는다"},
+        {"backend": "heax-step_forge", "tool": "stackup_profile", "why": "적층 단면의 층 두께를 읽는다"},
+        {"backend": "heax-step_forge", "tool": "stackup_figure", "why": "두 판의 적층 견주기 그림 한 장"},
+        {"backend": "_gateway", "tool": "figure_to_report", "why": "그림을 보고서에 넣는다(쓰기)"}
+      ],
+      "confirm_writes": [["heax-step_forge", "section_batch"], ["_gateway", "figure_to_report"]],
+      "samples": ["두 개정 같은 자리 단면 비교 그림 만들어줘", "이 판 적층 두께 비교해서 그림으로 보여줘"],
+      "apps": ["heax-step_forge"],
+      "source": "HWAXPortal docs/report-figures(F1 · F3 · F6 · a79 단면 지도)"
+    },
+    "cad-revision-compare": {
+      "title": "CAD 개정 비교",
+      "summary": "한 PLM 과제의 개정 줄을 보고, 두 개정 사이 무엇이 추가 · 삭제 · 이동 · 변형됐는지와 관심 부위 둘레의 변화를 읽는다.",
+      "triggers": ["개정 비교", "리비전 비교", "뭐가 바뀌", "변경점", "차이 비교", "판 비교"],
+      "entry": ["heax-step_forge", "revision_history"],
+      "steps": [
+        {"backend": "heax-step_forge", "tool": "revision_history", "why": "한 PLM 과제의 개정 줄과 이웃 개정끼리의 차이 수를 본다"},
+        {"backend": "heax-step_forge", "tool": "compare_revisions", "why": "두 개정의 추가 · 삭제 · 개명 · 이동 · 변형을 견준다"},
+        {"backend": "heax-step_forge", "tool": "what_changed_near", "why": "관심 파트 반경 안의 변화만 본다"},
+        {"backend": "heax-step_forge", "tool": "compare_assemblies", "why": "조립 구조를 견준다"},
+        {"backend": "heax-step_forge", "tool": "compare_part_shape", "why": "파트 형상 차이를 견준다"},
+        {"backend": "heax-step_forge", "tool": "explain_difference", "why": "차이의 뜻을 풀어 받는다"},
+        {"backend": "heax-step_forge", "tool": "carryover_report", "why": "이월(앞 판에서 그대로 온 것)을 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["DV1 이랑 DV2 사이 뭐가 바뀌었어?", "커넥터 주변 30mm 안에서 달라진 것 보여줘"],
+      "apps": ["heax-step_forge"],
+      "source": "StepForge 도구 설명(revision_history · compare_revisions · what_changed_near)"
+    },
+    "cad-ontology": {
+      "title": "StepForge 온톨로지 탐색",
+      "summary": "이름 · 식별자 · 별칭으로 허브 객체와 개정 · 파트 · 역할을 찾고, 객체 카드 · 이웃 · 경로로 따라간다. 판정이 필요하면 resolve 로 받는다.",
+      "triggers": ["stepforge 온톨로지", "cad 온톨로지", "온톨로지 객체", "객체 이웃", "온톨로지 경로"],
+      "entry": ["heax-step_forge", "onto_search"],
+      "steps": [
+        {"backend": "heax-step_forge", "tool": "onto_search", "why": "이름 · 식별자 · 별칭으로 찾는다(resolve=true 면 판정)"},
+        {"backend": "heax-step_forge", "tool": "onto_object", "why": "객체 하나의 카드 · 관계 · 키 이력을 본다"},
+        {"backend": "heax-step_forge", "tool": "onto_neighbors", "why": "이웃 객체를 본다"},
+        {"backend": "heax-step_forge", "tool": "onto_path", "why": "두 객체 사이 경로를 본다"},
+        {"backend": "heax-step_forge", "tool": "onto_query", "why": "주소로 이어진 값을 묻는다"},
+        {"backend": "heax-step_forge", "tool": "onto_overview", "why": "타입별 개수를 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["StepForge 온톨로지에서 이 후면 커버 객체 찾아줘", "이 파트가 어느 과제랑 이어져 있어?"],
+      "apps": ["heax-step_forge"],
+      "source": "core_vocab ontology(StepForge onto_search resolve — OF-5) · StepForge 도구 설명"
+    },
+    "cad-risk-screen": {
+      "title": "구조 위험 훑기",
+      "summary": "실패모드 사전을 돌려 이 설계에서 무엇을 봐야 하는지 가리킨다. 판정하지 않는다 — 값과 그 칸의 한계 · 의심 까닭을 낸다.",
+      "triggers": ["구조 위험", "실패모드", "실패 모드", "위험 훑", "취약부", "설계 위험 훑"],
+      "entry": ["heax-step_forge", "risk_screen"],
+      "steps": [
+        {"backend": "heax-step_forge", "tool": "risk_screen", "why": "실패모드 사전을 돌려 가리킨 칸의 값을 붙인다"},
+        {"backend": "heax-step_forge", "tool": "list_failure_modes", "why": "사전의 모드 · 지표 · 문턱을 본다"},
+        {"backend": "heax-step_forge", "tool": "slenderness_check", "why": "가는 형상을 본다"},
+        {"backend": "heax-step_forge", "tool": "stiffness_jump", "why": "강성이 급히 바뀌는 자리를 본다"},
+        {"backend": "heax-step_forge", "tool": "ligament_check", "why": "얇은 연결부(리거먼트)를 본다"},
+        {"backend": "heax-step_forge", "tool": "corner_proximity", "why": "모서리 근접을 본다"},
+        {"backend": "heax-step_forge", "tool": "rigid_body_check", "why": "강체 모드 · 떠 있는 부분을 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["이 모델 구조적으로 뭘 봐야 해?", "실패모드 사전 돌려서 취약한 곳 짚어줘"],
+      "apps": ["heax-step_forge"],
+      "source": "StepForge 도구 설명(risk_screen · PRD-07)"
+    },
+    "deck-preprocess": {
+      "title": "K파일 전처리 오퍼레이션",
+      "summary": "오퍼레이션 이름 · 인자를 추측하지 않는다 — 목록에서 고르고 args_schema 대로 세션의 파일에 적용한 뒤 산출물을 받는다. 인클루드가 빠지면 실행이 막힌다.",
+      "triggers": ["k파일", "kfile", "전처리 오퍼레이션", "재료카드 교체", "덱 전처리", "prestress", "매핑", "squeeze", "assemble"],
+      "entry": ["heax-kooremapper_mcp", "list_operations"],
+      "steps": [
+        {"backend": "heax-kooremapper_mcp", "tool": "list_operations", "why": "오퍼레이션 요약을 보고 고른다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "describe_operation", "why": "args_schema · 입출력 · 예제를 확인한다(args 는 이것을 따른다)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "list_sessions", "why": "기존 세션을 찾는다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "create_session", "why": "없으면 세션을 만든다(쓰기)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "upload_kfile", "why": "K파일을 올린다(쓰기 — 인클루드도 함께)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "list_session_files", "why": "파일 안의 노드 · 요소 · 파트 · 인클루드를 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "session_includes", "why": "빠진 인클루드를 본다(빠지면 run_operation 이 422)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "run_operation", "why": "오퍼레이션을 실행한다(쓰기 — 비동기)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "get_job", "why": "끝날 때까지 상태를 본다(실패면 include_logs)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "get_job_outputs", "why": "산출 file_id 를 확인한다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "download_result", "why": "산출물을 받는다"}
+      ],
+      "confirm_writes": [["heax-kooremapper_mcp", "create_session"], ["heax-kooremapper_mcp", "upload_kfile"], ["heax-kooremapper_mcp", "run_operation"]],
+      "samples": ["이 K파일 재료카드 교체하는 오퍼레이션 뭐 있어?", "bent 메시를 flat 메시로 매핑해줘"],
+      "apps": ["heax-kooremapper_mcp"],
+      "source": "KooRemapper SKILL.md 표준 워크플로 · HE he-sim-dynaforge"
+    },
+    "drop-campaign": {
+      "title": "낙하 캠페인 적재 · 분석",
+      "summary": "런이 수백 ~ 천 개인 묶음은 캠페인으로 받는다. 적재 상태 · 건강표로 유효 런을 맞춘 뒤 각도 · 피크 · 여유 · 구면 지도를 캠페인 도구로 본다.",
+      "triggers": ["캠페인", "캠페인 적재", "런 묶음", "각도 표", "구면 지도", "doe 캠페인"],
+      "entry": ["heax-kooremapper_mcp", "campaign_ingest_status"],
+      "steps": [
+        {"backend": "heax-kooremapper_mcp", "tool": "create_campaign", "why": "캠페인을 만든다(쓰기)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "ingest_campaign_manifest", "why": "런 목록(run_key · doe · pitch · roll)을 싣는다(쓰기)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_upload_instructions", "why": "런마다 REST intake 로 올리는 명령을 받는다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "campaign_ingest_status", "why": "listed = pending + received + skipped + rejected 를 맞춘다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "campaign_provenance", "why": "설정 세대 · 대체된 런 · 출처가 빈 런을 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "campaign_health_table", "why": "유효 n / 전체 N 과 판정을 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "campaign_angle_table", "why": "방향별 표를 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "campaign_angle_stats", "why": "방향 · 무리별 분포를 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "campaign_part_margin", "why": "기준값(set_campaign_criteria)으로 파트 여유를 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "campaign_sphere_map", "why": "구면 컨투어 그림을 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "compare_campaigns", "why": "리비전 캠페인을 공통 각도로 견준다"}
+      ],
+      "confirm_writes": [["heax-kooremapper_mcp", "create_campaign"], ["heax-kooremapper_mcp", "ingest_campaign_manifest"]],
+      "samples": ["전각도 낙하 런 500개 캠페인으로 올려줘", "이 캠페인 유효 런 몇 개고 방향별 피크 어때?"],
+      "apps": ["heax-kooremapper_mcp"],
+      "source": "KooRemapper SKILL.md(캠페인)"
+    },
+    "dyna-recipe": {
+      "title": "DynaForge 레시피로 분석 쌓기",
+      "summary": "새 분석 · 비교 코드를 쓰기 전에 쌓인 레시피부터 찾는다. 즉석 분석이 효과를 봤으면 제안 → 실데이터 → 평가 → 등록으로 올린다.",
+      "triggers": ["레시피", "recipe", "분석 레시피", "레시피 등록", "레시피 찾"],
+      "entry": ["heax-kooremapper_mcp", "recipe_search"],
+      "steps": [
+        {"backend": "heax-kooremapper_mcp", "tool": "recipe_search", "why": "이미 쌓인 레시피가 있는지 찾는다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "recipe_get", "why": "레시피 본문 · 매개변수를 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "recipe_run", "why": "실데이터로 돌린다(쓰기)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "recipe_propose", "why": "즉석 분석을 후보로 올린다(쓰기 — 정적 검사 · 자기 시험)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "recipe_evaluate", "why": "쓸모 있었나 · 왜를 남긴다(쓰기 — 등록 근거)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "recipe_register", "why": "관문을 통과하면 모두에게 열린다(쓰기 — 확인 뒤)"}
+      ],
+      "confirm_writes": [["heax-kooremapper_mcp", "recipe_run"], ["heax-kooremapper_mcp", "recipe_propose"], ["heax-kooremapper_mcp", "recipe_evaluate"], ["heax-kooremapper_mcp", "recipe_register"]],
+      "samples": ["파트별 최악 응력 비교하는 레시피 있어?", "방금 짠 분석 레시피로 올려줘"],
+      "apps": ["heax-kooremapper_mcp"],
+      "source": "KooRemapper SKILL.md 「레시피」"
+    },
+    "dyna-mesh-figures": {
+      "title": "격자를 그림으로 보기",
+      "summary": "세션의 K파일 격자를 단면 · 표면 · 적층 그림 셋으로 본다. 비등방 확대 그림은 눈으로만 읽지 말고 함께 오는 숫자를 먼저 읽는다.",
+      "triggers": ["격자 그림", "메시 그림", "격자 보기", "메시 단면", "적층 다이어그램"],
+      "entry": ["heax-kooremapper_mcp", "list_session_files"],
+      "steps": [
+        {"backend": "heax-kooremapper_mcp", "tool": "list_session_files", "why": "그림을 볼 파일과 파트를 확인한다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "mesh_surface_figure", "why": "표면 격자 그림"},
+        {"backend": "heax-kooremapper_mcp", "tool": "mesh_section_figure", "why": "단면 격자 그림"},
+        {"backend": "heax-kooremapper_mcp", "tool": "mesh_stack_diagram", "why": "적층 다이어그램과 층 숫자"}
+      ],
+      "confirm_writes": [],
+      "samples": ["이 K파일 격자 단면 그림으로 보여줘"],
+      "apps": ["heax-kooremapper_mcp"],
+      "source": "KooRemapper SKILL.md 「격자를 보는 법」"
+    },
+    "smarttwin-drop-run": {
+      "title": "SmartTwin 낙하 해석 내기",
+      "summary": "모델은 헤드노드에서 보이는 서버 경로여야 한다. 전각도 · 단일 낙하를 dry-run 으로 먼저 보이고 사람이 확인하면 제출한다.",
+      "triggers": ["전각도 낙하", "단일 낙하", "낙하 시뮬", "drop simulation", "낙하 제출", "26방향"],
+      "entry": ["smart-twin-mcp", "smarttwin_capabilities"],
+      "steps": [
+        {"backend": "smart-twin-mcp", "tool": "smarttwin_capabilities", "why": "전처리 · 후처리 기능과 도구 이름을 먼저 본다"},
+        {"backend": "smart-twin-mcp", "tool": "recipe_list", "why": "비슷한 레시피가 있는지 본다"},
+        {"backend": "smart-twin-mcp", "tool": "fullangle_drop_simulation", "why": "전각도 낙하(Fibonacci N 방향)를 낸다(쓰기 — dry-run 먼저)"},
+        {"backend": "smart-twin-mcp", "tool": "single_drop_simulation", "why": "한 방향 낙하를 낸다(쓰기)"},
+        {"backend": "smart-twin-mcp", "tool": "list_recent_jobs", "why": "제출한 잡을 본다"},
+        {"backend": "smart-twin-mcp", "tool": "job_status", "why": "Slurm 상태 · 출력 진행도를 본다"}
+      ],
+      "confirm_writes": [["smart-twin-mcp", "fullangle_drop_simulation"], ["smart-twin-mcp", "single_drop_simulation"]],
+      "samples": ["이 모델로 26방향 전각도 낙하 dry-run 해줘", "roll 30 pitch 45 로 한 방향 낙하 돌려줘"],
+      "apps": ["smart-twin-mcp"],
+      "source": "HE he-sim-smarttwin workflow"
+    },
+    "smarttwin-job-followup": {
+      "title": "SmartTwin 잡 상태 · 실패 진단",
+      "summary": "세션이 끊겨도 잡은 레지스트리에 남는다. 상태를 보고, 실패면 원인 범주를 받아 실패분만 다시 돌린다.",
+      "triggers": ["낙하 잡", "잡 어떻게", "잡 상태", "실패 진단", "doe 실패", "실패한 잡", "재실행"],
+      "entry": ["smart-twin-mcp", "list_recent_jobs"],
+      "steps": [
+        {"backend": "smart-twin-mcp", "tool": "list_recent_jobs", "why": "최근 잡을 찾는다"},
+        {"backend": "smart-twin-mcp", "tool": "job_status", "why": "Slurm 상태와 진행도를 본다"},
+        {"backend": "smart-twin-mcp", "tool": "get_job_details", "why": "출력 폴더 · 리포트 파일 존재를 본다"},
+        {"backend": "smart-twin-mcp", "tool": "job_diagnose", "why": "실패 원인 범주(license · memory · contact · timestep)를 받는다"},
+        {"backend": "smart-twin-mcp", "tool": "job_rerun", "why": "실패 · 미완료 DOE 만 다시 낸다(쓰기)"},
+        {"backend": "smart-twin-mcp", "tool": "job_postprocess", "why": "후처리를 다시 돌린다(쓰기)"},
+        {"backend": "smart-twin-mcp", "tool": "job_stop", "why": "잡을 멈춘다(쓰기 — 되돌릴 수 없다)"}
+      ],
+      "confirm_writes": [["smart-twin-mcp", "job_rerun"], ["smart-twin-mcp", "job_postprocess"], ["smart-twin-mcp", "job_stop"]],
+      "samples": ["어제 던진 낙하 잡 어떻게 됐어?", "실패한 DOE 원인 진단해줘"],
+      "apps": ["smart-twin-mcp"],
+      "source": "HE he-sim-smarttwin workflow · key_tools"
+    },
+    "smarttwin-catalog": {
+      "title": "SmartTwin 클러스터 도구 카탈로그",
+      "summary": "SmartTwinCluster 도구를 낱말로 찾고 스키마 · 예제를 본 뒤 인자를 맞춰 돌리고 결과를 읽는다. 레시피가 있으면 그것을 먼저 쓴다.",
+      "triggers": ["클러스터 도구", "카탈로그 도구", "smarttwin 도구", "kmm", "post 도구"],
+      "entry": ["smart-twin-mcp", "catalog_search"],
+      "steps": [
+        {"backend": "smart-twin-mcp", "tool": "catalog_search", "why": "도구를 낱말로 찾는다(빈 글이면 전부)"},
+        {"backend": "smart-twin-mcp", "tool": "catalog_describe", "why": "설명 · args 스키마 · 예제를 본다"},
+        {"backend": "smart-twin-mcp", "tool": "catalog_versions", "why": "판을 본다"},
+        {"backend": "smart-twin-mcp", "tool": "recipe_list", "why": "같은 일을 하는 레시피를 본다"},
+        {"backend": "smart-twin-mcp", "tool": "catalog_run", "why": "도구를 돌린다(쓰기 — 스키마로 검증)"},
+        {"backend": "smart-twin-mcp", "tool": "recipe_run", "why": "레시피로 돌린다(쓰기)"},
+        {"backend": "smart-twin-mcp", "tool": "tool_result", "why": "도구 잡의 상태 · rc · 산출물을 읽는다"}
+      ],
+      "confirm_writes": [["smart-twin-mcp", "catalog_run"], ["smart-twin-mcp", "recipe_run"]],
+      "samples": ["SmartTwin 에서 메시 바꾸는 도구 뭐 있어?"],
+      "apps": ["smart-twin-mcp"],
+      "source": "SmartTwin MCP 도구 설명(catalog_* · tool_result)"
+    },
+    "ste-run-small": {
+      "title": "ste 해석 하나(작은 입력)",
+      "summary": "작은 입력은 파일 내용을 제출에 함께 싣는다. 앱 스키마를 먼저 보고 내며, 상태를 본 뒤 요약으로 판정과 핵심 숫자를 받는다.",
+      "triggers": ["ste 해석", "ste 잡", "ste 제출", "해석 웹", "솔버 돌"],
+      "entry": ["ste", "list_apps"],
+      "steps": [
+        {"backend": "ste", "tool": "list_apps", "why": "실행 가능한 앱을 본다"},
+        {"backend": "ste", "tool": "get_app_schema", "why": "입력 패턴 · 파라미터를 본다"},
+        {"backend": "ste", "tool": "submit_job", "why": "files 로 잡을 낸다(쓰기 — 확인 뒤)"},
+        {"backend": "ste", "tool": "get_job_status", "why": "상태를 본다"},
+        {"backend": "ste", "tool": "ste_job_summary", "why": "판정과 핵심 숫자를 받는다"}
+      ],
+      "confirm_writes": [["ste", "submit_job"]],
+      "samples": ["ste 에서 CalculiX 로 이 입력 돌려줘"],
+      "apps": ["ste"],
+      "source": "SmartTwinExplorer mcp-contract 6장 R2 「작은 입력으로 해석 하나」"
+    },
+    "ste-run-large": {
+      "title": "ste 해석(큰 입력 파일)",
+      "summary": "큰 입력은 업로드 표를 받아 사용자 PC 에서 curl 로 올린 뒤 upload_id 로 낸다(업로드 주인만 · 한 번만).",
+      "triggers": ["큰 입력", "ste 업로드", "입력 파일 업로드", "upload_id"],
+      "entry": ["ste", "list_apps"],
+      "steps": [
+        {"backend": "ste", "tool": "list_apps", "why": "실행 가능한 앱을 본다"},
+        {"backend": "ste", "tool": "get_app_schema", "why": "입력 패턴 · 파라미터를 본다"},
+        {"backend": "ste", "tool": "prepare_upload", "why": "업로드 표와 PC 에서 쓸 curl 을 받는다(쓰기)"},
+        {"backend": "ste", "tool": "submit_job", "why": "upload_id 로 잡을 낸다(쓰기)"},
+        {"backend": "ste", "tool": "get_job_status", "why": "상태를 본다"},
+        {"backend": "ste", "tool": "ste_job_summary", "why": "판정과 핵심 숫자를 받는다"}
+      ],
+      "confirm_writes": [["ste", "prepare_upload"], ["ste", "submit_job"]],
+      "samples": ["2GB 입력 파일로 ste 해석 돌리고 싶어"],
+      "apps": ["ste"],
+      "source": "SmartTwinExplorer mcp-contract 6장 R2 「큰 입력 파일로 해석」"
+    },
+    "ste-results": {
+      "title": "ste 결과 보기",
+      "summary": "끝난 잡을 찾아 요약부터 보고, 필요한 결과 파일만 쪽으로 읽는다.",
+      "triggers": ["ste 결과", "해석 결과 파일", "잡 결과", "결과 파일 보"],
+      "entry": ["ste", "list_jobs"],
+      "steps": [
+        {"backend": "ste", "tool": "list_jobs", "why": "끝난 잡을 찾는다"},
+        {"backend": "ste", "tool": "ste_job_summary", "why": "판정과 핵심 숫자부터 본다"},
+        {"backend": "ste", "tool": "get_job_result", "why": "결과 파일 목록을 쪽으로 본다"},
+        {"backend": "ste", "tool": "get_job_file", "why": "파일 하나를 읽는다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["어제 ste 잡 결과 요약해줘"],
+      "apps": ["ste"],
+      "source": "SmartTwinExplorer mcp-contract 6장 R2 「끝난 잡의 결과 보기」"
+    },
+    "ste-sync-pc": {
+      "title": "ste 결과를 PC 로 받기",
+      "summary": "등록된 ste-sync 에이전트(사용자 PC)로 결과를 내려받게 잡 단위로 켠다.",
+      "triggers": ["pc 로 받", "결과 동기화", "ste-sync", "pc 동기화"],
+      "entry": ["ste", "get_sync_settings"],
+      "steps": [
+        {"backend": "ste", "tool": "get_sync_settings", "why": "동기화 설정과 등록된 PC 를 본다"},
+        {"backend": "ste", "tool": "set_job_sync", "why": "잡 단위로 동기화를 켠다(쓰기)"},
+        {"backend": "ste", "tool": "get_job_status", "why": "synced_at 으로 내려왔는지 본다"}
+      ],
+      "confirm_writes": [["ste", "set_job_sync"]],
+      "samples": ["이 ste 잡 결과 내 PC 로 받게 해줘"],
+      "apps": ["ste"],
+      "source": "SmartTwinExplorer mcp-contract 6장 R2 「결과를 PC 로 받기」"
+    },
+    "ste-cancel": {
+      "title": "ste 잡 멈추기",
+      "summary": "도는 잡에만 쓴다 — 끝난 잡에 부르면 기록이 CANCELLED 로 바뀐다. 멈추기는 되돌릴 수 없다.",
+      "triggers": ["ste 취소", "ste 멈", "잡 취소", "해석 멈춰"],
+      "entry": ["ste", "list_jobs"],
+      "steps": [
+        {"backend": "ste", "tool": "list_jobs", "why": "state=active 로 도는 잡을 찾는다"},
+        {"backend": "ste", "tool": "cancel_job", "why": "잡을 멈춘다(쓰기 — 되돌릴 수 없다)"},
+        {"backend": "ste", "tool": "get_job_status", "why": "멈췄는지 본다"}
+      ],
+      "confirm_writes": [["ste", "cancel_job"]],
+      "samples": ["돌고 있는 ste 잡 멈춰줘"],
+      "apps": ["ste"],
+      "source": "SmartTwinExplorer mcp-contract 6장 R2 「잡 멈추기」"
+    },
+    "ra-find-read": {
+      "title": "보고서 찾기 · 읽기 · 관계 따라가기",
+      "summary": "내용이나 조건으로 보고서를 찾아 필요한 쪽만 읽고, 걸린 보고서와 비슷한 보고서로 넓힌다. 이름이 무엇인지 모호하면 resolve 가 가린다.",
+      "triggers": ["보고서 찾", "보고서 목록", "보고서 검색", "보고서 읽", "게시판 보고서", "비슷한 보고서"],
+      "entry": ["reportarchive", "resolve"],
+      "steps": [
+        {"backend": "reportarchive", "tool": "resolve", "why": "이름이 게시판 · 사람 · 객체 · 보고서 제목 중 무엇인지 가린다"},
+        {"backend": "reportarchive", "tool": "list_boards", "why": "게시판 slug 를 본다"},
+        {"backend": "reportarchive", "tool": "list_folders", "why": "게시판의 폴더를 본다"},
+        {"backend": "reportarchive", "tool": "search_reports", "why": "본문으로 찾는다(최대 25건)"},
+        {"backend": "reportarchive", "tool": "list_reports", "why": "조건(게시판 · 폴더 · 기간 · 내 것 · 축 태그)으로 나열한다"},
+        {"backend": "reportarchive", "tool": "aggregate_reports", "why": "개수만 센다"},
+        {"backend": "reportarchive", "tool": "get_report_outline", "why": "쪽 · 블록 구조만 본다"},
+        {"backend": "reportarchive", "tool": "get_report", "why": "그 쪽만 읽는다(page)"},
+        {"backend": "reportarchive", "tool": "get_reports_digest", "why": "여러 건을 한 번에 줄여 읽는다(최대 20)"},
+        {"backend": "reportarchive", "tool": "list_report_links", "why": "걸린 참조 · 후속 · 요약을 본다"},
+        {"backend": "reportarchive", "tool": "list_related_reports", "why": "본문이 비슷한 보고서를 본다(추정)"}
+      ],
+      "confirm_writes": [],
+      "samples": ["우리 팀 게시판 '진행 중' 폴더 보고서 목록 보여줘", "힌지 관련 보고서 찾아서 3쪽만 읽어줘"],
+      "apps": ["reportarchive"],
+      "source": "ReportArchive docs/[일부] MCP_계약_현대화/R2_길안내.md ① · HE he-doc-reportarchive"
+    },
+    "report-write": {
+      "title": "보고서 쓰기 · 점검 · 게시",
+      "summary": "양식 · 지난 보고서 · 템플릿에서 초안을 만들고, 그림 · 점검 · 축 태그 · 근거 연결을 마친 뒤 확인받아 게시판에 올린다. 백지에서 구조를 짜지 않는다.",
+      "triggers": ["보고서 쓰", "보고서 써", "보고서 작성", "보고서 초안", "보고서 만들", "주간보고", "월간보고", "보고서 게시"],
+      "entry": ["reportarchive", "get_guide"],
+      "steps": [
+        {"backend": "reportarchive", "tool": "get_guide", "why": "topic=write 로 블록 형식 · 위젯 · 메타데이터 규칙을 받는다"},
+        {"backend": "reportarchive", "tool": "list_presets", "why": "정해진 양식(우리 팀 양식 · 지난번 형식)을 찾는다"},
+        {"backend": "reportarchive", "tool": "create_report_from_preset", "why": "양식으로 초안을 만든다"},
+        {"backend": "reportarchive", "tool": "copy_report", "why": "지난 보고서를 이어 쓴다"},
+        {"backend": "reportarchive", "tool": "list_templates", "why": "틀을 고른다"},
+        {"backend": "reportarchive", "tool": "describe_template", "why": "틀의 블록 · 위젯을 본다"},
+        {"backend": "reportarchive", "tool": "describe_metadata", "why": "report_type_id · entity_ids 의 유효 id 를 받는다"},
+        {"backend": "reportarchive", "tool": "create_report_draft", "why": "틀로 초안을 만든다(dry_run 먼저 — 형식이 틀린 블록은 조용히 버려진다)"},
+        {"backend": "reportarchive", "tool": "describe_report_format", "why": "HTML 양식 · 시스템 양식을 본다"},
+        {"backend": "reportarchive", "tool": "create_report_from_format", "why": "양식으로 만든다(수신 게시판이 있으면 곧바로 게시된다 — 먼저 알린다)"},
+        {"backend": "reportarchive", "tool": "get_reports_digest", "why": "재료 보고서를 한 번에 읽는다"},
+        {"backend": "_gateway", "tool": "figure_list", "why": "넣을 그림의 ref 를 본다"},
+        {"backend": "_gateway", "tool": "figure_to_report", "why": "그림을 그 사람 명의로 넣는다(쓰기)"},
+        {"backend": "reportarchive", "tool": "get_report_outline", "why": "빈 블록 · 깨진 파일 · 깨진 상호참조를 점검한다"},
+        {"backend": "reportarchive", "tool": "update_report_draft", "why": "옛 날짜 · 수치를 고친다(dry_run 먼저)"},
+        {"backend": "reportarchive", "tool": "suggest_report_tags", "why": "축 태그 후보를 받는다"},
+        {"backend": "reportarchive", "tool": "add_report_tags", "why": "고른 후보만 붙인다(남의 검색 결과도 바뀐다)"},
+        {"backend": "reportarchive", "tool": "link_reports", "why": "재료 보고서와 잇는다"},
+        {"backend": "reportarchive", "tool": "preview_publish", "why": "게시판 이름과 볼 사람 수를 보인다"},
+        {"backend": "reportarchive", "tool": "publish_report", "why": "확인받은 confirm_token 으로만 게시한다(10분 · 되돌리려면 승인)"}
+      ],
+      "confirm_writes": [["reportarchive", "publish_report"], ["reportarchive", "create_report_from_format"], ["reportarchive", "add_report_tags"], ["reportarchive", "link_reports"], ["_gateway", "figure_to_report"]],
+      "samples": ["지난 4주 주간보고 모아서 월간보고 초안 써줘", "우리 팀 양식으로 보고서 작성해줘", "새 보고서 초안 만들기"],
+      "apps": ["reportarchive"],
+      "source": "ReportArchive R2_길안내.md ② · 다앱 흉내(audit/discovery.md 2.2 보고서 쓰기) · HE he-doc-reportarchive"
+    },
+    "ra-analysis-report": {
+      "title": "해석 런으로 보고서 쓰기",
+      "summary": "바깥 해석 시스템에서 들여온 해석 런을 요약 · 비교하고, 부품을 기준정보에 이은 뒤 초안을 만든다. findings 는 다시 만들지 않고 단위는 units 에 있는 것만 쓴다.",
+      "triggers": ["해석 런", "analysis run", "런 요약", "해석 런 보고서", "런 비교"],
+      "entry": ["reportarchive", "list_analysis_runs"],
+      "steps": [
+        {"backend": "reportarchive", "tool": "list_analysis_runs", "why": "ready 런만 본다 — quality_failed 가 있으면 알린다"},
+        {"backend": "reportarchive", "tool": "get_analysis_summary", "why": "findings · 전역 피크 · 품질 · 단위 · 출처를 본다"},
+        {"backend": "reportarchive", "tool": "get_analysis_peaks", "why": "피크 랭킹"},
+        {"backend": "reportarchive", "tool": "get_analysis_series", "why": "파트 거동(줄인 점 수 n_original 을 함께)"},
+        {"backend": "reportarchive", "tool": "compare_analysis_runs", "why": "개선 전후를 견준다(warnings 먼저)"},
+        {"backend": "reportarchive", "tool": "list_analysis_parts", "why": "부품의 기준정보 연결 상태 · 후보를 본다"},
+        {"backend": "reportarchive", "tool": "map_analysis_part", "why": "사람이 고른 연결만 확정한다(쓰기 — 소급된다)"},
+        {"backend": "reportarchive", "tool": "create_report_from_run", "why": "런으로 초안을 만든다(쓰기 — 런이 출처로 묶인다)"},
+        {"backend": "reportarchive", "tool": "get_report_outline", "why": "초안을 점검한다"},
+        {"backend": "reportarchive", "tool": "suggest_report_tags", "why": "축 태그 후보"},
+        {"backend": "reportarchive", "tool": "add_report_tags", "why": "고른 태그만 붙인다"},
+        {"backend": "reportarchive", "tool": "preview_publish", "why": "게시 미리보기"},
+        {"backend": "reportarchive", "tool": "publish_report", "why": "확인받고 게시한다"}
+      ],
+      "confirm_writes": [["reportarchive", "map_analysis_part"], ["reportarchive", "create_report_from_run"], ["reportarchive", "add_report_tags"], ["reportarchive", "publish_report"]],
+      "samples": ["이번 주 올라온 낙하 해석 런 요약해줘", "개선 전후 런 비교해서 보고서 초안 만들어줘"],
+      "apps": ["reportarchive"],
+      "source": "ReportArchive R2_길안내.md ③ · HE he-doc-reportarchive"
+    },
+    "ra-ontology": {
+      "title": "RA 기준정보 조회 · 집계",
+      "summary": "모델 · 부품 · 과제 같은 기준정보 객체와 관계를 따라가고, 태그된 보고서 수와 측정값을 정확히 센다.",
+      "triggers": ["기준정보", "보고서 수 집계", "태그된 보고서", "측정값 집계", "ra 온톨로지"],
+      "entry": ["reportarchive", "list_object_types"],
+      "steps": [
+        {"backend": "reportarchive", "tool": "list_object_types", "why": "객체 종류 slug · 속성 key · 관계 slug 를 받는다"},
+        {"backend": "reportarchive", "tool": "search_objects", "why": "객체를 찾는다(truncated 면 조건을 좁힌다)"},
+        {"backend": "reportarchive", "tool": "get_object", "why": "속성 · 연결 객체 · 근거 보고서를 본다"},
+        {"backend": "reportarchive", "tool": "get_subgraph", "why": "여러 단계를 한 번에 본다"},
+        {"backend": "reportarchive", "tool": "aggregate_reports", "why": "보고서 수 · 숫자 집계(grouped_by 를 함께 전한다)"},
+        {"backend": "reportarchive", "tool": "list_reports", "why": "근거 보고서 전체 목록"},
+        {"backend": "reportarchive", "tool": "list_measure_metrics", "why": "측정 항목 이름 · 단위를 확인한다"},
+        {"backend": "reportarchive", "tool": "ask_ontology", "why": "여러 단계 관계 질문을 통째로 맡긴다(느리다)"}
+      ],
+      "confirm_writes": [],
+      "samples": ["이 모델에 태그된 보고서 몇 건이야?", "부품별 측정값 평균 집계해줘"],
+      "apps": ["reportarchive"],
+      "source": "ReportArchive R2_길안내.md ④"
+    },
+    "ra-knowledge-link": {
+      "title": "게시판 보고서를 스킬로 정제해 SP 로 보내기",
+      "summary": "한 조직 게시판의 보고서를 승인된 스킬로 정제해 SP 타입 객체로 보내는 연계를 만들고, 매핑 · 미리보기를 거쳐 승인을 신청한다. 공개 범위 동의는 사람이 한다.",
+      "triggers": ["지식 연계", "스킬 정제", "sp 로 보내", "지식 스킬", "연계 승인"],
+      "entry": ["reportarchive", "list_knowledge_skills"],
+      "steps": [
+        {"backend": "reportarchive", "tool": "list_knowledge_skills", "why": "승인 버전이 있는 스킬을 찾는다"},
+        {"backend": "reportarchive", "tool": "get_knowledge_skill", "why": "스킬 샘플 형식을 본다"},
+        {"backend": "reportarchive", "tool": "save_knowledge_skill", "why": "apply=False 로 검사한 뒤 저장한다(쓰기)"},
+        {"backend": "reportarchive", "tool": "start_knowledge_trial", "why": "표본 시험을 건다(LLM 을 쓴다)"},
+        {"backend": "reportarchive", "tool": "get_knowledge_trial", "why": "시험 결과를 본다"},
+        {"backend": "reportarchive", "tool": "request_knowledge_skill_approval", "why": "스킬 승인을 신청한다(쓰기)"},
+        {"backend": "reportarchive", "tool": "preview_knowledge_scope", "why": "원천 게시판의 건수 · 예시를 본다"},
+        {"backend": "reportarchive", "tool": "list_knowledge_targets", "why": "보낼 대상을 본다"},
+        {"backend": "reportarchive", "tool": "create_knowledge_link", "why": "연계를 만든다(쓰기)"},
+        {"backend": "reportarchive", "tool": "plan_knowledge_mapping", "why": "매핑 초안을 errors 0 까지 고친다"},
+        {"backend": "reportarchive", "tool": "save_knowledge_mapping", "why": "매핑을 저장한다(쓰기)"},
+        {"backend": "reportarchive", "tool": "preview_knowledge_link", "why": "SP 에 대입해 본다(쓰지 않는다)"},
+        {"backend": "reportarchive", "tool": "request_knowledge_link_approval", "why": "공개 범위 문장에 동의받고 승인을 신청한다(쓰기)"}
+      ],
+      "confirm_writes": [["reportarchive", "save_knowledge_skill"], ["reportarchive", "request_knowledge_skill_approval"], ["reportarchive", "create_knowledge_link"], ["reportarchive", "save_knowledge_mapping"], ["reportarchive", "request_knowledge_link_approval"]],
+      "samples": ["우리 게시판 보고서를 스킬로 정제해서 SP 로 보내는 연계 만들어줘"],
+      "apps": ["reportarchive"],
+      "source": "ReportArchive R2_길안내.md ⑤(그 판이 붙은 박스에서만 산다)"
+    },
+    "ra-edit": {
+      "title": "보고서 고치기 · 댓글 반영 · 되돌리기",
+      "summary": "댓글을 읽고 위젯 꼴로 받아 dry_run 으로 고친 뒤 답하고 닫는다. 되돌리기는 미리보기의 current_revision 을 expected_revision 으로 넘긴다.",
+      "triggers": ["댓글 반영", "보고서 고쳐", "보고서 수정", "표 한 줄", "되돌리", "이전 버전"],
+      "entry": ["reportarchive", "list_comments"],
+      "steps": [
+        {"backend": "reportarchive", "tool": "get_guide", "why": "topic=edit · comments 로 고치기 규칙을 받는다"},
+        {"backend": "reportarchive", "tool": "list_comments", "why": "댓글을 읽는다"},
+        {"backend": "reportarchive", "tool": "get_report", "why": "format=widgets 로 받는다"},
+        {"backend": "reportarchive", "tool": "update_report_draft", "why": "dry_run 으로 고친다(게시된 글이면 어디에 게시됐는지 알린다)"},
+        {"backend": "reportarchive", "tool": "append_rows", "why": "표에 줄을 더한다(dry_run)"},
+        {"backend": "reportarchive", "tool": "patch_cells", "why": "칸을 고친다(dry_run)"},
+        {"backend": "reportarchive", "tool": "remove_rows", "why": "줄을 지운다(확인 뒤)"},
+        {"backend": "reportarchive", "tool": "reply_comment", "why": "댓글에 답한다"},
+        {"backend": "reportarchive", "tool": "resolve_thread", "why": "댓글을 닫는다(확인 뒤)"},
+        {"backend": "reportarchive", "tool": "list_versions", "why": "판 목록을 본다"},
+        {"backend": "reportarchive", "tool": "restore_version", "why": "dry_run 뒤 expected_revision 으로 되돌린다(확인 뒤)"}
+      ],
+      "confirm_writes": [["reportarchive", "update_report_draft"], ["reportarchive", "remove_rows"], ["reportarchive", "resolve_thread"], ["reportarchive", "restore_version"]],
+      "samples": ["이 보고서 댓글 반영해서 고쳐줘", "어제 판으로 되돌려줘"],
+      "apps": ["reportarchive"],
+      "source": "ReportArchive R2_길안내.md 「여기 넣지 않은 업무 — 고치기」 · HE he-doc-reportarchive"
+    },
+    "mxwp-doc-write": {
+      "title": "백서 문서 쓰기 · 내보내기",
+      "summary": "주제로 문서를 찾아 구조를 읽고, 새 문서를 만들어 블록 · 그림을 넣은 뒤 Word 로 내보낸다. 블록 JSON 은 규칙으로 찾고 넣기 전에 검증한다.",
+      "triggers": ["백서 문서", "백서 쓰", "백서 작성", "word 로 내보내", "문서 내보내", "백서"],
+      "entry": ["mx-white-paper", "search_documents"],
+      "steps": [
+        {"backend": "mx-white-paper", "tool": "search_documents", "why": "주제로 문서를 찾는다(1차 진입점)"},
+        {"backend": "mx-white-paper", "tool": "get_document_outline", "why": "섹션 · 블록 id 를 얻는다"},
+        {"backend": "mx-white-paper", "tool": "query_rules", "why": "블록 JSON 작성법을 찾는다"},
+        {"backend": "mx-white-paper", "tool": "validate_block", "why": "넣기 전에 블록을 검증한다"},
+        {"backend": "mx-white-paper", "tool": "create_document", "why": "새 문서를 만든다(쓰기)"},
+        {"backend": "mx-white-paper", "tool": "insert_block", "why": "블록을 넣는다(쓰기)"},
+        {"backend": "mx-white-paper", "tool": "insert_image_block", "why": "그림 블록을 넣는다(쓰기)"},
+        {"backend": "mx-white-paper", "tool": "export_document", "why": "Word 로 내보낸다"}
+      ],
+      "confirm_writes": [["mx-white-paper", "create_document"], ["mx-white-paper", "insert_block"], ["mx-white-paper", "insert_image_block"]],
+      "samples": ["배터리 스웰링 대응 관련 백서 문서 찾아줘", "이 문서를 Word 로 내보내줘"],
+      "apps": ["mx-white-paper"],
+      "source": "MX 백서 R2 ① · HE he-doc-mxwhitepaper"
+    },
+    "wiki-answer": {
+      "title": "위키로 답하기",
+      "summary": "지식 질문은 문서를 찾기 전에 위키부터 — 근거 각주가 붙은 답을 옮기고, 맞다고 하면 문답 문서로 남긴다. wiki_ask 는 질문을 남기는 쓰기다.",
+      "triggers": ["위키", "위키에 물", "위키 답", "wiki"],
+      "entry": ["mx-white-paper", "wiki_index"],
+      "steps": [
+        {"backend": "mx-white-paper", "tool": "wiki_index", "why": "볼 수 있는 위키 문서를 갈래별로 먼저 읽는다"},
+        {"backend": "mx-white-paper", "tool": "wiki_search", "why": "위키를 낱말로 찾는다"},
+        {"backend": "mx-white-paper", "tool": "wiki_read", "why": "문서를 블록 근거와 함께 읽는다"},
+        {"backend": "mx-white-paper", "tool": "wiki_ask", "why": "묻는다 — [n] 각주 답(없으면 '아직 없다' 와 질문 id)"},
+        {"backend": "mx-white-paper", "tool": "wiki_fileback", "why": "사람이 맞다고 한 답을 문답 문서로 남긴다(쓰기)"}
+      ],
+      "confirm_writes": [["mx-white-paper", "wiki_ask"], ["mx-white-paper", "wiki_fileback"]],
+      "samples": ["위키에 힌지 먼지 유입 대책 정리된 거 있어?"],
+      "apps": ["mx-white-paper"],
+      "source": "MX 백서 R2 ② · HE he-doc-mxwhitepaper optional(wiki_ask)"
+    },
+    "wiki-fix": {
+      "title": "위키 고치기",
+      "summary": "열린 결함을 점검 보고서로 보고, 문서를 읽은 뒤 고침을 제안한다 — 제안은 늘 사람이 검토한다.",
+      "triggers": ["위키 고치", "위키 점검", "위키 수정", "위키 결함", "wiki lint"],
+      "entry": ["mx-white-paper", "wiki_lint_report"],
+      "steps": [
+        {"backend": "mx-white-paper", "tool": "wiki_lint_report", "why": "열린 결함(고아 · 근거 없음 · 낡음 · 모순)을 본다"},
+        {"backend": "mx-white-paper", "tool": "wiki_read", "why": "고칠 문서를 블록 근거와 함께 읽는다"},
+        {"backend": "mx-white-paper", "tool": "wiki_propose", "why": "고침을 제안한다(쓰기 — 사람 검토 큐)"}
+      ],
+      "confirm_writes": [["mx-white-paper", "wiki_propose"]],
+      "samples": ["위키에서 근거 없는 문서 찾아서 고침 제안해줘"],
+      "apps": ["mx-white-paper"],
+      "source": "MX 백서 R2 ③"
+    },
+    "doc-convert": {
+      "title": "문서 → Report Archive 정밀 변환",
+      "summary": "입력 상자의 PPT · Excel · Word 를 RA 패키지로 변환한다. 챗 업로드의 「Report Archive — 정밀 변환」 이 있으면 그것이 먼저다(진행 · 배달 · 알림을 포털이 잇는다).",
+      "triggers": ["정밀 변환", "ppt 를 ra", "문서 변환", "ppt 변환", "docforge", "엑셀 변환"],
+      "entry": ["heax-doc_forge", "docforge_list_inputs"],
+      "steps": [
+        {"backend": "heax-doc_forge", "tool": "docforge_list_inputs", "why": "입력 상자의 파일을 본다"},
+        {"backend": "heax-doc_forge", "tool": "docforge_convert", "why": "변환을 맡긴다(쓰기 — 확인 뒤)"},
+        {"backend": "heax-doc_forge", "tool": "docforge_status", "why": "진행을 본다(되풀이해 묻지 않는다)"},
+        {"backend": "heax-doc_forge", "tool": "docforge_package", "why": "버린 요소 · 모델 판독 · 경고 수를 보고 확인할 쪽을 짚는다"},
+        {"backend": "reportarchive", "tool": "get_report_outline", "why": "만든 보고서의 모델 판독 블록 · 빈 블록을 본다"}
+      ],
+      "confirm_writes": [["heax-doc_forge", "docforge_convert"]],
+      "samples": ["이 PPT 를 배치 그대로 RA 보고서로 옮기려면 어떻게 해?", "방금 맡긴 정밀 변환 어디까지 됐어?"],
+      "apps": ["heax-doc_forge", "reportarchive"],
+      "source": "DocForge R2 ① · HE he-doc-docforge"
+    },
+    "docforge-capabilities": {
+      "title": "DocForge 능력 확인",
+      "summary": "이 박스의 DocForge 가 무엇을 하는지(그림 판독 VLM 설정 여부 포함) 본다.",
+      "triggers": ["docforge 능력", "변환 가능", "그림 판독 되", "vlm 설정"],
+      "entry": ["heax-doc_forge", "docforge_capabilities"],
+      "steps": [
+        {"backend": "heax-doc_forge", "tool": "docforge_capabilities", "why": "지원 형식 · 그림 판독(VLM) 설정을 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["DRM 걸린 발표자료도 RA 로 옮길 수 있어?"],
+      "apps": ["heax-doc_forge"],
+      "source": "DocForge R2 ②"
+    },
+    "wda-report-video": {
+      "title": "보고서 → 영상",
+      "summary": "보고서를 조각내 디자인 회의를 돌리고 시나리오를 지어 영상으로 렌더한다. RA 보고서의 '발표자료로' 단추가 켜진 박스면 그것이 먼저다.",
+      "triggers": ["영상 만들", "보고서 영상", "발표 영상", "동영상"],
+      "entry": ["heax-web_design_agents", "report_ingest"],
+      "steps": [
+        {"backend": "heax-web_design_agents", "tool": "report_ingest", "why": "보고서를 들여 run_id 를 받는다(쓰기 — 서버가 읽을 수 있는 경로)"},
+        {"backend": "heax-web_design_agents", "tool": "report_fragmentize", "why": "조각을 만든다(조각 id 가 인용 화이트리스트)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_personas", "why": "participants 에 쓸 페르소나 id 를 본다"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_start", "why": "run_id 로 디자인 회의를 연다(쓰기)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_get_briefing", "why": "이번 차례의 브리핑을 받는다(쓰기 — 부를 때마다 전달 원장이 바뀐다)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_submit_turn", "why": "정해진 차례대로 인용과 함께 발언을 낸다(쓰기)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_close", "why": "회의를 닫는다(쓰기 — 확인 뒤)"},
+        {"backend": "heax-web_design_agents", "tool": "scenario_build", "why": "시나리오를 조립한다(쓰기 — 확인 뒤)"},
+        {"backend": "heax-web_design_agents", "tool": "render_submit", "why": "targets=video 로 렌더를 낸다(쓰기 — 확인 뒤)"},
+        {"backend": "heax-web_design_agents", "tool": "render_status", "why": "산출물 경로를 받는다(짧게 되풀이해 묻지 않는다)"},
+        {"backend": "heax-web_design_agents", "tool": "qa_run", "why": "품질 게이트를 돌린다"}
+      ],
+      "confirm_writes": [["heax-web_design_agents", "meeting_close"], ["heax-web_design_agents", "scenario_build"], ["heax-web_design_agents", "render_submit"]],
+      "samples": ["이 보고서로 발표 영상 만들어줘"],
+      "apps": ["heax-web_design_agents"],
+      "source": "WebDesignAgents R2 ① · HE he-doc-webdesign"
+    },
+    "wda-report-doc": {
+      "title": "보고서 → 발표자료(PPT · PDF)",
+      "summary": "보고서로 디자인 회의를 돌려 시나리오를 짓고 문서(PDF · PPT)로 렌더한다. RA 보고서의 '발표자료로' 단추가 켜진 박스면 그것이 먼저다.",
+      "triggers": ["발표자료", "ppt 만들", "pdf 만들", "슬라이드", "발표 자료"],
+      "entry": ["heax-web_design_agents", "report_ingest"],
+      "steps": [
+        {"backend": "heax-web_design_agents", "tool": "report_ingest", "why": "보고서를 들여 run_id 를 받는다(쓰기 — 서버가 읽을 수 있는 경로)"},
+        {"backend": "heax-web_design_agents", "tool": "report_fragmentize", "why": "조각을 만든다(조각 id 가 인용 화이트리스트)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_personas", "why": "participants 에 쓸 페르소나 id 를 본다"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_start", "why": "run_id 로 디자인 회의를 연다(쓰기)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_get_briefing", "why": "이번 차례의 브리핑을 받는다(쓰기 — 부를 때마다 전달 원장이 바뀐다)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_submit_turn", "why": "정해진 차례대로 인용과 함께 발언을 낸다(쓰기)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_close", "why": "회의를 닫는다(쓰기 — 확인 뒤)"},
+        {"backend": "heax-web_design_agents", "tool": "scenario_build", "why": "시나리오를 조립한다(쓰기 — 확인 뒤)"},
+        {"backend": "heax-web_design_agents", "tool": "format_list", "why": "만들 수 있는 골격(씬 역할 순서)을 본다"},
+        {"backend": "heax-web_design_agents", "tool": "render_submit", "why": "targets=pdf 로 렌더를 낸다(쓰기 — 확인 뒤)"},
+        {"backend": "heax-web_design_agents", "tool": "render_status", "why": "산출물 경로를 받는다"},
+        {"backend": "heax-web_design_agents", "tool": "qa_run", "why": "품질 게이트를 돌린다"}
+      ],
+      "confirm_writes": [["heax-web_design_agents", "meeting_close"], ["heax-web_design_agents", "scenario_build"], ["heax-web_design_agents", "render_submit"]],
+      "samples": ["이 보고서로 발표자료 만들어줘", "보고서 JSON 조각화하고 디자인 회의 열어줘"],
+      "apps": ["heax-web_design_agents"],
+      "source": "WebDesignAgents R2 ② · HE he-doc-webdesign"
+    },
+    "wda-meeting": {
+      "title": "디자인 심의만",
+      "summary": "페르소나를 골라 회의를 열고 차례대로 브리핑 · 발언을 돌린 뒤 닫고 회의록을 받는다.",
+      "triggers": ["디자인 회의", "디자인 심의", "회의록", "회의 열"],
+      "entry": ["heax-web_design_agents", "meeting_personas"],
+      "steps": [
+        {"backend": "heax-web_design_agents", "tool": "meeting_personas", "why": "participants 에 쓸 id 를 본다(순서가 발언 순서)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_start", "why": "회의를 연다(쓰기)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_get_briefing", "why": "차례의 브리핑을 받는다(쓰기 — 전달 원장이 바뀐다)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_submit_turn", "why": "인용과 함께 발언을 낸다(쓰기)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_close", "why": "회의를 닫는다(쓰기 — 확인 뒤)"},
+        {"backend": "heax-web_design_agents", "tool": "meeting_minutes", "why": "회의록 원문을 받는다"}
+      ],
+      "confirm_writes": [["heax-web_design_agents", "meeting_close"]],
+      "samples": ["디자인 회의 열어서 회의록 받아줘"],
+      "apps": ["heax-web_design_agents"],
+      "source": "WebDesignAgents R2 ③"
+    },
+    "wda-fix-scenes": {
+      "title": "발표 산출물 고치고 검증",
+      "summary": "씬 목록에서 잘못 만든 씬을 찾고 스틸 · HTML 로 확인한 뒤 핀포인트 패치로 고치고 품질 게이트를 다시 돌린다.",
+      "triggers": ["씬 고치", "씬 수정", "내레이션 바꿔", "씬 목록", "슬라이드 고치"],
+      "entry": ["heax-web_design_agents", "scene_list"],
+      "steps": [
+        {"backend": "heax-web_design_agents", "tool": "scene_list", "why": "씬 목록과 요약을 본다(핀포인트 수정의 진입점)"},
+        {"backend": "heax-web_design_agents", "tool": "scene_still", "why": "씬 스틸 PNG 로 확인한다"},
+        {"backend": "heax-web_design_agents", "tool": "scene_html", "why": "씬 하나만 도는 HTML 로 확인한다"},
+        {"backend": "heax-web_design_agents", "tool": "module_list", "why": "갈아 끼울 템플릿을 본다"},
+        {"backend": "heax-web_design_agents", "tool": "scenario_patch", "why": "원자 연산으로 고치고 재빌드한다(쓰기)"},
+        {"backend": "heax-web_design_agents", "tool": "qa_run", "why": "품질 게이트를 다시 돌린다"}
+      ],
+      "confirm_writes": [["heax-web_design_agents", "scenario_patch"]],
+      "samples": ["3번 씬 내레이션만 바꿔줘"],
+      "apps": ["heax-web_design_agents"],
+      "source": "WebDesignAgents R2 ④ · HE he-doc-webdesign samples"
+    },
+    "laminate-evaluate": {
+      "title": "적층안 평가",
+      "summary": "적층안의 ABD · 중립면을 보고 설계 규칙과 함께 평가한 뒤 설계 보고서를 낸다. 후보가 여럿이면 한 번에 평가하고 상세가 필요한 후보만 다시 본다. 처음이면 참조 예시의 꼴을 따른다.",
+      "triggers": ["적층안", "적층 평가", "abd", "중립면", "적층 설계", "laminate", "라미네이트"],
+      "entry": ["heax-laminate_analyzer_mcp", "analyze_laminate"],
+      "steps": [
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "get_reference_cases", "why": "처음이면 완전한 예시 payload 를 받아 꼴을 따른다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "validate_laminate_input", "why": "대화로 모은 입력을 먼저 검증한다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "analyze_laminate", "why": "ABD · 중립면 · 기본 응답을 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "check_design_rules", "why": "설계 규칙(대칭 · 균형 · 층 비율)을 함께 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "evaluate_laminate", "why": "적층안을 종합 평가한다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "batch_evaluate_laminates", "why": "후보 여럿을 한 번에 평가한다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "generate_design_report", "why": "설계 보고서를 낸다(단위계 · payload_hash · 가정 · 경고 포함)"}
+      ],
+      "confirm_writes": [],
+      "samples": ["[0/90/0] CFRP 적층 중립면이랑 ABD 계산해줘", "이 적층안 후보 셋 한 번에 평가해줘"],
+      "apps": ["heax-laminate_analyzer_mcp"],
+      "source": "Laminate R2 ① · HE he-calc-laminate"
+    },
+    "laminate-strength": {
+      "title": "적층 강도 · 파손",
+      "summary": "층별 응력을 복원하고 파손 포락선 · 점진 파손 · 자유단 박리를 본 뒤 피로 수명을 어림한다.",
+      "triggers": ["층별 응력", "파손 포락", "점진 파손", "박리", "피로 수명", "적층 강도"],
+      "entry": ["heax-laminate_analyzer_mcp", "recover_ply_stresses"],
+      "steps": [
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "recover_ply_stresses", "why": "층별 응력 · 변형률을 복원한다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "compute_failure_envelope", "why": "파손 포락선을 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "run_progressive_failure", "why": "점진 파손을 돌린다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "assess_free_edge_delamination", "why": "자유단 박리 위험을 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "estimate_fatigue_life", "why": "피로 수명을 어림한다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "estimate_spectrum_life", "why": "스펙트럼 하중 수명을 어림한다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["이 적층안 층별 응력이랑 파손 여유 봐줘", "반복 굽힘에서 피로 수명 얼마야?"],
+      "apps": ["heax-laminate_analyzer_mcp"],
+      "source": "Laminate R2 ②"
+    },
+    "laminate-buckling": {
+      "title": "적층 좌굴 · 진동",
+      "summary": "좌굴 하중을 보고 여유를 맞출 두께 배율을 풀며, 후좌굴 · 고유진동수를 본다.",
+      "triggers": ["좌굴", "고유진동", "후좌굴", "진동수", "좌굴 여유"],
+      "entry": ["heax-laminate_analyzer_mcp", "compute_buckling"],
+      "steps": [
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "compute_buckling", "why": "좌굴 하중 · 모드를 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "solve_required_thickness_scale", "why": "목표 여유에 필요한 두께 배율을 푼다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "compute_postbuckling", "why": "후좌굴 거동을 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "compute_natural_frequencies", "why": "고유진동수를 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["이 적층안 좌굴 여유 1.5 되려면 두께 몇 배 필요해?"],
+      "apps": ["heax-laminate_analyzer_mcp"],
+      "source": "Laminate R2 ③ · HE he-calc-laminate samples"
+    },
+    "laminate-thermal-moisture": {
+      "title": "적층 열 · 흡습 휨",
+      "summary": "층을 균질화한 뒤 열 응답(리플로우 휨 등)을 보고, 쌍안정 형상 · 큰 처짐 · 흡습을 본다.",
+      "triggers": ["리플로우 휨", "열 휨", "흡습 휨", "열응답", "warpage", "휨 예측", "쌍안정"],
+      "entry": ["heax-laminate_analyzer_mcp", "compute_thermal_response"],
+      "steps": [
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "homogenize_layer", "why": "패턴 층(동박률 등)을 균질화한다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "compute_thermal_response", "why": "온도 변화에 따른 휨 · 곡률을 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "compute_bistable_shapes", "why": "쌍안정 형상을 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "compute_large_deflection", "why": "큰 처짐을 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "compute_moisture_uptake", "why": "흡습량 · 흡습 팽창을 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["동박률 70% 4층 PCB 리플로우 휨 예측해줘"],
+      "apps": ["heax-laminate_analyzer_mcp"],
+      "source": "Laminate R2 ④ · HE he-calc-laminate samples"
+    },
+    "laminate-foldable": {
+      "title": "폴더블 · 형상 연계 적층",
+      "summary": "형상에서 적층을 짓고 부분 합성 굽힘 · 지정 곡률을 푼 뒤 층별 응력 · 균열 차폐 · 취성 파괴 · 응력 이완을 본다.",
+      "triggers": ["폴더블", "굽힘반경", "굽힘 반경", "접힘", "곡률 풀", "응력 이완"],
+      "entry": ["heax-laminate_analyzer_mcp", "build_laminate_from_geometry"],
+      "steps": [
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "build_laminate_from_geometry", "why": "형상(층 두께 · 재료)에서 적층을 짓는다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "assess_partial_composite_bending", "why": "부분 합성 굽힘을 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "solve_prescribed_curvature", "why": "지정 곡률(굽힘반경)을 푼다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "recover_ply_stresses", "why": "층별 응력을 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "assess_crack_shielding", "why": "균열 차폐를 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "assess_brittle_fracture", "why": "취성 파괴를 본다"},
+        {"backend": "heax-laminate_analyzer_mcp", "tool": "solve_stress_relaxation", "why": "응력 이완을 푼다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["폴더블 스택 굽힘반경 1.5mm 에서 층별 응력 봐줘"],
+      "apps": ["heax-laminate_analyzer_mcp"],
+      "source": "Laminate R2 ⑤ · HE he-calc-laminate samples"
+    },
+    "sed-predict": {
+      "title": "열충격 SED 예측",
+      "summary": "필수 입력(보드 · AP · 패키지 · 볼 · 패드)을 모두 받는다 — 빠진 값은 추측하지 말고 묻는다. 표는 파싱해 확인시키고 후보가 둘 이상이면 한 번에 비교한다.",
+      "triggers": ["sed 예측", "sed", "열충격", "솔더 피로", "패키지 배치"],
+      "entry": ["heax-thermal_shock_mcp", "get_model_info"],
+      "steps": [
+        {"backend": "heax-thermal_shock_mcp", "tool": "get_model_info", "why": "활성 모델의 학습 시각 · 표본 수 · 피처 범위를 본다"},
+        {"backend": "heax-thermal_shock_mcp", "tool": "parse_raw_rows", "why": "표 원본을 파싱해 확인시킨다(저장 안 함)"},
+        {"backend": "heax-thermal_shock_mcp", "tool": "predict_sed", "why": "한 배치의 SED 를 예측한다"},
+        {"backend": "heax-thermal_shock_mcp", "tool": "predict_sed_batch", "why": "후보 여럿을 한 번에 비교한다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["FULL 보드에 WLP 패키지 이 배치로 SED 예측해줘", "이 표에 있는 배치안 5개 SED 일괄 비교해줘"],
+      "apps": ["heax-thermal_shock_mcp"],
+      "source": "HE he-calc-thermalshock workflow"
+    },
+    "sed-train": {
+      "title": "열충격 학습 데이터 · 재학습",
+      "summary": "실측 추가는 파싱(require_sed) → 확인 → 저장 순서다. 재학습 · 활성화는 사용자가 원할 때만.",
+      "triggers": ["학습 데이터", "재학습", "실측 추가", "모델 학습", "sed 데이터"],
+      "entry": ["heax-thermal_shock_mcp", "get_dataset_summary"],
+      "steps": [
+        {"backend": "heax-thermal_shock_mcp", "tool": "get_dataset_summary", "why": "건수 · SED 분포 · 판정별 개수를 본다"},
+        {"backend": "heax-thermal_shock_mcp", "tool": "parse_raw_rows", "why": "require_sed=True 로 파싱해 확인시킨다"},
+        {"backend": "heax-thermal_shock_mcp", "tool": "add_training_data", "why": "확인된 실측을 저장한다(쓰기)"},
+        {"backend": "heax-thermal_shock_mcp", "tool": "train_model", "why": "재학습한다(쓰기 — 확인 뒤)"},
+        {"backend": "heax-thermal_shock_mcp", "tool": "activate_model", "why": "새 모델을 활성화한다(쓰기 — 확인 뒤)"}
+      ],
+      "confirm_writes": [["heax-thermal_shock_mcp", "add_training_data"], ["heax-thermal_shock_mcp", "train_model"], ["heax-thermal_shock_mcp", "activate_model"]],
+      "samples": ["학습 데이터 몇 건이고 FAIL 은 몇 건이야?", "새 실측 3건 추가하고 재학습해줘"],
+      "apps": ["heax-thermal_shock_mcp"],
+      "source": "HE he-calc-thermalshock workflow"
+    },
+    "datahub-browse": {
+      "title": "데이터 허브 둘러보기 · 나열",
+      "summary": "처음이면 규모를 보고, 조건으로 나열하거나 태그 어휘를 확인한 뒤 찾은 레코드의 본문을 절로 읽는다.",
+      "triggers": ["데이터 허브", "레코드 목록", "문서 목록", "허브 카탈로그", "태그 검색"],
+      "entry": ["ai-data-hub", "discover"],
+      "steps": [
+        {"backend": "ai-data-hub", "tool": "discover", "why": "허브 규모 · 데이터 종류 · 팀을 본다(compact 권장)"},
+        {"backend": "ai-data-hub", "tool": "list_agent_domains", "why": "도메인별 전문가 · 레코드 수를 본다"},
+        {"backend": "ai-data-hub", "tool": "list_records", "why": "조건으로 나열한다(본문 없이)"},
+        {"backend": "ai-data-hub", "tool": "list_tags", "why": "실제 태그 어휘를 확인한다"},
+        {"backend": "ai-data-hub", "tool": "tag_search", "why": "정확 일치 AND 로 태그 검색"},
+        {"backend": "ai-data-hub", "tool": "get_record_sections", "why": "레코드 본문을 절로 읽는다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["HE 팀 CAE manual 문서 목록 보여줘"],
+      "apps": ["ai-data-hub"],
+      "source": "HE he-data-aidatahub workflow"
+    },
+    "datahub-aggregate": {
+      "title": "표 레코드 통계",
+      "summary": "표 레코드의 통계는 행을 받아 직접 계산하지 말고 서버가 계산하게 한다.",
+      "triggers": ["통계", "평균", "최대값", "집계", "region 별", "yield"],
+      "entry": ["ai-data-hub", "data_aggregate"],
+      "steps": [
+        {"backend": "ai-data-hub", "tool": "list_records", "why": "표 레코드(record_id)를 찾는다"},
+        {"backend": "ai-data-hub", "tool": "data_aggregate", "why": "op · column · group_by · where 로 서버가 계산한다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["이 표 레코드에서 region 별 yield 최대값 알려줘"],
+      "apps": ["ai-data-hub"],
+      "source": "HE he-data-aidatahub workflow"
+    },
+    "datahub-register": {
+      "title": "데이터를 허브에 등록",
+      "summary": "등록은 dry_run 으로 검증해 부족한 필드만 사용자에게 묻고, 그 뒤 저장한다.",
+      "triggers": ["허브에 등록", "레코드 등록", "표 등록", "데이터 등록", "규격 검증"],
+      "entry": ["ai-data-hub", "describe_record_schema"],
+      "steps": [
+        {"backend": "ai-data-hub", "tool": "describe_record_schema", "why": "보강 필드 · enum · 예시를 본다"},
+        {"backend": "ai-data-hub", "tool": "import_record", "why": "dry_run=True 로 검증 → 부족한 필드만 묻고 → 저장한다(쓰기)"}
+      ],
+      "confirm_writes": [["ai-data-hub", "import_record"]],
+      "samples": ["이 표를 허브 규격으로 등록할 수 있게 검증해줘"],
+      "apps": ["ai-data-hub"],
+      "source": "HE he-data-aidatahub workflow"
+    },
+    "voc-analysis": {
+      "title": "VOC 분석",
+      "summary": "제품 코드를 먼저 확정하고(추측하지 않는다), 결함 프로파일 · 감성 추이 · 국가별 분포로 본다. 숫자에는 기간과 표본 수를 함께 적고 대표 원문을 인용한다.",
+      "triggers": ["voc 분석", "voc", "불만 추이", "사용자 불만", "고객 불만", "부정률", "감성 추이"],
+      "entry": ["signalforge", "resolve_product_keyword"],
+      "steps": [
+        {"backend": "signalforge", "tool": "resolve_product_keyword", "why": "제품명을 제품 코드로 확정한다"},
+        {"backend": "signalforge", "tool": "corpus_overview", "why": "코퍼스 규모 · 기간 · 커버리지를 본다"},
+        {"backend": "signalforge", "tool": "query_voc", "why": "조건으로 VOC 를 조회한다"},
+        {"backend": "signalforge", "tool": "search_voc", "why": "낱말로 VOC 를 찾는다"},
+        {"backend": "signalforge", "tool": "defect_profile", "why": "부품 · 증상별 결함 프로파일을 본다"},
+        {"backend": "signalforge", "tool": "analyze_sentiment_trend", "why": "감성 추이를 본다"},
+        {"backend": "signalforge", "tool": "get_top_issues", "why": "많이 언급된 이슈를 본다"},
+        {"backend": "signalforge", "tool": "get_country_breakdown", "why": "국가별로 나눈다"},
+        {"backend": "signalforge", "tool": "defect_evidence", "why": "대표 원문을 인용한다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["폴드7 힌지 관련 불만 최근 90일 추이 보여줘", "S25 울트라 배터리 VOC 국가별로 나눠줘"],
+      "apps": ["signalforge"],
+      "source": "다앱 흉내(audit/discovery.md 2.2 VOC 분석) · HE he-data-signalforge"
+    },
+    "voc-defect-surge": {
+      "title": "결함 급등 탐지",
+      "summary": "지금 급등하는 제품 · 부품 · 증상을 보고, 분해 · 시계열 · 원문으로 굳힌다. 신제품은 세대 비교로 출시 효과를 뺀 값이다.",
+      "triggers": ["결함 급등", "급등", "이상 탐지", "알림 점검", "급증"],
+      "entry": ["signalforge", "defect_anomalies"],
+      "steps": [
+        {"backend": "signalforge", "tool": "defect_anomalies", "why": "최근 탐지된 결함 급등을 본다"},
+        {"backend": "signalforge", "tool": "alert_check", "why": "임계치(부정률 · 급증 · 수집 멈춤)를 점검한다"},
+        {"backend": "signalforge", "tool": "defect_breakdown", "why": "급등 슬라이스를 나눠 본다"},
+        {"backend": "signalforge", "tool": "defect_timeline", "why": "결함 시계열을 본다"},
+        {"backend": "signalforge", "tool": "defect_evidence", "why": "실제 사용자 발언을 근거로 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["지금 결함 급등하는 제품·부품 뭐 있어?"],
+      "apps": ["signalforge"],
+      "source": "HE he-data-signalforge workflow"
+    },
+    "voc-new-product": {
+      "title": "신제품 세대 비교",
+      "summary": "신제품은 출시 직후 부정 언급이 원래 급증한다 — 직전 세대의 같은 주차와 견줘 진짜 이상인지 본다.",
+      "triggers": ["세대 비교", "출시 주차", "직전 세대", "lifecycle", "신제품 비교", "주차 비교"],
+      "entry": ["signalforge", "lifecycle_compare"],
+      "steps": [
+        {"backend": "signalforge", "tool": "resolve_product_keyword", "why": "두 제품의 코드를 확정한다"},
+        {"backend": "signalforge", "tool": "lifecycle_compare", "why": "직전 세대와 같은 라이프사이클 주차로 견준다"},
+        {"backend": "signalforge", "tool": "period_compare", "why": "최근 N일 대 직전 N일로 늘고 준 것을 본다"},
+        {"backend": "signalforge", "tool": "compare_products", "why": "제품끼리 견준다"},
+        {"backend": "signalforge", "tool": "get_product_timeline", "why": "제품 시계열을 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["폴드8 출시 12주차까지 폴드7 대비 부정률 비교해줘"],
+      "apps": ["signalforge"],
+      "source": "HE he-data-signalforge workflow · samples"
+    },
+    "voc-briefing": {
+      "title": "VOC 일일 브리핑",
+      "summary": "날짜의 수집량 · 감성 · 언급 상위 제품 · 부정 다발을 한 문서로 받고, 떠오르는 낱말 · 제품 요약으로 잇는다.",
+      "triggers": ["브리핑", "일일 voc", "오늘 voc", "voc 요약", "떠오르는 키워드"],
+      "entry": ["signalforge", "daily_briefing"],
+      "steps": [
+        {"backend": "signalforge", "tool": "daily_briefing", "why": "지정 날짜(KST)의 VOC 브리핑을 받는다"},
+        {"backend": "signalforge", "tool": "top_emerging_keywords", "why": "떠오르는 낱말을 본다"},
+        {"backend": "signalforge", "tool": "get_voc_summary", "why": "제품의 최근 VOC 요약을 받는다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["오늘 VOC 브리핑 해줘"],
+      "apps": ["signalforge"],
+      "source": "SignalForge 도구 설명(daily_briefing · get_voc_summary · top_emerging_keywords)"
+    },
+    "deliberation": {
+      "title": "전문가 심의",
+      "summary": "상황에 맞는 심의 종류를 고르고 서버 엔진에 맡긴다. job_id 를 바로 받아 알리고, 진행은 한 번 보고, 결정문을 요약한다. 새 관측은 처음부터 다시가 아니라 이어서 돌린다.",
+      "triggers": ["심의", "안 선택", "트레이드오프", "신뢰 판정", "시험 계획", "해석 설계", "심의 열", "심의 돌려"],
+      "entry": ["hwax-deliberation", "deliberate_jobs"],
+      "steps": [
+        {"backend": "hwax-deliberation", "tool": "deliberate_jobs", "why": "심의 종류 · 얹을 층 · 대기열을 본다"},
+        {"backend": "hwax-deliberation", "tool": "deliberate_start", "why": "심의를 맡긴다(쓰기 — 즉시 job_id, queued 면 순번을 알린다)"},
+        {"backend": "hwax-deliberation", "tool": "deliberate_status", "why": "진행을 본다(wait_s 로 한 번)"},
+        {"backend": "hwax-deliberation", "tool": "deliberate_result", "why": "결정문을 view=summary 로 먼저 받는다"},
+        {"backend": "hwax-deliberation", "tool": "deliberate_transcript", "why": "근거가 더 필요하면 좌석 발언을 본다"},
+        {"backend": "hwax-deliberation", "tool": "deliberate_continue", "why": "새 관측(human_note)으로 이어서 돌린다(쓰기)"}
+      ],
+      "confirm_writes": [["hwax-deliberation", "deliberate_start"], ["hwax-deliberation", "deliberate_continue"]],
+      "samples": ["A안·B안 중 어느 쪽이 나은지 안 선택 심의 돌려줘", "아까 심의 결정문 보여줘", "이 관측 넣어서 지난 심의 이어서 돌려줘"],
+      "apps": ["hwax-deliberation"],
+      "source": "HE he-expert-deliberation workflow · 서버 지침 13번"
+    },
+    "risk-review-status": {
+      "title": "리스크 심사 진행 · 등록부 읽기",
+      "summary": "과제의 커버리지를 보고, 이미 돈 패널의 기록을 읽어 중복 제기를 막으며, 등록부 · 종합 보고서를 읽는다.",
+      "triggers": ["커버리지", "심사 진행", "등록부", "패널 기록", "심사 과제 목록"],
+      "entry": ["heax-hwax_risk", "risk_list_projects"],
+      "steps": [
+        {"backend": "heax-hwax_risk", "tool": "risk_list_projects", "why": "target_key 를 얻는다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_get_coverage", "why": "도메인별 진행을 본다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_list_panels", "why": "돈 패널을 본다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_get_panel_transcript", "why": "패널 발언을 읽는다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_get_registry", "why": "등록부를 거른다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_taxonomy", "why": "허용값을 본다"},
+        {"backend": "heax-hwax_risk", "tool": "risk_get_report", "why": "종합 보고서를 읽는다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["심사 과제 목록이랑 커버리지 보여줘", "등록부에서 severity 높은 항목만 보여줘"],
+      "apps": ["heax-hwax_risk"],
+      "source": "HE he-expert-risk workflow · samples"
+    },
+    "web-research": {
+      "title": "웹 · 논문 조사",
+      "summary": "먼저 켜진 소스를 보고, 수집해 둔 것부터 찾는다. 사외 질의에 사내 기밀을 넣지 않는다. 인용은 문장 원문을 doc_id · 문장 번호와 함께 적는다.",
+      "triggers": ["논문 찾", "웹 검색", "웹 조사", "논문 검색", "외부 자료", "인용"],
+      "entry": ["heax-web_research_mcp", "describe_search_status"],
+      "steps": [
+        {"backend": "heax-web_research_mcp", "tool": "describe_search_status", "why": "운영 모드와 켜진 소스를 본다(꺼진 소스는 결과가 비는 까닭)"},
+        {"backend": "heax-web_research_mcp", "tool": "search_internal", "why": "이미 수집해 둔 것을 먼저 찾는다"},
+        {"backend": "heax-web_research_mcp", "tool": "search_scholar", "why": "논문을 찾는다(질의는 기록된다 — 기밀 금지)"},
+        {"backend": "heax-web_research_mcp", "tool": "search_web", "why": "웹을 찾는다"},
+        {"backend": "heax-web_research_mcp", "tool": "get_page", "why": "문서를 수집해 doc_id 를 받는다"},
+        {"backend": "heax-web_research_mcp", "tool": "search_in_page", "why": "문서 안에서 찾는다"},
+        {"backend": "heax-web_research_mcp", "tool": "get_quote", "why": "문장 원문을 꺼낸다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["OCA 점탄성 크리프 관련 논문 찾아줘", "이 URL 수집해서 핵심 문장 인용해줘"],
+      "apps": ["heax-web_research_mcp"],
+      "source": "HE he-research-web workflow"
+    },
+    "paper-ingest": {
+      "title": "논문 반입",
+      "summary": "대기 건수와 게이트 준비를 먼저 본다. PDF 는 웹 화면으로 올리게 하고, 본문 markdown 이 있으면 스테이징한 뒤 사용자가 원할 때 인입을 돌린다.",
+      "triggers": ["논문 반입", "논문 인입", "드롭폴더", "논문 올리", "게이트 다시"],
+      "entry": ["heax-paper_ingest", "inbox_status"],
+      "steps": [
+        {"backend": "heax-paper_ingest", "tool": "inbox_status", "why": "대기 논문 수와 게이트 준비를 본다"},
+        {"backend": "heax-paper_ingest", "tool": "submit_paper", "why": "본문 markdown 을 스테이징한다(쓰기)"},
+        {"backend": "heax-paper_ingest", "tool": "ingest_now", "why": "드롭폴더 전체를 처리한다(쓰기 — 확인 뒤)"},
+        {"backend": "heax-paper_ingest", "tool": "gate_expert_now", "why": "한 전문가의 게이트를 다시 돌린다(쓰기 — 확인 뒤)"}
+      ],
+      "confirm_writes": [["heax-paper_ingest", "submit_paper"], ["heax-paper_ingest", "ingest_now"], ["heax-paper_ingest", "gate_expert_now"]],
+      "samples": ["드롭폴더에 대기 중인 논문 몇 편이야?", "이 논문 본문 올리고 인입 돌려줘"],
+      "apps": ["heax-paper_ingest"],
+      "source": "HE he-research-paper workflow"
+    },
+    "routine-run": {
+      "title": "분석 루틴 돌리기",
+      "summary": "포털에 짜 둔 분석 루틴을 계획대로 돌린다 — 단계마다 허용 도구만 routine_call 로 부르고 닫은 뒤 보고서를 낸다(단계 안 쓰기는 거절된다).",
+      "triggers": ["분석 루틴", "루틴 돌", "루틴 실행", "routine"],
+      "entry": ["_gateway", "routine_list"],
+      "steps": [
+        {"backend": "_gateway", "tool": "routine_list", "why": "내 것 + 공개된 루틴을 본다"},
+        {"backend": "_gateway", "tool": "routine_get", "why": "계획(단계 · 울타리 · 허용 도구 · 예산)을 읽는다"},
+        {"backend": "_gateway", "tool": "routine_run_start", "why": "실행을 시작해 run_id 를 받는다"},
+        {"backend": "_gateway", "tool": "routine_call", "why": "단계의 허용 도구만 부른다"},
+        {"backend": "_gateway", "tool": "routine_step_done", "why": "단계를 닫는다(keys 는 결과에 나온 값만)"},
+        {"backend": "_gateway", "tool": "routine_report_submit", "why": "보고서를 낸다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["낙하 결과 귀환 확인 루틴 돌려줘"],
+      "apps": [],
+      "source": "게이트웨이 routine_* · HWAXPortal docs/analysis-routines"
+    },
+    "procedure-run": {
+      "title": "절차 다시 돌리기",
+      "summary": "한 번 한 일을 굳힌 절차를 변수만 바꿔 다시 돌린다. 사람 확인에서 멈추는 도구가 있다.",
+      "triggers": ["절차 돌", "절차 실행", "절차 다시", "procedure"],
+      "entry": ["_gateway", "procedure_list"],
+      "steps": [
+        {"backend": "_gateway", "tool": "procedure_list", "why": "절차와 변수 · 사람 확인 도구를 본다"},
+        {"backend": "_gateway", "tool": "procedure_get", "why": "입력 스키마를 본다"},
+        {"backend": "_gateway", "tool": "procedure_run_start", "why": "변수를 넣어 실행한다(사람 확인에서 멈춘다)"},
+        {"backend": "_gateway", "tool": "procedure_run_status", "why": "실행 상태를 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["지난번 절차 변수만 바꿔서 다시 돌려줘"],
+      "apps": [],
+      "source": "게이트웨이 procedure_* · HWAXPortal docs/procedures"
+    },
+    "ecad-checklist": {
+      "title": "ECAD 보드 체크리스트 결과",
+      "summary": "ECAD 허브의 잡 목록에서 대상 보드를 특정하고 체크리스트 결과를 항목 · 판정 · 근거 그대로 옮긴다. 도구가 준 판정을 바꾸지 않는다.",
+      "triggers": ["ecad", "odb", "보드 체크리스트", "설계 체크리스트", "pcb 체크리스트"],
+      "entry": ["odb-hub", "list_jobs"],
+      "steps": [
+        {"backend": "odb-hub", "tool": "list_jobs", "why": "ECAD 허브에 올라온 설계 잡을 본다"},
+        {"backend": "odb-hub", "tool": "find_job", "why": "대상 보드의 잡을 찾는다"},
+        {"backend": "odb-hub", "tool": "get_checklist_result", "why": "체크리스트 결과(항목 · 판정 · 근거)를 읽는다"},
+        {"backend": "odb-hub", "tool": "list_results", "why": "잡의 결과 목록을 본다"},
+        {"backend": "odb-hub", "tool": "get_task", "why": "작업 상태를 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["이 보드 ODB++ 설계 체크리스트 점검 결과 보여줘", "ECAD 허브에 올라온 설계 목록 알려줘"],
+      "apps": ["odb-hub"],
+      "source": "HE he-cad-odbhub(optional needs_tool) — 그 앱이 붙은 박스에서만 산다"
+    },
+    "arp-data-find": {
+      "title": "AI Ready Portal 데이터 찾기",
+      "summary": "ARP 에서 목록 · 검색으로 대상 데이터를 찾고 견준다. 답에는 데이터의 ID · 출처를 그대로 적는다.",
+      "triggers": ["arp", "ai ready", "레디 포털", "arp 데이터"],
+      "entry": ["arp", "search_data"],
+      "steps": [
+        {"backend": "arp", "tool": "search_data", "why": "데이터를 찾는다"},
+        {"backend": "arp", "tool": "compare_items", "why": "항목을 견준다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["ARP 에 있는 최근 낙하 해석 데이터 찾아줘", "이 과제 시뮬레이션 데이터가 ARP 에 뭐 있어?"],
+      "apps": ["arp"],
+      "source": "HE he-data-arp(optional needs_tool) — 그 앱이 붙은 박스에서만 산다"
+    }
+  }
+}

@@ -17486,3 +17486,22 @@ def test_C7_바깥_호출이_정리한_결과를_내고_안쪽_호출은_원문�
     assert asyncio.run(gw._call_tool("get_x", {})) is raw
     assert _health_body()["contract"]["result_dedup"] == {"mode": "1", "compacted": 1, "dropped": 0,
                                                          "saved_chars": len(raw.content[0].text) - len(out.content[0].text)}
+
+
+# ── 노출 설명 들여쓰기 걷기(HWAXPortal docs/mcp-modernize M2 · 게이트웨이 일괄 B) ─────────────────────────────────────────────
+
+_INDENTED = "부품 목록을 준다.\n\n    언제: 처음 볼 때.\n      - 들여쓴 목록은 상대 들여쓰기를 지킨다\n    돌려주는 꼴: {rows}\n    "
+
+
+def test_B_노출_설명은_cleandoc_꼴이고_앱_원문은_그대로다(monkeypatch, _fresh_scores):
+    t = types.Tool(name="list_parts", description=_INDENTED, inputSchema={"type": "object"})
+    _aggregate_tools(monkeypatch, {"heax-step_forge": [t]})
+    got = next(x for x in gw.exposed_tools if x.name == "list_parts").description
+    assert got == "부품 목록을 준다.\n\n언제: 처음 볼 때.\n  - 들여쓴 목록은 상대 들여쓰기를 지킨다\n돌려주는 꼴: {rows}"
+    assert t.description == _INDENTED, "앱이 준 도구 객체는 그대로다"
+    assert gw._DESC_CLEAN_STAT == {"tools": 1, "saved_chars": len(_INDENTED) - len(got)}
+    assert _health_body()["contract"]["desc_cleandoc"] == {"on": True, "tools": 1, "saved_chars": len(_INDENTED) - len(got)}
+    monkeypatch.setattr(gw, "DESC_CLEANDOC", False)
+    _aggregate_tools(monkeypatch, {"heax-step_forge": [t]})
+    assert next(x for x in gw.exposed_tools if x.name == "list_parts").description == _INDENTED, "끄면 앱 글 그대로"
+    assert gw._desc_clean(None) is None and gw._desc_clean("") == ""

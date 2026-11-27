@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import hmac
+import inspect
 import ipaddress
 import json
 import logging
@@ -1422,6 +1423,26 @@ def _arg_score_refresh() -> None:
                     100 * ARG_DESC_WARN_RATIO, w["tool"], w["args"], w["described"])
 
 
+# ── 노출 설명 들여쓰기 걷기(HWAXPortal docs/mcp-modernize M2 · 게이트웨이 일괄 B) ─────────────────────────────────────────────
+# 앱 docstring 은 함수 안 들여쓰기(4 · 8칸)를 줄마다 그대로 싣는다 — dev 11-27 카탈로그 설명 51만 자 가운데 23,399자(4.5%)가 그 앞 공백이다(StepForge
+# 13,120 · RA 3,891). 노출 사본(exposed_tools)의 설명을 inspect.cleandoc 꼴로 걷는다 — 첫 줄 앞 공백 · 둘째 줄부터의 **공통** 들여쓰기 · 앞뒤 빈 줄만
+# 뗀다(상대 들여쓰기 — 목록 · 코드 블록 — 는 그대로). 낱말은 그대로라 검색 점수는 바뀌지 않는다(빈칸이 든 손 동의어가 줄머리 공백에 걸치지 않는 한 —
+# 평가셋으로 잰다). 앱 원문은 앱에 그대로다. 끄기 GATEWAY_DESC_CLEANDOC=0(설명이 앱 글 그대로). 값 · 걷은 글자 수는 /health 의 contract.desc_cleandoc.
+DESC_CLEANDOC = os.environ.get("GATEWAY_DESC_CLEANDOC", "1").strip() != "0"
+_DESC_CLEAN_STAT = {"tools": 0, "saved_chars": 0}          # 마지막 재집계에서 걷은 도구 수 · 글자 수
+
+
+def _desc_clean(desc):
+    """노출 설명 — 켜면 inspect.cleandoc 꼴(글이 아니거나 비면 그대로), 끄면 그대로."""
+    if not DESC_CLEANDOC or not isinstance(desc, str) or not desc:
+        return desc
+    out = inspect.cleandoc(desc)
+    if out != desc:
+        _DESC_CLEAN_STAT["tools"] += 1
+        _DESC_CLEAN_STAT["saved_chars"] += len(desc) - len(out)
+    return out
+
+
 async def _aggregate():
     """모든 백엔드에서 list_tools 수집, 충돌 도구만 프리픽스, exposed_tools/route 구축."""
     collected: list[tuple[str, types.Tool]] = []  # (backend_key, tool)
@@ -1504,6 +1525,7 @@ async def _aggregate():
     # 가족은 마지막으로 온전히 읽은 표의 것이다(_core_family) — 표를 잠깐 못 읽는 사이에 이름이 맨 이름으로 뒤집히지 않게(그동안 빠지는 것은 소개 줄뿐이다).
     family = frozenset(_core_family())
     fam_renamed: dict[str, tuple[str, str]] = {}          # 옛 맨 이름 → (백엔드, 원래 이름)
+    _DESC_CLEAN_STAT.update(tools=0, saved_chars=0)
     for key, t in collected:
         # 충돌 여부와 **무관하게** 별칭을 등록한다(호출 전용).
         _alias = f"{key.replace('-', '')}_{t.name}"
@@ -1534,7 +1556,7 @@ async def _aggregate():
         exposed_tools.append(
             types.Tool(
                 name=exposed_name,
-                description=_core_tagged(key, t.description, tags),
+                description=_core_tagged(key, _desc_clean(t.description), tags),
                 inputSchema=t.inputSchema,
                 **({"outputSchema": t.outputSchema} if getattr(t, "outputSchema", None) else {}),
                 **({"annotations": ann} if ann else {}),
@@ -10048,7 +10070,8 @@ def _class_listed(tools: list) -> list:
 def _contract_health() -> dict:
     """/health 의 contract — MCP 현대화 M2(계약 정밀화)의 손잡이 값. 무인증 칸이라 값 · 수만 싣는다."""
     return {"tool_class_unified": TOOL_CLASS_UNIFIED,
-            "result_dedup": {"mode": RESULT_DEDUP, **_DEDUP_STAT}}
+            "result_dedup": {"mode": RESULT_DEDUP, **_DEDUP_STAT},
+            "desc_cleandoc": {"on": DESC_CLEANDOC, **_DESC_CLEAN_STAT}}
 
 
 async def _routine_call(a: dict) -> types.CallToolResult:

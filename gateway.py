@@ -3299,6 +3299,7 @@ _PURPOSE_TOOL_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,120}")
 _PURPOSE_FIELDS = frozenset({"title", "summary", "triggers", "entry", "steps", "confirm_writes", "samples", "apps", "source", "_doc"})
 _PURPOSE_LIMITS = {"title": 80, "summary": 600, "why": 300, "trigger": 60, "sample": 200, "source": 400}
 PURPOSE_MATCH_MIN = 2                  # 목적 층이 맞았다고 보는 트리거 조각 글자 수 합의 바닥(질의 '단면' · '좌굴' 같은 두 글자 낱말까지)
+PURPOSE_ENTRY_TOP = 3                  # 목적 가중 전 상위 이만큼 안에 그 목적 단계가 있으면 입구를 첫 줄로 세우지 않는다(평가셋으로 고른 값 — README 11-27 M3)
 PURPOSE_PROMPT_PREFIX = "purpose-"
 SKILL_URI_PREFIX = "skill://hwax/"
 SKILL_FILE = "SKILL.md"
@@ -3552,7 +3553,7 @@ def _purposes_map() -> dict:
 def _list_apps_tool(purposes: bool) -> types.Tool:
     """list_tool_apps 의 정의 — purposes 를 끄면(GATEWAY_PURPOSE_LIST=0) 종전 정의와 바이트까지 같다. 켜면 by 에 purpose 가, 인자에 purpose 가 붙는다."""
     by = {"type": "string", "enum": ["app", "area", "purpose"] if purposes else ["app", "area"],
-          "description": ("묶는 기준 — app(소유 앱, 기본) · area(하는 일) · purpose(업무 목적 — 차례 · 입구 · 확인할 쓰기)." if purposes else
+          "description": ("묶는 기준 — app(소유 앱, 기본) · area(하는 일) · purpose(업무 목적 — 차례 · 입구 · 확인)." if purposes else
                           "묶는 기준 — app(소유 앱, 기본) 또는 area(하는 일).")}
     props = {
         "app": {"type": "string", "description": "특정 앱 키(예: heax-thermal_shock_mcp). 생략 시 전체 앱 요약."},
@@ -3573,9 +3574,9 @@ def _list_apps_tool(purposes: bool) -> types.Tool:
             "by='area' 면 앱 대신 **하는 일(영역)** 로 묶는다 — CAD·형상 제어, 메시·해석 모델 구성, 시뮬레이션 실행·잡, "
             "해석 계산·예측, 해석 결과 분석, 물성·재료, VOC·시장 신호, 사내 지식 검색, 웹·논문 조사, 보고서·문서·발표, "
             "전문가·심의·리스크, 데이터 등록·온톨로지, 시스템·공통. '시뮬레이션 관련 도구 뭐 있어' 같은 질문엔 이걸 쓴다."
-            + (" by='purpose' 면 **업무 목적** 으로 묶는다 — 낙하 해석 준비 · 낙하 결과 분석 · 보고서 쓰기 · 설계 리스크 심사 · 재료 물성 찾기 · VOC 분석처럼 "
-               "여러 앱을 가로지르는 일의 차례 · 입구 도구 · 사람에게 확인할 쓰기를 준다(purpose='<키>' 면 그 목적의 단계 전부). "
-               "'낙하 해석 하려면 뭐부터 해' 같은 질문엔 이걸 쓴다. 앱 줄의 entry 는 그 앱에서 처음 부를 도구다." if purposes else "")
+            # 목적 이름을 늘어놓지 않는다 — 이 설명도 search_tools 가 낱말로 센다(목적 질의마다 이 도구가 끼어든다). 목적은 by='purpose' 의 답이 준다
+            + (" by='purpose' 면 업무 목적별 차례 · 입구 도구 · 사람 확인이 필요한 단계를 준다(purpose='<키>' 면 그 목적의 단계 전부). "
+               "'이 일은 뭐부터 하나' 같은 질문엔 이걸 쓴다. 앱 줄의 entry 는 그 앱에서 처음 부를 도구다." if purposes else "")
         ),
         inputSchema={"type": "object", "properties": props},
     )
@@ -4236,7 +4237,7 @@ _COPY_LABEL = re.compile(r"[(\[](?:시험|사본|테스트|test|copy|staging|dev
 SEARCH_TUNING_PATH = Path(__file__).with_name("search_tuning.json")
 SEARCH_TUNING_LOCAL_PATH = Path(__file__).with_name("search_tuning.local.json")
 _TUNING_SWITCHES = ("synonyms", "core_vocab", "delib_narrow", "quality", "write_penalty", "copy_fold", "noncore_demote", "onto_first",
-                    "onto_lookup_first", "space_fold")
+                    "onto_lookup_first", "space_fold", "purpose_boost", "app_entry_first")
 # space_fold(HWAXPortal docs/mcp-modernize M2 · M3 검색 작은 고침 — 기본 켬) — 질의 낱말을 빈칸을 뺀 설명 · 앱 라벨에서도 센다. '지식카드 찾기' 가 설명의
 # '지식 카드' 를 못 맞혀 AIDataHub 지식카드 도구가 20위 밖이었다(11-27 조사). 띄어 쓴 질의('지식 카드')는 낱말 둘로 이미 맞는다. 끄면 순위가 바이트까지 같다.
 # 접는 것은 SPACE_FOLD_MIN_CHARS 자 이상인 낱말만이다 — 짧은 낱말까지 접으면 낱말 경계를 넘어 맞아 평가셋 쌍이 나빠졌다(11-27, 길이 상한 없음 — 나빠짐 2).
@@ -4247,10 +4248,14 @@ SPACE_FOLD_MIN_CHARS = 4
 # 더한다. 코어 질문(어휘표 검색 낱말이 든 질의)에는 걸지 않는다 — 코어는 정본이 먼저다. cae00 검색 평가(+onto_first 판)를 본 뒤 박스 덧씌우기로 켠다.
 # onto_lookup_first(PLAN §12 · OF-36) — 온톨로지 · 코어 질의에서 질의가 앱 이름을 부르지 않았으면 ontology_lookup 을 1위에 세우고 hint 를 싣는다. 켜기는
 # cae00 검색 평가(+onto_lookup_first 판)를 본 뒤 박스 덧씌우기로. weights.onto_object 는 search_tools 의 object 인자가 있을 때만 쓴다(OF-37).
+# purpose_boost · app_entry_first(HWAXPortal docs/mcp-modernize M3 — 목적 묶음 tool_purposes.json 을 읽는다, 기본 켬) — 아래 _search_tools 의 목적 층 · 앱 입구
+# 주석. 켬은 평가(tool_search_eval — 손잡이를 켠 판 · 끈 판의 쌍별 순위)에서 기존 183쌍의 나빠짐이 0 이어서다(README 11-27 M3 절). 박스 덧씌우기로 끈다.
 _TUNING_OPT_IN = ("noncore_demote", "onto_first", "onto_lookup_first")
-_TUNING_WEIGHTS = ("name", "desc_cap", "app", "coverage", "write_penalty", "quality_per_word", "noncore", "onto", "onto_object")
+_TUNING_WEIGHTS = ("name", "desc_cap", "app", "coverage", "write_penalty", "quality_per_word", "noncore", "onto", "onto_object", "purpose_step",
+                   "purpose_cover", "purpose_hint_cover", "app_entry")
 _TUNING_FALLBACK = {"weights": {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2,
-                                "noncore": 0.5, "onto": 4, "onto_object": 4}}
+                                "noncore": 0.5, "onto": 4, "onto_object": 4, "purpose_step": 6, "purpose_cover": 0.2, "purpose_hint_cover": 0.2,
+                                "app_entry": 4}}
 _TUNING: dict = {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None}
 
 
@@ -4307,7 +4312,7 @@ def _tuning_parse(d: dict) -> dict:
                        for k, e in (d.get("synonyms") or {}).items()},
             "quality_words": tuple(str(x).lower() for x in quality.get("words") or ()),
             "quality_areas": tuple(str(x) for x in quality.get("areas") or ()),
-            "delib_ask": words("delib_ask"), "write_intent": words("write_intent")}
+            "delib_ask": words("delib_ask"), "write_intent": words("write_intent"), "app_entry_generic": words("app_entry_generic")}
 
 
 def _tuning() -> dict:
@@ -4855,6 +4860,52 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                          for v in vs for f in (re.sub(r"\s+", "", v),)) for w, vs in expand.items()} if fold else {}
     groups = _request_groups() if groups is None else groups
     visible = _visible_tools(groups)
+    # 목적 층(HWAXPortal docs/mcp-modernize M3 — 손잡이 purpose_boost). 목적 표(tool_purposes.json)의 트리거 가운데 띄어 쓴 조각이 모두 빈칸 뺀 질의에 든
+    # 것이 있으면 그 목적이 맞은 것이다 — 맞은 조각 글자 수 합이 가장 큰 목적 하나(같으면 표의 차례). 그 목적의 단계(호출자 시야 안)에 weights.purpose_step 을
+    # 더하고(질의 낱말에 안 맞아 점수 0 인 단계도 줄에 든다 — 쓰기 감점은 그대로 탄다) 입구를 첫 줄에 세우며 답에 purpose(차례 · 확인할 쓰기 · 더 볼 곳)를
+    # 싣는다. 다음으로 맞은 목적은 purpose_also. 2,000개 규모에서 '보고서 쓰기' · '설계 리스크 심사' · '낙하 해석 준비' 의 입구가 20위 밖이던 것을 겨눈다(11-27 조사).
+    # 앱 입구 먼저(손잡이 app_entry_first) — 질의가 앱 하나의 이름을 불렀고 그 앱의 입구(표 apps.<키>.entry)가 보이면 그 입구에 weights.app_entry 를 더한다.
+    # 앱 이름 말고는 일반 낱말(app_entry_generic — '시작' · '사용법' · '도구' …)뿐인 질의('StepForge 어떻게 써')는 입구를 첫 줄에 세운다. onto_first 의 일반화다.
+    # 두 손잡이를 끄면 아래 갈래가 하나도 타지 않는다 — 순위 · 글이 바이트까지 같다(E-7).
+    p_top, p_also, p_boost = None, [], {}
+    if sw.get("purpose_boost"):
+        vis_names = {t.name for t in visible}
+        hits = []
+        for i, (p, lv) in enumerate(_purposes_for(vis_names)):
+            stems, best = set(), 0
+            for parts in p["trig"]:
+                if all(w in q_flat for w in parts):
+                    stems.update(parts)
+                    best = max(best, sum(len(w) for w in parts))
+            if best >= PURPOSE_MATCH_MIN:
+                # 덮음 — 맞은 트리거 조각(합집합)의 글자 수 / 빈칸 뺀 질의 글자 수. '설계 리스크 심사' 같은 목적 질의는 크고, 도구 하나를 겨눈 긴 문장
+                # ('SUS304 물성을 표로 정리하고 …')은 작다 — 작으면 목적 층이 순위를 건드리지 않는다(weights.purpose_cover)
+                hits.append((-best, i, p, lv, sum(len(w) for w in stems) / max(1, len(q_flat))))
+        hits.sort(key=lambda h: (h[0], h[1]))
+        hits = [h for h in hits if h[4] >= wt["purpose_hint_cover"]]
+        if hits:
+            # 덮음이 purpose_hint_cover 이상이면 답에 purpose 를 싣고(순위는 그대로), purpose_cover 이상이면 순위도 건드린다(단계 가중 · 입구 첫 줄)
+            p_top = (hits[0][2], hits[0][3])
+            p_also = [h[2] for h in hits[1:4]]
+            if hits[0][4] >= wt["purpose_cover"]:
+                p_boost = {st["name"]: wt["purpose_step"] for st in p_top[1]["steps"]}
+    p_rank = bool(p_boost)                 # 목적 층이 순위를 건드리나(위 덮음 문턱) — 아니면 답의 purpose 만 싣는다
+    pre_rows: list = []                    # 목적 가중 전의 줄 정렬 열쇠(음수 점수 · 사본 표지 · 이름) — 입구를 세울지 판정한다(아래 _to_front 앞 주석)
+    ae_name, ae_only = None, False
+    if sw.get("app_entry_first"):
+        called = {}
+        for a in {route.get(t.name, ("_gateway",))[0] for t in visible} - {"_gateway"}:
+            nm = _label_names(str(_app_meta(a).get("label") or ""))
+            if any(_named(nm, v, q_flat) for vs in expand.values() for v in vs):
+                called[a] = nm
+        if len(called) == 1:
+            (a, nm), = called.items()
+            hit = _app_entry_name(a, _purpose_index(), {t.name for t in visible})
+            if hit:
+                ae_name = hit[0]
+                generic = tun.get("app_entry_generic") or ()
+                ae_only = all(any(w == g or (w.startswith(g) and len(w) - len(g) <= 2) for g in generic)
+                              for w in terms if not _named(nm, w, q_flat))
     # 형제 소개 줄(E2-4 · S-B)은 순위를 바꾸지 않는다 — 점수는 줄을 뗀 설명으로 낸다. 줄의 낱말이 점수에 들면 형제 줄이 오르고, 아래 접기가 그 줄을
     # 정본 아래로 접어 그 데이터를 갖지 않은 정본이 덕을 봤다(검토 10-31 — 형제 순위 신호는 S-A 로 미뤘다). 정본 소개 줄(R-3)은 종전대로 점수에 든다.
     sib_lines = _CORE_VOCAB.get("sib_tags_applied") or {}
@@ -4928,9 +4979,26 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                 final *= wt["noncore"]                           # 코어 질문의 비코어 앱 도구(E2-5) — 보정 뺀 점수도 곱해 boost_only 판정은 그대로다
                 base_final *= wt["noncore"]
                 via.add("demote:noncore")
+            pb = p_boost.get(t.name, 0) + (wt["app_entry"] if t.name == ae_name else 0)
+            if p_rank:
+                pre_rows.append((-final, 1 if _COPY_LABEL.search(label) else 0, t.name))
+            if pb:
+                # 목적 단계 · 앱 입구(위 목적 층 주석) — 곱셈 보정 뒤에 더한다(단계끼리의 낱말 순위는 그대로 두고 함께 올린다 — 앞에 더하면 쓰기 감점이 가중을
+                # 반으로 깎아 읽기 단계가 쓰기 단계를 넘었다). 보정 뺀 점수에는 넣지 않는다
+                final += pb
+                via.update(([f"purpose:{p_top[0]['key']}"] if t.name in p_boost else []) + (["app_entry"] if t.name == ae_name else []))
             # 줄 꼴 — (점수, 이름, 앱, 설명, 도구, 쓰기, 원래 이름, 사본 표지, 보정 뺀 점수, 점수를 보탠 규칙)
             rows.append((final, t.name, app, (t.description or "").strip(), t, is_write, original,
                          1 if _COPY_LABEL.search(label) else 0, base_final, tuple(sorted(via))))
+        elif t.name in p_boost or t.name == ae_name:
+            # 질의 낱말에는 안 맞았지만 맞은 목적의 단계이거나 부른 앱의 입구다 — 그 가중만으로 줄에 든다(쓰기 감점은 탄다 · 보정 뺀 점수는 0)
+            final = p_boost.get(t.name, 0) + (wt["app_entry"] if t.name == ae_name else 0)
+            is_write = _tool_is_write(t, original, app)
+            if is_write and not write_intent and sw["write_penalty"]:
+                final *= wt["write_penalty"]
+            rows.append((final, t.name, app, (t.description or "").strip(), t, is_write, original,
+                         1 if _COPY_LABEL.search(label) else 0, 0,
+                         tuple(sorted(([f"purpose:{p_top[0]['key']}"] if t.name in p_boost else []) + (["app_entry"] if t.name == ae_name else [])))))
     rows.sort(key=lambda r: (-r[0], r[7], r[1]))
     # 의미 순위(선택) — 켜져 있으면 임베딩 순위를 RRF 로 섞는다. 꺼져 있으면 이 아래는 종전과 한 글자도 다르지 않다.
     mode = None
@@ -4993,6 +5061,23 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     # 도구 · 동의어 갈래가 앞서거나 사본으로 접혔다). detail 이 없으면 순위 그대로다.
     # 온톨로지 조회 먼저(OF-36) — 켠 손잡이 · 온톨로지 · 코어 질의 · 질의가 앱 이름을 부르지 않았을 때만이다(부르면 그 앱의 입구 몫 — onto_first).
     # 이름 그대로(아래 exact)가 그 뒤에 서므로 도구 이름을 콕 집은 detail 질의는 그 도구가 첫 줄이다.
+    def _to_front(name: str, mark: str) -> None:
+        """그 이름의 줄을 첫 줄로 — 규칙 표지(via)에 mark 를 더한다. 사본 접기로 다른 줄에 접혔으면 세우지 않는다(대표가 그 자리다)."""
+        nonlocal rows
+        r = next((x for x in rows if x[1] == name), None)
+        if r is None:
+            return
+        nr = r[:9] + (tuple(sorted(set(r[9]) | {mark})),)
+        if id(r) in folded:
+            folded[id(nr)] = folded.pop(id(r))
+        rows = [nr] + [x for x in rows if x is not r]
+    if p_rank and p_top[1]["entry"] and not ({x[2] for x in sorted(pre_rows)[:PURPOSE_ENTRY_TOP]} & {st["name"] for st in p_top[1]["steps"]}):
+        # 맞은 목적의 입구(목적 층) — 목적 가중 전의 상위 PURPOSE_ENTRY_TOP 줄에 그 목적의 단계가 이미 있으면 세우지 않는다. 질의가 그 단계를 겨눈 것이다
+        # ('원인 규명' 의 첫 줄 deliberate_start · '낙하 결과 산포' 의 report_scatter 는 그 목적의 단계다 — 입구를 세우면 그 줄이 밀렸다). 가중 뒤의 순위로
+        # 보면 가중이 올린 단계를 '이미 있다' 로 읽는다
+        _to_front(p_top[1]["entry"]["name"], "purpose_entry")
+    if ae_name and ae_only:
+        _to_front(ae_name, "app_entry_first")                       # 앱 이름만 부른 질의 — 그 앱의 입구(앱 입구 먼저)
     lookup_first = lookup_q and not (named_apps - {"_gateway"})
     lookup_tool = next((t for t in visible if t.name == ONTO_LOOKUP_TOOL.name), None) if lookup_first else None
     if lookup_tool is not None:
@@ -5076,6 +5161,17 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
         payload.update(mode)        # 어느 순위로 답했나 — rrf, 또는 못 섞었으면 substring 과 그 까닭(mode_reason)
     payload["match_count"] = len(rows)
     payload["ranked"] = [m["tool"] for m in matches]
+    if p_top is not None:
+        # 맞은 업무 목적(목적 층) — 이름 순위 바로 뒤에 둔다(작은 창의 소비자가 앞에서부터 잘라도 남게). 단계는 호출자 시야 안의 것만이다
+        _p, _lv = p_top
+        payload["purpose"] = {"key": _p["key"], "title": _p["title"], "entry": _lv["entry"]["name"], "steps": [st["name"] for st in _lv["steps"]],
+                              "confirm": [st["name"] for st in _lv["steps"] if st["confirm"]],
+                              "more": f"list_tool_apps(by='purpose', purpose='{_p['key']}')",
+                              **({"prompt": f"{PURPOSE_PROMPT_PREFIX}{_p['key']}"} if PURPOSE_PROMPTS_ON else {})}
+        if p_also:
+            payload["purpose_also"] = [{"key": x["key"], "title": x["title"]} for x in p_also]
+        if log_query:
+            _adopt("search_purpose", _p["key"])
     _moved = _retired_in_query(q, groups)
     if _moved:
         # 옛 키 · 옛 접두를 담은 질의(GW-05) — 새 키(이름이 보이면 새 도구)를 말한다. 옛 이름은 대신 부르지 않는다
@@ -5099,7 +5195,9 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
                           "설명이 다른 판이다."
                           if any(x.get("differs") for m in matches for x in m.get("same_in") or ()) else "")
                        + (" tagline 은 그 형제 허브가 담은 데이터다 — 질문이 그 데이터에 대한 것이면 그 도구를 부른다."
-                          if any("tagline" in x for m in matches for x in m.get("same_in") or ()) else ""))
+                          if any("tagline" in x for m in matches for x in m.get("same_in") or ()) else "")
+                       + (" purpose 는 질의가 맞은 업무 목적의 차례다 — 입구(entry)부터 단계 차례로 부르되 이미 아는 것은 건너뛰고, confirm 은 사람에게 무엇이 "
+                          "바뀌는지 보이고 확인받은 뒤 부른다." if p_top is not None else ""))
     payload["matches"] = matches
     # 촘촘한 JSON(빈칸 없는 구분자) — 들여쓰기는 같은 내용을 기본 1.55배 · detail 1.33배로 불려 Claude 길의 토큰만 먹었다(10-16 카탈로그 스냅샷 ·
     # 평가셋 150 질의, HWAXPortal docs/token-saving TS-5, 11-02).

@@ -78,6 +78,8 @@
         {"backend": "heax-kooremapper_mcp", "tool": "report_part_risk", "why": "어느 파트가 어느 방향에서 위험한지 본다"},
         {"backend": "heax-kooremapper_mcp", "tool": "report_findings", "why": "소견을 심각도로 거른다"},
         {"backend": "heax-kooremapper_mcp", "tool": "report_angle_stats", "why": "방향 범주 · 각도 근처 통계로 민감도를 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_directional", "why": "방향 범주(면 · 엣지 · 코너)별 최악을 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "report_scatter", "why": "방향 섭동 산포 · 민감도(26방향별 평균 · 표준편차 · 최악)를 본다"},
         {"backend": "heax-kooremapper_mcp", "tool": "report_hotspots", "why": "공간 핫스팟 군집(어디가 뜨거운가)을 본다"},
         {"backend": "heax-kooremapper_mcp", "tool": "report_image", "why": "결과 그림을 직접 본다(번들로 들인 리포트만)"},
         {"backend": "heax-kooremapper_mcp", "tool": "compare_reports", "why": "조건 · 리비전 사이 파트별 최악값을 나란히 견준다"},
@@ -153,10 +155,7 @@
         {"backend": "ai-data-hub", "tool": "recommend_agents", "why": "질문에 맞는 전문가(에이전트)를 고른다"},
         {"backend": "ai-data-hub", "tool": "agent_search", "why": "고른 전문가의 사내 지식카드를 찾는다"},
         {"backend": "_gateway", "tool": "insight_find", "why": "같은 과제 · 차수의 앞선 심의 인사이트가 있는지 본다"},
-        {"backend": "hwax-deliberation", "tool": "deliberate_jobs", "why": "심의 종류와 지금 대기열을 본다(원인 불명은 diagnosis)"},
-        {"backend": "hwax-deliberation", "tool": "deliberate_start", "why": "원인 규명 심의를 서버 엔진으로 맡긴다(쓰기 — 확인 뒤, job_id 를 바로 받는다)"},
-        {"backend": "hwax-deliberation", "tool": "deliberate_status", "why": "진행을 한 번 본다(wait_s 가 있으면 그것으로 기다린다)"},
-        {"backend": "hwax-deliberation", "tool": "deliberate_result", "why": "결정문을 view=summary 로 먼저 받는다"}
+        {"backend": "hwax-deliberation", "tool": "deliberate_start", "why": "모은 근거로 원인 규명 심의(job=diagnosis)를 서버 엔진에 맡긴다(쓰기 — 확인 뒤 · job_id 를 바로 받고 진행은 deliberate_status 한 번 · 결정문은 deliberate_result(view=summary))"}
       ],
       "confirm_writes": [["hwax-deliberation", "deliberate_start"]],
       "samples": ["폴드 힌지 먼지 유입 불량 원인 규명해줘", "이 결함이 왜 생겼는지 VOC 랑 지식카드로 원인 분석 심의 열어줘"],
@@ -211,7 +210,7 @@
     "expert-consult": {
       "title": "전문가 고르고 묻기",
       "summary": "조직도에서 전문가를 고르고 그 역할 · 입구 도구 · 지식카드로 답한다. 주 전문가 하나에 보조 넷까지 — 관점이 갈리면 '이견' 으로 밝힌다.",
-      "triggers": ["전문가 고르", "전문가 찾", "누구한테 물", "전문가 추천", "조직도", "전문가에게 물"],
+      "triggers": ["전문가 고르", "전문가 찾", "누구한테 물", "전문가 추천", "조직도", "전문가에게 물", "전문가한테 물", "어느 전문가"],
       "entry": ["_gateway", "browse_experts"],
       "steps": [
         {"backend": "_gateway", "tool": "browse_experts", "why": "조직도(분류 → 분야 → 사람)를 훑거나 이름으로 찾는다"},
@@ -269,11 +268,11 @@
     "core-object-lookup": {
       "title": "코어 정본 객체 조회",
       "summary": "과제 · 개발모델 · 고장모드 · 시험항목 · 관리 기준 같은 코어 개체를 정본 허브에서 먼저 푼다. 후보가 여럿이면 고르지 말고 묻는다. 다른 허브 · 앱으로 건널 때는 key 로 다시 푼다.",
-      "triggers": ["정본 조회", "코어 객체", "온톨로지 조회", "고장모드 찾", "시험항목 찾", "관리 기준", "과제 코드", "개발모델"],
-      "entry": ["_gateway", "ontology_lookup"],
+      "triggers": ["정본 조회", "코어 객체", "온톨로지 조회", "온톨로지에서 과제", "plm 과제", "고장모드 찾", "시험항목 찾", "관리 기준", "과제 코드", "개발모델"],
+      "entry": ["rootdesigndatahub", "object_resolve"],
       "steps": [
-        {"backend": "_gateway", "tool": "ontology_lookup", "why": "이름 · 코드를 정본 개체로 풀고 앱마다 다음 호출을 받는다(exact 면 next 를 따른다)"},
-        {"backend": "rootdesigndatahub", "tool": "object_resolve", "why": "정본 허브에서 이름 · 코드를 푼다(candidates 면 묻는다)"},
+        {"backend": "rootdesigndatahub", "tool": "object_resolve", "why": "정본 허브에서 이름 · 코드를 먼저 푼다(candidates 면 고르지 말고 묻는다 — 코어 타입은 늘 정본이 먼저)"},
+        {"backend": "_gateway", "tool": "ontology_lookup", "why": "정본 판정 그대로 앱마다 key 를 채운 다음 호출(next)을 받는다(exact 면 그대로 부른다)"},
         {"backend": "rootdesigndatahub", "tool": "objects_list", "why": "개수는 목록을 세지 말고 total 로 답한다"},
         {"backend": "rootdesigndatahub", "tool": "objects_summary", "why": "타입별 개수를 받는다"},
         {"backend": "rootdesigndatahub", "tool": "graph_neighbors", "why": "무엇이 무엇과 이어졌는지 본다"},
@@ -291,7 +290,7 @@
     "project-history": {
       "title": "과제의 앞선 심의 · 인사이트 찾기",
       "summary": "같은 과제 · 차수에서 앞서 내린 심의 결정 카드와 리스크 심사 · 보고서를 모아 이번 일의 출발점으로 삼는다. 앞선 인사이트는 검증 대상이지 독립 근거가 아니다.",
-      "triggers": ["과제 인사이트", "앞선 심의", "이전 심의", "지난 심의 결과", "과제 이력", "예전 결정"],
+      "triggers": ["과제 인사이트", "앞선 심의", "이전 심의", "예전 심의", "지난 심의 결과", "과제 이력", "예전 결정"],
       "entry": ["_gateway", "insight_find"],
       "steps": [
         {"backend": "_gateway", "tool": "insight_find", "why": "과제(SP 허브 key) · 차수로 앞선 결정 카드를 찾는다"},
@@ -326,7 +325,7 @@
     "cad-project-status": {
       "title": "CAD 과제 찾기 · 진행 보기",
       "summary": "StepForge 과제를 이름 · 코드로 찾고, 어디까지 왔는지와 지금 부를 수 있는 도구 · 걸린 잡을 본다.",
-      "triggers": ["과제 진행", "어디까지 진행", "과제 찾", "cad 과제", "stepforge 과제", "파트 몇 개"],
+      "triggers": ["과제 진행", "어디까지 진행", "cad 과제", "stepforge 과제", "파트 몇 개"],
       "entry": ["heax-step_forge", "list_projects"],
       "steps": [
         {"backend": "heax-step_forge", "tool": "list_projects", "why": "과제를 이름 · 코드 · 목적으로 찾고 진행 카운트를 본다"},
@@ -381,7 +380,7 @@
     "cad-measure": {
       "title": "치수 · 간극 재기",
       "summary": "무엇을 잴지 헷갈리면 measurement_guide 를 먼저 본다 — 비슷한 값이 나와도 답하는 질문이 다르다. 스택업 층간 간극은 axis_gap, 방향 없는 최소거리는 measure_distance 다.",
-      "triggers": ["간극 재", "거리 재", "치수 재", "두께 재", "간격 재", "측정", "축방향 간극", "최소 거리"],
+      "triggers": ["간극 재", "거리 재", "치수 재", "두께 재", "간격 재", "축방향 간극", "최소 거리"],
       "entry": ["heax-step_forge", "measurement_guide"],
       "steps": [
         {"backend": "heax-step_forge", "tool": "measurement_guide", "why": "질문에 맞는 지표 · 도구 · 한계를 먼저 고른다"},
@@ -461,7 +460,7 @@
     "cad-ontology": {
       "title": "StepForge 온톨로지 탐색",
       "summary": "이름 · 식별자 · 별칭으로 허브 객체와 개정 · 파트 · 역할을 찾고, 객체 카드 · 이웃 · 경로로 따라간다. 판정이 필요하면 resolve 로 받는다.",
-      "triggers": ["stepforge 온톨로지", "cad 온톨로지", "온톨로지 객체", "객체 이웃", "온톨로지 경로"],
+      "triggers": ["stepforge 온톨로지", "cad 온톨로지", "형상 온톨로지"],
       "entry": ["heax-step_forge", "onto_search"],
       "steps": [
         {"backend": "heax-step_forge", "tool": "onto_search", "why": "이름 · 식별자 · 별칭으로 찾는다(resolve=true 면 판정)"},
@@ -479,7 +478,7 @@
     "cad-risk-screen": {
       "title": "구조 위험 훑기",
       "summary": "실패모드 사전을 돌려 이 설계에서 무엇을 봐야 하는지 가리킨다. 판정하지 않는다 — 값과 그 칸의 한계 · 의심 까닭을 낸다.",
-      "triggers": ["구조 위험", "실패모드", "실패 모드", "위험 훑", "취약부", "설계 위험 훑"],
+      "triggers": ["구조 위험", "실패모드", "실패 모드", "위험 훑", "취약부", "취약한 곳", "설계 위험 훑"],
       "entry": ["heax-step_forge", "risk_screen"],
       "steps": [
         {"backend": "heax-step_forge", "tool": "risk_screen", "why": "실패모드 사전을 돌려 가리킨 칸의 값을 붙인다"},
@@ -498,7 +497,7 @@
     "deck-preprocess": {
       "title": "K파일 전처리 오퍼레이션",
       "summary": "오퍼레이션 이름 · 인자를 추측하지 않는다 — 목록에서 고르고 args_schema 대로 세션의 파일에 적용한 뒤 산출물을 받는다. 인클루드가 빠지면 실행이 막힌다.",
-      "triggers": ["k파일", "kfile", "전처리 오퍼레이션", "재료카드 교체", "덱 전처리", "prestress", "매핑", "squeeze", "assemble"],
+      "triggers": ["k파일", "kfile", "오퍼레이션", "전처리 오퍼레이션", "재료카드 교체", "덱 전처리", "prestress", "squeeze", "assemble"],
       "entry": ["heax-kooremapper_mcp", "list_operations"],
       "steps": [
         {"backend": "heax-kooremapper_mcp", "tool": "list_operations", "why": "오퍼레이션 요약을 보고 고른다"},
@@ -558,6 +557,24 @@
       "samples": ["파트별 최악 응력 비교하는 레시피 있어?", "방금 짠 분석 레시피로 올려줘"],
       "apps": ["heax-kooremapper_mcp"],
       "source": "KooRemapper SKILL.md 「레시피」"
+    },
+    "dyna-task-revisions": {
+      "title": "DynaForge 과제 · 개정 견주기",
+      "summary": "허브에서 받은 과제를 과제명 · 과제코드 · 별칭으로 찾고, 그 과제의 개발 개정 줄과 판마다의 최악값 변화를 견준다. 정본은 허브다(읽기 전용) — 옛 식별자는 renamed_to 로 온다.",
+      "triggers": ["dynaforge 과제", "dynaforge 온톨로지", "과제 개정", "개정 줄", "판끼리 견주", "개정 견주"],
+      "entry": ["heax-kooremapper_mcp", "list_tasks"],
+      "steps": [
+        {"backend": "heax-kooremapper_mcp", "tool": "list_tasks", "why": "과제를 과제명 · 과제코드 · 별칭으로 찾는다(matched_by · match_kind)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "task_revisions", "why": "한 과제의 개발 개정 줄과 판마다 달린 리포트를 본다(task_found:false 면 정본에 없다)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "compare_task_revisions", "why": "판마다 최악 응력 · G · 심각도와 앞 판 대비 변화를 나란히 본다(안 잰 것은 null)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "ontology_types", "why": "받은 타입 정의와 건수를 본다"},
+        {"backend": "heax-kooremapper_mcp", "tool": "ontology_find", "why": "한 타입의 객체를 찾는다(사라진 것도 active:false 로 온다)"},
+        {"backend": "heax-kooremapper_mcp", "tool": "ontology_object", "why": "객체 하나의 칸 · 선 · 옛 식별자를 본다"}
+      ],
+      "confirm_writes": [],
+      "samples": ["이 과제 DV1 DV2 판끼리 최악 응력 변화 견줘줘", "DynaForge 온톨로지에서 이 과제 찾아줘"],
+      "apps": ["heax-kooremapper_mcp"],
+      "source": "core_vocab ontology(heax-kooremapper_mcp list_tasks · task_revisions · compare_task_revisions) · DynaForge 도구 설명"
     },
     "dyna-mesh-figures": {
       "title": "격자를 그림으로 보기",
@@ -915,7 +932,7 @@
     "doc-convert": {
       "title": "문서 → Report Archive 정밀 변환",
       "summary": "입력 상자의 PPT · Excel · Word 를 RA 패키지로 변환한다. 챗 업로드의 「Report Archive — 정밀 변환」 이 있으면 그것이 먼저다(진행 · 배달 · 알림을 포털이 잇는다).",
-      "triggers": ["정밀 변환", "ppt 를 ra", "문서 변환", "ppt 변환", "docforge", "엑셀 변환"],
+      "triggers": ["정밀 변환", "ppt 를 ra", "문서 변환", "ppt 변환", "엑셀 변환", "ra 보고서로 옮기", "drm 문서", "drm 걸린"],
       "entry": ["heax-doc_forge", "docforge_list_inputs"],
       "steps": [
         {"backend": "heax-doc_forge", "tool": "docforge_list_inputs", "why": "입력 상자의 파일을 본다"},
@@ -932,7 +949,7 @@
     "docforge-capabilities": {
       "title": "DocForge 능력 확인",
       "summary": "이 박스의 DocForge 가 무엇을 하는지(그림 판독 VLM 설정 여부 포함) 본다.",
-      "triggers": ["docforge 능력", "변환 가능", "그림 판독 되", "vlm 설정"],
+      "triggers": ["docforge 능력", "변환 가능", "그림 판독", "vlm 설정", "지원 형식"],
       "entry": ["heax-doc_forge", "docforge_capabilities"],
       "steps": [
         {"backend": "heax-doc_forge", "tool": "docforge_capabilities", "why": "지원 형식 · 그림 판독(VLM) 설정을 본다"}
@@ -968,7 +985,7 @@
     "wda-report-doc": {
       "title": "보고서 → 발표자료(PPT · PDF)",
       "summary": "보고서로 디자인 회의를 돌려 시나리오를 짓고 문서(PDF · PPT)로 렌더한다. RA 보고서의 '발표자료로' 단추가 켜진 박스면 그것이 먼저다.",
-      "triggers": ["발표자료", "ppt 만들", "pdf 만들", "슬라이드", "발표 자료"],
+      "triggers": ["발표자료", "발표자료 만들", "보고서로 발표자료", "ppt 만들", "pdf 만들", "슬라이드", "발표 자료"],
       "entry": ["heax-web_design_agents", "report_ingest"],
       "steps": [
         {"backend": "heax-web_design_agents", "tool": "report_ingest", "why": "보고서를 들여 run_id 를 받는다(쓰기 — 서버가 읽을 수 있는 경로)"},
@@ -1010,7 +1027,7 @@
     "wda-fix-scenes": {
       "title": "발표 산출물 고치고 검증",
       "summary": "씬 목록에서 잘못 만든 씬을 찾고 스틸 · HTML 로 확인한 뒤 핀포인트 패치로 고치고 품질 게이트를 다시 돌린다.",
-      "triggers": ["씬 고치", "씬 수정", "내레이션 바꿔", "씬 목록", "슬라이드 고치"],
+      "triggers": ["씬 고치", "씬 고쳐", "씬 수정", "내레이션 바꿔", "내레이션 고쳐", "씬 목록", "슬라이드 고치"],
       "entry": ["heax-web_design_agents", "scene_list"],
       "steps": [
         {"backend": "heax-web_design_agents", "tool": "scene_list", "why": "씬 목록과 요약을 본다(핀포인트 수정의 진입점)"},
@@ -1098,7 +1115,7 @@
     "laminate-foldable": {
       "title": "폴더블 · 형상 연계 적층",
       "summary": "형상에서 적층을 짓고 부분 합성 굽힘 · 지정 곡률을 푼 뒤 층별 응력 · 균열 차폐 · 취성 파괴 · 응력 이완을 본다.",
-      "triggers": ["폴더블", "굽힘반경", "굽힘 반경", "접힘", "곡률 풀", "응력 이완"],
+      "triggers": ["폴더블", "굽힘반경", "굽힘 반경", "굽힘반경 지정", "지정 곡률", "곡률 지정", "접힘", "곡률 풀", "응력 이완"],
       "entry": ["heax-laminate_analyzer_mcp", "build_laminate_from_geometry"],
       "steps": [
         {"backend": "heax-laminate_analyzer_mcp", "tool": "build_laminate_from_geometry", "why": "형상(층 두께 · 재료)에서 적층을 짓는다"},
@@ -1168,7 +1185,7 @@
     "datahub-aggregate": {
       "title": "표 레코드 통계",
       "summary": "표 레코드의 통계는 행을 받아 직접 계산하지 말고 서버가 계산하게 한다.",
-      "triggers": ["통계", "평균", "최대값", "집계", "region 별", "yield"],
+      "triggers": ["표 레코드", "표 통계", "표 집계", "표 평균", "표 최대값", "그룹별 집계"],
       "entry": ["ai-data-hub", "data_aggregate"],
       "steps": [
         {"backend": "ai-data-hub", "tool": "list_records", "why": "표 레코드(record_id)를 찾는다"},
@@ -1251,7 +1268,7 @@
     "voc-briefing": {
       "title": "VOC 일일 브리핑",
       "summary": "날짜의 수집량 · 감성 · 언급 상위 제품 · 부정 다발을 한 문서로 받고, 떠오르는 낱말 · 제품 요약으로 잇는다.",
-      "triggers": ["브리핑", "일일 voc", "오늘 voc", "voc 요약", "떠오르는 키워드"],
+      "triggers": ["voc 브리핑", "일일 브리핑", "일일 voc", "오늘 voc", "voc 요약", "떠오르는 키워드"],
       "entry": ["signalforge", "daily_briefing"],
       "steps": [
         {"backend": "signalforge", "tool": "daily_briefing", "why": "지정 날짜(KST)의 VOC 브리핑을 받는다"},
@@ -1266,7 +1283,7 @@
     "deliberation": {
       "title": "전문가 심의",
       "summary": "상황에 맞는 심의 종류를 고르고 서버 엔진에 맡긴다. job_id 를 바로 받아 알리고, 진행은 한 번 보고, 결정문을 요약한다. 새 관측은 처음부터 다시가 아니라 이어서 돌린다.",
-      "triggers": ["심의", "안 선택", "트레이드오프", "신뢰 판정", "시험 계획", "해석 설계", "심의 열", "심의 돌려"],
+      "triggers": ["심의", "심의 열", "심의 돌려", "심의 해", "심의 시작", "심의 맡", "전문가 심의"],
       "entry": ["hwax-deliberation", "deliberate_jobs"],
       "steps": [
         {"backend": "hwax-deliberation", "tool": "deliberate_jobs", "why": "심의 종류 · 얹을 층 · 대기열을 본다"},
@@ -1284,7 +1301,7 @@
     "risk-review-status": {
       "title": "리스크 심사 진행 · 등록부 읽기",
       "summary": "과제의 커버리지를 보고, 이미 돈 패널의 기록을 읽어 중복 제기를 막으며, 등록부 · 종합 보고서를 읽는다.",
-      "triggers": ["커버리지", "심사 진행", "등록부", "패널 기록", "심사 과제 목록"],
+      "triggers": ["커버리지", "심사 커버리지", "리스크 커버리지", "심사 진행", "등록부", "패널 기록", "심사 과제 목록"],
       "entry": ["heax-hwax_risk", "risk_list_projects"],
       "steps": [
         {"backend": "heax-hwax_risk", "tool": "risk_list_projects", "why": "target_key 를 얻는다"},
@@ -1303,7 +1320,7 @@
     "web-research": {
       "title": "웹 · 논문 조사",
       "summary": "먼저 켜진 소스를 보고, 수집해 둔 것부터 찾는다. 사외 질의에 사내 기밀을 넣지 않는다. 인용은 문장 원문을 doc_id · 문장 번호와 함께 적는다.",
-      "triggers": ["논문 찾", "웹 검색", "웹 조사", "논문 검색", "외부 자료", "인용"],
+      "triggers": ["논문 찾아", "관련 논문", "웹 검색", "웹 조사", "논문 검색", "외부 자료", "문장 인용"],
       "entry": ["heax-web_research_mcp", "describe_search_status"],
       "steps": [
         {"backend": "heax-web_research_mcp", "tool": "describe_search_status", "why": "운영 모드와 켜진 소스를 본다(꺼진 소스는 결과가 비는 까닭)"},

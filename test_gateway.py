@@ -6798,6 +6798,17 @@ _SEARCH_SPECS = [
 ] + [("signalforge", f"report_x{i:02d}", "보고서 report 묶음 — 같은 점수로 겹치는 도구들.") for i in range(12)]
 
 
+def _m3_off(monkeypatch):
+    """검색의 목적 층 · 앱 입구 손잡이(HWAXPortal docs/mcp-modernize M3 — 기본 켬)를 끈 손잡이로 돈다. 그 둘을 끄면 순위 · 글이 종전과 바이트까지 같다 —
+    종전 코드 사본(_SEARCH_TOOLS_MASTER)과 견주는 시험 · 다른 장치만 따로 보는 시험이 이것을 건다. _tuning 을 감싸 박스 덧씌우기 시험과 함께 쓴다."""
+    real = gw._tuning
+
+    def off():
+        d = real()
+        return {**d, "switches": {**d["switches"], "purpose_boost": False, "app_entry_first": False}}
+    monkeypatch.setattr(gw, "_tuning", off)
+
+
 def _search_catalog(monkeypatch, specs=None):
     """search_tools 가 보는 카탈로그를 앉힌다 — 앱 라벨·설명(app_hit)까지 실제와 같은 길로 읽힌다."""
     specs = specs or _SEARCH_SPECS
@@ -7228,6 +7239,7 @@ def test_E2_1_앱_목록_도구_지도_검색_줄은_가족_비코어에만_role
 def test_E2_1_실제_어휘표에서도_dev_카탈로그의_search_tools_답은_지금_코드와_바이트까지_같다(monkeypatch):
     """dev 에는 가족 · 비코어 앱이 붙어 있지 않다 — 역할 칸 · 가족 접기 · 가족 접두 · 비코어 낮추기(기본 끔)가 들어와도 실제 어휘표 아래 답이 기준본
     (_SEARCH_TOOLS_MASTER)과 한 글자도 다르지 않다. 의미 순위를 끈 바이트 시험(아래)은 어휘표 없이 같은 것을 본다."""
+    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
     _search_catalog(monkeypatch)
     monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
     _no_embed(monkeypatch)
@@ -7267,6 +7279,7 @@ def test_E2_2_가족_줄은_설명이_달라도_원래_이름으로_한_줄에_�
 def test_E2_2_설명이_같으면_가족_접기는_지금_코드와_바이트까지_같다(monkeypatch):
     """설명이 같은 합성 카탈로그(cae00 의 지금 꼴) — 가족 접기의 답이 기준본과 같다. 검색 줄의 역할 칸(role — E2-1 이 더한 것)만 빼고 응답 글을
     견준다. 사본 앱 이름을 부르는 질의(OT-12)와 비코어 · 심의 질의를 함께 지난다."""
+    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
     search = _role_kit(monkeypatch)
     legacy = _search_tools_master()
 
@@ -7537,6 +7550,7 @@ _NONCORE_HEAVY = {**_CORE_OTHER,
 def test_E2_5_비코어_낮추기는_기본_끔이고_켜면_코어_질문의_비코어_줄이_정본_읽기_도구_아래로_간다(monkeypatch, tmp_path):
     """손잡이 noncore_demote(기본 끔 — 결정 Q-1, cae00 검색 평가의 +noncore_demote 판을 본 뒤 박스 덧씌우기로 켠다). 켜면 코어 질문(어휘표 검색 낱말이
     든 질의)에서 비코어 앱 도구 점수에 weights.noncore 를 곱한다. 앱 이름을 부르면 · 코어 낱말이 없으면 그대로다. 질의 기록 via 에 남는다."""
+    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
     hub_tools = tuple((n, d) for n, d in _CORE_HUB_TOOLS if n in ("object_resolve", "objects_summary"))
     search = _role_kit(monkeypatch, hub_tools=hub_tools, other=_NONCORE_HEAVY)
     t = gw._tuning()
@@ -7570,6 +7584,7 @@ def test_E2_5_앱_이름을_부른_질의는_어휘표_라벨과_키로도_알�
     """외부 연결 앱의 게이트웨이 라벨은 포털 플랫폼 라벨이다(FMEA — 'FMEA Agent' · ARP — 'AI Ready Portal'). 그 라벨의 이름(fmeaagent · aireadyportal)만
     보면 'FMEA 관리 기준 개수' 가 앱을 부르지 않는 것이 되어, 손잡이를 켜면 1위가 정본 읽기 도구 아래로 밀렸다(검토 10-31 — 위 시험의 라벨 'FMEA' 는
     운영과 달라 가렸다). 어휘표의 앱 라벨(apps.<키>.label)과 백엔드 키도 그 앱의 이름이다. 부르지 않은 비코어는 그대로 낮춘다."""
+    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
     other = {**_NONCORE_HEAVY, "fmea": ("FMEA Agent", _NONCORE_HEAVY["fmea"][1]), "arp": ("AI Ready Portal", _NONCORE_HEAVY["arp"][1])}
     hub_tools = tuple((n, d) for n, d in _CORE_HUB_TOOLS if n in ("object_resolve", "objects_summary"))
     search = _role_kit(monkeypatch, hub_tools=hub_tools, other=other)
@@ -7864,6 +7879,7 @@ _OL_QS = ("온톨로지 조회", "온톨로지 검색", "ontology lookup", "고�
 
 
 def test_OL2_끄면_순위와_글이_도구가_없던_때와_바이트까지_같다(monkeypatch, tmp_path):
+    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
     search = _role_kit(monkeypatch, other=_OL_OTHER)
     assert gw._tuning()["switches"]["onto_lookup_first"] is False and gw._tuning()["weights"]["onto_object"] == 4
     now = {q: search(q, 20, raw=True) for q in _OL_QS}
@@ -8146,6 +8162,7 @@ def test_E4_리포_mcp_json_은_보기_머리로_늘_전체를_청한다():
 def test_search_tools_의미_순위를_끄면_답이_master_와_바이트까지_같다(monkeypatch):
     """옵션을 끈 것이 기본값이다 — 그때 search_tools 는 종전 코드와 글자 하나 다르지 않아야 하고 임베더를 부르지 않는다.
     질의는 손으로 고른 가장자리(짧음·빈 낱말·대소문자·조사·limit)와 평가셋의 질의 전부다."""
+    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
     from pathlib import Path
     _search_catalog(monkeypatch)
     _no_embed(monkeypatch)
@@ -8808,9 +8825,12 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     assert d["write_intent"] == ('등록', '생성', '만들', '작성', '쓰기', '추가', '수정', '고치', '고쳐', '바꾸', '바꿔', '변경', '삭제', '지우', '지워', '저장', '올리', '올려', '업로드', '반입', '가져오', '실행', '돌리', '돌려', '제출', '시작', '걸어', '적용', '반영', '보내', '발행', '게시', '취소', '중지', '멈추', '멈춰', '학습', '이어서', '다시 돌', '채워', '채우', '넣어', '넣고', '남기', '남겨', '붙여', '붙이', '기각', '승인', '심의', '토의', '심사', '회의', 'create', 'add ', 'update', 'edit', 'modify', 'delete', 'remove', 'save', 'register', 'upload', 'import', 'run ', 'execute', 'submit', 'start', 'launch', 'apply', 'publish', 'send', 'cancel', 'stop', 'train', 'rename')
     # noncore(0.5) · noncore_demote(끔)는 10-31 E2-5 가, onto(4) · onto_first(끔)는 11-02 온톨로지 먼저(HWAXPortal docs/ontology-first)가, onto_object(4) ·
     # onto_lookup_first(끔)는 11-17 온톨로지 조회(같은 폴더 PLAN §12)가 더한 새 손잡이다 — 끈 채로(onto_object 는 인자가 있을 때만) 들어와 순위는 그대로다
+    # purpose_step · purpose_cover · purpose_hint_cover · app_entry 와 켬인 purpose_boost · app_entry_first 는 11-27 M3(목적 묶음)이 더했다 — 평가셋 183쌍
+    # 나빠짐 0 을 보고 켰다(일부러 바꾼 기본값 — 끄면 순위가 종전과 바이트까지 같다, _m3_off)
     assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2, "noncore": 0.5,
-                            "onto": 4, "onto_object": 4}
+                            "onto": 4, "onto_object": 4, "purpose_step": 6, "purpose_cover": 0.2, "purpose_hint_cover": 0.2, "app_entry": 4}
     assert all(v for k, v in d["switches"].items() if k not in gw._TUNING_OPT_IN) and gw._TUNING_OPT_IN == ("noncore_demote", "onto_first", "onto_lookup_first")
+    assert d["switches"]["purpose_boost"] is True and d["switches"]["app_entry_first"] is True
     assert d["switches"]["space_fold"] is True, "11-27 M2 — 빈칸 접기(4자 이상 낱말) 기본 켬"
     assert d["switches"]["noncore_demote"] is False and d["switches"]["onto_first"] is False
     assert d["switches"]["onto_lookup_first"] is False and d["weights"]["onto_object"] == d["weights"]["onto"]
@@ -13019,6 +13039,7 @@ def test_search_tools_는_짝_단면_단면_비교로_section_pair_view_를_찾�
 
 
 def test_짝_단면_열쇠를_빼면_짝_단면이_다시_묻히고_단면_만의_순위는_열쇠와_상관없다(monkeypatch):
+    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
     _search_catalog(monkeypatch, _SECTION_SEARCH_SPECS)
     _no_embed(monkeypatch)
     ranked = lambda q: json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]  # noqa: E731
@@ -17700,6 +17721,7 @@ def test_쓰기_의도_낱말_작성_쓰기면_쓰기_도구를_감점하지_않
     def before(q, tun=None):                      # 로컬 도구(figure_to_report 등)도 시야에 있다 — 두 도구의 앞뒤만 본다
         r = _rank_of(q, tun)
         return r.index("create_report_draft") < r.index("get_report")
+    _m3_off(monkeypatch)                         # 목적 층(M3)은 보고서 쓰기 목적의 단계를 올려 감점을 비켜 간다 — 쓰기 의도 낱말만 따로 본다
     base = gw._tuning()
     old = {**base, "write_intent": tuple(w for w in base["write_intent"] if w not in ("작성", "쓰기"))}
     for q in ("보고서 작성", "보고서 쓰기"):
@@ -17887,7 +17909,7 @@ def test_M3_health_와_tools_map_에_목적이_실리고_끄면_칸이_없다(mo
     h = _health_body()["purposes"]
     assert (h["loaded"], h["count"], h["live"], h["inactive"], h["by_kind"]) == (True, 3, 2, 1, {"multi": 1, "app": 2})
     assert h["missing"] == {"steps": 2, "by_backend": {"cluster": 2}} and h["app_entries"] == 3
-    assert h["knobs"]["list"] and h["knobs"]["prompts"] and h["knobs"]["purpose_boost"] is False
+    assert h["knobs"]["list"] and h["knobs"]["prompts"] and h["knobs"]["purpose_boost"] is True and h["knobs"]["app_entry_first"] is True
     assert "app_entry_missing" not in h, "붙지 않은 앱(ghost)의 입구는 없는 것이 맞다 — 붙은 앱의 입구가 사라졌을 때만 센다"
     sent = []
 
@@ -18013,3 +18035,87 @@ def test_M0_채택_셈은_보기_tools_list_를_디스크에_날마다_남기고
     assert asyncio.run(gw._list_tools(req)) and gw._ADOPT_WARN["errors"] >= 1
     monkeypatch.setattr(gw, "ADOPTION_ON", False)
     assert "adoption" not in _health_body() and "adoption" not in gw._usage_rollup_view({})
+
+
+def _p_search(monkeypatch, tmp_path, submit_desc="잡을 낸다."):
+    """목적 층 시험의 카탈로그 — _p_catalog 에 목적 단계가 아닌 낙하 리포트 도구 하나를 더하고 앱 라벨을 준다(앱 입구 시험이 이름을 부른다)."""
+    _p_table(monkeypatch, tmp_path)
+    tools = _p_catalog(monkeypatch)
+    for t in tools:
+        if t.name == "submit":
+            object.__setattr__(t, "description", submit_desc)
+    extra = types.Tool(name="drop_report", description="낙하 해석 결과 리포트를 읽는다.", inputSchema={"type": "object", "properties": {}})
+    # StepForge 입구는 노출 이름이 이름순으로 뒤에 서게 바꾼다 — 앱 이름이 맞은 줄끼리 점수가 같으면 이름순이라 입구가 저절로 첫 줄일 수 있다
+    tools = [t.model_copy(update={"name": "zz_guide"}) if t.name == "guide" else t for t in tools]
+    route = {("zz_guide" if n == "guide" else n): v for n, v in gw.route.items()}
+    monkeypatch.setattr(gw, "exposed_tools", tools + [extra])
+    monkeypatch.setattr(gw, "route", {**route, "drop_report": ("st", "drop_report")})
+    monkeypatch.setattr(gw, "DISCOVERED_META", {"sf": {"label": "StepForge", "description": ""}, "ra": {"label": "Report Archive", "description": ""}})
+    _no_embed(monkeypatch)
+
+
+def _p_ask(q, **kw):
+    return json.loads(asyncio.run(gw._search_tools({"query": q, "limit": 10}, groups=[], embed=False, **kw)).content[0].text)
+
+
+def test_M3_목적_층은_입구를_첫_줄로_세우고_단계를_올리며_답에_purpose_를_싣는다(monkeypatch, tmp_path):
+    _p_search(monkeypatch, tmp_path)
+    out = _p_ask("낙하 해석 준비 해줘", log_query=False)
+    assert out["purpose"] == {"key": "drop-prep", "title": "낙하 해석 준비", "entry": "heaxsf_list_projects",
+                              "steps": ["heaxsf_list_projects", "run_job", "submit", "figure_list"], "confirm": ["run_job", "submit"],
+                              "more": "list_tool_apps(by='purpose', purpose='drop-prep')", "prompt": "purpose-drop-prep"}
+    assert list(out)[list(out).index("ranked") + 1] == "purpose", "이름 순위 바로 뒤 — 작은 창의 소비자가 앞에서부터 잘라도 남는다"
+    assert out["ranked"][0] == "heaxsf_list_projects", "목적 가중 전 첫 줄(drop_report)은 목적 단계가 아니다 — 입구를 세운다"
+    assert {"run_job", "submit", "figure_list", "drop_report"} <= set(out["ranked"]), "질의 낱말에 안 맞은 단계도 가중으로 줄에 든다"
+    assert "purpose 는 질의가 맞은 업무 목적의 차례다" in out["note"]
+    # 질의 기록의 귀속 — 목적 가중으로 든 줄은 규칙 표지에 purpose:<키>, 세운 입구는 purpose_entry
+    out = _p_ask("낙하 해석 준비 해줘")
+    rec = json.loads(next(gw.TOOL_QUERY_LOG_DIR.glob("queries-*.local.jsonl")).read_text().splitlines()[-1])
+    assert "purpose_entry" in rec["via"]["sf:list_projects"] and "purpose:drop-prep" in rec["via"]["sf:run_job"], rec
+    assert "sf:run_job" in rec["boost_only"], "질의 낱말로는 0점 — 목적 가중 덕에만 든 줄"
+    rows = gw._usage_rollup.adopt_query(gw.ADOPTION_PATH, "2000-01-01", "2999-12-31")
+    assert [(r["kind"], r["key"], r["n"]) for r in rows] == [("search_purpose", "drop-prep", 1)], "평가(log_query=False)는 세지 않는다"
+
+
+def test_M3_목적_단계가_이미_상위에_있으면_입구를_세우지_않고_덮음이_작으면_순위를_건드리지_않는다(monkeypatch, tmp_path):
+    _p_search(monkeypatch, tmp_path, submit_desc="낙하 해석을 낸다.")
+    out = _p_ask("낙하 해석 준비", log_query=False)
+    assert out["purpose"]["key"] == "drop-prep" and out["ranked"][0] != "heaxsf_list_projects", "submit(단계)이 목적 가중 전 상위 셋 안 — 입구를 세우지 않는다"
+    assert out["ranked"].index("submit") < out["ranked"].index("figure_list"), "단계끼리는 낱말 순위 그대로 함께 오른다(낱말에 맞은 submit 이 0점 단계 위)"
+    long_q = "어제 올린 파일로 낙하 해석 준비가 다 됐는지 확인하고 결과 리포트도 꼼꼼히 읽어 보고 싶다"
+    on = asyncio.run(gw._search_tools({"query": long_q, "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text
+    assert "purpose" not in json.loads(on), "트리거가 질의를 덮는 비율이 문턱(purpose_hint_cover) 밑 — 도구 하나를 겨눈 긴 문장"
+    _m3_off(monkeypatch)
+    assert asyncio.run(gw._search_tools({"query": long_q, "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text == on
+
+
+def test_M3_목적_층과_앱_입구를_끄면_답이_바이트까지_같고_켜도_목적이_안_맞는_질의는_같다(monkeypatch, tmp_path):
+    _p_search(monkeypatch, tmp_path)
+    qs = ("과제 목록", "보고서 초안", "잡을 낸다", "리포트")
+    on = {q: asyncio.run(gw._search_tools({"query": q, "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text for q in qs}
+    hit = asyncio.run(gw._search_tools({"query": "보고서 쓰기", "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text
+    _m3_off(monkeypatch)
+    off = {q: asyncio.run(gw._search_tools({"query": q, "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text for q in qs}
+    assert on == off, "목적 · 앱 이름이 안 맞는 질의는 켜도 같다"
+    hit_off = asyncio.run(gw._search_tools({"query": "보고서 쓰기", "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text
+    hit = json.loads(hit)
+    assert hit["purpose"]["key"] == "report-write" and "purpose" not in json.loads(hit_off)
+    assert hit["ranked"][0] == "create_report_draft", "그 목적의 단계(create_report_draft)가 이미 첫 줄이라 입구(ra_guide)를 세우지 않는다"
+
+
+def test_M3_앱_이름만_부르면_그_앱의_입구가_첫_줄이고_일을_함께_말하면_입구를_올리기만_한다(monkeypatch, tmp_path):
+    _p_search(monkeypatch, tmp_path)
+    for q, want in (("StepForge 어떻게 써?", "zz_guide"), ("StepForge", "zz_guide"), ("Report Archive 시작", "ra_guide")):
+        out = _p_ask(q, log_query=False)
+        assert out["ranked"][0] == want, (q, out["ranked"])
+    out = _p_ask("StepForge 과제 목록", log_query=False)
+    assert out["ranked"][0] == "heaxsf_list_projects" and "zz_guide" in out["ranked"], "일을 말한 질의 — 입구는 가중만(weights.app_entry)"
+    both = asyncio.run(gw._search_tools({"query": "StepForge Report Archive", "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text
+    monkeypatch.setattr(gw, "TOOL_PURPOSES_PATH", tmp_path / "없음.json")
+    monkeypatch.setattr(gw, "_PURPOSES", {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None})
+    got = asyncio.run(gw._search_tools({"query": "StepForge 어떻게 써?", "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text
+    _m3_off(monkeypatch)
+    assert both == asyncio.run(gw._search_tools({"query": "StepForge Report Archive", "limit": 10}, groups=[], embed=False,
+                                                log_query=False)).content[0].text, "두 앱을 부르면 어느 입구도 세우지 않는다(끈 것과 같다)"
+    assert got == asyncio.run(gw._search_tools({"query": "StepForge 어떻게 써?", "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text, \
+        "표를 못 읽으면 목적 · 앱 입구가 없다 — 끈 것과 같다"

@@ -6,7 +6,8 @@
   "synonyms — {낱말: {to: [이을 낱말 · 도구 이름 조각], owner, source_fix}}. 질의 낱말이 이 낱말을 담으면 to 를 함께 맞춘다(열쇠에 빈칸이 있으면 — '표 칸' — 빈칸을 뺀 질의에서 어느 낱말의 머리부터 빈칸을 뺀 꼴이 들 때 맞춘다. 한 글자 낱말은 질의에서 버려져 낱말로는 못 맞힌다). owner 는 그 낱말이 도구 설명에 없어 우리가 보정하는 플랫폼(백엔드 키 — 일반 낱말은 null), source_fix 는 그쪽이 고칠 것(비면 '설명 · 별칭에 그 낱말을 넣는다'). 플랫폼별 피드백 보고서(platform_feedback_report.py)가 읽는다.",
   "weights — 낱말 하나의 점수 = name × (이름 적중 또는 앱 이름 적중) + min(설명 빈도, desc_cap) + app × 앱 라벨 · 설명 적중, 도구 점수 = 합 × (1 + coverage × 맞힌 낱말 비율). 쓰기 낱말이 없는 질의의 쓰기 도구는 × write_penalty, 품질 질의는 품질 · VOC 영역 도구에 + quality_per_word × 품질 낱말 수, noncore_demote 를 켜면 코어 질문(어휘표 검색 낱말이 든 질의)의 비코어 앱 도구는 × noncore(질의가 그 앱 이름을 부르면 낮추지 않는다).",
   "onto_lookup_first(기본 끔 — 칸이 없어도 끔) — 켜면 '온톨로지' · 'ontology' 나 코어 어휘표 검색 낱말이 든 질의에서, 질의가 앱 이름을 부르지 않았을 때 게이트웨이 ontology_lookup 을 1위에 세우고 답에 hint 를 싣는다(HWAXPortal docs/ontology-first PLAN §12 · OF-36 — 끄면 순위 · 글이 바이트까지 같다). weights.onto_object — search_tools 의 object 인자(\"type_slug:key\")를 주면 그 타입을 받는 앱(코어 어휘표 ontology.lookup)과 허브 가족의, 이미 질의에 맞은 줄에 더한다(OF-37 — 인자가 없으면 쓰지 않는다).",
-  "11-27(HWAXPortal docs/mcp-modernize M2 · 검색 작은 고침) — write_intent 에 '작성' · '쓰기' 를 더했다('보고서 작성 · 쓰기' 에서 create_report_draft 가 쓰기 감점을 받았다). switches.space_fold(기본 켬) — 질의 낱말을 빈칸을 뺀 설명 · 앱 라벨에서도 센다('지식카드' ↔ '지식 카드'). 쓰기 감점의 '쓰기 도구' 는 게이트웨이의 읽기 · 쓰기 한 판정(GATEWAY_TOOL_CLASS_UNIFIED — 앱 표지 · 확인된 읽기 목록 · 이름의 쓰기 동사)이다. 평가셋에서 나빠진 쌍 0 을 보고 넣었다."
+  "11-27(HWAXPortal docs/mcp-modernize M2 · 검색 작은 고침) — write_intent 에 '작성' · '쓰기' 를 더했다('보고서 작성 · 쓰기' 에서 create_report_draft 가 쓰기 감점을 받았다). switches.space_fold(기본 켬) — 질의 낱말을 빈칸을 뺀 설명 · 앱 라벨에서도 센다('지식카드' ↔ '지식 카드'). 쓰기 감점의 '쓰기 도구' 는 게이트웨이의 읽기 · 쓰기 한 판정(GATEWAY_TOOL_CLASS_UNIFIED — 앱 표지 · 확인된 읽기 목록 · 이름의 쓰기 동사)이다. 평가셋에서 나빠진 쌍 0 을 보고 넣었다.",
+  "11-27(HWAXPortal docs/mcp-modernize M3) — switches.purpose_boost(목적 층 — 질의가 목적 표 tool_purposes.json 의 트리거에 맞으면 그 목적 단계에 weights.purpose_step 을 더하고 입구를 첫 줄에, 답에 purpose) · switches.app_entry_first(앱 하나의 이름을 부른 질의 — 그 앱 입구에 weights.app_entry, 앱 이름과 app_entry_generic 낱말뿐이면 입구를 첫 줄에). weights.purpose_cover — 맞은 트리거 조각이 빈칸 뺀 질의를 덮는 비율이 이 이상일 때만 순위를 건드린다(purpose_hint_cover 이상이면 답에 purpose 만 싣는다). 둘 다 기본 켬 — dev 카탈로그 평가에서 기존 183쌍 나빠짐 0 · 나아짐 8(tool_search_eval/README.md 11-27 M3 절). 박스에서 끄려면 덧씌우기에 false."
  ],
  "version": 1,
  "switches": {
@@ -19,7 +20,9 @@
   "noncore_demote": false,
   "onto_first": false,
   "onto_lookup_first": false,
-  "space_fold": true
+  "space_fold": true,
+  "purpose_boost": true,
+  "app_entry_first": true
  },
  "weights": {
   "name": 4,
@@ -30,7 +33,11 @@
   "quality_per_word": 2,
   "noncore": 0.5,
   "onto": 4,
-  "onto_object": 4
+  "onto_object": 4,
+  "purpose_step": 6,
+  "purpose_cover": 0.2,
+  "purpose_hint_cover": 0.2,
+  "app_entry": 4
  },
  "synonyms": {
   "보고서": {
@@ -766,5 +773,37 @@
   "stop",
   "train",
   "rename"
+ ],
+ "app_entry_generic": [
+  "시작",
+  "처음",
+  "사용법",
+  "쓰는",
+  "써",
+  "쓰려",
+  "어떻게",
+  "뭐",
+  "무엇",
+  "뭘",
+  "도구",
+  "기능",
+  "안내",
+  "가이드",
+  "소개",
+  "방법",
+  "목록",
+  "할수",
+  "있어",
+  "있나",
+  "돼",
+  "되나",
+  "해줘",
+  "줘",
+  "help",
+  "guide",
+  "start",
+  "how",
+  "tools",
+  "what"
  ]
 }

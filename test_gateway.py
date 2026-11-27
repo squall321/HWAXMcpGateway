@@ -6434,6 +6434,7 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     body = tools_map()
     assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read", "views",
                           "panel_read", "orig"] + (["tool_class", "gateway_annotated"] if gw.TOOL_CLASS_UNIFIED else []) + (
+                          ["would_close"] if gw.TOOL_CLASS_MODE == "shadow" else []) + (
                           ["gateway_filled"] if gw.ARG_DOC_FILL is not False else []), \
         "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4) · 패널 확인용 읽기 목록(HA-20 B-2) · 원래 이름" \
         "(ontology-first F0)은 맨 뒤에 덧붙는다"
@@ -8574,9 +8575,12 @@ def test_read_tools_deny_는_StepForge_mesh_size_advice_를_루틴_단계에서_
     assert gw._tool_class(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice") == ("write", "deny"), "한 판정 — 닫기 목록은 쓰기 부류"
     monkeypatch.setattr(gw, "READ_DENY", frozenset())
     assert gw._tool_class(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice") == ("unknown", "none")
-    assert not gw._routine_read(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice"), "한 판정은 이름 꼴로 읽기를 열지 않는다"
-    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
-    assert gw._routine_read(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice"), "끈 박스 — 닫기 목록이 없으면 이름 꼴(advice)로 열린다"
+    _class_mode(monkeypatch, "1")
+    assert not gw._routine_read(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice"), "엄격 — 이름 꼴로 읽기를 열지 않는다"
+    for mode in ("shadow", "0"):
+        _class_mode(monkeypatch, mode)
+        assert gw._routine_read(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice"), \
+            (mode, "그림자 · 끔 — 닫기 목록이 없으면 이름 꼴(advice)로 열린다")
 
 
 def test_read_tools_deny_는_리스크_앱_근거_묶음_만들기를_읽기로_보지_않는다(monkeypatch):
@@ -8588,8 +8592,11 @@ def test_read_tools_deny_는_리스크_앱_근거_묶음_만들기를_읽기로_
     assert not gw._routine_read(_tool("risk_build_evidence_bundle"), "heax-hwax_risk", "risk_build_evidence_bundle")
     assert gw._tool_is_write(_tool("risk_build_evidence_bundle"), "risk_build_evidence_bundle", "heax-hwax_risk"), "한 판정 — 닫기 목록은 쓰기 부류"
     ro = types.Tool(name="risk_get_evidence_bundle", inputSchema={"type": "object"}, annotations=types.ToolAnnotations(readOnlyHint=True))
+    _class_mode(monkeypatch, "1")
     assert gw._routine_read(ro, "heax-hwax_risk", "risk_get_evidence_bundle"), "받기는 앱 표지로 읽기다"
-    assert not gw._routine_read(_tool("risk_get_evidence_bundle"), "heax-hwax_risk", "risk_get_evidence_bundle"), "표지 없으면 한 판정은 모름"
+    assert not gw._routine_read(_tool("risk_get_evidence_bundle"), "heax-hwax_risk", "risk_get_evidence_bundle"), "표지 없으면 엄격은 모름"
+    _class_mode(monkeypatch, "shadow")
+    assert gw._routine_read(_tool("risk_get_evidence_bundle"), "heax-hwax_risk", "risk_get_evidence_bundle"), "그림자 — 옛 판정(이름 꼴)"
     monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
     assert not gw._routine_read(_tool("risk_build_evidence_bundle"), "heax-hwax_risk", "risk_build_evidence_bundle")
     assert gw._routine_read(_tool("risk_get_evidence_bundle"), "heax-hwax_risk", "risk_get_evidence_bundle"), "끈 박스 — 이름 꼴(get)로 열린다"
@@ -10529,9 +10536,16 @@ _RT_NOT_READ_MSG_OFF = ("ROUTINE_ERROR: 단계 안에서는 읽기로 확인된 
                         "이름 꼴). 읽기 도구라면 앱이 readOnlyHint 를 달거나 박스의 read_tools.local.json 에 더한다")
 
 
+def _class_mode(monkeypatch, mode: str) -> None:
+    """읽기 · 쓰기 한 판정의 손잡이를 건다 — shadow(기본) · 1(엄격) · 0(끔). 모듈 값 셋을 함께(gateway 의 계산과 같게)."""
+    monkeypatch.setattr(gw, "TOOL_CLASS_MODE", mode)
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", mode != "0")
+    monkeypatch.setattr(gw, "TOOL_CLASS_STRICT", mode == "1")
+
+
 def _rt_not_read(key: str) -> str:
-    """단계 울타리의 '읽기로 확인되지 않았다' 글 — 부를 때의 손잡이(gw.TOOL_CLASS_UNIFIED)를 따른다."""
-    return (_RT_NOT_READ_MSG if gw.TOOL_CLASS_UNIFIED else _RT_NOT_READ_MSG_OFF).format(key)
+    """단계 울타리의 '읽기로 확인되지 않았다' 글 — 부를 때의 손잡이(gw.TOOL_CLASS_STRICT — 엄격만 새 글)를 따른다."""
+    return (_RT_NOT_READ_MSG if gw.TOOL_CLASS_STRICT else _RT_NOT_READ_MSG_OFF).format(key)
 
 
 def test_실행_시작에_run_id_를_주면_이어서를_부르고_나머지_인자는_보지_않는다(monkeypatch):
@@ -10874,12 +10888,13 @@ def test_심의_단계는_심의_도구_셋을_표지와_무관하게_열고_그
     for n in trio:
         res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": n, "arguments": {"job_id": "j"}})
         assert res.isError and text == _rt_not_read(f"hwax-deliberation:{n}"), (n, text)
-    seen, inner = _rt_kit(monkeypatch, plan={**_RT_PLAN, "steps": [delib, plat]})        # 표지 없음 — 한 판정은 셋 다 모름이라 막는다
+    _class_mode(monkeypatch, "1")
+    seen, inner = _rt_kit(monkeypatch, plan={**_RT_PLAN, "steps": [delib, plat]})        # 표지 없음 — 엄격은 셋 다 모름이라 막는다
     for n in trio:
         res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": n, "arguments": {"job_id": "j"}})
         assert res.isError and text == _rt_not_read(f"hwax-deliberation:{n}"), (n, text)
     assert inner == []
-    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)                                  # 끈 박스 — 이름 꼴로 가른다
+    _class_mode(monkeypatch, "shadow")                                                 # 그림자 · 끈 박스 — 이름 꼴로 가른다
     seen, inner = _rt_kit(monkeypatch, plan={**_RT_PLAN, "steps": [delib, plat]})
     for n, ok in (("deliberate_start", False), ("deliberate_status", True), ("deliberate_result", False)):
         res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": n, "arguments": {"job_id": "j"}})
@@ -14836,11 +14851,14 @@ def test_M1_박스_덧씌우기만으로는_앱이_쓰기로_적은_도구를_�
     why = gw._readonly_denial("w_view", {})
     assert why.startswith("read_only: 'w_view'") and "readOnlyHint=False" in why and "앱 표지가 이긴다" in why, why
     assert gw._readonly_denial("p_view", {}) == "", "표지가 없으면 덧씌우기로 연다"
+    _class_mode(monkeypatch, "1")
     why = gw._readonly_denial("t_view", {})
-    assert why.startswith("read_only: 't_view'") and "앱 표지가 이긴다" in why, "한 판정 — 추적 목록도 앱의 readOnlyHint=False 를 못 이긴다"
-    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
-    assert gw._readonly_denial("t_view", {}) == "", "끈 박스 — 추적 목록은 지금 그대로(앱의 readOnlyHint=False 보다 먼저)"
-    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", True)
+    assert why.startswith("read_only: 't_view'") and "앱 표지가 이긴다" in why, "엄격 — 추적 목록도 앱의 readOnlyHint=False 를 못 이긴다"
+    for mode in ("shadow", "0"):
+        _class_mode(monkeypatch, mode)
+        assert gw._readonly_denial("t_view", {}) == "", (mode, "그림자 · 끔 — 추적 목록은 지금 그대로(앱의 readOnlyHint=False 보다 먼저)")
+    assert gw._would_close()[0] == ["t_view"], "그림자는 엄격이었으면 닫혔을 것으로 센다(읽기 전용 PAT)"
+    _class_mode(monkeypatch, "1")
     for n in ("d_view", "h_view"):
         w = gw._readonly_denial(n, {})
         assert w.startswith(f"read_only: '{n}'") and "destructiveHint" in w, (n, w)
@@ -14852,16 +14870,17 @@ def test_M1_박스_덧씌우기만으로는_앱이_쓰기로_적은_도구를_�
 
 def test_M1_PATCH_는_쓰기_파괴_표지가_달린_항목을_남기되_경고하고_보기는_표지로_막힌_것을_적는다(monkeypatch, tmp_path):
     _labelled(monkeypatch, tmp_path)
+    _class_mode(monkeypatch, "1")
     st, out = _http(monkeypatch, "/readonly-allowlist", "PATCH", {"add": ["sf:w_view", "sf:p_view", "sf:d_view"]})
     assert st == 200 and "sf:w_view" in json.loads(gw.READ_TOOLS_LOCAL_PATH.read_text(encoding="utf-8"))["tools"], "항목은 남긴다"
     assert [w.split("'")[1] for w in out["warnings"]] == ["sf:w_view", "sf:d_view"] and "열리지 않는다" in out["warnings"][0]
     rows = {e["tool"]: e for e in out["entries"]}
     assert rows["sf:w_view"]["blocked_by_label"] == "readOnlyHint=False" and rows["sf:d_view"]["blocked_by_label"] == "destructiveHint"
-    assert rows["sf:t_view"]["blocked_by_label"] == "readOnlyHint=False", "한 판정 — 추적 항목도 앱 표지가 막는다"
+    assert rows["sf:t_view"]["blocked_by_label"] == "readOnlyHint=False", "엄격 — 추적 항목도 앱 표지가 막는다"
     assert "blocked_by_label" not in rows["sf:p_view"]
-    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
+    _class_mode(monkeypatch, "shadow")
     rows_off = {e["tool"]: e for e in _http(monkeypatch, "/readonly-allowlist")[1]["entries"]}
-    assert "blocked_by_label" not in rows_off["sf:t_view"] and "blocked_by_label" not in rows_off["sf:p_view"], "끈 박스 — 추적 항목은 지금 그대로 연다"
+    assert "blocked_by_label" not in rows_off["sf:t_view"] and "blocked_by_label" not in rows_off["sf:p_view"], "그림자 — 추적 항목은 지금 그대로 연다"
     assert "루틴" in out["scope"] and "패널" in out["scope"], "같은 항목이 루틴 단계 · 패널 확인에도 든다고 말한다"
     assert _http(monkeypatch, "/readonly-allowlist")[1]["scope"] == out["scope"]
 
@@ -17295,6 +17314,7 @@ def _cls_kit(monkeypatch):
 
 def test_한_판정은_닫기_파괴_override_표지_목록_이름_차례로_가르고_이름은_읽기로_열지_않는다(monkeypatch):
     tools = _cls_kit(monkeypatch)
+    _class_mode(monkeypatch, "1")
     want = {"d_ro": ("write", "deny"),                     # 닫기 목록이 앱의 readOnlyHint=True 보다 먼저다
             "kill": ("write", "app_annotation"), "ov_kill": ("write", "app_annotation"),    # destructiveHint 는 override 도 이긴다
             "ov": ("read", "override"),                     # override 는 앱의 readOnlyHint=False 를 이긴다(사용자 결정 RF-39)
@@ -17330,6 +17350,7 @@ def test_한_판정을_끄면_종전_판정_셋_그대로다(monkeypatch):
 
 def test_한_판정은_읽기_전용_PAT_도_부류로_가른다(monkeypatch):
     _cls_kit(monkeypatch)
+    _class_mode(monkeypatch, "1")
     monkeypatch.setattr(gw, "tool_readonly_hint", {})
     for n in ("ov", "r_hint", "declared_view", "listed", "boxed", "create_x"):
         assert gw._readonly_denial(n, {}) == "", n
@@ -17362,6 +17383,7 @@ def test_한_판정은_tools_list_사본에_표지를_싣되_앱이_적은_값�
 
 def test_한_판정은_tools_map_에_도구별_부류와_근거를_싣고_셋을_그_위에_세운다(monkeypatch):
     _cls_kit(monkeypatch)
+    _class_mode(monkeypatch, "1")
     monkeypatch.setattr(gw, "backends", {})
     st, body = _gate_call(monkeypatch, "/tools-map")
     assert st == 200
@@ -17375,9 +17397,10 @@ def test_한_판정은_tools_map_에_도구별_부류와_근거를_싣고_셋을
     ga = set(body["gateway_annotated"])
     assert {"listed", "boxed", "create_x", "kill", "search_tools"} <= ga, "앱이 readOnlyHint 를 안 적고 부류가 정해진 것"
     assert not ga & {"d_ro", "ov", "w_hint", "r_hint", "declared_view", "get_x", "idem"}, "앱 표지가 있거나 모름이면 싣지 않는다"
-    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
+    assert "would_close" not in body, "엄격에는 would_close 칸이 없다(이미 닫았다)"
+    _class_mode(monkeypatch, "0")
     st, off = _gate_call(monkeypatch, "/tools-map")
-    assert "tool_class" not in off and "gateway_annotated" not in off, "끄면 종전 칸 그대로"
+    assert "tool_class" not in off and "gateway_annotated" not in off and "would_close" not in off, "끄면 종전 칸 그대로"
     assert "get_x" in off["routine_read"] and "get_x" not in off["panel_read"]
 
 
@@ -17391,9 +17414,11 @@ def _health_body(monkeypatch=None) -> dict:
 
 
 def test_한_판정_손잡이가_health_의_contract_에_실린다(monkeypatch):
-    for on in (True, False):
-        monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", on)
-        assert _health_body()["contract"]["tool_class_unified"] is on
+    assert gw.TOOL_CLASS_MODE == "shadow" and gw.TOOL_CLASS_UNIFIED and not gw.TOOL_CLASS_STRICT, "기본은 그림자(사용자 결정 MM-8)"
+    for mode in ("shadow", "1", "0"):
+        _class_mode(monkeypatch, mode)
+        c = _health_body()["contract"]
+        assert c["tool_class_unified"] == mode and ("would_close" in c) is (mode == "shadow"), mode
 
 
 # ── 구조 결과 두 벌 정리(HWAXPortal docs/mcp-modernize M2 · contract C7) ─────────────────────────────────────────────────────────
@@ -17689,3 +17714,61 @@ def test_M2_손잡이는_띄운_셸의_환경이_먼저이고_없으면_provisio
     assert gw._env_knob("GATEWAY_RESULT_DEDUP", "1") == "0", "띄운 셸의 환경이 먼저"
     monkeypatch.setenv("GATEWAY_RESULT_DEDUP", "  ")
     assert gw._env_knob("GATEWAY_RESULT_DEDUP", "1") == "drop", "빈 환경 값은 없는 것"
+
+
+# ── 그림자(사용자 결정 11-27 MM-8) — 여는 판정은 옛 판정, 노출 · write 는 한 판정, 엄격이면 닫혔을 것을 센다 ──────────────────────
+
+def _maps(monkeypatch) -> dict:
+    """손잡이 셋마다 /tools-map 과 읽기 전용 PAT 이 여는 백엔드 도구."""
+    out = {}
+    for mode in ("0", "shadow", "1"):
+        _class_mode(monkeypatch, mode)
+        st, body = _gate_call(monkeypatch, "/tools-map")
+        assert st == 200
+        body["readonly_ok"] = sorted(n for n in gw.route if gw._readonly_denial(n, {}) == "")
+        out[mode] = body
+    return out
+
+
+def test_그림자는_루틴_위임_패널_읽기_전용_PAT_이_끈_판과_같은_집합을_연다(monkeypatch):
+    _cls_kit(monkeypatch)
+    monkeypatch.setattr(gw, "tool_readonly_hint", {("sf", "r_hint"): True, ("sf", "declared_view"): True})
+    m = _maps(monkeypatch)
+    for k in ("routine_read", "panel_read", "readonly_ok"):
+        assert m["shadow"][k] == m["0"][k], k
+    assert "get_x" in m["shadow"]["routine_read"] and "get_x" not in m["1"]["routine_read"], "이름 낱말 — 그림자는 열고 엄격은 닫는다"
+    assert "w_hint" in m["shadow"]["readonly_ok"] and "w_hint" not in m["1"]["readonly_ok"], "추적 목록 + 앱 readOnlyHint=False"
+    # 단계 울타리도 옛 판정이다(루틴 · 위임은 /tools-map routine_read 를 읽고 routine_call 은 _routine_read 로 막는다)
+    _class_mode(monkeypatch, "shadow")
+    assert gw._routine_read(gw.exposed_tools[[t.name for t in gw.exposed_tools].index("get_x")], "sf", "get_x")
+
+
+def test_그림자의_노출_표지와_write_는_한_판정을_따르고_모순이_없다(monkeypatch):
+    tools = _cls_kit(monkeypatch)
+    m = _maps(monkeypatch)
+    assert m["shadow"]["write"] == m["1"]["write"] and "d_ro" in m["shadow"]["write"] and "d_ro" not in m["0"]["write"], "write 는 한 판정"
+    assert m["shadow"]["tool_class"] == m["1"]["tool_class"] and m["shadow"]["gateway_annotated"] == m["1"]["gateway_annotated"]
+    assert not set(m["shadow"]["write"]) & (set(m["shadow"]["routine_read"]) | set(m["shadow"]["panel_read"])), "그림자도 모순 0"
+    _class_mode(monkeypatch, "shadow")
+    out = {t.name: t for t in gw._class_listed(list(tools.values()))}
+    assert out["listed"].annotations.readOnlyHint is True and out["create_x"].annotations.readOnlyHint is True
+    assert out["get_x"] is tools["get_x"], "그림자도 모르면 표지를 싣지 않는다(루틴이 여는 이름 낱말 도구라도)"
+    assert gw._tool_is_write(tools["d_ro"], "d_ro", "sf"), "검색 쓰기 감점 · write 는 한 판정"
+
+
+def test_그림자의_would_close_는_엄격_모드의_닫힘과_같고_health_에_앱별_수가_실린다(monkeypatch):
+    _cls_kit(monkeypatch)
+    monkeypatch.setattr(gw, "tool_readonly_hint", {("sf", "r_hint"): True, ("sf", "declared_view"): True})
+    m = _maps(monkeypatch)
+    closed = set()
+    for k in ("routine_read", "panel_read", "readonly_ok"):
+        closed |= set(m["shadow"][k]) - set(m["1"][k])
+    assert set(m["1"]["routine_read"]) <= set(m["shadow"]["routine_read"]), "엄격은 새로 열지 않는다"
+    assert m["shadow"]["would_close"] == sorted(closed) and closed >= {"get_x", "w_hint"}, (m["shadow"]["would_close"], closed)
+    _class_mode(monkeypatch, "shadow")
+    wc = _health_body()["contract"]["would_close"]
+    assert wc == {"total": len(closed), "by_app": {"sf": len(closed)}}
+    first = gw._would_close()
+    assert gw._would_close() is first, "카탈로그 · 목록이 같으면 쥐어 둔 값"
+    monkeypatch.setattr(gw, "READ_TOOLS", gw.READ_TOOLS | {"sf:get_x"})
+    assert "get_x" not in gw._would_close()[0], "읽기 목록을 고치면 다시 센다"

@@ -6404,9 +6404,11 @@ def test_가장_나쁜_도구_다섯과_앱_순서():
                           {"tool": "t5of5", "args": 5, "described": 0}, {"tool": "t2a", "args": 2, "described": 0},
                           {"tool": "t2b", "args": 2, "described": 0}]
     assert board["apps"][-1]["described_ratio"] is None and board["apps"][-1]["worst"] == []
-    assert board["total"] == {"apps": 4, "tools": 11, "args": 36, "described": 10, "unit_or_range": 0,
-                              **({"gateway_filled": 0} if gw.ARG_DOC_FILL is not False else {}),     # docstring 대신 채우기(A)를 켜면 따로 센다
-                              "described_ratio": 0.278, "unit_or_range_ratio": 0.0}
+    total = dict(board["total"])
+    total.pop("nested", None) if gw.ARG_SCORE_NESTED else None              # 중첩 칸(M2)은 따로 본다 — test_중첩_*
+    assert total == {"apps": 4, "tools": 11, "args": 36, "described": 10, "unit_or_range": 0,
+                     **({"gateway_filled": 0} if gw.ARG_DOC_FILL is not False else {}),     # docstring 대신 채우기(A)를 켜면 따로 센다
+                     "described_ratio": 0.278, "unit_or_range_ratio": 0.0}
 
 
 def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monkeypatch, _fresh_scores):
@@ -6444,10 +6446,11 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
     filled = ["gateway_filled"] if gw.ARG_DOC_FILL is not False else []      # docstring 대신 채우기(A)를 켜면 그 칸이 더 붙는다
+    nested = ["nested"] if gw.ARG_SCORE_NESTED else []                     # 중첩 인자 칸(M2)이 더 붙는다 — 맨 위 수는 그대로
     assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", *filled, "described_ratio",
-                                 "unit_or_range_ratio"]
+                                 "unit_or_range_ratio", *nested]
     row = {r["app"]: r for r in sc["apps"]}["reportarchive"]
-    assert list(row) == ["app", "tools", "args", "described", "unit_or_range", *filled, "described_ratio",
+    assert list(row) == ["app", "tools", "args", "described", "unit_or_range", *filled, *nested, "described_ratio",
                          "unit_or_range_ratio", "worst"]
     assert (row["tools"], row["args"], row["described"]) == (2, 3, 2)
     assert row["worst"] == [{"tool": "ra_find", "args": 2, "described": 1}]
@@ -17568,3 +17571,44 @@ def test_A_손잡이_끔은_스키마가_앱_그대로이고_목록이면_그_�
     _aggregate_tools(monkeypatch, {"heax-web_research_mcp": [_fill_tool()]})
     assert gw._GW_FILLED == {"search_voc": frozenset({"product_code", "limit", "match"})}
     assert gw._docstring_args("설명뿐") == {} and gw._arg_fill("x", "Args:\n  a: b", {"type": "object"}) == ({"type": "object"}, frozenset())
+
+
+# ── 점수판 결함 — 중첩 인자 · 도구 수(HWAXPortal docs/mcp-modernize M2 · M0) ─────────────────────────────────────────────────
+
+def test_중첩_인자는_객체_배열_항목_defs_까지_세고_자유형_객체를_따로_세며_맨_위_수는_그대로다(monkeypatch, _fresh_scores):
+    sch = {"type": "object", "$defs": {"Ply": {"type": "object", "properties": {
+               "angle": {"type": "number", "description": "각도(deg)"}, "mat": {"type": "string"}}}},
+           "properties": {
+               "laminate": {"type": "object", "description": "적층"},                                           # 자유형 객체(설명은 있다)
+               "plies": {"type": "array", "description": "층", "items": {"$ref": "#/$defs/Ply"}},             # 배열 항목 → $defs
+               "opts": {"anyOf": [{"type": "object", "properties": {"fast": {"type": "boolean"}}}, {"type": "null"}]},
+               "meta": {"type": "object", "properties": {"note": {"type": "string", "description": "메모"},
+                                                         "extra": {"type": "object"}}}}}
+    t = types.Tool(name="analyze", description="", inputSchema=sch)
+    assert gw._arg_nested(t) == (5, 2, 2), "중첩 angle · mat · fast · note · extra 다섯 · 설명 둘 · 자유형 laminate · extra"
+    assert gw._arg_counts(t) == (4, 2, 0), "맨 위 수는 종전 셈 그대로(단위 낱말은 중첩 angle 에만 있다)"
+    _aggregate_tools(monkeypatch, {"heax-laminate_analyzer_mcp": [t]})
+    rows = {r["app"]: r for r in gw._ARG_SCORE["apps"]}
+    row = rows["heax-laminate_analyzer_mcp"]
+    assert row["nested"] == {"args": 5, "described": 2, "free_objects": 2, "described_ratio": 0.4} and row["args"] == 4
+    tot = gw._ARG_SCORE["total"]["nested"]
+    assert tot["args"] == sum(r["nested"]["args"] for r in rows.values()), "합계는 앱 줄(게이트웨이 자체 포함)의 합"
+    monkeypatch.setattr(gw, "ARG_SCORE_NESTED", False)
+    _aggregate_tools(monkeypatch, {"heax-laminate_analyzer_mcp": [t]})
+    assert all("nested" not in r for r in gw._ARG_SCORE["apps"]) and "nested" not in gw._ARG_SCORE["total"], "끄면 종전 점수판"
+
+
+def test_도구_수_셋의_뜻이_health_에_있고_tools_map_은_REST_다리까지_싣는다(monkeypatch, _fresh_scores):
+    monkeypatch.setattr(gw, "REST", {"ra": {}})
+    _aggregate_tools(monkeypatch, {"signalforge": [_stool("query_voc"), _stool("get_x")]})
+    locs = gw._local_tools()
+    assert {"rest_catalog", "rest_call"} <= {t.name for t in locs}
+    tc = _health_body()["contract"]["tool_counts"]
+    assert (tc["backend"], tc["gateway_local"], tc["tools_list_max"], tc["tools_map"]) == (2, len(locs), 2 + len(locs), 3 + len(locs))
+    assert _health_body()["tools"] == 2 and "tools/list" in tc["meaning"]
+    st, tmap = _gate_call(monkeypatch, "/tools-map")
+    assert len(tmap["map"]) == tc["tools_map"] and tmap["map"]["rest_call"] == "_gateway", "지도와 /health 의 수가 맞는다"
+    monkeypatch.setattr(gw, "ARG_SCORE_NESTED", False)
+    st, old = _gate_call(monkeypatch, "/tools-map")
+    assert "rest_call" not in old["map"] and len(old["map"]) == tc["tools_map"] - 2, "끄면 종전 손 목록(REST 다리 둘이 빠진다)"
+    assert _health_body()["contract"]["tool_counts"]["tools_map"] is None

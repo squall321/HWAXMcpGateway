@@ -1360,6 +1360,64 @@ def _arg_counts(tool: types.Tool) -> tuple[int, int, int]:
     return len(props), described, unit_range
 
 
+# 중첩 인자(HWAXPortal docs/mcp-modernize M2 · audit/contract 8-1) — 맨 위만 세면 자유형 객체가 '설명 있음' 하나로 구조 공백을 가리고(Laminate 90),
+# 객체 · 배열 항목 · $defs 안의 필드는 아예 안 보인다. 맨 위 수는 그대로 두고 nested 칸을 더한다 — 맨 위 아래(객체 속성 · 배열 항목의 속성 · anyOf
+# 갈래 · $ref 가 가리키는 $defs)의 인자 수 · 설명 있는 수, 그리고 맨 위를 포함한 자유형 객체(type object 인데 properties 없음) 수. 깊이 4 까지.
+# 끄기 GATEWAY_ARG_SCORE_NESTED=0 — 점수판 · /tools-map 이 종전과 같다(도구 수 칸도 — 아래 _toolmap_locals).
+ARG_SCORE_NESTED = os.environ.get("GATEWAY_ARG_SCORE_NESTED", "1").strip() != "0"
+
+
+def _schema_ref(node, root: dict):
+    """'#/…' $ref 를 푼다 — 못 풀면 그대로."""
+    ref = node.get("$ref") if isinstance(node, dict) else None
+    if isinstance(ref, str) and ref.startswith("#/"):
+        cur = root
+        for part in ref[2:].split("/"):
+            cur = cur.get(part) if isinstance(cur, dict) else None
+        return cur if isinstance(cur, dict) else node
+    return node
+
+
+def _arg_nested(tool: types.Tool) -> tuple[int, int, int]:
+    """도구 하나의 (중첩 인자, 그 가운데 설명 있는 것, 자유형 객체 — 맨 위 포함). 세는 법은 위 머리말."""
+    root = tool.inputSchema if isinstance(tool.inputSchema, dict) else {}
+    top = root.get("properties") if isinstance(root.get("properties"), dict) else {}
+    acc = {"n": 0, "d": 0, "free": 0}
+    seen: set[int] = set()
+
+    def kids(sch) -> list[dict]:
+        """한 속성 스키마 아래의 속성 묶음들 — 객체 속성 · 배열 항목 · anyOf/oneOf/allOf 갈래(각각 $ref 를 푼다)."""
+        out, s = [], _schema_ref(sch, root)
+        for node in [s, _schema_ref(s.get("items") or {}, root)] + [_schema_ref(a, root) for k in ("anyOf", "oneOf", "allOf")
+                                                                    for a in (s.get(k) or []) if isinstance(a, dict)]:
+            if isinstance(node, dict) and isinstance(node.get("properties"), dict) and id(node) not in seen:
+                seen.add(id(node))
+                out.append(node["properties"])
+        return out
+
+    def free(sch) -> bool:
+        s = _schema_ref(sch, root)
+        ty = s.get("type")
+        types_ = set(ty) if isinstance(ty, list) else {ty}
+        alts = [_schema_ref(a, root) for a in (s.get("anyOf") or []) if isinstance(a, dict)]
+        return ("object" in types_ and not s.get("properties")) or (
+            any(a.get("type") == "object" for a in alts) and not any(a.get("properties") for a in alts))
+
+    def visit(props: dict, depth: int):
+        for v in props.values():
+            if not isinstance(v, dict):
+                continue
+            acc["free"] += free(v)
+            if depth:
+                acc["n"] += 1
+                acc["d"] += bool(str(v.get("description") or _schema_ref(v, root).get("description") or "").strip())
+            if depth < 4:
+                for sub in kids(v):
+                    visit(sub, depth + 1)
+    visit(top, 0)
+    return acc["n"], acc["d"], acc["free"]
+
+
 def _arg_ratio(part: int, whole: int) -> float | None:
     return round(part / whole, 3) if whole else None
 
@@ -1382,10 +1440,18 @@ def _arg_scoreboard(pairs) -> dict:
         a["unit_or_range"] += u
         if fill:
             a["gateway_filled"] += len(_GW_FILLED.get(tool.name) or ())
+        if ARG_SCORE_NESTED:
+            nn, nd, nf = _arg_nested(tool)
+            nest = a.setdefault("nested", {"args": 0, "described": 0, "free_objects": 0})
+            nest["args"] += nn
+            nest["described"] += nd
+            nest["free_objects"] += nf
         if n > d:
             a["bad"].append({"tool": tool.name, "args": n, "described": d})
     rows = []
     for app, a in acc.items():
+        if "nested" in a:
+            a["nested"]["described_ratio"] = _arg_ratio(a["nested"]["described"], a["nested"]["args"])
         worst = sorted(a.pop("bad"), key=lambda w: (w["described"] - w["args"], -w["args"], w["tool"]))[:5]
         rows.append({"app": app, **a,
                      "described_ratio": _arg_ratio(a["described"], a["args"]),
@@ -1394,11 +1460,13 @@ def _arg_scoreboard(pairs) -> dict:
     rows.sort(key=lambda r: (r["args"] == 0, r["described"] / r["args"] if r["args"] else 0,
                              r["described"] - r["args"], r["app"]))
     tot = {k: sum(r[k] for r in rows) for k in ("tools", "args", "described", "unit_or_range") + (("gateway_filled",) if fill else ())}
-    return {"threshold": ARG_DESC_WARN_RATIO,
-            "total": {"apps": len(rows), **tot,
-                      "described_ratio": _arg_ratio(tot["described"], tot["args"]),
-                      "unit_or_range_ratio": _arg_ratio(tot["unit_or_range"], tot["args"])},
-            "apps": rows}
+    total = {"apps": len(rows), **tot,
+             "described_ratio": _arg_ratio(tot["described"], tot["args"]),
+             "unit_or_range_ratio": _arg_ratio(tot["unit_or_range"], tot["args"])}
+    if ARG_SCORE_NESTED:
+        nt = {k: sum((r.get("nested") or {}).get(k, 0) for r in rows) for k in ("args", "described", "free_objects")}
+        total["nested"] = {**nt, "described_ratio": _arg_ratio(nt["described"], nt["args"])}
+    return {"threshold": ARG_DESC_WARN_RATIO, "total": total, "apps": rows}
 
 
 def _arg_score_refresh() -> None:
@@ -10177,7 +10245,20 @@ def _contract_health() -> dict:
             "result_dedup": {"mode": RESULT_DEDUP, **_DEDUP_STAT},
             "desc_cleandoc": {"on": DESC_CLEANDOC, **_DESC_CLEAN_STAT},
             "arg_doc_fill": {"on": sorted(ARG_DOC_FILL) if isinstance(ARG_DOC_FILL, frozenset) else ARG_DOC_FILL,
-                             "tools": len(_GW_FILLED), "args": sum(len(v) for v in _GW_FILLED.values())}}
+                             "tools": len(_GW_FILLED), "args": sum(len(v) for v in _GW_FILLED.values())},
+            "arg_score_nested": ARG_SCORE_NESTED,
+            "tool_counts": _tool_counts()}
+
+
+def _tool_counts() -> dict:
+    """도구 수 셋의 뜻(M0 — 11-27 dev 에서 /health 765 · /tools-map 796 · tools/list 797 로 갈렸다). 시야(그룹 · 끈 앱 · 시험 사본 · 보기)를 타지 않는
+    최대 수다 — 사람마다의 tools/list 는 이보다 적다."""
+    b, loc = len(exposed_tools), len(_local_tools())
+    return {"backend": b, "gateway_local": loc, "admin_only": 1, "tools_list_max": b + loc, "tools_list_max_admin": b + loc + 1,
+            "tools_map": b + loc + 1 if ARG_SCORE_NESTED else None,
+            "meaning": ("tools(/health) = backend — 백엔드 도구만. tools/list = backend + gateway_local(관리자는 admin_only 하나 더 — 읽기 전용 허용 "
+                        "목록 보기), 그 사람의 그룹 · 끈 앱 · 시험 사본 · 개인 보기로 준다. /tools-map 의 map = backend + gateway_local + admin_only"
+                        "(무인증 지도는 모든 도구를 싣는다 — GATEWAY_ARG_SCORE_NESTED=0 이면 종전 손 목록이라 REST 다리 둘이 빠진다)")}
 
 
 async def _routine_call(a: dict) -> types.CallToolResult:
@@ -12946,6 +13027,11 @@ def _bearer_gate(app, pat_verifier=None):
                         GAS_TRANSPORT_TOOL, RELIAB_TOOL, RA_REPORT_FORMAT_TOOL, *PROCEDURE_TOOLS, *_res_tools(), *_ix_tools(),
                         *([ARTIFACT_TO_STE_TOOL] if STE_UPLOAD_SITE in REST else [])):
                 _map.setdefault(_lt.name, "_gateway")
+            if ARG_SCORE_NESTED:
+                # 도구 수 맞추기(M0) — tools/list 가 내는 로컬 도구 전부(_local_tools — REST 다리 rest_catalog · rest_call 포함)를 싣는다. 손 목록에서
+                # 둘이 빠져 /tools-map 796 · tools/list 797 로 갈렸다(11-27). 뜻은 /health 의 contract.tool_counts.
+                for _lt in _local_tools():
+                    _map.setdefault(_lt.name, "_gateway")
             # 앱 단위 선택 UI 용 계층 정보. map 만 주면 (a) 앱 라벨·설명이 없어 클라이언트가
             # 앱 키에서 이름을 추측하게 되고 (b) 세션이 끊긴 앱은 route 에 도구가 없어 목록에서
             # 통째로 사라진다. backends 를 먼저 채워 '앱은 있는데 지금 불통'을 보이게 한다.

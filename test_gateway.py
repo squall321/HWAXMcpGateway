@@ -6405,6 +6405,7 @@ def test_가장_나쁜_도구_다섯과_앱_순서():
                           {"tool": "t2b", "args": 2, "described": 0}]
     assert board["apps"][-1]["described_ratio"] is None and board["apps"][-1]["worst"] == []
     assert board["total"] == {"apps": 4, "tools": 11, "args": 36, "described": 10, "unit_or_range": 0,
+                              **({"gateway_filled": 0} if gw.ARG_DOC_FILL is not False else {}),     # docstring 대신 채우기(A)를 켜면 따로 센다
                               "described_ratio": 0.278, "unit_or_range_ratio": 0.0}
 
 
@@ -6430,7 +6431,8 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     _aggregate_tools(monkeypatch, {"reportarchive": [leaky, _stool("ra_get", {"id": "보고서 id"})]})
     body = tools_map()
     assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read", "views",
-                          "panel_read", "orig"] + (["tool_class"] if gw.TOOL_CLASS_UNIFIED else []), \
+                          "panel_read", "orig"] + (["tool_class"] if gw.TOOL_CLASS_UNIFIED else []) + (
+                          ["gateway_filled"] if gw.ARG_DOC_FILL is not False else []), \
         "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4) · 패널 확인용 읽기 목록(HA-20 B-2) · 원래 이름" \
         "(ontology-first F0)은 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
@@ -6441,10 +6443,11 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     assert {a["app"]: a["tool_count"] for a in body["apps"]} == {"_gateway": 30, "reportarchive": 2}
     sc = body["arg_scores"]
     assert list(sc) == ["threshold", "total", "apps"] and sc["threshold"] == 0.3
-    assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", "described_ratio",
+    filled = ["gateway_filled"] if gw.ARG_DOC_FILL is not False else []      # docstring 대신 채우기(A)를 켜면 그 칸이 더 붙는다
+    assert list(sc["total"]) == ["apps", "tools", "args", "described", "unit_or_range", *filled, "described_ratio",
                                  "unit_or_range_ratio"]
     row = {r["app"]: r for r in sc["apps"]}["reportarchive"]
-    assert list(row) == ["app", "tools", "args", "described", "unit_or_range", "described_ratio",
+    assert list(row) == ["app", "tools", "args", "described", "unit_or_range", *filled, "described_ratio",
                          "unit_or_range_ratio", "worst"]
     assert (row["tools"], row["args"], row["described"]) == (2, 3, 2)
     assert row["worst"] == [{"tool": "ra_find", "args": 2, "described": 1}]
@@ -17505,3 +17508,63 @@ def test_B_노출_설명은_cleandoc_꼴이고_앱_원문은_그대로다(monkey
     _aggregate_tools(monkeypatch, {"heax-step_forge": [t]})
     assert next(x for x in gw.exposed_tools if x.name == "list_parts").description == _INDENTED, "끄면 앱 글 그대로"
     assert gw._desc_clean(None) is None and gw._desc_clean("") == ""
+
+
+# ── docstring 인자 설명 대신 채우기(HWAXPortal docs/mcp-modernize M2 · 게이트웨이 일괄 A — 임시) ──────────────────────────────────
+
+_ARGS_DOC = '''VOC 를 찾는다.
+
+    Args:
+        product_code: 제품 코드 (예: GS25U) — 생략 시 전체
+        limit (int): 반환 건수 (기본 20,
+            최대 100)
+        `match`: 맞추는 법 — 'auto' | 'phrase'
+        vlm: 그림 모델 llm: 글 모델
+        keep: 앱이 적은 설명이 있으면 덮지 않는다
+        twice: 처음
+        twice: 다시
+        empty:
+    Returns:
+        status: 돌려주는 칸 — 인자가 아니다
+    '''
+
+
+def _fill_tool(props=None):
+    names = ("product_code", "limit", "match", "vlm", "llm", "keep", "twice", "empty", "status", "nodoc")
+    p = {n: {"type": "string"} for n in names} if props is None else props
+    p.get("keep", {})["description"] = "앱 설명"
+    return types.Tool(name="search_voc", description=_ARGS_DOC, inputSchema={"type": "object", "properties": p})
+
+
+def test_A_Args_절의_정확한_이름만_빈_인자_설명을_채우고_섞이거나_겹치거나_돌려주는_칸은_두지_않는다(monkeypatch, _fresh_scores):
+    t = _fill_tool()
+    before = json.dumps(t.inputSchema, sort_keys=True)
+    _aggregate_tools(monkeypatch, {"signalforge": [t]})
+    props = next(x for x in gw.exposed_tools if x.name == "search_voc").inputSchema["properties"]
+    got = {n: p.get("description") for n, p in props.items()}
+    assert got == {"product_code": "제품 코드 (예: GS25U) — 생략 시 전체", "limit": "반환 건수 (기본 20, 최대 100)",
+                   "match": "맞추는 법 — 'auto' | 'phrase'", "vlm": None, "llm": None, "keep": "앱 설명", "twice": None, "empty": None,
+                   "status": None, "nodoc": None}, got
+    assert json.dumps(t.inputSchema, sort_keys=True) == before, "앱 스키마는 그대로 — 노출 사본만"
+    assert gw._GW_FILLED == {"search_voc": frozenset({"product_code", "limit", "match"})}
+    row = gw._ARG_SCORE["apps"][0]
+    assert (row["args"], row["described"], row["gateway_filled"]) == (10, 1, 3), "채운 셋은 설명 있음에 세지 않는다(앱의 실제 상태)"
+    assert gw._ARG_SCORE["total"]["gateway_filled"] == 3
+    assert _health_body()["contract"]["arg_doc_fill"] == {"on": True, "tools": 1, "args": 3}
+    st, tmap = _gate_call(monkeypatch, "/tools-map")
+    assert tmap["gateway_filled"] == {"search_voc": ["limit", "match", "product_code"]}, "품질 카드가 빼고 센다"
+
+
+def test_A_손잡이_끔은_스키마가_앱_그대로이고_목록이면_그_앱만(monkeypatch, _fresh_scores):
+    t = _fill_tool()
+    monkeypatch.setattr(gw, "ARG_DOC_FILL", False)
+    _aggregate_tools(monkeypatch, {"signalforge": [t]})
+    assert next(x for x in gw.exposed_tools if x.name == "search_voc").inputSchema == t.inputSchema and gw._GW_FILLED == {}
+    assert "gateway_filled" not in gw._ARG_SCORE["total"] and "gateway_filled" not in gw._ARG_SCORE["apps"][0], "끄면 점수판이 종전과 같다"
+    assert "gateway_filled" not in _gate_call(monkeypatch, "/tools-map")[1]
+    monkeypatch.setattr(gw, "ARG_DOC_FILL", frozenset({"heax-web_research_mcp"}))
+    _aggregate_tools(monkeypatch, {"signalforge": [t]})
+    assert gw._GW_FILLED == {}, "목록에 없는 앱은 채우지 않는다"
+    _aggregate_tools(monkeypatch, {"heax-web_research_mcp": [_fill_tool()]})
+    assert gw._GW_FILLED == {"search_voc": frozenset({"product_code", "limit", "match"})}
+    assert gw._docstring_args("설명뿐") == {} and gw._arg_fill("x", "Args:\n  a: b", {"type": "object"}) == ({"type": "object"}, frozenset())

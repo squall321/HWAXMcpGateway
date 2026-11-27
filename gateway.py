@@ -1341,12 +1341,16 @@ def _arg_schema_range(prop: dict) -> bool:
 
 
 def _arg_counts(tool: types.Tool) -> tuple[int, int, int]:
-    """도구 하나의 (인자, 설명 있는 인자, 단위·범위가 든 인자) — 세는 법은 위 머리말."""
+    """도구 하나의 (인자, 설명 있는 인자, 단위·범위가 든 인자) — 세는 법은 위 머리말. 게이트웨이가 채운 인자(_GW_FILLED)는 설명 없음으로 센다
+    (앱의 실제 상태 — 채운 수는 gateway_filled 로 따로)."""
     props = tool.inputSchema.get("properties") if isinstance(tool.inputSchema, dict) else None
     if not isinstance(props, dict):
         return 0, 0, 0
+    filled = _GW_FILLED.get(tool.name) or ()
     described = unit_range = 0
-    for p in props.values():
+    for k, p in props.items():
+        if k in filled:
+            continue
         desc = p.get("description") if isinstance(p, dict) else None
         if not isinstance(desc, str) or not desc.strip():
             continue
@@ -1367,13 +1371,17 @@ def _arg_scoreboard(pairs) -> dict:
     · 앱마다 가장 나쁜 도구 다섯 — 설명 없는 인자가 많은 순, 같으면 인자가 많은 순. 설명이 다 있는 도구는 싣지 않는다.
     """
     acc: dict[str, dict] = {}
+    fill = ARG_DOC_FILL is not False                  # 대신 채우기를 켠 게이트웨이만 gateway_filled 칸을 싣는다(끄면 점수판이 종전과 같다)
     for app, tool in pairs:
         n, d, u = _arg_counts(tool)
-        a = acc.setdefault(app, {"tools": 0, "args": 0, "described": 0, "unit_or_range": 0, "bad": []})
+        a = acc.setdefault(app, {"tools": 0, "args": 0, "described": 0, "unit_or_range": 0, **({"gateway_filled": 0} if fill else {}),
+                                 "bad": []})
         a["tools"] += 1
         a["args"] += n
         a["described"] += d
         a["unit_or_range"] += u
+        if fill:
+            a["gateway_filled"] += len(_GW_FILLED.get(tool.name) or ())
         if n > d:
             a["bad"].append({"tool": tool.name, "args": n, "described": d})
     rows = []
@@ -1385,7 +1393,7 @@ def _arg_scoreboard(pairs) -> dict:
                      "worst": worst})
     rows.sort(key=lambda r: (r["args"] == 0, r["described"] / r["args"] if r["args"] else 0,
                              r["described"] - r["args"], r["app"]))
-    tot = {k: sum(r[k] for r in rows) for k in ("tools", "args", "described", "unit_or_range")}
+    tot = {k: sum(r[k] for r in rows) for k in ("tools", "args", "described", "unit_or_range") + (("gateway_filled",) if fill else ())}
     return {"threshold": ARG_DESC_WARN_RATIO,
             "total": {"apps": len(rows), **tot,
                       "described_ratio": _arg_ratio(tot["described"], tot["args"]),
@@ -1441,6 +1449,98 @@ def _desc_clean(desc):
         _DESC_CLEAN_STAT["tools"] += 1
         _DESC_CLEAN_STAT["saved_chars"] += len(desc) - len(out)
     return out
+
+
+# ── docstring 인자 설명 대신 채우기(HWAXPortal docs/mcp-modernize M2 · MM-3 · 게이트웨이 일괄 A — 임시) ──────────────────────────────────
+# 공식 SDK 1.x FastMCP 는 docstring 의 「Args:」 를 inputSchema 로 옮기지 않는다 — SignalForge · 웹 리서치처럼 Google 꼴로 인자 뜻을 정성껏 써도 스키마의
+# 인자 설명은 비어, 인자 설명만 보는 클라이언트 · 웹 챗(설명을 자른다)에서 뜻이 사라진다. 앱이 Field(description=) 로 옮기는 것이 정답이고(공통 계약 C2),
+# 그때까지 노출 사본만 채운다. 엄격하게만 — ① 인자의 스키마 설명이 비었을 때 ② 도구 설명에 「Args:」 · 「Arguments:」 · 「Parameters:」 · 「인자:」 절이 있고
+# ③ 그 절의 항목 줄(절보다 들여쓴 첫 깊이)이 `이름:` 또는 `이름 (꼴):` 로 그 인자 이름과 정확히 맞을 때(백틱 감싼 이름도). 더 들여쓴 줄은 그 항목의
+# 이어짐이다. 채우지 않는 것 — 한 항목에 다른 인자 이름이 `이름:` 꼴로 섞이면(한 줄에 둘 — DocForge 'vlm: … llm: …'), 같은 이름이 두 번 나오면,
+# 글이 비면, 돌려주는 칸(Returns · Raises · 반환 … 절은 들여쓰기가 절 머리와 같아 절이 끝난다). 맨 위 인자만 본다. enum 은 넣지 않는다(MM-3).
+# 점수판은 앱의 실제 상태를 가리지 않는다 — 채운 인자는 '설명 있음' 에 세지 않고 gateway_filled 로 따로 센다(_GW_FILLED).
+# 손잡이 GATEWAY_ARG_DOC_FILL — 1(기본, 모든 앱) · 0(끔 — 스키마가 앱 그대로) · 백엔드 키 쉼표 목록(그 앱만). 값 · 채운 수는 /health 의 contract.arg_doc_fill.
+_ARG_FILL_RAW = os.environ.get("GATEWAY_ARG_DOC_FILL", "1").strip()
+ARG_DOC_FILL: frozenset | bool = (False if _ARG_FILL_RAW in ("0", "") else True if _ARG_FILL_RAW == "1"
+                                  else frozenset(x.strip() for x in _ARG_FILL_RAW.split(",") if x.strip()))
+_GW_FILLED: dict[str, frozenset] = {}                     # 노출 이름 → 게이트웨이가 채운 맨 위 인자 이름(마지막 재집계)
+_ARG_SECTION_RE = re.compile(r"^(?P<ind>[ \t]*)(?:Args|Arguments|Parameters|인자)\s*:\s*$", re.I)
+_ARG_ENTRY_RE = re.compile(r"^`?(?P<name>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s*\([^()]*\))?\s*:(?:\s+(?P<text>.*))?$")
+
+
+def _arg_fill_on(backend: str) -> bool:
+    return ARG_DOC_FILL is True or (isinstance(ARG_DOC_FILL, frozenset) and backend in ARG_DOC_FILL)
+
+
+def _docstring_args(desc: str) -> dict[str, str]:
+    """도구 설명의 인자 절에서 {인자 이름: 글} — 두 번 나온 이름은 빼고, 글이 빈 항목도 뺀다. 절의 경계는 위 머리말."""
+    lines = inspect.cleandoc(desc or "").splitlines()
+    found: dict[str, list[str]] = {}
+    dup: set[str] = set()
+    i = 0
+    while i < len(lines):
+        m = _ARG_SECTION_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        head = len(m.group("ind").expandtabs())
+        body = []
+        i += 1
+        while i < len(lines) and (not lines[i].strip() or len(lines[i]) - len(lines[i].lstrip()) > head):
+            body.append(lines[i].expandtabs())
+            i += 1
+        filled = [ln for ln in body if ln.strip()]
+        if not filled:
+            continue
+        depth = min(len(ln) - len(ln.lstrip()) for ln in filled)
+        cur = None
+        for ln in body:
+            if not ln.strip():
+                continue                                     # 빈 줄은 항목을 끊지 않는다(다음 줄이 더 들여쓰였으면 이어짐)
+            ind = len(ln) - len(ln.lstrip())
+            if ind == depth:
+                e = _ARG_ENTRY_RE.match(ln.strip())
+                if e is None:
+                    cur = None                               # 항목 꼴이 아닌 줄 — 앞 항목을 닫고 이 줄은 버린다
+                    continue
+                cur = e.group("name")
+                if cur in found:
+                    dup.add(cur)
+                found[cur] = [e.group("text") or ""]
+            elif cur is not None:
+                found[cur].append(ln.strip())
+    out = {}
+    for name, parts in found.items():
+        text = " ".join(x for x in parts if x).strip()
+        if name not in dup and text:
+            out[name] = text
+    return out
+
+
+def _arg_fill(backend: str, desc, schema) -> tuple[dict, frozenset]:
+    """(노출 inputSchema, 채운 인자 이름) — 채울 것이 없거나 끄면 (앱 스키마 그대로, 빈 집합). 앱 스키마 객체는 바꾸지 않는다(새 dict)."""
+    if not _arg_fill_on(backend) or not isinstance(desc, str) or not isinstance(schema, dict):
+        return schema, frozenset()
+    props = schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return schema, frozenset()
+    empty = [n for n, p in props.items() if isinstance(p, dict) and not str(p.get("description") or "").strip()]
+    if not empty:
+        return schema, frozenset()
+    docs = _docstring_args(desc)
+    new_props, done = dict(props), set()
+    for n in empty:
+        text = docs.get(n)
+        if not text:
+            continue
+        # 한 항목에 다른 인자가 '이름:' 꼴로 섞였다(한 줄에 둘) — 경계를 믿을 수 없어 채우지 않는다
+        if any(re.search(rf"(?<![\w`]){re.escape(o)}`?\s*:", text) for o in props if o != n):
+            continue
+        new_props[n] = {**props[n], "description": text}
+        done.add(n)
+    if not done:
+        return schema, frozenset()
+    return {**schema, "properties": new_props}, frozenset(done)
 
 
 async def _aggregate():
@@ -1526,6 +1626,7 @@ async def _aggregate():
     family = frozenset(_core_family())
     fam_renamed: dict[str, tuple[str, str]] = {}          # 옛 맨 이름 → (백엔드, 원래 이름)
     _DESC_CLEAN_STAT.update(tools=0, saved_chars=0)
+    _GW_FILLED.clear()
     for key, t in collected:
         # 충돌 여부와 **무관하게** 별칭을 등록한다(호출 전용).
         _alias = f"{key.replace('-', '')}_{t.name}"
@@ -1550,6 +1651,9 @@ async def _aggregate():
         else:
             exposed_name = t.name
         ann = getattr(t, "annotations", None)
+        in_schema, filled = _arg_fill(key, t.description, t.inputSchema)      # docstring 인자 설명 대신 채우기(A — 임시, 노출 사본만)
+        if filled:
+            _GW_FILLED[exposed_name] = filled
         if (key, t.name) in declared_read:
             # 선언된 읽기 도구 — 노출 사본에 readOnlyHint 를 단다(클라이언트도 읽기로 보게). 앱이 단 다른 표지는 그대로 둔다.
             ann = ann.model_copy(update={"readOnlyHint": True}) if ann is not None else types.ToolAnnotations(readOnlyHint=True)
@@ -1557,7 +1661,7 @@ async def _aggregate():
             types.Tool(
                 name=exposed_name,
                 description=_core_tagged(key, _desc_clean(t.description), tags),
-                inputSchema=t.inputSchema,
+                inputSchema=in_schema,
                 **({"outputSchema": t.outputSchema} if getattr(t, "outputSchema", None) else {}),
                 **({"annotations": ann} if ann else {}),
                 **({"title": t.title} if getattr(t, "title", None) else {}),
@@ -10071,7 +10175,9 @@ def _contract_health() -> dict:
     """/health 의 contract — MCP 현대화 M2(계약 정밀화)의 손잡이 값. 무인증 칸이라 값 · 수만 싣는다."""
     return {"tool_class_unified": TOOL_CLASS_UNIFIED,
             "result_dedup": {"mode": RESULT_DEDUP, **_DEDUP_STAT},
-            "desc_cleandoc": {"on": DESC_CLEANDOC, **_DESC_CLEAN_STAT}}
+            "desc_cleandoc": {"on": DESC_CLEANDOC, **_DESC_CLEAN_STAT},
+            "arg_doc_fill": {"on": sorted(ARG_DOC_FILL) if isinstance(ARG_DOC_FILL, frozenset) else ARG_DOC_FILL,
+                             "tools": len(_GW_FILLED), "args": sum(len(v) for v in _GW_FILLED.values())}}
 
 
 async def _routine_call(a: dict) -> types.CallToolResult:
@@ -12917,6 +13023,9 @@ def _bearer_gate(app, pat_verifier=None):
                 # 얹는다. 끈 게이트웨이(GATEWAY_TOOL_CLASS_UNIFIED=0)에는 이 칸이 없다. 위 칸들은 그대로다.
                 **({"tool_class": {_n: {"class": _c[0], "source": _c[1]} for _n, _c in sorted(_cls_all.items())}}
                    if TOOL_CLASS_UNIFIED else {}),
+                # 게이트웨이가 docstring 「Args:」 로 채운 인자 — {노출 이름: [인자 이름]}(대신 채우기 A — 임시). 품질 카드 · 점수판이 앱의 실제 상태를
+                # 가리지 않게 이것을 빼고 센다. 끈 게이트웨이(GATEWAY_ARG_DOC_FILL=0)에는 칸이 없다.
+                **({"gateway_filled": {_n: sorted(_v) for _n, _v in sorted(_GW_FILLED.items())}} if ARG_DOC_FILL is not False else {}),
             }, ensure_ascii=False).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

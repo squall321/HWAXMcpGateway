@@ -17466,6 +17466,11 @@ def test_C7_drop_은_빈_껍데기_스키마_도구의_구조를_떼고_목록�
     out = gw._res_dedup("get_x", {}, _dup_res({"result": [{"k": 1}, "s"]}, '{"k": 1}', "s"))
     assert out.structuredContent is None, "감싼 목록 — 원소마다 글 블록"
     assert gw._DEDUP_STAT["dropped"] == 2
+    _dedup_kit(monkeypatch, mode="drop", schema=_BARE_DICT)
+    pretty = json.dumps({"a": [1, 2]}, indent=2)
+    out = gw._res_dedup("get_x", {}, _dup_res({"a": [1, 2]}, pretty))
+    assert out.structuredContent is None and out.content[0].text == '{"a":[1,2]}', "drop 은 구조를 떼고 남는 글도 촘촘히"
+    assert gw._DEDUP_STAT == {"compacted": 1, "dropped": 1, "saved_chars": (len(pretty) - 11) + 11}
     tools = [types.Tool(name="a", inputSchema={"type": "object"}, outputSchema=_BARE_DICT),
              types.Tool(name="b", inputSchema={"type": "object"}, outputSchema=_FIELDS), types.Tool(name="c", inputSchema={"type": "object"})]
     listed = gw._schema_listed(tools)

@@ -8870,7 +8870,8 @@ async def _res_keep(name: str, arguments, res):
 #  · 1(기본, compact) — 글 블록이 structuredContent 와 같은 JSON 이면 그 글을 촘촘한 JSON 으로 다시 쓴다(같은 값 · 들여쓰기 없음). 구조 · 출력 스키마는
 #    그대로라 스펙(출력 스키마가 있으면 구조 결과를 낸다)과 클라이언트 검증이 그대로다. 감싼 값(글이 X 그대로)은 줄일 것이 없다.
 #  · drop — 그에 더해 출력 스키마가 '빈 껍데기'(필드 이름이 없는 FastMCP 자동 스키마 — 빈 객체 · result 하나)인 도구는 tools/list 에서 출력 스키마를
-#    떼고(_schema_listed) 결과에서 구조를 뗀다(글만 — 스키마가 없으니 구조는 선택이다). 필드가 있는 출력 스키마는 떼지 않는다(구조 · 촘촘한 글).
+#    떼고(_schema_listed) 결과에서 구조를 뗀다(촘촘한 글만 — 스키마가 없으니 구조는 선택이다). 필드가 있는 출력 스키마는 떼지 않는다(구조 · 촘촘한 글).
+#    어림(11-27 — /tools-map 같은 지도형 JSON) — 전송 바이트(글은 JSON 문자열로 한 번 더 escape)가 1 은 13 ~ 30%, drop 은 그보다 더(구조 한 벌).
 #    ⚠ 옮기는 날의 위험 — stateless 라 재기동 뒤에도 클라이언트는 목록을 다시 받지 않는다. 그 전에 받은 목록(출력 스키마 있음)을 쥔 Claude Code(MCP TS
 #    SDK)는 구조 없는 결과를 'has an output schema but did not return structured content' 로 거절한다 — 세션을 다시 열 때까지. 그래서 기본은 1 이다.
 #  · 결과 손잡이를 청한 연결(X-HWAX-Result: ref)도 모드대로다 — 큰 결과는 결과 손잡이가 글 · 구조를 머리 + 손잡이로 바꾼다(_res_keep — 이 정리 뒤).
@@ -8961,19 +8962,20 @@ def _res_dedup(name: str, arguments, res):
         kind = _sc_dup_kind(texts, res.structuredContent)
         if kind is None:
             return res
+        upd: dict = {}
+        if kind[0] == "json":
+            compact = json.dumps(kind[1], ensure_ascii=False, separators=(",", ":"))
+            if len(compact) < len(texts[0]):
+                _DEDUP_STAT["compacted"] += 1
+                _DEDUP_STAT["saved_chars"] += len(texts[0]) - len(compact)
+                blocks[idx[0]] = blocks[idx[0]].model_copy(update={"text": compact})
+                upd["content"] = blocks
         if RESULT_DEDUP == "drop" and (t is None or _schema_bare(getattr(t, "outputSchema", None))):
+            # 구조를 뗀다 — 남는 글(촘촘히 다시 쓴 것)과 같은 값이다. 뗀 몫은 그 글의 길이로 어림한다
             _DEDUP_STAT["dropped"] += 1
-            _DEDUP_STAT["saved_chars"] += sum(len(x) for x in texts)        # 근사 — 뗀 구조는 글과 같은 값이다
-            return res.model_copy(update={"structuredContent": None})
-        if kind[0] != "json":
-            return res
-        compact = json.dumps(kind[1], ensure_ascii=False, separators=(",", ":"))
-        if len(compact) >= len(texts[0]):
-            return res
-        _DEDUP_STAT["compacted"] += 1
-        _DEDUP_STAT["saved_chars"] += len(texts[0]) - len(compact)
-        blocks[idx[0]] = blocks[idx[0]].model_copy(update={"text": compact})
-        return res.model_copy(update={"content": blocks})
+            _DEDUP_STAT["saved_chars"] += sum(len(getattr(blocks[i], "text", "")) for i in idx)
+            upd["structuredContent"] = None
+        return res.model_copy(update=upd) if upd else res
     except Exception as exc:  # noqa: BLE001 — 정리가 도구 결과를 막으면 안 된다
         log.warning("구조 결과 두 벌 정리 실패(%s) — 원문을 그대로 준다: %r", name, exc)
         return res

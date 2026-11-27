@@ -3872,7 +3872,11 @@ _COPY_LABEL = re.compile(r"[(\[](?:시험|사본|테스트|test|copy|staging|dev
 SEARCH_TUNING_PATH = Path(__file__).with_name("search_tuning.json")
 SEARCH_TUNING_LOCAL_PATH = Path(__file__).with_name("search_tuning.local.json")
 _TUNING_SWITCHES = ("synonyms", "core_vocab", "delib_narrow", "quality", "write_penalty", "copy_fold", "noncore_demote", "onto_first",
-                    "onto_lookup_first")
+                    "onto_lookup_first", "space_fold")
+# space_fold(HWAXPortal docs/mcp-modernize M2 · M3 검색 작은 고침 — 기본 켬) — 질의 낱말을 빈칸을 뺀 설명 · 앱 라벨에서도 센다. '지식카드 찾기' 가 설명의
+# '지식 카드' 를 못 맞혀 AIDataHub 지식카드 도구가 20위 밖이었다(11-27 조사). 띄어 쓴 질의('지식 카드')는 낱말 둘로 이미 맞는다. 끄면 순위가 바이트까지 같다.
+# 접는 것은 SPACE_FOLD_MIN_CHARS 자 이상인 낱말만이다 — 짧은 낱말까지 접으면 낱말 경계를 넘어 맞아 평가셋 쌍이 나빠졌다(11-27, 길이 상한 없음 — 나빠짐 2).
+SPACE_FOLD_MIN_CHARS = 4
 # 기본이 끔인 손잡이 — 칸이 없으면(덧씌우기가 null 로 지웠거나 기본값 파일을 못 읽었다) 끔으로 읽는다. 나머지는 칸이 없으면 켬이다.
 # noncore_demote(E2-5) 는 cae00 검색 평가(+noncore_demote 판)를 본 뒤 박스 덧씌우기로 켠다(결정 Q-1).
 # onto_first(HWAXPortal docs/ontology-first OF-7 · M3) — 질의가 앱 이름을 부른 줄에서 그 앱의 온톨로지 입구(코어 어휘표 ontology 의 entry)에 가중치 onto 를
@@ -4480,6 +4484,11 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
     obj_apps = (frozenset(app for app, _t, _a, typs in (vocab or {}).get("onto_lookup") or () if not typs or obj_m.group(1) in typs)
                 | frozenset((vocab or {}).get("family") or ())) if obj_m else frozenset()
     w_name, w_app, cap, w_cov = wt["name"], wt["app"], wt["desc_cap"], wt["coverage"]
+    fold = bool(sw.get("space_fold"))
+    # 접는 낱말 — 빈칸을 뺀 꼴이 SPACE_FOLD_MIN_CHARS 자 이상인 것만 빈칸을 뺀 설명에서 센다(짧은 낱말은 낱말 경계를 넘어 엉뚱하게 맞는다 — '다른' ·
+    # '재서'). 짧은 낱말은 종전대로 설명 그대로에서 센다. 값 쌍 (센 꼴, 빈칸 뺀 글에서 세나).
+    expand_f = {w: tuple((f, True) if len(f) >= SPACE_FOLD_MIN_CHARS else (v, False)
+                         for v in vs for f in (re.sub(r"\s+", "", v),)) for w, vs in expand.items()} if fold else {}
     groups = _request_groups() if groups is None else groups
     visible = _visible_tools(groups)
     # 형제 소개 줄(E2-4 · S-B)은 순위를 바꾸지 않는다 — 점수는 줄을 뗀 설명으로 낸다. 줄의 낱말이 점수에 들면 형제 줄이 오르고, 아래 접기가 그 줄을
@@ -4497,14 +4506,20 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
         label = str(meta.get("label") or "")
         hay_app = (label + " " + str(meta.get("description") or "")).lower()
         names = _label_names(label)
+        if fold:
+            desc_f, hay_app_f = re.sub(r"\s+", "", desc), re.sub(r"\s+", "", hay_app)   # 빈칸을 뺀 설명 · 앱 라벨(space_fold)
         score, covered = 0, 0
         base, base_cov = 0, 0             # 보정 없이 — 질의 낱말 그 자체만으로 낸 점수(귀속 · boost_only 판정)
         via: set[str] = set()
         row_named = False                 # 질의가 이 줄의 앱 이름을 불렀나(비코어 낮추기를 비켜 간다)
         for w, variants in expand.items():
             name_hit = any(v in name for v in variants)
-            desc_freq = max(min(desc.count(v), cap) for v in variants)
-            app_hit = any(v in hay_app for v in variants)
+            if fold:
+                desc_freq = max(min((desc_f if fl else desc).count(v), cap) for v, fl in expand_f[w])
+                app_hit = any(v in (hay_app_f if fl else hay_app) for v, fl in expand_f[w])
+            else:
+                desc_freq = max(min(desc.count(v), cap) for v in variants)
+                app_hit = any(v in hay_app for v in variants)
             # 질의가 앱 이름을 불렀으면(진짜 앱 라벨 적중) 이름 적중과 같은 가중이다 — 종전엔 라벨 · 설명 어디에 맞든 1점이었다(HG-01).
             named = any(_named(names, v, q_flat) for v in variants)
             if named:
@@ -4513,12 +4528,16 @@ async def _search_tools(arguments: dict, *, groups: list[str] | None = None, tun
             if name_hit or desc_freq or app_hit or named:
                 covered += 1
                 score += w_name * (name_hit or named) + desc_freq + w_app * app_hit
-                b_name, b_desc, b_app, b_named = w in name, min(desc.count(w), cap), w in hay_app, _named(names, w, q_flat)
+                b_name, b_named = w in name, _named(names, w, q_flat)
+                fw = fold and len(w) >= SPACE_FOLD_MIN_CHARS
+                b_desc, b_app = (min(desc_f.count(w), cap), w in hay_app_f) if fw else (min(desc.count(w), cap), w in hay_app)
                 if b_name or b_desc or b_app or b_named:
                     base_cov += 1
                     base += w_name * (b_name or b_named) + b_desc + w_app * b_app
-                for v in variants[1:]:
-                    if v in name or v in desc or v in hay_app or _named(names, v, q_flat):
+                for i, v in enumerate(variants[1:], 1):
+                    fv, fl = expand_f[w][i] if fold else (v, False)
+                    if (v in name or fv in (desc_f if fl else desc) or fv in (hay_app_f if fl else hay_app)
+                            or _named(names, v, q_flat)):
                         via.update(src[w].get(v, ()))
         if app in demote and not row_named:
             # 낮추기를 비켜 갈 이름 — 게이트웨이 라벨의 이름에 더해 어휘표의 앱 라벨 · 백엔드 키. 외부 연결 앱의 라벨은 포털 플랫폼 라벨(FMEA Agent)이라

@@ -8786,12 +8786,14 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     # 옮기기 전(10-29) 게이트웨이 코드 상수 그대로 — 기본값을 일부러 바꾸면 이 값을 함께 고친다(순위 기준 사본도 다시 뜬다)
     assert d["delib_ask"] == ('심의', '토의', '회의')
     assert d["quality_words"] == ('불량', '시장', '원인', '대책', '사례') and d["quality_areas"] == ("quality", "voc")
-    assert d["write_intent"] == ('등록', '생성', '만들', '추가', '수정', '고치', '고쳐', '바꾸', '바꿔', '변경', '삭제', '지우', '지워', '저장', '올리', '올려', '업로드', '반입', '가져오', '실행', '돌리', '돌려', '제출', '시작', '걸어', '적용', '반영', '보내', '발행', '게시', '취소', '중지', '멈추', '멈춰', '학습', '이어서', '다시 돌', '채워', '채우', '넣어', '넣고', '남기', '남겨', '붙여', '붙이', '기각', '승인', '심의', '토의', '심사', '회의', 'create', 'add ', 'update', 'edit', 'modify', 'delete', 'remove', 'save', 'register', 'upload', 'import', 'run ', 'execute', 'submit', 'start', 'launch', 'apply', 'publish', 'send', 'cancel', 'stop', 'train', 'rename')
+    # 11-27 M2 검색 작은 고침이 '작성' · '쓰기' 를 더했다(보고서 작성 · 쓰기에서 create_report_draft 가 쓰기 감점 — 일부러 바꾼 기본값, 평가셋 나빠짐 0)
+    assert d["write_intent"] == ('등록', '생성', '만들', '작성', '쓰기', '추가', '수정', '고치', '고쳐', '바꾸', '바꿔', '변경', '삭제', '지우', '지워', '저장', '올리', '올려', '업로드', '반입', '가져오', '실행', '돌리', '돌려', '제출', '시작', '걸어', '적용', '반영', '보내', '발행', '게시', '취소', '중지', '멈추', '멈춰', '학습', '이어서', '다시 돌', '채워', '채우', '넣어', '넣고', '남기', '남겨', '붙여', '붙이', '기각', '승인', '심의', '토의', '심사', '회의', 'create', 'add ', 'update', 'edit', 'modify', 'delete', 'remove', 'save', 'register', 'upload', 'import', 'run ', 'execute', 'submit', 'start', 'launch', 'apply', 'publish', 'send', 'cancel', 'stop', 'train', 'rename')
     # noncore(0.5) · noncore_demote(끔)는 10-31 E2-5 가, onto(4) · onto_first(끔)는 11-02 온톨로지 먼저(HWAXPortal docs/ontology-first)가, onto_object(4) ·
     # onto_lookup_first(끔)는 11-17 온톨로지 조회(같은 폴더 PLAN §12)가 더한 새 손잡이다 — 끈 채로(onto_object 는 인자가 있을 때만) 들어와 순위는 그대로다
     assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2, "noncore": 0.5,
                             "onto": 4, "onto_object": 4}
     assert all(v for k, v in d["switches"].items() if k not in gw._TUNING_OPT_IN) and gw._TUNING_OPT_IN == ("noncore_demote", "onto_first", "onto_lookup_first")
+    assert d["switches"]["space_fold"] is True, "11-27 M2 — 빈칸 접기(4자 이상 낱말) 기본 켬"
     assert d["switches"]["noncore_demote"] is False and d["switches"]["onto_first"] is False
     assert d["switches"]["onto_lookup_first"] is False and d["weights"]["onto_object"] == d["weights"]["onto"]
     # 11-02 그림 저장에서 '그림' 에 figure 를 더하고 '이미지' 를 새로 넣었다(그림 도구를 찾게 — 일부러 바꾼 기본값)
@@ -8800,7 +8802,9 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     # 11-03 StepForge F1 이 '짝 단면' · '단면 비교'(띄어 쓴 열쇠) → section_pair_view 를 새로 넣었다(81)
     # 11-17 cae00 요청 OL-5(사용자 결정 — 기본값으로 옮김)가 '온톨로지' · 'ontology' 를 새로 넣었다(83 — 박스 덧씌우기에서 잰 그대로, HWAXPortal
     # docs/ontology-first OF-42)
-    assert len(d["synonyms"]) == 83 and d["synonyms"]["요약"] == ("digest", "summary")
+    # 11-27 M2 검색 작은 고침이 '지식카드' → AIDataHub 검색 셋을 넣었다(84 — 설명이 영어라 '지식카드 찾기' 가 20위 밖이었다, 평가셋 나빠짐 0)
+    assert len(d["synonyms"]) == 84 and d["synonyms"]["요약"] == ("digest", "summary")
+    assert d["synonyms"]["지식카드"] == ("agent_search", "list_records", "hybrid_search")
     assert d["synonyms"]["온톨로지"] == ("ontology", "onto_", "object_resolve", "graph_neighbors", "objects_summary", "코어 정본")
     assert d["synonyms"]["ontology"] == ("object_resolve", "graph_neighbors", "objects_summary", "코어 정본")
     assert d["synonyms"]["docx"] == d["synonyms"]["변환기"] == d["synonyms"]["표 칸"] == ("kit_get",)
@@ -17616,3 +17620,53 @@ def test_도구_수_셋의_뜻이_health_에_있고_tools_map_은_REST_다리까
     st, old = _gate_call(monkeypatch, "/tools-map")
     assert "rest_call" not in old["map"] and len(old["map"]) == tc["tools_map"] - 2, "끄면 종전 손 목록(REST 다리 둘이 빠진다)"
     assert _health_body()["contract"]["tool_counts"]["tools_map"] is None
+
+
+
+# ── 검색 작은 고침(HWAXPortal docs/mcp-modernize M2 · M3) ─────────────────────────────────────────────────────────────────────
+
+def _search_kit(monkeypatch, tools: dict):
+    """{노출 이름: (백엔드, 설명, 표지)} 를 검색 시야로 앉힌다(로컬 도구 · 정책 없이)."""
+    monkeypatch.setattr(gw, "exposed_tools", [types.Tool(name=n, description=d, inputSchema={"type": "object"},
+                                                         **({"annotations": a} if a else {})) for n, (_b, d, a) in tools.items()])
+    monkeypatch.setattr(gw, "route", {n: (b, n) for n, (b, _d, _a) in tools.items()})
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "REST", {})
+
+
+def _rank_of(query, tun=None):
+    res = asyncio.run(gw._search_tools({"query": query, "limit": 20}, groups=[], tuning=tun, embed=False, log_query=False))
+    return json.loads(res.content[0].text)["ranked"]
+
+
+def test_빈칸_접기는_4자_이상_낱말을_빈칸_뺀_설명에서도_세고_끄면_종전이다(monkeypatch):
+    _search_kit(monkeypatch, {"kc_find": ("ai-data-hub", "전문가 지식 카드 를 찾는다", None),
+                              "other_tool": ("sf", "엉뚱한 다 른 도구", None)})
+    base = gw._tuning()
+    assert "kc_find" in _rank_of("지식카드 보기"), "붙여 쓴 질의가 띄어 쓴 설명을 맞힌다"
+    off = {**base, "switches": {**base["switches"], "space_fold": False}}
+    assert "kc_find" not in _rank_of("지식카드 보기", off), "끄면 종전 — 못 맞힌다"
+    assert "other_tool" not in _rank_of("다른", base), "4자 미만 낱말은 접지 않는다(낱말 경계를 넘는 엉뚱한 맞음)"
+
+
+def test_쓰기_의도_낱말_작성_쓰기면_쓰기_도구를_감점하지_않고_감점은_한_판정의_쓰기다(monkeypatch):
+    ann = types.ToolAnnotations
+    _search_kit(monkeypatch, {"create_report_draft": ("reportarchive", "보고서 초안을 만든다", None),
+                              "get_report": ("reportarchive", "보고서를 읽는다", ann(readOnlyHint=True)),
+                              "mesh_size_advice": ("heax-step_forge", "보고서 메시 크기 권고", None)})
+    monkeypatch.setattr(gw, "READ_DENY", frozenset({"heax-step_forge:mesh_size_advice"}))
+    def before(q, tun=None):                      # 로컬 도구(figure_to_report 등)도 시야에 있다 — 두 도구의 앞뒤만 본다
+        r = _rank_of(q, tun)
+        return r.index("create_report_draft") < r.index("get_report")
+    base = gw._tuning()
+    old = {**base, "write_intent": tuple(w for w in base["write_intent"] if w not in ("작성", "쓰기"))}
+    for q in ("보고서 작성", "보고서 쓰기"):
+        assert before(q), q
+        assert not before(q, old), ("종전 낱말이면 쓰기 감점으로 밀렸다", q)
+    assert not before("보고서"), "쓰기 낱말이 없으면 쓰기 도구는 감점"
+    rows = json.loads(asyncio.run(gw._search_tools({"query": "보고서 메시"}, groups=[], embed=False, log_query=False)).content[0].text)
+    assert gw._tool_is_write(gw.exposed_tools[2], "mesh_size_advice", "heax-step_forge"), "닫기 목록 도구는 한 판정의 쓰기 — 감점된다"
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
+    assert not gw._tool_is_write(gw.exposed_tools[2], "mesh_size_advice", "heax-step_forge"), "끈 박스는 종전(이름 꼴만)"
+    assert rows["ranked"]

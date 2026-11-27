@@ -3776,6 +3776,8 @@ def _ra_formats_load() -> dict:
         for kind, row in doc.items():
             if kind.startswith("_"):
                 continue
+            if kind == "auto_pipeline":     # 포털 자동 파이프라인 줄 — 포털만 읽는다(HWAXPortal docs/auto-pipeline AP-18)
+                continue
             tid = row.get("template_id") if isinstance(row, dict) else None
             ver = row.get("template_version") if isinstance(row, dict) else None
             if (kind in _RA_FORMAT_DEFAULTS and isinstance(tid, str) and _RA_FORMAT_ID.fullmatch(tid)

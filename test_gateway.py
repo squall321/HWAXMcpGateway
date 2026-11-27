@@ -15435,6 +15435,18 @@ def test_RA_템플릿은_박스_파일이_없으면_종전_그대로이고_있�
     assert gw._ra_formats_health()["kinds"]["deliberation"]["source"] == "box"
 
 
+def test_RA_템플릿_박스_파일의_포털_자동_파이프라인_줄은_건너뛴다(monkeypatch, tmp_path):
+    # 포털만 읽는 auto_pipeline 줄은 「모르는 종류」 가 아니다(HWAXPortal docs/auto-pipeline AP-18)
+    f = tmp_path / "ra-formats.local.json"
+    f.write_text(json.dumps({"deliberation": {"template_id": "sys.hwax.deliberation", "template_version": 4},
+                             "auto_pipeline": {"board": "sys-hwax-auto", "token_file": "infra/secrets/x.token", "formats": {}}}),
+                 encoding="utf-8")
+    monkeypatch.setattr(gw, "RA_FORMATS_PATH", f)
+    assert gw._ra_format_args() == {"template_id": "sys.hwax.deliberation", "template_version": 4}
+    h = gw._ra_formats_health()
+    assert h["error"] is None and "auto_pipeline" not in h["kinds"], h
+
+
 @pytest.mark.parametrize("raw", ["{ 깨진", "[1]", json.dumps({"deliberation": {"template_id": "../x", "template_version": 1}}),
                                  json.dumps({"deliberation": {"template_id": "sys.hwax.deliberation", "template_version": True}}),
                                  json.dumps({"deliberation": {"template_id": "sys.hwax.deliberation", "template_version": "2"}}),

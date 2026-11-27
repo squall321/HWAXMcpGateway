@@ -4063,30 +4063,44 @@ def _search_eval_run() -> dict:
     live = [p for p in pairs if p.get("query") and any(g in have for g in p.get("gold") or [])]
     variants = _eval_variants()
     ranks: dict[str, dict[str, int | None]] = {}
+    purp: dict[str, dict[str, str | None]] = {}      # 답의 purpose(목적 층 — M3) — 목적 쌍(purpose 칸)의 purpose@1
+    app1: dict[str, dict[str, str]] = {}             # 첫 줄의 앱 — app 칸이 있는 쌍(he · appentry)의 app@1
+    by_id = {p["id"]: p for p in live}
 
     async def run_all():
         for name, tun in variants.items():
-            ranks[name] = {}
+            ranks[name], purp[name], app1[name] = {}, {}, {}
             for p in live:
                 res = await _search_tools({"query": p["query"], "limit": 20}, groups=[SERVICE_GROUP], tuning=tun,
                                           embed=False, log_query=False)
-                ranked = json.loads(res.content[0].text).get("ranked") or [] if not res.isError else []
+                body = json.loads(res.content[0].text) if not res.isError else {}
+                ranked = body.get("ranked") or []
                 ranks[name][p["id"]] = next((i for i, n in enumerate(ranked, 1) if keys.get(n) in set(p["gold"])), None)
+                purp[name][p["id"]] = (body.get("purpose") or {}).get("key")
+                app1[name][p["id"]] = keys.get(ranked[0], ":").split(":")[0] if ranked else ""
     asyncio.run(run_all())
 
-    def summary(rv: dict, ids) -> dict:
+    def summary(name: str, ids) -> dict:
+        rv = ranks[name]
         rs = [rv[i] for i in ids]
         n = len(rs)
         if not n:
             return {"n": 0}
-        return {"n": n, "hit@1": round(sum(1 for r in rs if r and r <= 1) / n, 3), "hit@5": round(sum(1 for r in rs if r and r <= 5) / n, 3),
-                "mrr@20": round(sum(1 / r for r in rs if r) / n, 3)}
+        out = {"n": n, "hit@1": round(sum(1 for r in rs if r and r <= 1) / n, 3), "hit@5": round(sum(1 for r in rs if r and r <= 5) / n, 3),
+               "mrr@20": round(sum(1 / r for r in rs if r) / n, 3)}
+        pu = [purp[name][i] == by_id[i]["purpose"] for i in ids if by_id[i].get("purpose")]
+        ap = [app1[name][i] == by_id[i]["app"] for i in ids if by_id[i].get("app")]
+        if pu:
+            out["purpose@1"] = round(sum(pu) / len(pu), 3)
+        if ap:
+            out["app@1"] = round(sum(ap) / len(ap), 3)
+        return out
     by_src = {"전체": [p["id"] for p in live]}
-    for src in ("doc", "auto", "box"):
+    for src in ("doc", "auto", "box", "purpose", "appentry", "he"):
         ids = [p["id"] for p in live if p.get("source") == src]
         if ids:
             by_src[src] = ids
-    out_v = {name: {g: summary(ranks[name], ids) for g, ids in by_src.items()} for name in variants}
+    out_v = {name: {g: summary(name, ids) for g, ids in by_src.items()} for name in variants}
     changed = [{"id": p["id"], "query": p["query"], "source": p.get("source"),
                 "effective": ranks["effective"][p["id"]], "base": ranks["base"][p["id"]], "off": ranks["off"][p["id"]]}
                for p in live if len({ranks["effective"][p["id"]], ranks["base"][p["id"]], ranks["off"][p["id"]]}) > 1]

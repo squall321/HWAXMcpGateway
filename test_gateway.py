@@ -6798,14 +6798,15 @@ _SEARCH_SPECS = [
 ] + [("signalforge", f"report_x{i:02d}", "보고서 report 묶음 — 같은 점수로 겹치는 도구들.") for i in range(12)]
 
 
-def _m3_off(monkeypatch):
+def _m3_off(monkeypatch, also=()):
     """검색의 목적 층 · 앱 입구 손잡이(HWAXPortal docs/mcp-modernize M3 — 기본 켬)를 끈 손잡이로 돈다. 그 둘을 끄면 순위 · 글이 종전과 바이트까지 같다 —
-    종전 코드 사본(_SEARCH_TOOLS_MASTER)과 견주는 시험 · 다른 장치만 따로 보는 시험이 이것을 건다. _tuning 을 감싸 박스 덧씌우기 시험과 함께 쓴다."""
+    종전 코드 사본(_SEARCH_TOOLS_MASTER)과 견주는 시험 · 다른 장치만 따로 보는 시험이 이것을 건다. _tuning 을 감싸 박스 덧씌우기 시험과 함께 쓴다.
+    also — 함께 끌 다른 손잡이(종전 사본보다 뒤에 들어온 것 — space_fold)."""
     real = gw._tuning
 
     def off():
         d = real()
-        return {**d, "switches": {**d["switches"], "purpose_boost": False, "app_entry_first": False}}
+        return {**d, "switches": {**d["switches"], "purpose_boost": False, "app_entry_first": False, **{k: False for k in also}}}
     monkeypatch.setattr(gw, "_tuning", off)
 
 
@@ -7239,7 +7240,8 @@ def test_E2_1_앱_목록_도구_지도_검색_줄은_가족_비코어에만_role
 def test_E2_1_실제_어휘표에서도_dev_카탈로그의_search_tools_답은_지금_코드와_바이트까지_같다(monkeypatch):
     """dev 에는 가족 · 비코어 앱이 붙어 있지 않다 — 역할 칸 · 가족 접기 · 가족 접두 · 비코어 낮추기(기본 끔)가 들어와도 실제 어휘표 아래 답이 기준본
     (_SEARCH_TOOLS_MASTER)과 한 글자도 다르지 않다. 의미 순위를 끈 바이트 시험(아래)은 어휘표 없이 같은 것을 본다."""
-    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
+    # 목적 층 · 앱 입구(M3)와 빈칸 접기(M2)는 끈 채로 본다 — 종전 사본보다 뒤에 들어온 기본 켬이다(아래 master 시험 주석)
+    _m3_off(monkeypatch, also=("space_fold",))
     _search_catalog(monkeypatch)
     monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
     _no_embed(monkeypatch)
@@ -8162,7 +8164,9 @@ def test_E4_리포_mcp_json_은_보기_머리로_늘_전체를_청한다():
 def test_search_tools_의미_순위를_끄면_답이_master_와_바이트까지_같다(monkeypatch):
     """옵션을 끈 것이 기본값이다 — 그때 search_tools 는 종전 코드와 글자 하나 다르지 않아야 하고 임베더를 부르지 않는다.
     질의는 손으로 고른 가장자리(짧음·빈 낱말·대소문자·조사·limit)와 평가셋의 질의 전부다."""
-    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
+    # 목적 층 · 앱 입구(M3)와 빈칸 접기(M2)는 끈 채로 본다 — 둘 다 종전 사본보다 뒤에 들어온 기본 켬이고 끄면 종전과 같다. 빈칸 접기는 평가셋에
+    # 띄어 쓴 꼴만 설명에 있는 4자 이상 낱말 질의('보여주고' ↔ '보여 주고' — M3 의 HE 운영자 쌍)가 들어와 드러났다
+    _m3_off(monkeypatch, also=("space_fold",))
     from pathlib import Path
     _search_catalog(monkeypatch)
     _no_embed(monkeypatch)
@@ -18268,3 +18272,41 @@ def test_M3_실제_목적_표의_SKILL_md_frontmatter_는_Agent_Skills_꼴이다
         meta = {k: v for k, _sep, v in (ln.partition(": ") for ln in fm.strip().splitlines())}
         assert set(meta) == {"name", "description"} and gw.re.fullmatch(r"[a-z0-9-]{1,64}", meta["name"]), p["key"]
         assert 0 < len(json.loads(meta["description"])) <= 1024, p["key"]
+
+
+def test_M3_검색_평가_창구는_목적_쌍의_purpose_at_1_과_앱_쌍의_app_at_1_을_판마다_센다(monkeypatch, tmp_path):
+    _p_search(monkeypatch, tmp_path)
+    pairs = tmp_path / "pairs.jsonl"
+    pairs.write_text("\n".join(json.dumps(p, ensure_ascii=False) for p in (
+        {"id": "purpose-x", "query": "낙하 해석 준비 해줘", "gold": ["sf:list_projects"], "purpose": "drop-prep", "source": "purpose"},
+        {"id": "appentry-x", "query": "StepForge 어떻게 써?", "gold": ["sf:guide"], "app": "sf", "source": "appentry"},
+        {"id": "he-x", "query": "보고서 초안 만들어줘", "gold": ["ra:create_report_draft"], "app": "ra", "source": "he"})) + "\n", encoding="utf-8")
+    monkeypatch.setattr(gw, "SEARCH_PAIRS_PATH", pairs)
+    st, body = _gate_call(monkeypatch, "/search-eval", "POST", body={})
+    assert st == 200, body
+    assert (body["pairs"]["purpose"], body["pairs"]["appentry"], body["pairs"]["he"]) == (1, 1, 1)
+    eff = body["variants"]["effective"]
+    assert eff["purpose"]["purpose@1"] == 1.0 and eff["purpose"]["hit@1"] == 1.0, eff
+    assert eff["appentry"]["hit@1"] == 1.0 and eff["appentry"]["app@1"] == 1.0 and eff["he"]["app@1"] == 1.0
+    off = body["variants"]["-purpose_boost"]
+    assert off["purpose"]["purpose@1"] == 0.0, "목적 층을 끈 판에는 purpose 가 없다"
+    assert body["variants"]["-app_entry_first"]["appentry"]["hit@1"] < 1.0, "앱 입구를 끈 판은 입구가 첫 줄이 아니다"
+
+
+def test_M3_run_py_names_는_스냅샷에서_이름만_담은_이름표를_짓고_expected_missing_을_지킨다(tmp_path):
+    import argparse
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tse_run_names", gw.Path(gw.__file__).with_name("tool_search_eval") / "run.py")
+    run = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run)
+    cat = tmp_path / "catalog.local.json"
+    cat.write_text(json.dumps({"taken_at": "t", "local_tools": ["search_tools"], "tools": [
+        {"name": "x", "app": "a", "original": "x", "description": "비밀 설명", "inputSchema": {}},
+        {"name": "b_y", "app": "b", "original": "y", "description": "", "inputSchema": {}}]}), encoding="utf-8")
+    out = tmp_path / "purpose_catalog.json"
+    out.write_text(json.dumps({"_doc": ["d"], "expected_missing": {"a": {"why": "새 판", "tools": ["z"]}}}), encoding="utf-8")
+    run._names(argparse.Namespace(catalog=str(cat), out=str(out)))
+    got = json.loads(out.read_text(encoding="utf-8"))
+    assert got == {"_doc": ["d"], "taken_at": "t", "tools": {"a": ["x"], "b": ["y"]}, "local_tools": ["search_tools"],
+                   "expected_missing": {"a": {"why": "새 판", "tools": ["z"]}}}
+    assert "비밀 설명" not in out.read_text(encoding="utf-8"), "설명 · 스키마는 싣지 않는다(이름만)"

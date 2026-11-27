@@ -1010,7 +1010,7 @@
     "wda-meeting": {
       "title": "디자인 심의만",
       "summary": "페르소나를 골라 회의를 열고 차례대로 브리핑 · 발언을 돌린 뒤 닫고 회의록을 받는다.",
-      "triggers": ["디자인 회의", "디자인 심의", "회의록", "회의 열"],
+      "triggers": ["디자인 회의", "디자인 심의", "디자인 회의록", "회의 열"],
       "entry": ["heax-web_design_agents", "meeting_personas"],
       "steps": [
         {"backend": "heax-web_design_agents", "tool": "meeting_personas", "why": "participants 에 쓸 id 를 본다(순서가 발언 순서)"},

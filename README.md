@@ -763,3 +763,38 @@ curl -s http://127.0.0.1:9009/health | python3 -c "import sys,json;print(len(jso
 
 검색(search_tools)의 작은 고침은 `search_tuning.json` 이다 — 쓰기 의도 낱말 '작성' · '쓰기', `switches.space_fold`(4자 이상 낱말을 빈칸 뺀 설명에서도
 센다 — 박스 덧씌우기로 끈다), 손 동의어 '지식카드'. 평가는 `tool_search_eval/README.md` 의 11-27 절.
+
+## MCP 현대화 M3 — 목적 단위 접근(HWAXPortal docs/mcp-modernize M3)
+
+도구가 2,000개 가까우면(cae00) 낱말 순위만으로는 첫 걸음을 못 맞힌다 — 목적으로 먼저 좁히고 그 안에서 앱 입구 → 도구로 내려간다. 정본은 목적 묶음 표
+`tool_purposes.json`(추적) 하나이고, 게이트웨이가 그 표에서 표면 여섯을 짓는다. 웹 챗 · 심의 좌석 · PC 킷은 `/tools-map` 의 `purposes` 로 같은 표를 읽는다(그쪽 소비는 따로).
+
+- **표의 꼴** — `purposes.<목적 키>` = `{title · summary · triggers · entry([백엔드, 원래 이름]) · steps([{backend, tool, why}] 차례) · confirm_writes · samples · apps
+  · source}`, `apps.<백엔드 키>` = `{entry, why}`(앱 입구). 도구는 노출 이름이 아니라 (백엔드, 원래 이름)이다 — 겹침 · 허브 가족 접두는 경로표로 푼다. 게이트웨이
+  자체 도구는 백엔드 `_gateway`. 칸 뜻 · 씨앗은 파일 머리 `_doc`. 지금 목적 72(다앱 13 · 앱 59) · 앱 입구 20 — 씨앗은 HE팀 운영자 19명 · 앱 R2 길 안내 · 다앱 흉내 다섯.
+- **이 박스에 없는 단계** — 그 앱이 붙은 박스에서만 산다(cae00 전용 정본 허브 · ECAD 허브 · ARP · 클러스터 앱, RA 새 판의 도구). 없으면 그 단계를 빼고
+  `/health` 의 `purposes.missing`(앱별)에 센다. 단계가 하나도 안 남은 목적은 그 박스에 없다(`inactive`).
+- **박스 덧씌우기** — 같은 자리의 `tool_purposes.local.json`(gitignore) — 검색 손잡이 · 코어 어휘표와 같은 **JSON merge patch**(목적 키로 묶은 객체는 합치고 목록은
+  통째로 바뀌며 `null` 은 그 목적을 지운다). 꼴이 틀리면(모르는 칸 · entry 가 steps 밖 · confirm 이 steps 밖 · apps 가 단계 백엔드를 다 담지 않음 · 키 꼴) **통째로
+  버리고 기본 표**로 돌며 까닭을 `/health purposes.overlay.error` 에 싣는다. 바뀐 시각을 보고 재기동 없이 다시 읽는다.
+- **시험** — 표의 단계 · 입구 · 앱 입구가 dev 카탈로그 이름표 `tool_search_eval/purpose_catalog.json`(이름만)에 있어야 한다(앱 새 판의 도구는 `expected_missing` 에
+  까닭과 함께). 앱 판이 바뀌어 이름이 사라지면 시험이 붉어진다 — 표를 고친다.
+
+| 표면 | 손잡이(기본) | 하는 일 |
+|---|---|---|
+| `list_tool_apps(by='purpose', purpose=?)` · 앱 줄 `entry` | `GATEWAY_PURPOSE_LIST`(켬) | 업무 목적마다 차례 · 입구 · 단계 수, 목적을 고르면 단계마다 도구 · 까닭 · 쓰기(게이트웨이 판정) · 확인(표) · 질의 예 · prompt · skill. 앱 줄마다 처음 부를 도구. 시야 밖 단계는 수만(`unavailable_steps`) |
+| search_tools 목적 층 | `switches.purpose_boost`(켬) | 질의가 목적 트리거에 맞으면(띄어 쓴 조각이 모두 빈칸 뺀 질의에 든다) 덮음 ≥ `purpose_hint_cover` 이면 답의 `ranked` 바로 뒤에 `purpose`(차례 · 입구 · 확인 · 더 볼 곳 · prompt), ≥ `purpose_cover` 이면 그 목적 단계에 `purpose_step` 을 곱셈 보정 뒤에 더하고 목적 가중 전 상위 셋에 그 목적 단계가 없을 때만 입구를 첫 줄로 |
+| search_tools 앱 입구 | `switches.app_entry_first`(켬) | 앱 하나의 이름을 부른 질의 — 그 앱 입구에 `app_entry`, 앱 이름과 일반 낱말(`app_entry_generic`)뿐이면 입구를 첫 줄로 |
+| 보기 `purpose:<키>,…` | `GATEWAY_PURPOSE_VIEW`(켬) | 연결 머리 `X-HWAX-View` 로 tools/list 를 그 목적들의 단계 + 게이트웨이 공통으로(보기 셋과 같은 규칙 — 목록만 줄인다). 포털 사람 설정 저장은 아직 세 보기 |
+| MCP prompts `purpose-<키>` | `GATEWAY_PURPOSE_PROMPTS`(켬) | 사람 PAT 에만 · 루틴 뒤. 가져오면 입구 · 차례 · 확인할 쓰기 글(선택 인자 `task`). 부를 때까지 문맥을 먹지 않는다 — 서버 지침(2,048자)에 못 싣는 길 안내 |
+| 자원 `skill://hwax/<키>/SKILL.md` | `GATEWAY_PURPOSE_SKILLS`(켬) | Skills over MCP 내보내기 준비(확장 skills/list 는 SDK 2.x 뒤 M4) — frontmatter `name: hwax-<키>` · `description`, 본문 언제 · 입구 · 차례 · 지킬 것. 사람 PAT 에만 |
+| `/tools-map` `purposes` · `/health` `purposes` | `GATEWAY_PURPOSES`(켬 — 0 이면 표를 읽지 않고 모든 표면이 꺼진다) | 단계마다 (백엔드, 원래 이름) · 노출 이름 · 까닭 · 확인 · 쓰기 판정과 앱 입구 / 지문 · 덧씌우기 · 목적 수 · 산 목적 · 없는 단계 · 입구 없음 · 입구 쓰기 · 손잡이 |
+
+- 환경 손잡이는 띄운 셸의 환경이 먼저, 없으면 곁의 `provision.env` 줄(M2 와 같은 규칙 — 바꾸면 다시 띄운다). 검색 손잡이는 `search_tuning.json`(박스 덧씌우기로
+  재기동 없이). **각 손잡이를 끄면 그 표면이 종전과 바이트까지 같다**(시험이 종전 정의 · 코드 사본과 맞댄다).
+- 검색 손잡이의 기본 켬은 평가에서 기존 183쌍 나빠짐 0 을 보고 정했다(master 대비 나아짐 8 · purpose@1 0 → 0.942 · HE 운영자 질의 app@1 0.661 → 0.887 —
+  `tool_search_eval/README.md` 11-27 M3).
+- **채택 셈**(M0 · M3) — 보기별 tools/list(`tools_list`) · 목적 보기(`view_purpose`) · prompts/get(`prompt` — `purpose-<키>` · `routine`) · 자원 읽기(`resource` —
+  `skill:<키>` · `ui`) · 목적 목록(`list_purpose`) · 검색 목적 층(`search_purpose`)을 KST 날마다 디스크 원장 `usage-adoption.sqlite`(이용 통계 표 곁 · 0600 · 사람 ·
+  질의 글 없음)에 센다. `/health` 의 `adoption` 은 최근 7일 합, `/usage-rollup` 의 `adoption` 은 기간의 날마다. 끄기 `GATEWAY_ADOPTION_LEDGER=0` · 덮기
+  `GATEWAY_ADOPTION_PATH`. 종전 `/health tools_list_by_view` 는 프로세스 메모리(기동 뒤)라 그대로 둔다.

@@ -64,6 +64,17 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "_INGEST_CHECK", {})
     # 이용 통계 창구가 감사 원장을 접어 두는 표도 같다 — 안 걸면 /usage-rollup 시험이 박스의 데이터 루트(원장 곁 usage-rollup.sqlite)에 시험 줄을 접는다
     monkeypatch.setattr(gw, "USAGE_ROLLUP_PATH", tmp_path / "usage-rollup.sqlite")
+    # 목적 묶음 표의 박스 덧씌우기 · 손잡이도 같다(HWAXPortal docs/mcp-modernize M3) — 박스에 tool_purposes.local.json 이 있거나 provision.env 가 손잡이를
+    # 꺼 두면 목적 시험이 그 박스 값으로 돈다. 기본 표(추적)와 코드 기본값(모두 켬)만 보게 건다
+    monkeypatch.setattr(gw, "TOOL_PURPOSES_LOCAL_PATH", tmp_path / "tool_purposes.local.json")
+    monkeypatch.setattr(gw, "_PURPOSES", {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None})
+    for _k in ("PURPOSES_ON", "PURPOSE_LIST_ON", "PURPOSE_VIEW_ON", "PURPOSE_PROMPTS_ON", "PURPOSE_SKILLS_ON"):
+        monkeypatch.setattr(gw, _k, True)
+    # 채택 셈 원장도 같다 — 안 걸면 시험의 tools/list · prompts/get 이 박스의 데이터 루트(원장 곁 usage-adoption.sqlite)에 셈을 쌓는다
+    monkeypatch.setattr(gw, "ADOPTION_PATH", tmp_path / "usage-adoption.sqlite")
+    monkeypatch.setattr(gw, "ADOPTION_ON", True)
+    monkeypatch.setattr(gw, "_ADOPT_HEALTH", {"at": -1e9, "data": None})
+    monkeypatch.setattr(gw, "_ADOPT_WARN", {"at": -1e9, "errors": 0})
 
 
 @pytest.fixture(autouse=True)
@@ -6435,9 +6446,9 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read", "views",
                           "panel_read", "orig"] + (["tool_class", "gateway_annotated"] if gw.TOOL_CLASS_UNIFIED else []) + (
                           ["would_close"] if gw.TOOL_CLASS_MODE == "shadow" else []) + (
-                          ["gateway_filled"] if gw.ARG_DOC_FILL is not False else []), \
+                          ["gateway_filled"] if gw.ARG_DOC_FILL is not False else []) + (["purposes"] if gw.PURPOSES_ON else []), \
         "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4) · 패널 확인용 읽기 목록(HA-20 B-2) · 원래 이름" \
-        "(ontology-first F0)은 맨 뒤에 덧붙는다"
+        "(ontology-first F0) · 목적 묶음(mcp-modernize M3)은 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
     assert body["backends"] == ["_gateway", "reportarchive"]
     # 로컬 8 + 분석 루틴 6 + 과제 인사이트 2 + 그림 4 + PC 키트 1 + 온톨로지 조회 1 + 관리자 읽기 목록 보기 1(GW-02 — tools/list 는 관리자에게만)
@@ -6785,6 +6796,18 @@ _SEARCH_SPECS = [
     ("ste", "ste_submit_job", "해석 잡을 제출한다(slurm)."),
     ("mx-white-paper", "export_document", "위키 문서를 docx 로 내보낸다. report 작성에 쓴다."),
 ] + [("signalforge", f"report_x{i:02d}", "보고서 report 묶음 — 같은 점수로 겹치는 도구들.") for i in range(12)]
+
+
+def _m3_off(monkeypatch, also=()):
+    """검색의 목적 층 · 앱 입구 손잡이(HWAXPortal docs/mcp-modernize M3 — 기본 켬)를 끈 손잡이로 돈다. 그 둘을 끄면 순위 · 글이 종전과 바이트까지 같다 —
+    종전 코드 사본(_SEARCH_TOOLS_MASTER)과 견주는 시험 · 다른 장치만 따로 보는 시험이 이것을 건다. _tuning 을 감싸 박스 덧씌우기 시험과 함께 쓴다.
+    also — 함께 끌 다른 손잡이(종전 사본보다 뒤에 들어온 것 — space_fold)."""
+    real = gw._tuning
+
+    def off():
+        d = real()
+        return {**d, "switches": {**d["switches"], "purpose_boost": False, "app_entry_first": False, **{k: False for k in also}}}
+    monkeypatch.setattr(gw, "_tuning", off)
 
 
 def _search_catalog(monkeypatch, specs=None):
@@ -7217,6 +7240,8 @@ def test_E2_1_앱_목록_도구_지도_검색_줄은_가족_비코어에만_role
 def test_E2_1_실제_어휘표에서도_dev_카탈로그의_search_tools_답은_지금_코드와_바이트까지_같다(monkeypatch):
     """dev 에는 가족 · 비코어 앱이 붙어 있지 않다 — 역할 칸 · 가족 접기 · 가족 접두 · 비코어 낮추기(기본 끔)가 들어와도 실제 어휘표 아래 답이 기준본
     (_SEARCH_TOOLS_MASTER)과 한 글자도 다르지 않다. 의미 순위를 끈 바이트 시험(아래)은 어휘표 없이 같은 것을 본다."""
+    # 목적 층 · 앱 입구(M3)와 빈칸 접기(M2)는 끈 채로 본다 — 종전 사본보다 뒤에 들어온 기본 켬이다(아래 master 시험 주석)
+    _m3_off(monkeypatch, also=("space_fold",))
     _search_catalog(monkeypatch)
     monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
     _no_embed(monkeypatch)
@@ -7256,6 +7281,7 @@ def test_E2_2_가족_줄은_설명이_달라도_원래_이름으로_한_줄에_�
 def test_E2_2_설명이_같으면_가족_접기는_지금_코드와_바이트까지_같다(monkeypatch):
     """설명이 같은 합성 카탈로그(cae00 의 지금 꼴) — 가족 접기의 답이 기준본과 같다. 검색 줄의 역할 칸(role — E2-1 이 더한 것)만 빼고 응답 글을
     견준다. 사본 앱 이름을 부르는 질의(OT-12)와 비코어 · 심의 질의를 함께 지난다."""
+    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
     search = _role_kit(monkeypatch)
     legacy = _search_tools_master()
 
@@ -7526,6 +7552,7 @@ _NONCORE_HEAVY = {**_CORE_OTHER,
 def test_E2_5_비코어_낮추기는_기본_끔이고_켜면_코어_질문의_비코어_줄이_정본_읽기_도구_아래로_간다(monkeypatch, tmp_path):
     """손잡이 noncore_demote(기본 끔 — 결정 Q-1, cae00 검색 평가의 +noncore_demote 판을 본 뒤 박스 덧씌우기로 켠다). 켜면 코어 질문(어휘표 검색 낱말이
     든 질의)에서 비코어 앱 도구 점수에 weights.noncore 를 곱한다. 앱 이름을 부르면 · 코어 낱말이 없으면 그대로다. 질의 기록 via 에 남는다."""
+    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
     hub_tools = tuple((n, d) for n, d in _CORE_HUB_TOOLS if n in ("object_resolve", "objects_summary"))
     search = _role_kit(monkeypatch, hub_tools=hub_tools, other=_NONCORE_HEAVY)
     t = gw._tuning()
@@ -7559,6 +7586,7 @@ def test_E2_5_앱_이름을_부른_질의는_어휘표_라벨과_키로도_알�
     """외부 연결 앱의 게이트웨이 라벨은 포털 플랫폼 라벨이다(FMEA — 'FMEA Agent' · ARP — 'AI Ready Portal'). 그 라벨의 이름(fmeaagent · aireadyportal)만
     보면 'FMEA 관리 기준 개수' 가 앱을 부르지 않는 것이 되어, 손잡이를 켜면 1위가 정본 읽기 도구 아래로 밀렸다(검토 10-31 — 위 시험의 라벨 'FMEA' 는
     운영과 달라 가렸다). 어휘표의 앱 라벨(apps.<키>.label)과 백엔드 키도 그 앱의 이름이다. 부르지 않은 비코어는 그대로 낮춘다."""
+    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
     other = {**_NONCORE_HEAVY, "fmea": ("FMEA Agent", _NONCORE_HEAVY["fmea"][1]), "arp": ("AI Ready Portal", _NONCORE_HEAVY["arp"][1])}
     hub_tools = tuple((n, d) for n, d in _CORE_HUB_TOOLS if n in ("object_resolve", "objects_summary"))
     search = _role_kit(monkeypatch, hub_tools=hub_tools, other=other)
@@ -7853,6 +7881,7 @@ _OL_QS = ("온톨로지 조회", "온톨로지 검색", "ontology lookup", "고�
 
 
 def test_OL2_끄면_순위와_글이_도구가_없던_때와_바이트까지_같다(monkeypatch, tmp_path):
+    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
     search = _role_kit(monkeypatch, other=_OL_OTHER)
     assert gw._tuning()["switches"]["onto_lookup_first"] is False and gw._tuning()["weights"]["onto_object"] == 4
     now = {q: search(q, 20, raw=True) for q in _OL_QS}
@@ -8041,7 +8070,7 @@ def test_E4_도구_지도는_게이트웨이가_보기를_안다고_말한다(mo
 
     async def send(m): sent.append(m)
     asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/tools-map", "headers": []}, None, send))
-    assert json.loads(sent[1]["body"])["views"] == ["full", "bundle", "light"]
+    assert json.loads(sent[1]["body"])["views"] == ["full", "bundle", "light"] + (["purpose"] if gw.PURPOSE_VIEW_ON else []), "목적 보기(M3)는 켠 박스만"
 
 
 def test_E4_list_tool_apps_의_view_는_보기_영역_수_모르는_영역_출처를_말한다(monkeypatch):
@@ -8135,6 +8164,9 @@ def test_E4_리포_mcp_json_은_보기_머리로_늘_전체를_청한다():
 def test_search_tools_의미_순위를_끄면_답이_master_와_바이트까지_같다(monkeypatch):
     """옵션을 끈 것이 기본값이다 — 그때 search_tools 는 종전 코드와 글자 하나 다르지 않아야 하고 임베더를 부르지 않는다.
     질의는 손으로 고른 가장자리(짧음·빈 낱말·대소문자·조사·limit)와 평가셋의 질의 전부다."""
+    # 목적 층 · 앱 입구(M3)와 빈칸 접기(M2)는 끈 채로 본다 — 둘 다 종전 사본보다 뒤에 들어온 기본 켬이고 끄면 종전과 같다. 빈칸 접기는 평가셋에
+    # 띄어 쓴 꼴만 설명에 있는 4자 이상 낱말 질의('보여주고' ↔ '보여 주고' — M3 의 HE 운영자 쌍)가 들어와 드러났다
+    _m3_off(monkeypatch, also=("space_fold",))
     from pathlib import Path
     _search_catalog(monkeypatch)
     _no_embed(monkeypatch)
@@ -8797,9 +8829,12 @@ def test_검색_손잡이_기본값은_옮기기_전_코드_상수와_같다():
     assert d["write_intent"] == ('등록', '생성', '만들', '작성', '쓰기', '추가', '수정', '고치', '고쳐', '바꾸', '바꿔', '변경', '삭제', '지우', '지워', '저장', '올리', '올려', '업로드', '반입', '가져오', '실행', '돌리', '돌려', '제출', '시작', '걸어', '적용', '반영', '보내', '발행', '게시', '취소', '중지', '멈추', '멈춰', '학습', '이어서', '다시 돌', '채워', '채우', '넣어', '넣고', '남기', '남겨', '붙여', '붙이', '기각', '승인', '심의', '토의', '심사', '회의', 'create', 'add ', 'update', 'edit', 'modify', 'delete', 'remove', 'save', 'register', 'upload', 'import', 'run ', 'execute', 'submit', 'start', 'launch', 'apply', 'publish', 'send', 'cancel', 'stop', 'train', 'rename')
     # noncore(0.5) · noncore_demote(끔)는 10-31 E2-5 가, onto(4) · onto_first(끔)는 11-02 온톨로지 먼저(HWAXPortal docs/ontology-first)가, onto_object(4) ·
     # onto_lookup_first(끔)는 11-17 온톨로지 조회(같은 폴더 PLAN §12)가 더한 새 손잡이다 — 끈 채로(onto_object 는 인자가 있을 때만) 들어와 순위는 그대로다
+    # purpose_step · purpose_cover · purpose_hint_cover · app_entry 와 켬인 purpose_boost · app_entry_first 는 11-27 M3(목적 묶음)이 더했다 — 평가셋 183쌍
+    # 나빠짐 0 을 보고 켰다(일부러 바꾼 기본값 — 끄면 순위가 종전과 바이트까지 같다, _m3_off)
     assert d["weights"] == {"name": 4, "desc_cap": 3, "app": 1, "coverage": 1, "write_penalty": 0.5, "quality_per_word": 2, "noncore": 0.5,
-                            "onto": 4, "onto_object": 4}
+                            "onto": 4, "onto_object": 4, "purpose_step": 6, "purpose_cover": 0.2, "purpose_hint_cover": 0.2, "app_entry": 4}
     assert all(v for k, v in d["switches"].items() if k not in gw._TUNING_OPT_IN) and gw._TUNING_OPT_IN == ("noncore_demote", "onto_first", "onto_lookup_first")
+    assert d["switches"]["purpose_boost"] is True and d["switches"]["app_entry_first"] is True
     assert d["switches"]["space_fold"] is True, "11-27 M2 — 빈칸 접기(4자 이상 낱말) 기본 켬"
     assert d["switches"]["noncore_demote"] is False and d["switches"]["onto_first"] is False
     assert d["switches"]["onto_lookup_first"] is False and d["weights"]["onto_object"] == d["weights"]["onto"]
@@ -11316,6 +11351,7 @@ def test_프롬프트_목록은_사람_PAT_로_루틴마다_하나이고_공유_
     단계 사슬, 인자는 루틴 변수다(필수 표시는 포털 목록의 required 를 따르고, 표시가 없는 옛 포털이면 필수로 적지 않는다 — 가져오기가 계획으로
     다시 본다). 보관한 루틴은 빠진다. 공유 비밀 · 익명은 사람이 아니라 포털에 묻지도 않고 빈 목록, 포털이 실패해도 빈 목록(경고 한 줄) —
     붙을 때 부르는 목록이라 터지면 연결이 오류로 보인다."""
+    monkeypatch.setattr(gw, "PURPOSE_PROMPTS_ON", False)      # 루틴 프롬프트만 본다 — 목적 프롬프트(M3)는 따로 시험한다(끄면 목록이 종전과 같다)
     seen, _ = _rt_kit(monkeypatch, extra={("GET", "/routines"): _RT_LIST})
     _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
     got = asyncio.run(gw._list_prompts())
@@ -11345,6 +11381,7 @@ def test_프롬프트_목록에서_권한_없음_403_은_정보로_남기고_다
     """분석 루틴 권한(feat:routines)이 없는 사람의 클라이언트도 붙을 때마다 prompts/list 를 부른다 — 포털의 403 은 정상 거절이라 경고로 두면
     로그가 그것으로 찬다. 403 만 정보(INFO)로 내리고 닿지 못함 · 5xx · 토큰 거절 같은 고장은 경고 그대로다. 포털 창구(_routine_portal)를
     진짜로 타서 포털의 HTTP 상태가 예외에 실려 오는지까지 본다(포털 AuthError 의 꼴 — JSON detail)."""
+    monkeypatch.setattr(gw, "PURPOSE_PROMPTS_ON", False)      # 루틴 프롬프트만 본다 — 목적 프롬프트(M3)는 따로 시험한다(끄면 목록이 종전과 같다)
     reply = {}
     real = httpx.AsyncClient
 
@@ -11428,6 +11465,7 @@ def test_진짜_클라이언트가_prompts_를_광고받고_목록과_가져오�
     """처리기를 바로 부르는 시험만으로는 등록(FastMCP 기본 처리기가 이기면 빈 목록) · 직렬화(title)가 빠져도 초록이다 — 메모리 전송으로
     진짜 ClientSession 을 붙여 initialize 의 capabilities 부터 본다. 메모리 전송에는 HTTP 요청이 없어 호출자 PAT 자리를 세운다."""
     from mcp.shared.memory import create_connected_server_and_client_session
+    monkeypatch.setattr(gw, "PURPOSE_PROMPTS_ON", False)      # 루틴 프롬프트만 본다 — 목적 프롬프트(M3)는 따로 시험한다(끄면 목록이 종전과 같다)
     _rt_kit(monkeypatch, extra={("GET", "/routines"): _RT_LIST, ("GET", "/routines/rt1/plan"): _RT_PROMPT_PLAN})
     monkeypatch.setattr(gw, "_caller_bearer", lambda: "Bearer pat-person")
 
@@ -13008,6 +13046,7 @@ def test_search_tools_는_짝_단면_단면_비교로_section_pair_view_를_찾�
 
 
 def test_짝_단면_열쇠를_빼면_짝_단면이_다시_묻히고_단면_만의_순위는_열쇠와_상관없다(monkeypatch):
+    _m3_off(monkeypatch)                         # 목적 층 · 앱 입구 손잡이는 끈 채로 본다(M3 — 끄면 종전과 같다)
     _search_catalog(monkeypatch, _SECTION_SEARCH_SPECS)
     _no_embed(monkeypatch)
     ranked = lambda q: json.loads(asyncio.run(gw._search_tools({"query": q})).content[0].text)["ranked"]  # noqa: E731
@@ -13955,7 +13994,8 @@ def test_SRC13_서비스_PAT_의_목록은_그_작업의_허용_도구뿐이고_
     assert asyncio.run(gw._list_tools(types.ListToolsRequest())) == [], "문을 지난 뒤 작업이 빠지면 아무것도 보이지 않는다"
     # 대조군 — 서비스가 아니면(사람 PAT) 같은 리소스 · 프롬프트가 보인다(위의 빈 답이 그 자리에 아무것도 없어서가 아니다)
     _set_request(monkeypatch, {gw.VIA_HEADER: "pat", "authorization": "Bearer person"}, "198.51.100.4")
-    assert [str(r.uri) for r in asyncio.run(gw._list_resources())] == ["ui://step_forge/panel"]
+    assert [str(r.uri) for r in asyncio.run(gw._list_resources()) if str(r.uri).startswith("ui://")] == ["ui://step_forge/panel"], \
+        "사람 PAT 에는 ui 패널이 보인다(목적 skill 자원 — M3 — 은 그 뒤에 붙는다)"
     assert _read("ui://step_forge/panel").root.contents
     asyncio.run(gw._list_prompts())
     assert asked, "사람 PAT 는 포털에 루틴 목록을 묻는다"
@@ -17689,6 +17729,7 @@ def test_쓰기_의도_낱말_작성_쓰기면_쓰기_도구를_감점하지_않
     def before(q, tun=None):                      # 로컬 도구(figure_to_report 등)도 시야에 있다 — 두 도구의 앞뒤만 본다
         r = _rank_of(q, tun)
         return r.index("create_report_draft") < r.index("get_report")
+    _m3_off(monkeypatch)                         # 목적 층(M3)은 보고서 쓰기 목적의 단계를 올려 감점을 비켜 간다 — 쓰기 의도 낱말만 따로 본다
     base = gw._tuning()
     old = {**base, "write_intent": tuple(w for w in base["write_intent"] if w not in ("작성", "쓰기"))}
     for q in ("보고서 작성", "보고서 쓰기"):
@@ -17772,3 +17813,500 @@ def test_그림자의_would_close_는_엄격_모드의_닫힘과_같고_health_�
     assert gw._would_close() is first, "카탈로그 · 목록이 같으면 쥐어 둔 값"
     monkeypatch.setattr(gw, "READ_TOOLS", gw.READ_TOOLS | {"sf:get_x"})
     assert "get_x" not in gw._would_close()[0], "읽기 목록을 고치면 다시 센다"
+
+
+# ── 목적 묶음 정본 tool_purposes.json(HWAXPortal docs/mcp-modernize M3) ───────────────────────────────────────────────────────────────────
+_P_TABLE = {"version": 1,
+            "apps": {"sf": {"entry": "guide", "why": "처음 부른다"}, "ra": {"entry": "ra_guide", "why": "작업 전에"},
+                     "ghost": {"entry": "nope", "why": "없는 앱"}},
+            "purposes": {
+                "drop-prep": {"title": "낙하 해석 준비", "summary": "CAD 를 점검하고 덱을 만든 뒤 낸다.",
+                              "triggers": ["낙하 해석 준비", "낙하 준비"], "entry": ["sf", "list_projects"],
+                              "steps": [{"backend": "sf", "tool": "list_projects", "why": "과제 특정"},
+                                        {"backend": "sf", "tool": "run_job", "why": "잡"},
+                                        {"backend": "st", "tool": "submit", "why": "제출"},
+                                        {"backend": "cluster", "tool": "smarttwin_submit", "why": "클러스터(그 박스에서만)"},
+                                        {"backend": "_gateway", "tool": "figure_list", "why": "그림"}],
+                              "confirm_writes": [["sf", "run_job"], ["st", "submit"]],
+                              "samples": ["STEP 으로 낙하 해석 돌리려면?"], "apps": ["sf", "st", "cluster"], "source": "시험"},
+                "report-write": {"title": "보고서 쓰기", "summary": "초안을 만들고 게시한다.", "triggers": ["보고서 쓰", "보고서 작성"],
+                                 "entry": ["ra", "ra_guide"],
+                                 "steps": [{"backend": "ra", "tool": "ra_guide", "why": "규칙"},
+                                           {"backend": "ra", "tool": "create_report_draft", "why": "초안"}],
+                                 "confirm_writes": [], "samples": [], "apps": ["ra"]},
+                "box-only": {"title": "박스 전용", "summary": "그 앱이 붙은 박스에서만.", "triggers": ["박스 전용"], "entry": ["cluster", "x"],
+                             "steps": [{"backend": "cluster", "tool": "x", "why": "없다"}], "confirm_writes": [], "samples": [],
+                             "apps": ["cluster"]}}}
+
+
+def _p_table(monkeypatch, tmp_path, table=None, overlay=None):
+    p = tmp_path / "tool_purposes.json"
+    p.write_text(json.dumps(table or _P_TABLE, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(gw, "TOOL_PURPOSES_PATH", p)
+    if overlay is not None:
+        gw.TOOL_PURPOSES_LOCAL_PATH.write_text(overlay if isinstance(overlay, str) else json.dumps(overlay, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(gw, "_PURPOSES", {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None})
+
+
+def _p_catalog(monkeypatch, groups=(), policy=None, ann=None):
+    """목적 시험의 카탈로그 — sf(StepForge 꼴) · st · ra 와 겹침 접두 하나(sf 의 list_projects 를 다른 앱도 내서 접두가 붙었다)."""
+    specs = [("sf", "heaxsf_list_projects", "list_projects", "과제 목록 — 과제를 찾는다."), ("sf", "guide", "guide", "처음 부를 안내."),
+             ("sf", "run_job", "run_job", "무거운 잡을 건다."), ("st", "submit", "submit", "해석을 낸다."),
+             ("other", "other_list_projects", "list_projects", "다른 앱의 같은 이름."),
+             ("ra", "ra_guide", "ra_guide", "보고서 쓰기 안내."), ("ra", "create_report_draft", "create_report_draft", "보고서 초안을 만든다.")]
+    tools = [types.Tool(name=n, description=d, inputSchema={"type": "object", "properties": {}},
+                        **({"annotations": types.ToolAnnotations(**(ann or {}).get(n))} if (ann or {}).get(n) else {})) for _b, n, _o, d in specs]
+    monkeypatch.setattr(gw, "exposed_tools", tools)
+    monkeypatch.setattr(gw, "route", {n: (b, o) for b, n, o, _d in specs})
+    monkeypatch.setattr(gw, "backends", {b: type("B", (), {"session": object()})() for b in ("sf", "st", "ra", "other")})
+    monkeypatch.setattr(gw, "POLICY", policy or {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: list(groups))
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    return tools
+
+
+def test_M3_목적_표를_읽고_노출_이름은_경로표로_푼다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch)
+    d = gw._purposes()
+    assert list(d["purposes"]) == ["drop-prep", "report-write", "box-only"], "표의 차례"
+    p = d["purposes"]["drop-prep"]
+    assert p["entry"] == ("sf", "list_projects") and p["kind"] == "multi" and d["purposes"]["report-write"]["kind"] == "app"
+    assert p["trig"] == (("낙하", "해석", "준비"), ("낙하", "준비")) and p["confirm"] == {("sf", "run_job"), ("st", "submit")}
+    lv = gw._purpose_live(p, gw._purpose_index(), None)
+    assert [s["name"] for s in lv["steps"]] == ["heaxsf_list_projects", "run_job", "submit", "figure_list"], "겹침 접두 이름 · 게이트웨이 도구"
+    assert lv["missing"] == [("cluster", "smarttwin_submit")] and lv["entry_live"] and lv["entry"]["name"] == "heaxsf_list_projects"
+    assert [p["key"] for p, _lv in gw._purposes_for(None)] == ["drop-prep", "report-write"], "단계가 하나도 없는 목적은 이 박스에 없다"
+
+
+def test_M3_목적_표_꼴이_틀리면_통째로_버리고_덧씌우기는_합치거나_버린다(monkeypatch, tmp_path, caplog):
+    _p_catalog(monkeypatch)
+    for bad, why in (({**_P_TABLE, "purposes": {"Bad Key": _P_TABLE["purposes"]["box-only"]}}, "목적 키"),
+                     ({**_P_TABLE, "purposes": {"x1": {**_P_TABLE["purposes"]["box-only"], "entry": ["cluster", "y"]}}}, "entry"),
+                     ({**_P_TABLE, "purposes": {"x1": {**_P_TABLE["purposes"]["box-only"], "stepz": []}}}, "모르는 칸"),
+                     ({**_P_TABLE, "purposes": {"x1": {**_P_TABLE["purposes"]["drop-prep"], "apps": ["sf"]}}}, "apps"),
+                     ({**_P_TABLE, "purposes": {"x1": {**_P_TABLE["purposes"]["drop-prep"], "confirm_writes": [["ra", "z"]]}}}, "confirm")):
+        _p_table(monkeypatch, tmp_path, bad)
+        with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+            d = gw._purposes()
+        assert d["purposes"] == {} and why in (gw._PURPOSES["error"] or ""), (why, gw._PURPOSES["error"])
+    # 덧씌우기 — 목적 하나를 고치고(merge patch) · 하나를 더하고 · 하나를 지운다(null)
+    _p_table(monkeypatch, tmp_path, overlay={"purposes": {"report-write": {"title": "보고서 쓰기(박스)"}, "box-only": None,
+                                                         "extra": {"title": "더함", "summary": "박스가 더했다.", "triggers": ["더함"],
+                                                                   "entry": ["ra", "ra_guide"], "steps": [{"backend": "ra", "tool": "ra_guide", "why": "w"}],
+                                                                   "apps": ["ra"]}}})
+    d = gw._purposes()
+    assert list(d["purposes"]) == ["drop-prep", "report-write", "extra"] and d["purposes"]["report-write"]["title"] == "보고서 쓰기(박스)"
+    assert d["fingerprint"] != d["base_fingerprint"] and gw._PURPOSES["overlay"]["changed"] == ["purposes.report-write", "purposes.box-only",
+                                                                                                 "purposes.extra"]
+    # 깨진 덧씌우기는 통째로 버리고 기본 표 — 까닭을 남긴다
+    _p_table(monkeypatch, tmp_path, overlay={"purposes": {"report-write": {"entry": ["ra", "없는것"]}}})
+    d = gw._purposes()
+    assert list(d["purposes"]) == ["drop-prep", "report-write", "box-only"] and "덧씌우기를 버렸다" in gw._PURPOSES["overlay"]["error"]
+    _p_table(monkeypatch, tmp_path, overlay="{not json")
+    assert len(gw._purposes()["purposes"]) == 3 and "덧씌우기를 버렸다" in gw._PURPOSES["overlay"]["error"]
+    # 끈 박스는 빈 표
+    monkeypatch.setattr(gw, "PURPOSES_ON", False)
+    assert gw._purposes()["purposes"] == {}
+
+
+def test_M3_health_와_tools_map_에_목적이_실리고_끄면_칸이_없다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, ann={"run_job": {"readOnlyHint": False}})
+    h = _health_body()["purposes"]
+    assert (h["loaded"], h["count"], h["live"], h["inactive"], h["by_kind"]) == (True, 3, 2, 1, {"multi": 1, "app": 2})
+    assert h["missing"] == {"steps": 2, "by_backend": {"cluster": 2}} and h["app_entries"] == 3
+    assert h["knobs"]["list"] and h["knobs"]["prompts"] and h["knobs"]["purpose_boost"] is True and h["knobs"]["app_entry_first"] is True
+    assert "app_entry_missing" not in h, "붙지 않은 앱(ghost)의 입구는 없는 것이 맞다 — 붙은 앱의 입구가 사라졌을 때만 센다"
+    sent = []
+
+    async def send(m):
+        sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/tools-map", "headers": []}, None, send))
+    tm = json.loads(sent[1]["body"])["purposes"]
+    item = next(i for i in tm["items"] if i["key"] == "drop-prep")
+    assert item["entry"] == {"backend": "sf", "tool": "list_projects", "name": "heaxsf_list_projects"} and item["live"]
+    assert [(s["tool"], s["name"], s["confirm"], s.get("write")) for s in item["steps"]] == [
+        ("list_projects", "heaxsf_list_projects", False, False), ("run_job", "run_job", True, True), ("submit", "submit", True, True),
+        ("smarttwin_submit", None, False, None), ("figure_list", "figure_list", False, False)]
+    assert tm["app_entries"]["sf"] == {"tool": "guide", "name": "guide", "why": "처음 부른다"} and tm["app_entries"]["ghost"]["name"] is None
+    monkeypatch.setattr(gw, "PURPOSES_ON", False)
+    assert "purposes" not in _health_body()
+    sent.clear()
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/tools-map", "headers": []}, None, send))
+    assert "purposes" not in json.loads(sent[1]["body"])
+
+
+def test_M3_list_tool_apps_by_purpose_는_시야_밖_단계를_빼고_수만_센다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, groups=["g"], policy={"st": ["st-users"]}, ann={"run_job": {"readOnlyHint": False}})
+    body = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose"})).content[0].text)
+    rows = {r["purpose"]: r for r in body["purposes"]}
+    assert list(rows) == ["drop-prep", "report-write"] and body["purpose_count"] == 2
+    dp = rows["drop-prep"]
+    assert dp["steps"] == ["heaxsf_list_projects", "run_job", "figure_list"] and dp["unavailable_steps"] == 2, "권한 없는 st 와 이 박스에 없는 단계"
+    assert dp["entry"] == "heaxsf_list_projects" and "submit" not in json.dumps(dp), "못 쓰는 앱의 도구 이름을 말하지 않는다"
+    assert dp["apps"] == ["Sf"], "앱 라벨은 쓸 수 있는 앱만"
+    one = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose", "purpose": "drop-prep"})).content[0].text)["purposes"][0]
+    assert one["steps"][1] == {"tool": "run_job", "why": "잡", "write": True, "confirm": True}
+    assert one["confirm_writes"] == ["run_job"] and one["samples"] == ["STEP 으로 낙하 해석 돌리려면?"]
+    assert one["prompt"] == "purpose-drop-prep" and one["skill"] == "skill://hwax/drop-prep/SKILL.md"
+    bad = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose", "purpose": "nope"})).content[0].text)
+    assert bad["error"].startswith("unknown purpose: nope") and "drop-prep" in bad["error"]
+    gone = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose", "purpose": "box-only"})).content[0].text)
+    assert gone["error"].startswith("unavailable purpose: box-only")
+    slim = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose", "include_tools": False})).content[0].text)
+    assert all("steps" not in r for r in slim["purposes"])
+
+
+def test_M3_앱_줄에_입구가_실리고_끄면_list_tool_apps_가_종전과_같다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch)
+    body = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    apps = {a["app"]: a for a in body["apps"]}
+    assert (apps["sf"]["entry"], apps["sf"]["entry_why"]) == ("guide", "처음 부른다") and apps["ra"]["entry"] == "ra_guide"
+    assert "entry" not in apps["st"] and "entry" not in apps["_gateway"]
+    on_area = asyncio.run(gw._list_tool_apps({"by": "area"})).content[0].text
+    monkeypatch.setattr(gw, "PURPOSE_LIST_ON", False)
+    off = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    assert all("entry" not in a for a in off["apps"])
+    assert asyncio.run(gw._list_tool_apps({"by": "area"})).content[0].text == on_area, "영역 보기는 손잡이와 상관없다"
+    assert "purposes" not in json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose"})).content[0].text), "끄면 by=purpose 는 앱 목록(종전)"
+
+
+def test_M3_list_tool_apps_정의는_끄면_종전과_바이트까지_같다():
+    old = types.Tool(
+        name="list_tool_apps",
+        description=(
+            "이 게이트웨이에 연결된 MCP 앱(도메인) 목록과 각 앱의 도구를 계층적으로 반환한다. "
+            "'무슨 앱/도구가 있냐', '어떤 기능이 되냐' 같은 질문에 전체 도구를 나열하는 대신 이걸 호출하라. "
+            "각 앱마다 accessible(내 권한으로 사용 가능한지)·reachable(백엔드 생존)·tool_count·tools 를 준다. "
+            "app 인자를 주면 그 앱의 도구만 상세(이름+설명)로 반환한다. "
+            "by='area' 면 앱 대신 **하는 일(영역)** 로 묶는다 — CAD·형상 제어, 메시·해석 모델 구성, 시뮬레이션 실행·잡, "
+            "해석 계산·예측, 해석 결과 분석, 물성·재료, VOC·시장 신호, 사내 지식 검색, 웹·논문 조사, 보고서·문서·발표, "
+            "전문가·심의·리스크, 데이터 등록·온톨로지, 시스템·공통. '시뮬레이션 관련 도구 뭐 있어' 같은 질문엔 이걸 쓴다."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "app": {"type": "string", "description": "특정 앱 키(예: heax-thermal_shock_mcp). 생략 시 전체 앱 요약."},
+                "include_tools": {"type": "boolean", "description": "전체 목록에도 도구 이름을 포함(기본 true)."},
+                "by": {"type": "string", "enum": ["app", "area"],
+                       "description": "묶는 기준 — app(소유 앱, 기본) 또는 area(하는 일)."},
+                "area": {"type": "string", "description": "by='area' 에서 특정 영역 키만(예: sim, cad, voc). 도구 설명까지 준다."},
+            },
+        },
+    )
+    assert gw._list_apps_tool(False).model_dump_json() == old.model_dump_json()
+    on = gw._list_apps_tool(True)
+    assert on.inputSchema["properties"]["by"]["enum"] == ["app", "area", "purpose"] and "purpose" in on.inputSchema["properties"]
+    assert gw.LIST_APPS_TOOL.model_dump_json() == on.model_dump_json(), "기본은 켬"
+
+
+def test_M3_실제_목적_표는_꼴이_맞고_dev_카탈로그의_이름만_쓴다():
+    """추적하는 표(tool_purposes.json)가 읽히고, 단계 · 입구 · 앱 입구가 dev 카탈로그 이름표(tool_search_eval/purpose_catalog.json)의 이름이다 — 이 박스에 없는
+    앱(cae00 전용)의 단계는 이름표에 그 백엔드가 없어 대조하지 않는다. 앱 새 판의 도구는 expected_missing 에 까닭과 함께 적는다."""
+    d = gw._purposes_parse(json.loads(gw.TOOL_PURPOSES_PATH.read_text(encoding="utf-8")))
+    cat = json.loads((gw.Path(gw.__file__).with_name("tool_search_eval") / "purpose_catalog.json").read_text(encoding="utf-8"))
+    have = {(b, n) for b, ns in cat["tools"].items() for n in ns} | {("_gateway", n) for n in cat["local_tools"]}
+    later = {(b, n) for b, e in cat["expected_missing"].items() for n in e["tools"]}
+    known = set(cat["tools"]) | {"_gateway"}
+    bad = [(k, bk, t) for k, p in d["purposes"].items() for bk, t, _w in p["steps"] if bk in known and (bk, t) not in have | later]
+    assert bad == [], bad
+    assert [(bk, t) for bk, (t, _w) in d["apps"].items() if bk in known and (bk, t) not in have] == []
+    assert len(d["purposes"]) >= 60 and sum(p["kind"] == "multi" for p in d["purposes"].values()) >= 10
+    for k, p in d["purposes"].items():
+        assert gw._VIEW_AREA_RE.fullmatch(k) and len(f"hwax-{k}") <= 64, k     # 보기 글 · skill 이름에 그대로 쓴다
+        assert p["samples"] and p["triggers"], k
+    used = {(b, n) for p in d["purposes"].values() for b, n, _w in p["steps"]}
+    assert later <= used, "expected_missing 은 표가 쓰는 도구만 적는다"
+
+
+def test_M0_채택_셈은_보기_tools_list_를_디스크에_날마다_남기고_health_와_usage_rollup_이_읽는다(monkeypatch, tmp_path):
+    """보기 채택 셈(/health tools_list_by_view)은 프로세스 메모리라 재기동마다 0 이었다(11-27 조사). 디스크 원장(usage-adoption.sqlite)에 KST 날마다
+    갈래 · 열쇠로 센다 — 사람 · 질의 글은 싣지 않는다. /health 는 최근 7일 합, /usage-rollup 은 기간의 날마다를 싣는다. 끄면 쓰지 않고 칸도 없다."""
+    _p_catalog(monkeypatch)
+    _set_request_headers(monkeypatch, {gw.VIEW_HEADER: "light"})
+    req = types.ListToolsRequest(method="tools/list")
+    asyncio.run(gw._list_tools(req))
+    asyncio.run(gw._list_tools(req))
+    asyncio.run(gw._list_tools(None))                      # SDK 의 호출 검증 캐시 채우기는 세지 않는다
+    rows = gw._usage_rollup.adopt_query(gw.ADOPTION_PATH, "2000-01-01", "2999-12-31")
+    assert [(r["kind"], r["key"], r["n"]) for r in rows] == [("tools_list", "light", 2)]
+    h = _health_body()["adoption"]
+    assert h["by_kind"] == {"tools_list": {"light": 2}} and h["write_errors"] == 0
+    out = gw._usage_rollup_view({})
+    assert [(r["kind"], r["key"], r["n"]) for r in out["adoption"]] == [("tools_list", "light", 2)]
+    # 쓰지 못해도 목록은 나온다(무음은 아니다)
+    monkeypatch.setattr(gw, "ADOPTION_PATH", tmp_path / "no-dir" / "x" / "\0bad")
+    assert asyncio.run(gw._list_tools(req)) and gw._ADOPT_WARN["errors"] >= 1
+    monkeypatch.setattr(gw, "ADOPTION_ON", False)
+    assert "adoption" not in _health_body() and "adoption" not in gw._usage_rollup_view({})
+
+
+def _p_search(monkeypatch, tmp_path, submit_desc="잡을 낸다."):
+    """목적 층 시험의 카탈로그 — _p_catalog 에 목적 단계가 아닌 낙하 리포트 도구 하나를 더하고 앱 라벨을 준다(앱 입구 시험이 이름을 부른다)."""
+    _p_table(monkeypatch, tmp_path)
+    tools = _p_catalog(monkeypatch)
+    for t in tools:
+        if t.name == "submit":
+            object.__setattr__(t, "description", submit_desc)
+    extra = types.Tool(name="drop_report", description="낙하 해석 결과 리포트를 읽는다.", inputSchema={"type": "object", "properties": {}})
+    # StepForge 입구는 노출 이름이 이름순으로 뒤에 서게 바꾼다 — 앱 이름이 맞은 줄끼리 점수가 같으면 이름순이라 입구가 저절로 첫 줄일 수 있다
+    tools = [t.model_copy(update={"name": "zz_guide"}) if t.name == "guide" else t for t in tools]
+    route = {("zz_guide" if n == "guide" else n): v for n, v in gw.route.items()}
+    monkeypatch.setattr(gw, "exposed_tools", tools + [extra])
+    monkeypatch.setattr(gw, "route", {**route, "drop_report": ("st", "drop_report")})
+    monkeypatch.setattr(gw, "DISCOVERED_META", {"sf": {"label": "StepForge", "description": ""}, "ra": {"label": "Report Archive", "description": ""}})
+    _no_embed(monkeypatch)
+
+
+def _p_ask(q, **kw):
+    return json.loads(asyncio.run(gw._search_tools({"query": q, "limit": 10}, groups=[], embed=False, **kw)).content[0].text)
+
+
+def test_M3_목적_층은_입구를_첫_줄로_세우고_단계를_올리며_답에_purpose_를_싣는다(monkeypatch, tmp_path):
+    _p_search(monkeypatch, tmp_path)
+    out = _p_ask("낙하 해석 준비 해줘", log_query=False)
+    assert out["purpose"] == {"key": "drop-prep", "title": "낙하 해석 준비", "entry": "heaxsf_list_projects",
+                              "steps": ["heaxsf_list_projects", "run_job", "submit", "figure_list"], "confirm": ["run_job", "submit"],
+                              "more": "list_tool_apps(by='purpose', purpose='drop-prep')", "prompt": "purpose-drop-prep"}
+    assert list(out)[list(out).index("ranked") + 1] == "purpose", "이름 순위 바로 뒤 — 작은 창의 소비자가 앞에서부터 잘라도 남는다"
+    assert out["ranked"][0] == "heaxsf_list_projects", "목적 가중 전 첫 줄(drop_report)은 목적 단계가 아니다 — 입구를 세운다"
+    assert {"run_job", "submit", "figure_list", "drop_report"} <= set(out["ranked"]), "질의 낱말에 안 맞은 단계도 가중으로 줄에 든다"
+    assert "purpose 는 질의가 맞은 업무 목적의 차례다" in out["note"]
+    # 질의 기록의 귀속 — 목적 가중으로 든 줄은 규칙 표지에 purpose:<키>, 세운 입구는 purpose_entry
+    out = _p_ask("낙하 해석 준비 해줘")
+    rec = json.loads(next(gw.TOOL_QUERY_LOG_DIR.glob("queries-*.local.jsonl")).read_text().splitlines()[-1])
+    assert "purpose_entry" in rec["via"]["sf:list_projects"] and "purpose:drop-prep" in rec["via"]["sf:run_job"], rec
+    assert "sf:run_job" in rec["boost_only"], "질의 낱말로는 0점 — 목적 가중 덕에만 든 줄"
+    rows = gw._usage_rollup.adopt_query(gw.ADOPTION_PATH, "2000-01-01", "2999-12-31")
+    assert [(r["kind"], r["key"], r["n"]) for r in rows] == [("search_purpose", "drop-prep", 1)], "평가(log_query=False)는 세지 않는다"
+
+
+def test_M3_목적_단계가_이미_상위에_있으면_입구를_세우지_않고_덮음이_작으면_순위를_건드리지_않는다(monkeypatch, tmp_path):
+    _p_search(monkeypatch, tmp_path, submit_desc="낙하 해석을 낸다.")
+    out = _p_ask("낙하 해석 준비", log_query=False)
+    assert out["purpose"]["key"] == "drop-prep" and out["ranked"][0] != "heaxsf_list_projects", "submit(단계)이 목적 가중 전 상위 셋 안 — 입구를 세우지 않는다"
+    assert out["ranked"].index("submit") < out["ranked"].index("figure_list"), "단계끼리는 낱말 순위 그대로 함께 오른다(낱말에 맞은 submit 이 0점 단계 위)"
+    long_q = "어제 올린 파일로 낙하 해석 준비가 다 됐는지 확인하고 결과 리포트도 꼼꼼히 읽어 보고 싶다"
+    on = asyncio.run(gw._search_tools({"query": long_q, "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text
+    assert "purpose" not in json.loads(on), "트리거가 질의를 덮는 비율이 문턱(purpose_hint_cover) 밑 — 도구 하나를 겨눈 긴 문장"
+    _m3_off(monkeypatch)
+    assert asyncio.run(gw._search_tools({"query": long_q, "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text == on
+
+
+def test_M3_목적_층과_앱_입구를_끄면_답이_바이트까지_같고_켜도_목적이_안_맞는_질의는_같다(monkeypatch, tmp_path):
+    _p_search(monkeypatch, tmp_path)
+    qs = ("과제 목록", "보고서 초안", "잡을 낸다", "리포트")
+    on = {q: asyncio.run(gw._search_tools({"query": q, "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text for q in qs}
+    hit = asyncio.run(gw._search_tools({"query": "보고서 쓰기", "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text
+    _m3_off(monkeypatch)
+    off = {q: asyncio.run(gw._search_tools({"query": q, "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text for q in qs}
+    assert on == off, "목적 · 앱 이름이 안 맞는 질의는 켜도 같다"
+    hit_off = asyncio.run(gw._search_tools({"query": "보고서 쓰기", "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text
+    hit = json.loads(hit)
+    assert hit["purpose"]["key"] == "report-write" and "purpose" not in json.loads(hit_off)
+    assert hit["ranked"][0] == "create_report_draft", "그 목적의 단계(create_report_draft)가 이미 첫 줄이라 입구(ra_guide)를 세우지 않는다"
+
+
+def test_M3_앱_이름만_부르면_그_앱의_입구가_첫_줄이고_일을_함께_말하면_입구를_올리기만_한다(monkeypatch, tmp_path):
+    _p_search(monkeypatch, tmp_path)
+    for q, want in (("StepForge 어떻게 써?", "zz_guide"), ("StepForge", "zz_guide"), ("Report Archive 시작", "ra_guide")):
+        out = _p_ask(q, log_query=False)
+        assert out["ranked"][0] == want, (q, out["ranked"])
+    out = _p_ask("StepForge 과제 목록", log_query=False)
+    assert out["ranked"][0] == "heaxsf_list_projects" and "zz_guide" in out["ranked"], "일을 말한 질의 — 입구는 가중만(weights.app_entry)"
+    both = asyncio.run(gw._search_tools({"query": "StepForge Report Archive", "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text
+    monkeypatch.setattr(gw, "TOOL_PURPOSES_PATH", tmp_path / "없음.json")
+    monkeypatch.setattr(gw, "_PURPOSES", {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None})
+    got = asyncio.run(gw._search_tools({"query": "StepForge 어떻게 써?", "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text
+    _m3_off(monkeypatch)
+    assert both == asyncio.run(gw._search_tools({"query": "StepForge Report Archive", "limit": 10}, groups=[], embed=False,
+                                                log_query=False)).content[0].text, "두 앱을 부르면 어느 입구도 세우지 않는다(끈 것과 같다)"
+    assert got == asyncio.run(gw._search_tools({"query": "StepForge 어떻게 써?", "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text, \
+        "표를 못 읽으면 목적 · 앱 입구가 없다 — 끈 것과 같다"
+
+
+def test_M3_보기_글은_purpose_를_받고_끄면_틀린_꼴이다():
+    assert gw._parse_view("purpose:drop-prep") == ("purpose", ("drop-prep",))
+    assert gw._parse_view(" PURPOSE:drop-prep,report-write,drop-prep ") == ("purpose", ("drop-prep", "report-write"))
+    for bad in ("purpose:", "purpose:Drop Prep!", "purpose:" + ",".join(f"p{i}" for i in range(33))):
+        assert gw._parse_view(bad) is None, bad
+    assert gw._view_text("purpose", ("drop-prep", "report-write")) == "purpose:drop-prep,report-write"
+
+
+def test_M3_목적_보기_손잡이를_끄면_purpose_글은_전체로_간다(monkeypatch):
+    monkeypatch.setattr(gw, "PURPOSE_VIEW_ON", False)
+    assert gw._parse_view("purpose:drop-prep") is None and gw._parse_view("bundle:cad") == ("bundle", ("cad",))
+
+
+def test_M3_목적_보기는_목록만_그_목적의_단계와_로컬_도구로_줄이고_검색은_그대로다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, groups=["g"], policy={"st": ["st-users"]})
+    hdrs = {gw.GROUPS_HEADER: "g", gw.VIEW_HEADER: "purpose:drop-prep,nope,box-only", gw.VIEW_SRC_HEADER: "header"}
+    _set_request_headers(monkeypatch, hdrs)
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["g"])
+    monkeypatch.setattr(gw, "_VIEW_LISTS", {"full": 0, "bundle": 0, "light": 0, "purpose": 0})
+    listed = _listed()
+    local = {t.name for t in gw._local_tools()}
+    backend = [n for n in listed if n not in local]
+    assert backend == ["heaxsf_list_projects", "run_job"], "권한 없는 st 의 단계와 다른 목적의 도구는 목록에 없다"
+    assert local <= set(listed), "게이트웨이 공통(로컬 도구)은 다 싣는다"
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert v["mode"] == "purpose" and v["purposes"] == ["drop-prep"] and v["unknown_purposes"] == ["nope", "box-only"]
+    assert v["listed"] == len(listed) and v["hidden_by_view"] > 0 and "search_tools" in v["note"]
+    found = json.loads(asyncio.run(gw._search_tools({"query": "보고서 초안"}, embed=False, log_query=False)).content[0].text)
+    assert "create_report_draft" in found["ranked"], "보기는 검색 시야를 줄이지 않는다"
+    assert gw._VIEW_LISTS["purpose"] == 1
+    rows = gw._usage_rollup.adopt_query(gw.ADOPTION_PATH, "2000-01-01", "2999-12-31")
+    assert sorted((r["kind"], r["key"]) for r in rows) == [("tools_list", "purpose"), ("view_purpose", "box-only"), ("view_purpose", "drop-prep"),
+                                                           ("view_purpose", "nope")]
+
+
+def test_M3_목적_프롬프트는_사람_PAT_에만_목적마다_하나이고_포털이_죽어도_낸다(monkeypatch, tmp_path):
+    _rt_kit(monkeypatch, extra={("GET", "/routines"): _RT_LIST})
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, groups=["g"], policy={"st": ["st-users"]}, ann={"run_job": {"readOnlyHint": False}})
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["g"])
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
+    got = asyncio.run(gw._list_prompts())
+    assert [p.name for p in got] == ["routine-rt1", "purpose-drop-prep", "purpose-report-write"], "루틴 뒤에 목적 — 단계가 안 보이는 목적은 없다"
+    dp = got[1]
+    assert dp.title == "목적 — 낙하 해석 준비" and "heaxsf_list_projects → run_job → figure_list" in dp.description and "submit" not in dp.description
+    assert [(a.name, a.required) for a in dp.arguments] == [("task", False)]
+    async def down(method, path, **kw):
+        raise gw._RoutineError("포털에 닿지 못했다(ConnectError)")
+    monkeypatch.setattr(gw, "_routine_portal", down)
+    assert [p.name for p in asyncio.run(gw._list_prompts())] == ["purpose-drop-prep", "purpose-report-write"], "포털이 죽어도 목적 프롬프트는 낸다"
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    for headers in ({}, {"authorization": "Bearer gw-secret"}):
+        _set_request_headers(monkeypatch, headers)
+        assert asyncio.run(gw._list_prompts()) == [], "사람 PAT 가 아니면 빈 목록(종전 그대로)"
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
+    monkeypatch.setattr(gw, "PURPOSE_PROMPTS_ON", False)
+    assert asyncio.run(gw._list_prompts()) == [], "끄면 종전(포털이 죽으면 빈 목록)"
+
+
+def test_M3_목적_프롬프트_글은_입구_차례_확인할_쓰기를_이_박스의_노출_이름으로_말한다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, groups=["g"], policy={"st": ["st-users"]}, ann={"run_job": {"readOnlyHint": False}})
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["g"])
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
+    res = asyncio.run(gw._get_prompt("purpose-drop-prep", {"task": "DV2 판으로\n전각도 «낙하» 준비"}))
+    text = res.messages[0].content.text
+    assert res.description == "업무 목적 — 낙하 해석 준비" and res.messages[0].role == "user"
+    assert "입구 — heaxsf_list_projects: 과제 특정" in text
+    assert "1. heaxsf_list_projects — 과제 특정" in text and "2. run_job — 잡 [쓰기 · 확인 뒤]" in text and "3. figure_list — 그림" in text
+    assert "확인할 쓰기(run_job)" in text and "쓸 수 없는 단계 2개는 뺐다" in text and "submit" not in text, "권한 없는 st 의 도구 이름은 말하지 않는다"
+    assert "«DV2 판으로 전각도 낙하 준비»" in text, "사람이 준 글은 한 줄 «…» 데이터"
+    for bad, msg in (("purpose-nope", "모르는 프롬프트"), ("purpose-box-only", "모르는 프롬프트")):
+        with pytest.raises(gw.McpError) as ei:
+            asyncio.run(gw._get_prompt(bad, {}))
+        assert msg in ei.value.error.message
+    with pytest.raises(gw.McpError) as ei:
+        asyncio.run(gw._get_prompt("purpose-drop-prep", {"x": "1"}))
+    assert "없는 입력: x" in ei.value.error.message
+    rows = gw._usage_rollup.adopt_query(gw.ADOPTION_PATH, "2000-01-01", "2999-12-31")
+    assert [(r["kind"], r["key"], r["n"]) for r in rows] == [("prompt", "purpose-drop-prep", 1)]
+    monkeypatch.setattr(gw, "PURPOSE_PROMPTS_ON", False)
+    with pytest.raises(gw.McpError) as ei:
+        asyncio.run(gw._get_prompt("purpose-drop-prep", {}))
+    assert ei.value.error.message == "모르는 프롬프트: purpose-drop-prep — 이 게이트웨이의 프롬프트는 routine-<루틴 id> 다", "끄면 종전 글"
+
+
+def test_M3_실제_목적_표의_프롬프트_글은_사람이_읽을_만큼_짧다():
+    """목적 프롬프트는 부를 때 한 번 싣는다 — 실제 표의 가장 긴 목적도 4,000자 안이다(단계가 스무 개인 보고서 쓰기 포함)."""
+    d = gw._purposes_parse(json.loads(gw.TOOL_PURPOSES_PATH.read_text(encoding="utf-8")))
+    for p in d["purposes"].values():
+        lv = {"steps": [{"backend": b, "tool": t, "name": t, "why": w, "confirm": (b, t) in p["confirm"]} for b, t, w in p["steps"]],
+              "entry": {"backend": p["entry"][0], "tool": p["entry"][1], "name": p["entry"][1],
+                        "why": next(w for b, t, w in p["steps"] if (b, t) == p["entry"])}, "entry_live": True, "missing": [], "hidden": 0}
+        assert len(gw._purpose_prompt_text(p, lv, "", {})) < 4000, p["key"]
+
+
+def test_M3_목적_skill_은_사람_PAT_의_자원_목록에_서고_읽으면_SKILL_md_를_준다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, groups=["g"], policy={"st": ["st-users"]}, ann={"run_job": {"readOnlyHint": False}})
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["g"])
+    monkeypatch.setattr(gw, "_UI_RESOURCES", {})
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
+    res = asyncio.run(gw._list_resources())
+    assert [(str(r.uri), r.name, r.mimeType) for r in res] == [("skill://hwax/drop-prep/SKILL.md", "hwax-drop-prep", "text/markdown"),
+                                                               ("skill://hwax/report-write/SKILL.md", "hwax-report-write", "text/markdown")]
+    out = _read("skill://hwax/drop-prep/SKILL.md")
+    c = out.root.contents[0]
+    assert (str(c.uri), c.mimeType) == ("skill://hwax/drop-prep/SKILL.md", "text/markdown") and res[0].size == len(c.text.encode())
+    head, fm, body = c.text.split("---\n", 2)
+    meta = {k: v for k, _sep, v in (ln.partition(": ") for ln in fm.strip().splitlines())}
+    assert head == "" and meta["name"] == "hwax-drop-prep" and json.loads(meta["description"]).startswith("낙하 해석 준비 — ")
+    assert "## 입구\n\n`heaxsf_list_projects` — 과제 특정" in body and "2. `run_job` — 잡 (쓰기 · 확인 뒤)" in body and "submit" not in body
+    for uri in ("skill://hwax/box-only/SKILL.md", "skill://hwax/nope/SKILL.md", "skill://hwax/drop-prep/other.md"):
+        with pytest.raises(gw.McpError) as ei:
+            _read(uri)
+        assert ei.value.error.code == -32002, uri
+    rows = gw._usage_rollup.adopt_query(gw.ADOPTION_PATH, "2000-01-01", "2999-12-31")
+    assert [(r["kind"], r["key"]) for r in rows] == [("resource", "skill:drop-prep")]
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    _set_request_headers(monkeypatch, {"authorization": "Bearer gw-secret"})
+    assert asyncio.run(gw._list_resources()) == [], "사람 PAT 가 아니면 skill 이 없다"
+    with pytest.raises(gw.McpError):
+        _read("skill://hwax/drop-prep/SKILL.md")
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
+    monkeypatch.setattr(gw, "PURPOSE_SKILLS_ON", False)
+    assert asyncio.run(gw._list_resources()) == [], "끄면 목록이 종전과 같다"
+    with pytest.raises(gw.McpError) as ei:
+        _read("skill://hwax/drop-prep/SKILL.md")
+    assert ei.value.error.message == "Resource not found: skill://hwax/drop-prep/SKILL.md", "끄면 종전처럼 모르는 주소"
+
+
+def test_M3_실제_목적_표의_SKILL_md_frontmatter_는_Agent_Skills_꼴이다():
+    d = gw._purposes_parse(json.loads(gw.TOOL_PURPOSES_PATH.read_text(encoding="utf-8")))
+    for p in d["purposes"].values():
+        lv = {"steps": [{"backend": b, "tool": t, "name": t, "why": w, "confirm": (b, t) in p["confirm"]} for b, t, w in p["steps"]],
+              "entry": {"backend": p["entry"][0], "tool": p["entry"][1], "name": p["entry"][1],
+                        "why": next(w for b, t, w in p["steps"] if (b, t) == p["entry"])}, "entry_live": True, "missing": [], "hidden": 0}
+        md = gw._purpose_skill_md(p, lv, {})
+        _h, fm, _b = md.split("---\n", 2)
+        meta = {k: v for k, _sep, v in (ln.partition(": ") for ln in fm.strip().splitlines())}
+        assert set(meta) == {"name", "description"} and gw.re.fullmatch(r"[a-z0-9-]{1,64}", meta["name"]), p["key"]
+        assert 0 < len(json.loads(meta["description"])) <= 1024, p["key"]
+
+
+def test_M3_검색_평가_창구는_목적_쌍의_purpose_at_1_과_앱_쌍의_app_at_1_을_판마다_센다(monkeypatch, tmp_path):
+    _p_search(monkeypatch, tmp_path)
+    pairs = tmp_path / "pairs.jsonl"
+    pairs.write_text("\n".join(json.dumps(p, ensure_ascii=False) for p in (
+        {"id": "purpose-x", "query": "낙하 해석 준비 해줘", "gold": ["sf:list_projects"], "purpose": "drop-prep", "source": "purpose"},
+        {"id": "appentry-x", "query": "StepForge 어떻게 써?", "gold": ["sf:guide"], "app": "sf", "source": "appentry"},
+        {"id": "he-x", "query": "보고서 초안 만들어줘", "gold": ["ra:create_report_draft"], "app": "ra", "source": "he"})) + "\n", encoding="utf-8")
+    monkeypatch.setattr(gw, "SEARCH_PAIRS_PATH", pairs)
+    st, body = _gate_call(monkeypatch, "/search-eval", "POST", body={})
+    assert st == 200, body
+    assert (body["pairs"]["purpose"], body["pairs"]["appentry"], body["pairs"]["he"]) == (1, 1, 1)
+    eff = body["variants"]["effective"]
+    assert eff["purpose"]["purpose@1"] == 1.0 and eff["purpose"]["hit@1"] == 1.0, eff
+    assert eff["appentry"]["hit@1"] == 1.0 and eff["appentry"]["app@1"] == 1.0 and eff["he"]["app@1"] == 1.0
+    off = body["variants"]["-purpose_boost"]
+    assert off["purpose"]["purpose@1"] == 0.0, "목적 층을 끈 판에는 purpose 가 없다"
+    assert body["variants"]["-app_entry_first"]["appentry"]["hit@1"] < 1.0, "앱 입구를 끈 판은 입구가 첫 줄이 아니다"
+
+
+def test_M3_run_py_names_는_스냅샷에서_이름만_담은_이름표를_짓고_expected_missing_을_지킨다(tmp_path):
+    import argparse
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tse_run_names", gw.Path(gw.__file__).with_name("tool_search_eval") / "run.py")
+    run = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run)
+    cat = tmp_path / "catalog.local.json"
+    cat.write_text(json.dumps({"taken_at": "t", "local_tools": ["search_tools"], "tools": [
+        {"name": "x", "app": "a", "original": "x", "description": "비밀 설명", "inputSchema": {}},
+        {"name": "b_y", "app": "b", "original": "y", "description": "", "inputSchema": {}}]}), encoding="utf-8")
+    out = tmp_path / "purpose_catalog.json"
+    out.write_text(json.dumps({"_doc": ["d"], "expected_missing": {"a": {"why": "새 판", "tools": ["z"]}}}), encoding="utf-8")
+    run._names(argparse.Namespace(catalog=str(cat), out=str(out)))
+    got = json.loads(out.read_text(encoding="utf-8"))
+    assert got == {"_doc": ["d"], "taken_at": "t", "tools": {"a": ["x"], "b": ["y"]}, "local_tools": ["search_tools"],
+                   "expected_missing": {"a": {"why": "새 판", "tools": ["z"]}}}
+    assert "비밀 설명" not in out.read_text(encoding="utf-8"), "설명 · 스키마는 싣지 않는다(이름만)"

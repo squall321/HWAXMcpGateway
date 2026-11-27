@@ -422,8 +422,63 @@ def query(db_path, p: dict) -> dict:
     }
 
 
-def view(db_path, audit_path, raw: dict, *, resolve=None, budget_s: float = BUDGET_S, today: str | None = None) -> dict:
-    """창구 한 번 — 물음을 읽고(틀리면 ValueError), 밀린 줄을 접고, 기간의 답을 낸다."""
+def view(db_path, audit_path, raw: dict, *, resolve=None, budget_s: float = BUDGET_S, today: str | None = None,
+         adoption_path=None) -> dict:
+    """창구 한 번 — 물음을 읽고(틀리면 ValueError), 밀린 줄을 접고, 기간의 답을 낸다. adoption_path 를 주면 같은 기간의 채택 셈(adoption)을 덧붙인다."""
     p = params(raw, today)
     complete = catch_up(db_path, audit_path, resolve=resolve, budget_s=budget_s)
-    return {**query(db_path, p), "complete": complete}
+    out = {**query(db_path, p), "complete": complete}
+    if adoption_path is not None:
+        out["adoption"] = adopt_query(adoption_path, p["since"], p["until"])
+    return out
+
+
+# ── 채택 셈(HWAXPortal docs/mcp-modernize M0 · M3) ───────────────────────────────────────────────────────────────────────────────────────
+# 보기(tools/list 의 full · bundle · light · purpose) · prompts/get · 자원 읽기(skill · ui) · 목적 목록 · 검색 목적 층이 얼마나 쓰이나를 KST 날마다 센다.
+# 종전 셈(게이트웨이 /health 의 tools_list_by_view)은 프로세스 메모리라 재기동마다 0 이었다 — 그래서 '보기를 아무도 안 쓴다' 를 운영에서 잴 수 없었다.
+# 감사 원장에서 다시 지을 수 없는 셈이라 위 접은 표(usage-rollup.sqlite — 꼴이 바뀌면 버리고 다시 접는다)와 따로 둔다. 사람 · 질의 글은 싣지 않는다 —
+# 무엇(kind)과 어느 것(key — 보기 이름 · 목적 키 · 'routine' · 'ui')의 날마다의 수뿐이다. 파일은 0600 이다.
+ADOPT_KINDS = frozenset(("tools_list", "view_purpose", "prompt", "resource", "list_purpose", "search_purpose"))
+_ADOPT_KEY = re.compile(r"[A-Za-z0-9_.:*-]{1,80}")
+_ADOPT_SCHEMA = ("CREATE TABLE IF NOT EXISTS adopt (day TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, n INTEGER NOT NULL,"
+                 " PRIMARY KEY (day, kind, key)) WITHOUT ROWID")
+_ADOPT_LOCK = threading.Lock()
+
+
+def _adopt_open(path) -> sqlite3.Connection:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists():
+        os.close(os.open(p, os.O_WRONLY | os.O_CREAT, 0o600))
+    conn = sqlite3.connect(str(p), timeout=2.0, isolation_level=None)
+    conn.execute(_ADOPT_SCHEMA)
+    return conn
+
+
+def adopt_note(path, kind: str, key: str, *, day: str | None = None) -> None:
+    """한 번 셈 — (오늘 KST, kind, key) 의 수를 1 올린다. 모르는 kind 는 ValueError, 꼴이 다른 key 는 '(other)' 다(요청이 정한 글자를 싣지 않는다)."""
+    if kind not in ADOPT_KINDS:
+        raise ValueError(f"모르는 채택 갈래: {kind}")
+    key = key if isinstance(key, str) and _ADOPT_KEY.fullmatch(key) else "(other)"
+    day = day or datetime.now(KST).date().isoformat()
+    with _ADOPT_LOCK, closing(_adopt_open(path)) as conn:
+        conn.execute("INSERT INTO adopt VALUES (?, ?, ?, 1) ON CONFLICT (day, kind, key) DO UPDATE SET n = n + 1", (day, kind, key))
+
+
+def adopt_query(path, since: str, until: str) -> list[dict]:
+    """기간(KST 날, 끝 포함)의 채택 셈 — [{day, kind, key, n}] 날 · 갈래 · 열쇠 차례. 원장이 없으면 빈 목록(만들지 않는다)."""
+    if not Path(path).exists():
+        return []
+    with closing(_adopt_open(path)) as conn:
+        return [{"day": d, "kind": k, "key": key, "n": n} for d, k, key, n in conn.execute(
+            "SELECT day, kind, key, n FROM adopt WHERE day BETWEEN ? AND ? ORDER BY day, kind, key", (since, until))]
+
+
+def adopt_summary(path, days: int = 7, today: str | None = None) -> dict:
+    """최근 days 일(오늘 포함)의 갈래별 합 — {since, until, by_kind: {kind: {key: n}}}. /health 가 싣는다."""
+    end = date.fromisoformat(today) if today else datetime.now(KST).date()
+    start = end - timedelta(days=max(1, days) - 1)
+    by: dict[str, dict[str, int]] = {}
+    for r in adopt_query(path, start.isoformat(), end.isoformat()):
+        by.setdefault(r["kind"], {})[r["key"]] = by.get(r["kind"], {}).get(r["key"], 0) + r["n"]
+    return {"since": start.isoformat(), "until": end.isoformat(), "by_kind": {k: dict(sorted(v.items())) for k, v in sorted(by.items())}}

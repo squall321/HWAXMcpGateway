@@ -40,3 +40,8 @@ usage-rollup.sqlite*
 # 상호작용 수집 창고(HWAXPortal docs/interaction-data contract §3) — 기본은 체크아웃 밖(데이터 루트의 interaction_spool · 리포 옆
 # <리포>-interaction_spool)이다. GATEWAY_INTERACTION_SPOOL_DIR 를 리포 안 상대 경로로 잡은 박스에서 원문이 커밋 · stash 되지 않게
 interaction_spool/
+# 목적 묶음 표의 박스 덧씌우기(HWAXPortal docs/mcp-modernize M3) — 검색 손잡이 · 코어 어휘표 덧씌우기와 같은 꼴(merge patch), 박스에서 커밋 없이
+# 목적을 더하고 고친다. 무시 목록에 없으면 deploy-all · update-all 의 git stash -u 가 치운다
+tool_purposes.local.json
+# 채택 셈 원장(HWAXPortal docs/mcp-modernize M0 · M3 — 보기 · prompts · 자원 읽기의 날마다 수) — 이용 통계 표 곁에 생긴다. 원장이 리포 안이면 리포 안이다
+usage-adoption.sqlite*

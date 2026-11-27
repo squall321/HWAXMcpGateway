@@ -309,7 +309,7 @@
       "title": "심의 결과를 리스크 원장에 제출",
       "summary": "리스크 패널 브리프의 근거로 돈 HWAX 심의의 결정문 · 좌석 발언을 리스크 원장에 제출하고 finding 을 넣는다. taxonomy 의 허용값만 쓴다(추측한 값은 422).",
       "triggers": ["패널 제출", "원장에 제출", "심의 결과 제출", "finding 넣", "리스크 원장"],
-      "entry": ["heax-hwax_risk", "risk_get_brief"],
+      "entry": ["heax-hwax_risk", "risk_taxonomy"],
       "steps": [
         {"backend": "heax-hwax_risk", "tool": "risk_get_brief", "why": "브리프 토큰으로 패널 근거(E0 ~ E9)를 받는다"},
         {"backend": "hwax-deliberation", "tool": "deliberate_transcript", "why": "좌석 발언을 full=true 로 받는다(화면용 글은 뒤쪽 인용이 빠진다)"},

@@ -17941,7 +17941,9 @@ def test_M3_health_와_tools_map_에_목적이_실리고_끄면_칸이_없다(mo
 def test_M3_list_tool_apps_by_purpose_는_시야_밖_단계를_빼고_수만_센다(monkeypatch, tmp_path):
     _p_table(monkeypatch, tmp_path)
     _p_catalog(monkeypatch, groups=["g"], policy={"st": ["st-users"]}, ann={"run_job": {"readOnlyHint": False}})
-    body = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose"})).content[0].text)
+    plain = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose"})).content[0].text)
+    assert all("steps" not in r for r in plain["purposes"]), "목적 목록은 기본으로 단계 이름을 싣지 않는다(72 목적 × 단계가 3.7만 자였다)"
+    body = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose", "include_tools": True})).content[0].text)
     rows = {r["purpose"]: r for r in body["purposes"]}
     assert list(rows) == ["drop-prep", "report-write"] and body["purpose_count"] == 2
     dp = rows["drop-prep"]

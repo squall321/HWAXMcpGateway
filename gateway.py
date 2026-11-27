@@ -5493,7 +5493,9 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
     if str((arguments or {}).get("by") or "").strip() == "area":
         return _list_by_area(by_app, groups, str((arguments or {}).get("area") or "").strip(), include=include)
     if PURPOSE_LIST_ON and str((arguments or {}).get("by") or "").strip() == "purpose":
-        return _list_by_purpose(groups, str((arguments or {}).get("purpose") or "").strip(), include=include)
+        # 목적 목록은 기본으로 단계 이름을 싣지 않는다 — 72 목적 × 단계 이름이 3.7만 자였다(11-27 dev). 단계는 목적을 골라(purpose=…) 받거나 include_tools=true 로
+        return _list_by_purpose(groups, str((arguments or {}).get("purpose") or "").strip(),
+                                include=bool((arguments or {}).get("include_tools")))
     # 앱 입구(목적 표 apps.<키>.entry — GATEWAY_PURPOSE_LIST) — 앱 줄에 처음 부를 도구를 싣는다. 이 박스에 없거나 시야 밖이면 칸이 없다
     p_idx = _purpose_index() if PURPOSE_LIST_ON else None
     p_vis = {t.name for t in _visible_tools(groups)} if PURPOSE_LIST_ON else None
@@ -5711,7 +5713,7 @@ def _list_by_purpose(groups: list[str], want: str, include: bool = True) -> type
         payload["error"] = (f"unknown purpose: {want} — 가능한 키: {', '.join(p['key'] for p, _lv in live)}" if want not in _purposes()["purposes"]
                             else f"unavailable purpose: {want} — 이 박스 · 이 계정에는 그 목적의 단계가 하나도 없다")
     return types.CallToolResult(
-        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
+        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=None if not want else 2))])
 
 
 # ── 전문가 조직도 (클로드에서도 사람을 고르게 한다) ────────────────────────────────

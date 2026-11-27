@@ -387,19 +387,21 @@ _VIEW_AREAS_MAX = 32
 
 def _parse_view(raw) -> tuple[str, tuple[str, ...]] | None:
     """보기 글 → (보기, 영역들). full · light · bundle:<영역>,<영역>… 만 받고 틀린 꼴이면 None 이다. 영역 이름이 이 박스에 있는지는 보지
-    않는다(모르는 영역은 list_tool_apps 의 view 가 말한다)."""
+    않는다(모르는 영역은 list_tool_apps 의 view 가 말한다). 목적 보기 손잡이(GATEWAY_PURPOSE_VIEW — HWAXPortal docs/mcp-modernize M3)를 켠 박스는
+    purpose:<목적 키>,<목적 키>… 도 받는다(목적 키 — tool_purposes.json, 모르는 키는 view 가 말한다). 끄면 그 글은 틀린 꼴(전체)이다 — 종전과 같다."""
     s = str(raw or "").strip().lower()
     if s in ("full", "light"):
         return s, ()
-    if s.startswith("bundle:"):
-        areas = tuple(dict.fromkeys(a.strip() for a in s[len("bundle:"):].split(",") if a.strip()))
-        if areas and len(areas) <= _VIEW_AREAS_MAX and all(_VIEW_AREA_RE.fullmatch(a) for a in areas):
-            return "bundle", areas
+    for mode in ("bundle", "purpose") if PURPOSE_VIEW_ON else ("bundle",):
+        if s.startswith(mode + ":"):
+            areas = tuple(dict.fromkeys(a.strip() for a in s[len(mode) + 1:].split(",") if a.strip()))
+            if areas and len(areas) <= _VIEW_AREAS_MAX and all(_VIEW_AREA_RE.fullmatch(a) for a in areas):
+                return mode, areas
     return None
 
 
 def _view_text(mode: str, areas: tuple[str, ...] = ()) -> str:
-    return f"bundle:{','.join(areas)}" if mode == "bundle" else mode
+    return f"{mode}:{','.join(areas)}" if mode in ("bundle", "purpose") else mode
 
 
 def _aff_proof(secret: str, email: str, aff: str, now: float | None = None) -> str:
@@ -11213,6 +11215,12 @@ def _listed_tools(groups: list[str]) -> list[types.Tool]:
         return vis
     if mode == "light":
         return list(_VIEW_LIGHT_TOOLS)
+    if mode == "purpose":
+        # 목적 보기(M3) — 고른 목적들의 단계 도구(이 호출자 시야 안) + 로컬 도구 전부. 차례는 시야 차례 그대로(이름을 바꾸지 않는다 — 빼기만 한다)
+        want = set(areas)
+        names = {st["name"] for p, lv in _purposes_for({t.name for t in vis}) if p["key"] in want for st in lv["steps"]}
+        local = {id(t) for t in _local_tools()} | {id(READONLY_ALLOWLIST_TOOL)}
+        return [t for t in vis if id(t) in local or t.name in names]
     d = _CORE_VOCAB["data"] or {}
     canon, sib, reads = d.get("canonical"), d.get("siblings") or frozenset(), d.get("core_reads") or frozenset()
     want, local = set(areas), {id(t) for t in _local_tools()} | {id(READONLY_ALLOWLIST_TOOL)}
@@ -11241,12 +11249,18 @@ def _view_info(groups: list[str]) -> dict:
         unknown = [a for a in areas if a not in known]
         if unknown:
             out["unknown_areas"] = unknown
+    elif mode == "purpose":
+        live = {p["key"] for p, _lv in _purposes_for({t.name for t in vis})}
+        out["purposes"] = [a for a in areas if a in live]
+        unknown = [a for a in areas if a not in live]
+        if unknown:
+            out["unknown_purposes"] = unknown           # 표에 없거나 이 박스 · 이 계정에서 단계가 하나도 안 보이는 목적
     out.update(listed=len(listed), hidden_by_view=len(vis) - len(listed))
     if src:
         out["source"] = src.split(";", 1)[0]
     if "bad-header" in src:
-        out["error"] = ("연결 머리 X-HWAX-View 의 꼴이 틀려 전체 목록을 냈다 — full · light · bundle:<영역>,<영역> · portal(포털에서 고른 보기를 따른다) "
-                        "가운데 하나다")
+        out["error"] = ("연결 머리 X-HWAX-View 의 꼴이 틀려 전체 목록을 냈다 — full · light · bundle:<영역>,<영역> · "
+                        + ("purpose:<목적 키>,<목적 키> · " if PURPOSE_VIEW_ON else "") + "portal(포털에서 고른 보기를 따른다) 가운데 하나다")
     if mode != "full":
         # 바꾸는 자리는 출처를 따른다 — 포털 설정에서 온 보기는 포털에서, 연결 머리가 정한 보기는 그 클라이언트 설정에서(머리가 포털 설정을 덮는다)
         where = ("포털 '개인 토큰 › 허브에 보일 앱'(/tokens?tab=apps)에서 바꾸고" if out.get("source") == "portal" else
@@ -12940,8 +12954,9 @@ async def _read_ui_resource(req: types.ReadResourceRequest):
 _low.request_handlers[types.ReadResourceRequest] = _read_ui_resource
 
 
-# 기동 뒤 보기별 tools/list 수 — /health 가 싣는다(개인 보기의 채택을 잰다, E-4 E4-2)
-_VIEW_LISTS = {"full": 0, "bundle": 0, "light": 0}
+# 기동 뒤 보기별 tools/list 수 — /health 가 싣는다(개인 보기의 채택을 잰다, E-4 E4-2). 목적 보기(M3)를 켠 박스는 purpose 칸이 는다. 재기동에도 남는 날마다
+# 셈은 채택 셈 원장(_adopt — tools_list · view_purpose)이다
+_VIEW_LISTS = {"full": 0, "bundle": 0, "light": 0, **({"purpose": 0} if PURPOSE_VIEW_ON else {})}
 
 
 @_low.list_tools()
@@ -12960,8 +12975,12 @@ async def _list_tools(req: types.ListToolsRequest):
         return _class_listed([t for t in _visible_tools(_request_groups()) if _panel_denial(t.name, pnl) is None])
     if req is None:
         return _visible_tools(_request_groups())
-    _VIEW_LISTS[_request_view()[0]] += 1
-    _adopt("tools_list", _request_view()[0])          # 보기 채택을 날마다 디스크에(재기동에도 남는다 — M0)
+    _vmode, _vareas, _vsrc = _request_view()
+    _VIEW_LISTS[_vmode] = _VIEW_LISTS.get(_vmode, 0) + 1
+    _adopt("tools_list", _vmode)                      # 보기 채택을 날마다 디스크에(재기동에도 남는다 — M0)
+    if _vmode == "purpose":
+        for _k in _vareas:
+            _adopt("view_purpose", _k)                # 어느 목적 보기로 붙었나(M3)
     listed = _schema_listed(_class_listed(_listed_tools(_request_groups())))     # drop 모드면 빈 껍데기 출력 스키마를 뗀다(C7 — _res_dedup)
     if RESULT_REFS_ON and _request_result_ref():
         # 결과 손잡이를 청한 연결 — 출력 스키마를 뗀다. 줄인 structuredContent({ref, chars, …, head})는 도구의 출력 스키마에 맞지 않아 Claude Code(MCP
@@ -13685,7 +13704,7 @@ def _bearer_gate(app, pat_verifier=None):
                 "routine_read": _judged["routine_read"],
                 # 이 게이트웨이가 아는 개인 보기(E-4) — 포털이 보기를 저장 · 보일 때 본다. 이 칸이 없는 옛 게이트웨이는 보기를 읽지 않아 늘 전체로 돈다
                 # (포털 화면이 '저장했습니다' 만 말하던 것을 막는다, 검토 10-31). 위 칸들은 그대로다.
-                "views": ["full", "bundle", "light"],
+                "views": ["full", "bundle", "light", *(["purpose"] if PURPOSE_VIEW_ON else [])],
                 # 패널 첫 쓰기 확인이 읽기로 보는 도구의 노출 이름(정렬, 백엔드 도구만) — _panel_read(표지 · 읽기 목록, 이름 낱말 없이). 포털 패널 창구는
                 # routine_read 가 아니라 이것을 본다 — 이것 밖이면 그 패널 세션의 첫 호출에 확인을 묻는다(HWAXPortal docs/request-1027 HA-20 B-2).
                 "panel_read": _judged["panel_read"],

@@ -8068,7 +8068,7 @@ def test_E4_도구_지도는_게이트웨이가_보기를_안다고_말한다(mo
 
     async def send(m): sent.append(m)
     asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/tools-map", "headers": []}, None, send))
-    assert json.loads(sent[1]["body"])["views"] == ["full", "bundle", "light"]
+    assert json.loads(sent[1]["body"])["views"] == ["full", "bundle", "light"] + (["purpose"] if gw.PURPOSE_VIEW_ON else []), "목적 보기(M3)는 켠 박스만"
 
 
 def test_E4_list_tool_apps_의_view_는_보기_영역_수_모르는_영역_출처를_말한다(monkeypatch):
@@ -18119,3 +18119,39 @@ def test_M3_앱_이름만_부르면_그_앱의_입구가_첫_줄이고_일을_�
                                                 log_query=False)).content[0].text, "두 앱을 부르면 어느 입구도 세우지 않는다(끈 것과 같다)"
     assert got == asyncio.run(gw._search_tools({"query": "StepForge 어떻게 써?", "limit": 10}, groups=[], embed=False, log_query=False)).content[0].text, \
         "표를 못 읽으면 목적 · 앱 입구가 없다 — 끈 것과 같다"
+
+
+def test_M3_보기_글은_purpose_를_받고_끄면_틀린_꼴이다():
+    assert gw._parse_view("purpose:drop-prep") == ("purpose", ("drop-prep",))
+    assert gw._parse_view(" PURPOSE:drop-prep,report-write,drop-prep ") == ("purpose", ("drop-prep", "report-write"))
+    for bad in ("purpose:", "purpose:Drop Prep!", "purpose:" + ",".join(f"p{i}" for i in range(33))):
+        assert gw._parse_view(bad) is None, bad
+    assert gw._view_text("purpose", ("drop-prep", "report-write")) == "purpose:drop-prep,report-write"
+
+
+def test_M3_목적_보기_손잡이를_끄면_purpose_글은_전체로_간다(monkeypatch):
+    monkeypatch.setattr(gw, "PURPOSE_VIEW_ON", False)
+    assert gw._parse_view("purpose:drop-prep") is None and gw._parse_view("bundle:cad") == ("bundle", ("cad",))
+
+
+def test_M3_목적_보기는_목록만_그_목적의_단계와_로컬_도구로_줄이고_검색은_그대로다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, groups=["g"], policy={"st": ["st-users"]})
+    hdrs = {gw.GROUPS_HEADER: "g", gw.VIEW_HEADER: "purpose:drop-prep,nope,box-only", gw.VIEW_SRC_HEADER: "header"}
+    _set_request_headers(monkeypatch, hdrs)
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["g"])
+    monkeypatch.setattr(gw, "_VIEW_LISTS", {"full": 0, "bundle": 0, "light": 0, "purpose": 0})
+    listed = _listed()
+    local = {t.name for t in gw._local_tools()}
+    backend = [n for n in listed if n not in local]
+    assert backend == ["heaxsf_list_projects", "run_job"], "권한 없는 st 의 단계와 다른 목적의 도구는 목록에 없다"
+    assert local <= set(listed), "게이트웨이 공통(로컬 도구)은 다 싣는다"
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert v["mode"] == "purpose" and v["purposes"] == ["drop-prep"] and v["unknown_purposes"] == ["nope", "box-only"]
+    assert v["listed"] == len(listed) and v["hidden_by_view"] > 0 and "search_tools" in v["note"]
+    found = json.loads(asyncio.run(gw._search_tools({"query": "보고서 초안"}, embed=False, log_query=False)).content[0].text)
+    assert "create_report_draft" in found["ranked"], "보기는 검색 시야를 줄이지 않는다"
+    assert gw._VIEW_LISTS["purpose"] == 1
+    rows = gw._usage_rollup.adopt_query(gw.ADOPTION_PATH, "2000-01-01", "2999-12-31")
+    assert sorted((r["kind"], r["key"]) for r in rows) == [("tools_list", "purpose"), ("view_purpose", "box-only"), ("view_purpose", "drop-prep"),
+                                                           ("view_purpose", "nope")]

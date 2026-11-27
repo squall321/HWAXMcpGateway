@@ -8650,6 +8650,122 @@ async def _res_keep(name: str, arguments, res):
         return res
 
 
+# ── 구조 결과 두 벌 정리(HWAXPortal docs/mcp-modernize M2 · contract C7) ─────────────────────────────────────────────────────────
+# SDK(FastMCP 1.x)는 구조 결과(structuredContent)를 내는 도구의 결과에 같은 값을 글 블록으로도 싣는다 — dict 는 들여쓴 JSON(indent=2), 감싼 값
+# ({"result": X})은 X 그대로. 바깥으로 두 벌이 나가 응답이 두 배를 넘는다(글은 JSON 문자열 안에서 따옴표 · 줄바꿈이 한 번 더 escape 된다). 어느 쪽을
+# 모델에 넘기는지는 클라이언트마다 다르다(글만 · 구조 먼저 · 구조만 오면 버림 — 11-27 조사). 그래서 **글은 늘 남긴다**(모든 클라이언트가 읽는다).
+#  · 1(기본, compact) — 글 블록이 structuredContent 와 같은 JSON 이면 그 글을 촘촘한 JSON 으로 다시 쓴다(같은 값 · 들여쓰기 없음). 구조 · 출력 스키마는
+#    그대로라 스펙(출력 스키마가 있으면 구조 결과를 낸다)과 클라이언트 검증이 그대로다. 감싼 값(글이 X 그대로)은 줄일 것이 없다.
+#  · drop — 그에 더해 출력 스키마가 '빈 껍데기'(필드 이름이 없는 FastMCP 자동 스키마 — 빈 객체 · result 하나)인 도구는 tools/list 에서 출력 스키마를
+#    떼고(_schema_listed) 결과에서 구조를 뗀다(글만 — 스키마가 없으니 구조는 선택이다). 필드가 있는 출력 스키마는 떼지 않는다(구조 · 촘촘한 글).
+#    ⚠ 옮기는 날의 위험 — stateless 라 재기동 뒤에도 클라이언트는 목록을 다시 받지 않는다. 그 전에 받은 목록(출력 스키마 있음)을 쥔 Claude Code(MCP TS
+#    SDK)는 구조 없는 결과를 'has an output schema but did not return structured content' 로 거절한다 — 세션을 다시 열 때까지. 그래서 기본은 1 이다.
+#  · 결과 손잡이를 청한 연결(X-HWAX-Result: ref)도 모드대로다 — 큰 결과는 결과 손잡이가 글 · 구조를 머리 + 손잡이로 바꾼다(_res_keep — 이 정리 뒤).
+#  · 건드리지 않는 것 — 실패 결과 · 구조와 글이 다른 결과(요약 글 + 데이터 구조) · 패널 PAT 호출 · 패널 도구(_meta.ui — 패널이 구조를 읽는다) ·
+#    게이트웨이 안쪽 호출(바깥 호출 _call_tool_entry 에서만 — 감사 · 근거 원장 · 응답 캐시 · 상호작용 수집은 원문). 끄기 GATEWAY_RESULT_DEDUP=0.
+RESULT_DEDUP = {"0": "0", "drop": "drop"}.get(os.environ.get("GATEWAY_RESULT_DEDUP", "1").strip().lower(), "1")
+_DEDUP_STAT = {"compacted": 0, "dropped": 0, "saved_chars": 0}      # 기동 뒤 — /health contract.result_dedup
+
+
+def _schema_has_fields(node) -> bool:
+    """스키마 나무 어딘가에 필드 이름(비지 않은 properties · $ref · $defs)이 있나."""
+    if isinstance(node, dict):
+        if node.get("properties") or node.get("$ref") or node.get("$defs") or node.get("definitions"):
+            return True
+        return any(_schema_has_fields(v) for k, v in node.items() if isinstance(v, (dict, list)))
+    if isinstance(node, list):
+        return any(_schema_has_fields(v) for v in node)
+    return False
+
+
+def _schema_bare(sch) -> bool:
+    """출력 스키마가 빈 껍데기인가 — 필드 이름이 없는 FastMCP 자동 스키마(빈 객체 {type: object, additionalProperties: true} · 감싼 값
+    {properties: {result: <필드 없는 꼴>}}). 11-27 dev 카탈로그의 출력 스키마 107개가 모두 이 꼴이다."""
+    if not isinstance(sch, dict):
+        return True
+    props = sch.get("properties") or {}
+    if set(props) - {"result"} or sch.get("$defs") or sch.get("definitions") or sch.get("$ref"):
+        return False
+    return not _schema_has_fields(props.get("result")) and not any(
+        _schema_has_fields(sch.get(k)) for k in ("items", "anyOf", "oneOf", "allOf", "additionalProperties", "patternProperties"))
+
+
+def _schema_listed(tools: list) -> list:
+    """drop 모드의 tools/list 사본 — 빈 껍데기 출력 스키마를 뗀다. 다른 모드 · 필드 있는 스키마는 그대로(같은 객체)."""
+    if RESULT_DEDUP != "drop":
+        return tools
+    return [t.model_copy(update={"outputSchema": None}) if getattr(t, "outputSchema", None) and _schema_bare(t.outputSchema) else t
+            for t in tools]
+
+
+def _sc_dup_kind(texts: list[str], sc) -> tuple[str, object] | None:
+    """글 블록들이 structuredContent 와 같은 값의 두 번째 벌인가 — ('json', 글을 읽은 값) · ('wrap', None) · None(다르다)."""
+    def parsed(t):
+        try:
+            return json.loads(t)
+        except ValueError:
+            return _NO_JSON
+
+    def same(a, b) -> bool:
+        # 파이썬 == 은 true 와 1 을 같다고 본다 — 값이 같아 보이면 정렬한 촘촘한 JSON 으로 한 번 더 견준다(JSON 값이 같아야 두 번째 벌이다)
+        if a is _NO_JSON or a != b:
+            return False
+        dump = lambda o: json.dumps(o, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)   # noqa: E731
+        return dump(a) == dump(b)
+    if len(texts) == 1:
+        v = parsed(texts[0])
+        if same(v, sc):
+            return "json", v
+    if isinstance(sc, dict) and set(sc) == {"result"}:
+        x = sc["result"]
+        if len(texts) == 1 and (texts[0] == x if isinstance(x, str) else same(parsed(texts[0]), x)):
+            return "wrap", None
+        if isinstance(x, list) and texts and len(texts) == len(x) and all(
+                (t == e if isinstance(e, str) else same(parsed(t), e)) for t, e in zip(texts, x)):
+            return "wrap", None
+    return None
+
+
+_NO_JSON = object()
+
+
+def _res_dedup(name: str, arguments, res):
+    """바깥 호출 결과의 두 벌을 정리한 **사본** — 위 머리말. 바꿀 것이 없으면 그대로(같은 객체). ⚠ 던지지 않는다(정리가 결과를 막으면 안 된다)."""
+    if RESULT_DEDUP == "0" or not isinstance(res, types.CallToolResult) or res.isError or res.structuredContent is None:
+        return res
+    try:
+        if _request_panel() is not None:
+            return res
+        tool = _res_inner_name(name, arguments)
+        resolved = route.get(tool) or alias_route.get(tool)
+        t = _tool_by_route(*resolved) if resolved else None
+        if t is not None and _ui_uri(t):
+            return res
+        blocks = list(res.content or [])
+        idx = [i for i, c in enumerate(blocks) if getattr(c, "type", None) == "text" and isinstance(getattr(c, "text", None), str)
+               and not (FIG_STORE_ON and c.text.startswith(_FIG_NOTE_HEADS))]
+        texts = [blocks[i].text for i in idx]
+        kind = _sc_dup_kind(texts, res.structuredContent)
+        if kind is None:
+            return res
+        if RESULT_DEDUP == "drop" and (t is None or _schema_bare(getattr(t, "outputSchema", None))):
+            _DEDUP_STAT["dropped"] += 1
+            _DEDUP_STAT["saved_chars"] += sum(len(x) for x in texts)        # 근사 — 뗀 구조는 글과 같은 값이다
+            return res.model_copy(update={"structuredContent": None})
+        if kind[0] != "json":
+            return res
+        compact = json.dumps(kind[1], ensure_ascii=False, separators=(",", ":"))
+        if len(compact) >= len(texts[0]):
+            return res
+        _DEDUP_STAT["compacted"] += 1
+        _DEDUP_STAT["saved_chars"] += len(texts[0]) - len(compact)
+        blocks[idx[0]] = blocks[idx[0]].model_copy(update={"text": compact})
+        return res.model_copy(update={"content": blocks})
+    except Exception as exc:  # noqa: BLE001 — 정리가 도구 결과를 막으면 안 된다
+        log.warning("구조 결과 두 벌 정리 실패(%s) — 원문을 그대로 준다: %r", name, exc)
+        return res
+
+
 _RES_REF_ARG = {"type": "string", "maxLength": 26, "description": "결과 손잡이 — 줄인 도구 결과의 ref(res_… 26자)"}
 RESULT_GET_TOOL = types.Tool(
     name="result_get",
@@ -9931,7 +10047,8 @@ def _class_listed(tools: list) -> list:
 
 def _contract_health() -> dict:
     """/health 의 contract — MCP 현대화 M2(계약 정밀화)의 손잡이 값. 무인증 칸이라 값 · 수만 싣는다."""
-    return {"tool_class_unified": TOOL_CLASS_UNIFIED}
+    return {"tool_class_unified": TOOL_CLASS_UNIFIED,
+            "result_dedup": {"mode": RESULT_DEDUP, **_DEDUP_STAT}}
 
 
 async def _routine_call(a: dict) -> types.CallToolResult:
@@ -12050,14 +12167,14 @@ async def _list_tools(req: types.ListToolsRequest):
     # 바깥 목록(서비스 · 패널 · 사람)에는 부류를 annotations 에 실은 사본을 낸다(_class_listed — MM-5, 끄면 같은 목록). 호출 검증용(req None)은 그대로다.
     svc = _request_service()
     if svc is not None:
-        return _class_listed(_service_listed(svc))
+        return _schema_listed(_class_listed(_service_listed(svc)))
     pnl = _request_panel()
     if pnl is not None:
         return _class_listed([t for t in _visible_tools(_request_groups()) if _panel_denial(t.name, pnl) is None])
     if req is None:
         return _visible_tools(_request_groups())
     _VIEW_LISTS[_request_view()[0]] += 1
-    listed = _class_listed(_listed_tools(_request_groups()))
+    listed = _schema_listed(_class_listed(_listed_tools(_request_groups())))     # drop 모드면 빈 껍데기 출력 스키마를 뗀다(C7 — _res_dedup)
     if RESULT_REFS_ON and _request_result_ref():
         # 결과 손잡이를 청한 연결 — 출력 스키마를 뗀다. 줄인 structuredContent({ref, chars, …, head})는 도구의 출력 스키마에 맞지 않아 Claude Code(MCP
         # TS SDK)가 결과를 거절한다. 떼면 클라이언트가 검증하지 않는다. 사본만 바꾼다 — 집계 목록 · 다른 연결의 목록은 그대로다.
@@ -12143,6 +12260,8 @@ async def _call_tool_entry(name: str, arguments: dict):
     도구(browse_experts · use_experts …)가 빈손이 된다. 박스 스위치와 연결 머리가 둘 다 있을 때만이고, 아니면 _call_tool 의 결과 그대로다.
     상호작용 수집(_ix_call)도 여기서만 — 줄이기 전의 원문을 적는다. 수집 스위치가 꺼지면 _call_tool 을 그대로 부른다."""
     res = await (_ix_call(name, arguments) if INTERACTION_CAPTURE_ON else _call_tool(name, arguments))
+    if RESULT_DEDUP != "0":
+        res = _res_dedup(name, arguments, res)          # 구조 결과 두 벌 정리(C7) — 결과 손잡이보다 먼저(줄일 글이 촘촘한 한 벌이다)
     if RESULT_REFS_ON and _request_result_ref():
         return await _res_keep(name, arguments, res)
     return res

@@ -16144,10 +16144,15 @@ def test_결과_손잡이_structuredContent_도_같은_꼴로_줄이고_그_연�
         content=[types.TextContent(type="text", text=js)], structuredContent=obj)})
     res = call("get_obj")
     h = _res_handle_of(res)
-    assert res.structuredContent == {**h, "head": js[:gw.RESULT_REF_HEAD_CHARS]}, "structuredContent 도 머리 + 손잡이"
+    # 구조 결과 두 벌 정리(C7 — 기본 켬)가 먼저 돈다 — 같은 JSON 글은 촘촘한 한 벌이 되어 원문 · 머리 · 쪽이 그것을 센다(값은 같다)
+    js_eff = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) if gw.RESULT_DEDUP != "0" else js
+    assert res.structuredContent == {**h, "head": js_eff[:gw.RESULT_REF_HEAD_CHARS]}, "structuredContent 도 머리 + 손잡이"
     meta = gw._res_load(h["ref"])
     text, sc = gw._res_read_body(meta)
-    assert text == js and sc == obj, "원문 글과 structuredContent 를 함께 둔다"
+    assert text == js_eff and sc == obj, "원문 글과 structuredContent 를 함께 둔다"
+    monkeypatch.setattr(gw, "RESULT_DEDUP", "0")
+    h0 = _res_handle_of(call("get_obj"))
+    assert gw._res_read_body(gw._res_load(h0["ref"]))[0] == js and h0["chars"] == len(js), "끄면 들여쓴 원문 그대로"
     # 글이 짧고 structuredContent 가 크면 그 촘촘한 JSON 이 원문이다
     call2, _ = _res_kit(monkeypatch, results={"get_sc": lambda: types.CallToolResult(
         content=[types.TextContent(type="text", text="ok")], structuredContent=obj)})
@@ -16560,6 +16565,7 @@ def _ix_http(monkeypatch, method, path, headers, body=None, query=b""):
 
 
 def test_상호작용_수집을_끄면_결과_목록_지침_경로가_지금과_바이트까지_같다(monkeypatch):
+    monkeypatch.setattr(gw, "RESULT_DEDUP", "0")        # 구조 결과 두 벌 정리(C7)는 따로 본다 — 여기는 수집 스위치만
     want = _ix_sec_result().model_dump_json()
     call, _b = _ix_kit(monkeypatch, on=False)
     assert call("get_rows", {"token": "t"}).model_dump_json() == want
@@ -17374,3 +17380,109 @@ def test_한_판정_손잡이가_health_의_contract_에_실린다(monkeypatch):
     for on in (True, False):
         monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", on)
         assert _health_body()["contract"]["tool_class_unified"] is on
+
+
+# ── 구조 결과 두 벌 정리(HWAXPortal docs/mcp-modernize M2 · contract C7) ─────────────────────────────────────────────────────────
+
+def _dup_res(sc, *texts, error=False):
+    return types.CallToolResult(content=[types.TextContent(type="text", text=t) for t in texts], structuredContent=sc, isError=error)
+
+
+def _dedup_kit(monkeypatch, mode="1", schema=None, ui=False):
+    monkeypatch.setattr(gw, "RESULT_DEDUP", mode)
+    monkeypatch.setattr(gw, "_DEDUP_STAT", {"compacted": 0, "dropped": 0, "saved_chars": 0})
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", False)
+    kw = {"outputSchema": schema} if schema else {}
+    if ui:
+        kw["_meta"] = {"ui": {"resourceUri": "ui://sf/panel"}}
+    monkeypatch.setattr(gw, "exposed_tools", [types.Tool(name="get_x", inputSchema={"type": "object"}, **kw)])
+    monkeypatch.setattr(gw, "route", {"get_x": ("sf", "get_x")})
+    monkeypatch.setattr(gw, "alias_route", {"sf_get_x": ("sf", "get_x")})
+
+
+_BARE_DICT = {"additionalProperties": True, "title": "get_xDictOutput", "type": "object"}
+_BARE_WRAP = {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "get_xOutput", "type": "object"}
+_FIELDS = {"type": "object", "properties": {"rows": {"type": "array", "items": {"type": "integer"}}, "total": {"type": "integer"}}}
+
+
+def test_C7_출력_스키마_빈_껍데기_판정은_필드_이름이_없는_FastMCP_자동_꼴만():
+    for sch in (_BARE_DICT, _BARE_WRAP, {"additionalProperties": True, "type": "object"}, None,
+                {"properties": {"result": {"type": "array", "items": {"type": "string"}}}, "type": "object"}):
+        assert gw._schema_bare(sch), sch
+    for sch in (_FIELDS, {"properties": {"result": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}}}}}},
+                {"type": "object", "$defs": {"Row": {"type": "object"}}, "properties": {"result": {"$ref": "#/$defs/Row"}}}):
+        assert not gw._schema_bare(sch), sch
+
+
+def test_C7_기본은_같은_JSON_글을_촘촘하게_다시_쓰고_구조_스키마는_그대로다(monkeypatch):
+    _dedup_kit(monkeypatch, schema=_BARE_DICT)
+    sc = {"rows": [1, 2, 3], "name": "가나", "nested": {"a": None, "b": 1.5}}
+    pretty = json.dumps(sc, ensure_ascii=False, indent=2)
+    img = types.ImageContent(type="image", data="AAAA", mimeType="image/png")
+    res = types.CallToolResult(content=[types.TextContent(type="text", text=pretty), img], structuredContent=sc)
+    out = gw._res_dedup("get_x", {}, res)
+    assert out.structuredContent == sc and json.loads(out.content[0].text) == sc and out.content[1] is img
+    assert out.content[0].text == '{"rows":[1,2,3],"name":"가나","nested":{"a":null,"b":1.5}}' and res.content[0].text == pretty, "사본만 바꾼다"
+    assert gw._DEDUP_STAT == {"compacted": 1, "dropped": 0, "saved_chars": len(pretty) - len(out.content[0].text)}
+    once = gw._res_dedup("get_x", {}, out)
+    assert once is out, "이미 촘촘하면 그대로"
+    wrap = _dup_res({"result": "그대로 글"}, "그대로 글")
+    assert gw._res_dedup("get_x", {}, wrap) is wrap, "감싼 값(글이 X 그대로)은 줄일 것이 없다 — 기본 모드는 구조를 떼지 않는다"
+
+
+def test_C7_다른_결과_실패_패널_패널_도구_끔은_건드리지_않는다(monkeypatch):
+    _dedup_kit(monkeypatch, mode="drop", schema=_BARE_DICT)
+    for res in (_dup_res({"a": 1}, "요약 — a 는 1"), _dup_res({"a": 1}, '{"a": true}'), _dup_res({"a": 1}, '{"a": 1}', error=True),
+                types.CallToolResult(content=[types.TextContent(type="text", text="x")])):
+        assert gw._res_dedup("get_x", {}, res) is res
+    res = _dup_res({"a": 1}, '{\n  "a": 1\n}')
+    monkeypatch.setattr(gw, "_request_panel", lambda: {"app": "sf"})
+    assert gw._res_dedup("get_x", {}, res) is res, "패널 PAT 호출은 원문 — 패널이 구조를 읽는다"
+    monkeypatch.setattr(gw, "_request_panel", lambda: None)
+    _dedup_kit(monkeypatch, mode="drop", schema=_BARE_DICT, ui=True)
+    assert gw._res_dedup("get_x", {}, res) is res, "패널 도구(_meta.ui)는 원문"
+    _dedup_kit(monkeypatch, mode="0", schema=_BARE_DICT)
+    assert gw._res_dedup("get_x", {}, res) is res, "끄면 그대로"
+
+
+def test_C7_drop_은_빈_껍데기_스키마_도구의_구조를_떼고_목록에서도_스키마를_뗀다(monkeypatch):
+    _dedup_kit(monkeypatch, mode="drop", schema=_BARE_WRAP)
+    out = gw._res_dedup("invoke_tool", {"name": "sf_get_x"}, _dup_res({"result": "긴 글"}, "긴 글"))
+    assert out.structuredContent is None and out.content[0].text == "긴 글", "invoke_tool 은 안쪽 이름(별칭도)으로 본다"
+    out = gw._res_dedup("get_x", {}, _dup_res({"result": [{"k": 1}, "s"]}, '{"k": 1}', "s"))
+    assert out.structuredContent is None, "감싼 목록 — 원소마다 글 블록"
+    assert gw._DEDUP_STAT["dropped"] == 2
+    tools = [types.Tool(name="a", inputSchema={"type": "object"}, outputSchema=_BARE_DICT),
+             types.Tool(name="b", inputSchema={"type": "object"}, outputSchema=_FIELDS), types.Tool(name="c", inputSchema={"type": "object"})]
+    listed = gw._schema_listed(tools)
+    assert listed[0].outputSchema is None and listed[1] is tools[1] and listed[2] is tools[2] and tools[0].outputSchema == _BARE_DICT
+    _dedup_kit(monkeypatch, mode="drop", schema=_FIELDS)
+    sc = {"rows": [1], "total": 1}
+    out = gw._res_dedup("get_x", {}, _dup_res(sc, json.dumps(sc, indent=2)))
+    assert out.structuredContent == sc and out.content[0].text == '{"rows":[1],"total":1}', "필드 있는 스키마 — 구조는 남기고(스펙) 글만 촘촘히"
+    monkeypatch.setattr(gw, "RESULT_DEDUP", "1")
+    assert gw._schema_listed(tools) is tools, "기본 모드는 목록 그대로"
+
+
+def test_C7_결과_손잡이_연결도_모드대로_촘촘히_하고_손잡이의_구조_꼴은_그대로다(monkeypatch):
+    _dedup_kit(monkeypatch, schema=_FIELDS)
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", True)
+    monkeypatch.setattr(gw, "_request_result_ref", lambda: True)
+    out = gw._res_dedup("get_x", {}, _dup_res({"rows": [1], "total": 1}, '{"rows": [1], "total": 1}'))
+    assert out.structuredContent == {"rows": [1], "total": 1} and out.content[0].text == '{"rows":[1],"total":1}', \
+        "구조를 떼지 않는다 — 큰 결과는 결과 손잡이가 구조를 머리 + 손잡이로 바꾼다(offload-v2 §3-2)"
+
+
+def test_C7_바깥_호출이_정리한_결과를_내고_안쪽_호출은_원문이다(monkeypatch):
+    _dedup_kit(monkeypatch, schema=_BARE_DICT)
+    sc = {"a": [1, 2]}
+    raw = _dup_res(sc, json.dumps(sc, indent=2))
+
+    async def fake(name, args):
+        return raw
+    monkeypatch.setattr(gw, "_call_tool", fake)
+    out = asyncio.run(gw._call_tool_entry("get_x", {}))
+    assert out.content[0].text == '{"a":[1,2]}' and out.structuredContent == sc and raw.content[0].text != out.content[0].text
+    assert asyncio.run(gw._call_tool("get_x", {})) is raw
+    assert _health_body()["contract"]["result_dedup"] == {"mode": "1", "compacted": 1, "dropped": 0,
+                                                         "saved_chars": len(raw.content[0].text) - len(out.content[0].text)}

@@ -70,6 +70,11 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "_PURPOSES", {"key": None, "data": None, "error": "아직 읽지 않음", "overlay": None})
     for _k in ("PURPOSES_ON", "PURPOSE_LIST_ON", "PURPOSE_VIEW_ON", "PURPOSE_PROMPTS_ON", "PURPOSE_SKILLS_ON"):
         monkeypatch.setattr(gw, _k, True)
+    # 채택 셈 원장도 같다 — 안 걸면 시험의 tools/list · prompts/get 이 박스의 데이터 루트(원장 곁 usage-adoption.sqlite)에 셈을 쌓는다
+    monkeypatch.setattr(gw, "ADOPTION_PATH", tmp_path / "usage-adoption.sqlite")
+    monkeypatch.setattr(gw, "ADOPTION_ON", True)
+    monkeypatch.setattr(gw, "_ADOPT_HEALTH", {"at": -1e9, "data": None})
+    monkeypatch.setattr(gw, "_ADOPT_WARN", {"at": -1e9, "errors": 0})
 
 
 @pytest.fixture(autouse=True)
@@ -17920,3 +17925,25 @@ def test_M3_실제_목적_표는_꼴이_맞고_dev_카탈로그의_이름만_쓴
         assert p["samples"] and p["triggers"], k
     used = {(b, n) for p in d["purposes"].values() for b, n, _w in p["steps"]}
     assert later <= used, "expected_missing 은 표가 쓰는 도구만 적는다"
+
+
+def test_M0_채택_셈은_보기_tools_list_를_디스크에_날마다_남기고_health_와_usage_rollup_이_읽는다(monkeypatch, tmp_path):
+    """보기 채택 셈(/health tools_list_by_view)은 프로세스 메모리라 재기동마다 0 이었다(11-27 조사). 디스크 원장(usage-adoption.sqlite)에 KST 날마다
+    갈래 · 열쇠로 센다 — 사람 · 질의 글은 싣지 않는다. /health 는 최근 7일 합, /usage-rollup 은 기간의 날마다를 싣는다. 끄면 쓰지 않고 칸도 없다."""
+    _p_catalog(monkeypatch)
+    _set_request_headers(monkeypatch, {gw.VIEW_HEADER: "light"})
+    req = types.ListToolsRequest(method="tools/list")
+    asyncio.run(gw._list_tools(req))
+    asyncio.run(gw._list_tools(req))
+    asyncio.run(gw._list_tools(None))                      # SDK 의 호출 검증 캐시 채우기는 세지 않는다
+    rows = gw._usage_rollup.adopt_query(gw.ADOPTION_PATH, "2000-01-01", "2999-12-31")
+    assert [(r["kind"], r["key"], r["n"]) for r in rows] == [("tools_list", "light", 2)]
+    h = _health_body()["adoption"]
+    assert h["by_kind"] == {"tools_list": {"light": 2}} and h["write_errors"] == 0
+    out = gw._usage_rollup_view({})
+    assert [(r["kind"], r["key"], r["n"]) for r in out["adoption"]] == [("tools_list", "light", 2)]
+    # 쓰지 못해도 목록은 나온다(무음은 아니다)
+    monkeypatch.setattr(gw, "ADOPTION_PATH", tmp_path / "no-dir" / "x" / "\0bad")
+    assert asyncio.run(gw._list_tools(req)) and gw._ADOPT_WARN["errors"] >= 1
+    monkeypatch.setattr(gw, "ADOPTION_ON", False)
+    assert "adoption" not in _health_body() and "adoption" not in gw._usage_rollup_view({})

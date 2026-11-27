@@ -4099,8 +4099,47 @@ USAGE_ROLLUP_PATH = _usage_rollup_path_setting()
 
 
 def _usage_rollup_view(raw: dict) -> dict:
-    """/usage-rollup — 밀린 감사 줄을 접고 기간의 답을 낸다(일꾼 스레드에서 돈다). 도구 이름은 지금 경로표가 아는 원래 이름으로 접는다."""
-    return _usage_rollup.view(USAGE_ROLLUP_PATH, AUDIT_PATH, raw, resolve=lambda n: route.get(n) or alias_route.get(n))
+    """/usage-rollup — 밀린 감사 줄을 접고 기간의 답을 낸다(일꾼 스레드에서 돈다). 도구 이름은 지금 경로표가 아는 원래 이름으로 접는다. 채택 셈을 켠 박스는
+    같은 기간의 adoption 이 붙는다(끄면 답이 종전과 같다)."""
+    return _usage_rollup.view(USAGE_ROLLUP_PATH, AUDIT_PATH, raw, resolve=lambda n: route.get(n) or alias_route.get(n),
+                              adoption_path=ADOPTION_PATH if ADOPTION_ON else None)
+
+
+# 채택 셈(HWAXPortal docs/mcp-modernize M0 · M3) — 보기별 tools/list · prompts/get · 자원 읽기(skill · ui) · 목적 목록 · 검색 목적 층을 KST 날마다 디스크
+# 원장(usage-adoption.sqlite — 이용 통계 표 곁, 0600)에 센다. 종전 셈(/health tools_list_by_view)은 프로세스 메모리라 재기동마다 0 이었다. 셈은 호출을 막지
+# 않는다 — 실패는 60초에 한 줄 경고뿐이다. /health 의 adoption(최근 7일 갈래별 합) · /usage-rollup 의 adoption(기간의 날마다)이 읽는다. 끄기
+# GATEWAY_ADOPTION_LEDGER=0(그러면 디스크에 쓰지 않고 두 칸이 없다). 덮기 GATEWAY_ADOPTION_PATH(상대 경로는 리포 루트 기준).
+ADOPTION_ON = _env_knob("GATEWAY_ADOPTION_LEDGER", "1") != "0"
+_ADOPTION_ENV = (os.environ.get("GATEWAY_ADOPTION_PATH") or "").strip()
+ADOPTION_PATH = ((Path(_ADOPTION_ENV).expanduser() if Path(_ADOPTION_ENV).expanduser().is_absolute()
+                  else Path(__file__).resolve().parent / Path(_ADOPTION_ENV).expanduser()) if _ADOPTION_ENV
+                 else USAGE_ROLLUP_PATH.with_name("usage-adoption.sqlite"))
+_ADOPT_WARN = {"at": -1e9, "errors": 0}
+_ADOPT_HEALTH: dict = {"at": -1e9, "data": None}
+
+
+def _adopt(kind: str, key: str) -> None:
+    """채택 하나를 센다 — 끈 박스는 아무것도 안 한다. 실패해도 호출은 그대로다(무음은 아니다 — 60초에 한 줄)."""
+    if not ADOPTION_ON:
+        return
+    try:
+        _usage_rollup.adopt_note(ADOPTION_PATH, kind, key)
+    except Exception as exc:  # noqa: BLE001 — 셈 하나 때문에 도구 목록 · 프롬프트를 잃지 않는다
+        _ADOPT_WARN["errors"] += 1
+        if time.monotonic() - _ADOPT_WARN["at"] > 60:
+            _ADOPT_WARN["at"] = time.monotonic()
+            log.warning("채택 셈을 적지 못했다(누적 %d) — 호출은 그대로다: %r", _ADOPT_WARN["errors"], exc)
+
+
+def _adoption_health() -> dict:
+    """/health 의 adoption — 최근 7일(KST, 오늘 포함) 갈래별 합 · 적기 실패 수. 60초 쥐어 둔다(상태판이 자주 묻는다)."""
+    if _ADOPT_HEALTH["data"] is None or time.monotonic() - _ADOPT_HEALTH["at"] > 60:
+        try:
+            data = _usage_rollup.adopt_summary(ADOPTION_PATH)
+        except Exception as exc:  # noqa: BLE001
+            data = {"error": f"못 읽음({type(exc).__name__})"}
+        _ADOPT_HEALTH.update(at=time.monotonic(), data=data)
+    return {**_ADOPT_HEALTH["data"], "write_errors": _ADOPT_WARN["errors"]}
 
 
 async def _read_json_body(receive, limit: int = 64 * 1024) -> dict:
@@ -10956,6 +10995,7 @@ async def _get_prompt(name: str, arguments: dict[str, str] | None) -> types.GetP
     missing = [f"{v.get('label') or v['key']}({v['key']})" for v in vars_ if v.get("required", True) is not False and v["key"] not in inputs]
     if missing:
         raise McpError(types.ErrorData(code=types.INVALID_PARAMS, message=f"필수 입력이 없다 — {', '.join(missing)}"))
+    _adopt("prompt", "routine")                       # 루틴 id 는 싣지 않는다 — 갈래만 센다
     return types.GetPromptResult(
         description=f"분석 루틴 — {plan.get('title') or rid}",
         messages=[types.PromptMessage(role="user", content=types.TextContent(type="text", text=_rt_prompt_text(rid, plan, inputs)))])
@@ -12729,6 +12769,7 @@ async def _read_ui_resource(req: types.ReadResourceRequest):
             f"리소스가 상한 {RESOURCE_MAX_BYTES:,}바이트(GATEWAY_RESOURCE_MAX_BYTES)를 넘는다({size:,}바이트)")))
     _audit(f"resources/read {_clip(uri, 160)}", key, True, None, round((time.monotonic() - t0) * 1000), caller=email or None, mode=mode,
            rid=rid)
+    _adopt("resource", "ui")
     return types.ServerResult(res)
 
 
@@ -12756,6 +12797,7 @@ async def _list_tools(req: types.ListToolsRequest):
     if req is None:
         return _visible_tools(_request_groups())
     _VIEW_LISTS[_request_view()[0]] += 1
+    _adopt("tools_list", _request_view()[0])          # 보기 채택을 날마다 디스크에(재기동에도 남는다 — M0)
     listed = _schema_listed(_class_listed(_listed_tools(_request_groups())))     # drop 모드면 빈 껍데기 출력 스키마를 뗀다(C7 — _res_dedup)
     if RESULT_REFS_ON and _request_result_ref():
         # 결과 손잡이를 청한 연결 — 출력 스키마를 뗀다. 줄인 structuredContent({ref, chars, …, head})는 도구의 출력 스키마에 맞지 않아 Claude Code(MCP
@@ -13380,6 +13422,8 @@ def _bearer_gate(app, pat_verifier=None):
                 "contract": _contract_health(),
                 # 목적 묶음(MCP 현대화 M3) — 표 지문 · 덧씌우기 · 목적 수 · 이 박스에 없는 단계 · 손잡이 · 채택 셈. 끈 박스(GATEWAY_PURPOSES=0)에는 칸이 없다
                 **({"purposes": _purposes_health()} if PURPOSES_ON else {}),
+                # 채택 셈(M0 · M3) — 최근 7일 보기 · prompts · 자원 · 목적 목록 · 검색 목적 층(디스크 원장 — 재기동에도 남는다). 끈 박스에는 칸이 없다
+                **({"adoption": _adoption_health()} if ADOPTION_ON else {}),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

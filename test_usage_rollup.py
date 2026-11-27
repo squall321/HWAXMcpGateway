@@ -332,3 +332,36 @@ def test_옛_꼴의_접은_표는_버리고_원장_처음부터_다시_접는다
     with closing(sqlite3.connect(box.db)) as c:
         assert c.execute("SELECT v FROM meta WHERE k = 'schema'").fetchone()[0] == ur.SCHEMA_VERSION
     assert _only(box.view()["calls"])["calls"] == 1, "새 꼴에서는 다시 버리지 않는다"
+
+
+# ── 채택 셈(HWAXPortal docs/mcp-modernize M0 · M3) — 보기 · prompts · 자원 읽기의 날마다 수를 디스크에 ─────────────────────────────────────
+def test_채택_셈은_날_갈래_열쇠마다_올리고_기간으로_낸다(tmp_path):
+    p = tmp_path / "usage-adoption.sqlite"
+    assert ur.adopt_query(p, "2026-11-01", "2026-11-30") == [] and not p.exists(), "원장이 없으면 만들지 않는다"
+    for day, kind, key in (("2026-11-26", "tools_list", "full"), ("2026-11-27", "tools_list", "full"), ("2026-11-27", "tools_list", "full"),
+                           ("2026-11-27", "view_purpose", "drop-prep"), ("2026-11-27", "prompt", "purpose-drop-prep"),
+                           ("2026-11-27", "resource", "skill:drop-prep")):
+        ur.adopt_note(p, kind, key, day=day)
+    assert oct(p.stat().st_mode & 0o777) == "0o600", "주인만"
+    got = ur.adopt_query(p, "2026-11-27", "2026-11-27")
+    assert got == [{"day": "2026-11-27", "kind": "prompt", "key": "purpose-drop-prep", "n": 1},
+                   {"day": "2026-11-27", "kind": "resource", "key": "skill:drop-prep", "n": 1},
+                   {"day": "2026-11-27", "kind": "tools_list", "key": "full", "n": 2},
+                   {"day": "2026-11-27", "kind": "view_purpose", "key": "drop-prep", "n": 1}]
+    s = ur.adopt_summary(p, days=7, today="2026-11-27")
+    assert (s["since"], s["until"]) == ("2026-11-21", "2026-11-27") and s["by_kind"]["tools_list"] == {"full": 3}
+    with pytest.raises(ValueError):
+        ur.adopt_note(p, "nope", "x")
+    ur.adopt_note(p, "prompt", "질의 글은 싣지 않는다 <script>", day="2026-11-27")
+    assert {r["key"] for r in ur.adopt_query(p, "2026-11-27", "2026-11-27") if r["kind"] == "prompt"} == {"purpose-drop-prep", "(other)"}
+
+
+def test_이용_통계_창구는_채택_셈을_주면_같은_기간의_adoption_을_덧붙인다(tmp_path):
+    box = Box(tmp_path)
+    box.write(_line("2026-11-27T01:00:00+00:00", "x", "sf"))
+    a = tmp_path / "usage-adoption.sqlite"
+    ur.adopt_note(a, "tools_list", "light", day="2026-11-27")
+    ur.adopt_note(a, "tools_list", "light", day="2026-10-01")
+    assert "adoption" not in box.view(), "주지 않으면 종전과 같다"
+    out = ur.view(box.db, box.audit, {"since": "2026-11-01", "until": "2026-11-30"}, adoption_path=a)
+    assert out["adoption"] == [{"day": "2026-11-27", "kind": "tools_list", "key": "light", "n": 1}]

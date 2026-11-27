@@ -963,8 +963,9 @@
       "title": "보고서 → 영상",
       "summary": "보고서를 조각내 디자인 회의를 돌리고 시나리오를 지어 영상으로 렌더한다. RA 보고서의 '발표자료로' 단추가 켜진 박스면 그것이 먼저다.",
       "triggers": ["영상 만들", "보고서 영상", "발표 영상", "동영상"],
-      "entry": ["heax-web_design_agents", "report_ingest"],
+      "entry": ["heax-web_design_agents", "format_list"],
       "steps": [
+        {"backend": "heax-web_design_agents", "tool": "format_list", "why": "쓸 형식(format_id)을 고른다 — 읽기라 입구로 둔다(입구가 쓰기면 첫 호출부터 확인 카드가 선다)"},
         {"backend": "heax-web_design_agents", "tool": "report_ingest", "why": "보고서를 들여 run_id 를 받는다(쓰기 — 서버가 읽을 수 있는 경로)"},
         {"backend": "heax-web_design_agents", "tool": "report_fragmentize", "why": "조각을 만든다(조각 id 가 인용 화이트리스트)"},
         {"backend": "heax-web_design_agents", "tool": "meeting_personas", "why": "participants 에 쓸 페르소나 id 를 본다"},
@@ -986,7 +987,7 @@
       "title": "보고서 → 발표자료(PPT · PDF)",
       "summary": "보고서로 디자인 회의를 돌려 시나리오를 짓고 문서(PDF · PPT)로 렌더한다. RA 보고서의 '발표자료로' 단추가 켜진 박스면 그것이 먼저다.",
       "triggers": ["발표자료", "발표자료 만들", "보고서로 발표자료", "ppt 만들", "pdf 만들", "슬라이드", "발표 자료"],
-      "entry": ["heax-web_design_agents", "report_ingest"],
+      "entry": ["heax-web_design_agents", "format_list"],
       "steps": [
         {"backend": "heax-web_design_agents", "tool": "report_ingest", "why": "보고서를 들여 run_id 를 받는다(쓰기 — 서버가 읽을 수 있는 경로)"},
         {"backend": "heax-web_design_agents", "tool": "report_fragmentize", "why": "조각을 만든다(조각 id 가 인용 화이트리스트)"},

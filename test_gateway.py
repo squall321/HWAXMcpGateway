@@ -17908,6 +17908,72 @@ def test_M3_health_와_tools_map_에_목적이_실리고_끄면_칸이_없다(mo
     assert "purposes" not in json.loads(sent[1]["body"])
 
 
+def test_M3_list_tool_apps_by_purpose_는_시야_밖_단계를_빼고_수만_센다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, groups=["g"], policy={"st": ["st-users"]}, ann={"run_job": {"readOnlyHint": False}})
+    body = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose"})).content[0].text)
+    rows = {r["purpose"]: r for r in body["purposes"]}
+    assert list(rows) == ["drop-prep", "report-write"] and body["purpose_count"] == 2
+    dp = rows["drop-prep"]
+    assert dp["steps"] == ["heaxsf_list_projects", "run_job", "figure_list"] and dp["unavailable_steps"] == 2, "권한 없는 st 와 이 박스에 없는 단계"
+    assert dp["entry"] == "heaxsf_list_projects" and "submit" not in json.dumps(dp), "못 쓰는 앱의 도구 이름을 말하지 않는다"
+    assert dp["apps"] == ["Sf"], "앱 라벨은 쓸 수 있는 앱만"
+    one = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose", "purpose": "drop-prep"})).content[0].text)["purposes"][0]
+    assert one["steps"][1] == {"tool": "run_job", "why": "잡", "write": True, "confirm": True}
+    assert one["confirm_writes"] == ["run_job"] and one["samples"] == ["STEP 으로 낙하 해석 돌리려면?"]
+    assert one["prompt"] == "purpose-drop-prep" and one["skill"] == "skill://hwax/drop-prep/SKILL.md"
+    bad = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose", "purpose": "nope"})).content[0].text)
+    assert bad["error"].startswith("unknown purpose: nope") and "drop-prep" in bad["error"]
+    gone = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose", "purpose": "box-only"})).content[0].text)
+    assert gone["error"].startswith("unavailable purpose: box-only")
+    slim = json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose", "include_tools": False})).content[0].text)
+    assert all("steps" not in r for r in slim["purposes"])
+
+
+def test_M3_앱_줄에_입구가_실리고_끄면_list_tool_apps_가_종전과_같다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch)
+    body = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    apps = {a["app"]: a for a in body["apps"]}
+    assert (apps["sf"]["entry"], apps["sf"]["entry_why"]) == ("guide", "처음 부른다") and apps["ra"]["entry"] == "ra_guide"
+    assert "entry" not in apps["st"] and "entry" not in apps["_gateway"]
+    on_area = asyncio.run(gw._list_tool_apps({"by": "area"})).content[0].text
+    monkeypatch.setattr(gw, "PURPOSE_LIST_ON", False)
+    off = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    assert all("entry" not in a for a in off["apps"])
+    assert asyncio.run(gw._list_tool_apps({"by": "area"})).content[0].text == on_area, "영역 보기는 손잡이와 상관없다"
+    assert "purposes" not in json.loads(asyncio.run(gw._list_tool_apps({"by": "purpose"})).content[0].text), "끄면 by=purpose 는 앱 목록(종전)"
+
+
+def test_M3_list_tool_apps_정의는_끄면_종전과_바이트까지_같다():
+    old = types.Tool(
+        name="list_tool_apps",
+        description=(
+            "이 게이트웨이에 연결된 MCP 앱(도메인) 목록과 각 앱의 도구를 계층적으로 반환한다. "
+            "'무슨 앱/도구가 있냐', '어떤 기능이 되냐' 같은 질문에 전체 도구를 나열하는 대신 이걸 호출하라. "
+            "각 앱마다 accessible(내 권한으로 사용 가능한지)·reachable(백엔드 생존)·tool_count·tools 를 준다. "
+            "app 인자를 주면 그 앱의 도구만 상세(이름+설명)로 반환한다. "
+            "by='area' 면 앱 대신 **하는 일(영역)** 로 묶는다 — CAD·형상 제어, 메시·해석 모델 구성, 시뮬레이션 실행·잡, "
+            "해석 계산·예측, 해석 결과 분석, 물성·재료, VOC·시장 신호, 사내 지식 검색, 웹·논문 조사, 보고서·문서·발표, "
+            "전문가·심의·리스크, 데이터 등록·온톨로지, 시스템·공통. '시뮬레이션 관련 도구 뭐 있어' 같은 질문엔 이걸 쓴다."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "app": {"type": "string", "description": "특정 앱 키(예: heax-thermal_shock_mcp). 생략 시 전체 앱 요약."},
+                "include_tools": {"type": "boolean", "description": "전체 목록에도 도구 이름을 포함(기본 true)."},
+                "by": {"type": "string", "enum": ["app", "area"],
+                       "description": "묶는 기준 — app(소유 앱, 기본) 또는 area(하는 일)."},
+                "area": {"type": "string", "description": "by='area' 에서 특정 영역 키만(예: sim, cad, voc). 도구 설명까지 준다."},
+            },
+        },
+    )
+    assert gw._list_apps_tool(False).model_dump_json() == old.model_dump_json()
+    on = gw._list_apps_tool(True)
+    assert on.inputSchema["properties"]["by"]["enum"] == ["app", "area", "purpose"] and "purpose" in on.inputSchema["properties"]
+    assert gw.LIST_APPS_TOOL.model_dump_json() == on.model_dump_json(), "기본은 켬"
+
+
 def test_M3_실제_목적_표는_꼴이_맞고_dev_카탈로그의_이름만_쓴다():
     """추적하는 표(tool_purposes.json)가 읽히고, 단계 · 입구 · 앱 입구가 dev 카탈로그 이름표(tool_search_eval/purpose_catalog.json)의 이름이다 — 이 박스에 없는
     앱(cae00 전용)의 단계는 이름표에 그 백엔드가 없어 대조하지 않는다. 앱 새 판의 도구는 expected_missing 에 까닭과 함께 적는다."""

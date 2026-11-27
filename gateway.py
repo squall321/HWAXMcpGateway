@@ -3549,28 +3549,39 @@ def _purposes_map() -> dict:
             "app_entries": {bk: {"tool": tool, "name": idx.get((bk, tool)), "why": why} for bk, (tool, why) in d["apps"].items()}}
 
 
-LIST_APPS_TOOL = types.Tool(
-    name="list_tool_apps",
-    description=(
-        "이 게이트웨이에 연결된 MCP 앱(도메인) 목록과 각 앱의 도구를 계층적으로 반환한다. "
-        "'무슨 앱/도구가 있냐', '어떤 기능이 되냐' 같은 질문에 전체 도구를 나열하는 대신 이걸 호출하라. "
-        "각 앱마다 accessible(내 권한으로 사용 가능한지)·reachable(백엔드 생존)·tool_count·tools 를 준다. "
-        "app 인자를 주면 그 앱의 도구만 상세(이름+설명)로 반환한다. "
-        "by='area' 면 앱 대신 **하는 일(영역)** 로 묶는다 — CAD·형상 제어, 메시·해석 모델 구성, 시뮬레이션 실행·잡, "
-        "해석 계산·예측, 해석 결과 분석, 물성·재료, VOC·시장 신호, 사내 지식 검색, 웹·논문 조사, 보고서·문서·발표, "
-        "전문가·심의·리스크, 데이터 등록·온톨로지, 시스템·공통. '시뮬레이션 관련 도구 뭐 있어' 같은 질문엔 이걸 쓴다."
-    ),
-    inputSchema={
-        "type": "object",
-        "properties": {
-            "app": {"type": "string", "description": "특정 앱 키(예: heax-thermal_shock_mcp). 생략 시 전체 앱 요약."},
-            "include_tools": {"type": "boolean", "description": "전체 목록에도 도구 이름을 포함(기본 true)."},
-            "by": {"type": "string", "enum": ["app", "area"],
-                   "description": "묶는 기준 — app(소유 앱, 기본) 또는 area(하는 일)."},
-            "area": {"type": "string", "description": "by='area' 에서 특정 영역 키만(예: sim, cad, voc). 도구 설명까지 준다."},
-        },
-    },
-)
+def _list_apps_tool(purposes: bool) -> types.Tool:
+    """list_tool_apps 의 정의 — purposes 를 끄면(GATEWAY_PURPOSE_LIST=0) 종전 정의와 바이트까지 같다. 켜면 by 에 purpose 가, 인자에 purpose 가 붙는다."""
+    by = {"type": "string", "enum": ["app", "area", "purpose"] if purposes else ["app", "area"],
+          "description": ("묶는 기준 — app(소유 앱, 기본) · area(하는 일) · purpose(업무 목적 — 차례 · 입구 · 확인할 쓰기)." if purposes else
+                          "묶는 기준 — app(소유 앱, 기본) 또는 area(하는 일).")}
+    props = {
+        "app": {"type": "string", "description": "특정 앱 키(예: heax-thermal_shock_mcp). 생략 시 전체 앱 요약."},
+        "include_tools": {"type": "boolean", "description": "전체 목록에도 도구 이름을 포함(기본 true)."},
+        "by": by,
+        "area": {"type": "string", "description": "by='area' 에서 특정 영역 키만(예: sim, cad, voc). 도구 설명까지 준다."},
+    }
+    if purposes:
+        props["purpose"] = {"type": "string", "description": "by='purpose' 에서 특정 목적 키만(예: drop-prep · report-write · design-risk-review). "
+                                                             "단계마다 도구 · 까닭 · 쓰기 · 확인과 입구 · 질의 예까지 준다."}
+    return types.Tool(
+        name="list_tool_apps",
+        description=(
+            "이 게이트웨이에 연결된 MCP 앱(도메인) 목록과 각 앱의 도구를 계층적으로 반환한다. "
+            "'무슨 앱/도구가 있냐', '어떤 기능이 되냐' 같은 질문에 전체 도구를 나열하는 대신 이걸 호출하라. "
+            "각 앱마다 accessible(내 권한으로 사용 가능한지)·reachable(백엔드 생존)·tool_count·tools 를 준다. "
+            "app 인자를 주면 그 앱의 도구만 상세(이름+설명)로 반환한다. "
+            "by='area' 면 앱 대신 **하는 일(영역)** 로 묶는다 — CAD·형상 제어, 메시·해석 모델 구성, 시뮬레이션 실행·잡, "
+            "해석 계산·예측, 해석 결과 분석, 물성·재료, VOC·시장 신호, 사내 지식 검색, 웹·논문 조사, 보고서·문서·발표, "
+            "전문가·심의·리스크, 데이터 등록·온톨로지, 시스템·공통. '시뮬레이션 관련 도구 뭐 있어' 같은 질문엔 이걸 쓴다."
+            + (" by='purpose' 면 **업무 목적** 으로 묶는다 — 낙하 해석 준비 · 낙하 결과 분석 · 보고서 쓰기 · 설계 리스크 심사 · 재료 물성 찾기 · VOC 분석처럼 "
+               "여러 앱을 가로지르는 일의 차례 · 입구 도구 · 사람에게 확인할 쓰기를 준다(purpose='<키>' 면 그 목적의 단계 전부). "
+               "'낙하 해석 하려면 뭐부터 해' 같은 질문엔 이걸 쓴다. 앱 줄의 entry 는 그 앱에서 처음 부를 도구다." if purposes else "")
+        ),
+        inputSchema={"type": "object", "properties": props},
+    )
+
+
+LIST_APPS_TOOL = _list_apps_tool(PURPOSE_LIST_ON)
 
 
 # ── REST 다리 ────────────────────────────────────────────────────────────────
@@ -5367,6 +5378,11 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
 
     if str((arguments or {}).get("by") or "").strip() == "area":
         return _list_by_area(by_app, groups, str((arguments or {}).get("area") or "").strip(), include=include)
+    if PURPOSE_LIST_ON and str((arguments or {}).get("by") or "").strip() == "purpose":
+        return _list_by_purpose(groups, str((arguments or {}).get("purpose") or "").strip(), include=include)
+    # 앱 입구(목적 표 apps.<키>.entry — GATEWAY_PURPOSE_LIST) — 앱 줄에 처음 부를 도구를 싣는다. 이 박스에 없거나 시야 밖이면 칸이 없다
+    p_idx = _purpose_index() if PURPOSE_LIST_ON else None
+    p_vis = {t.name for t in _visible_tools(groups)} if PURPOSE_LIST_ON else None
 
     apps = []
     denied = 0
@@ -5428,6 +5444,9 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             entry["muted"] = True
             entry["muted_note"] = ("사용자가 포털에서 꺼 둔 앱이다 — 사용자가 이 앱을 쓰라고 한 경우에만 부른다. "
                                    "계속 쓰려면 포털 '개인 토큰 › 허브에 보일 앱'(/tokens?tab=apps)에서 켜면 된다.")
+        _ent = _app_entry_name(key, p_idx, p_vis) if p_idx is not None and not local else None
+        if _ent:
+            entry["entry"], entry["entry_why"] = _ent
         if want_app:
             # 설명은 자르지 않는다 — search_tools 와 같은 계약 자리다(300자에서 자르면 tools/list 원문에 있는 함정·인자 규칙이
             # 이 길로만 사라졌다). 운영 창 1,048,576 토큰에서 한 앱의 도구 설명 전부는 묶이지 않는다.
@@ -5532,6 +5551,53 @@ def _list_by_area(by_app: dict, groups: list[str], want_area: str, include: bool
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
 
+
+
+def _list_by_purpose(groups: list[str], want: str, include: bool = True) -> types.CallToolResult:
+    """list_tool_apps(by='purpose') — 업무 목적으로 묶는다(목적 표 tool_purposes.json, HWAXPortal docs/mcp-modernize M3). 호출자 시야(권한 · 끈 앱 · 시험 사본)
+    밖의 단계는 빼고 수만 센다 — 못 쓰는 앱의 이름 · 도구를 말하지 않는다(L7). 단계가 하나도 안 보이는 목적은 없다. 목적을 고르면 단계마다 도구 · 까닭 ·
+    쓰기(게이트웨이 판정) · 확인(표)과 입구 · 질의 예 · prompt · skill 을 준다. include_tools=false 면 요약에 단계 이름을 싣지 않는다."""
+    vis = {t.name for t in _visible_tools(groups)}
+    idx = _purpose_index()
+    live = _purposes_for(vis, idx)
+    tool_of = {t.name: t for t in list(exposed_tools) + _local_tools()}
+    _adopt("list_purpose", want or "*")
+
+    def labels(p) -> list[str]:
+        return [_app_meta(a)["label"] for a in p["apps"] if a in backends and _backend_allowed(a, groups)]
+    rows = []
+    for p, lv in live:
+        if want and p["key"] != want:
+            continue
+        row = {"purpose": p["key"], "title": p["title"], "summary": p["summary"], "kind": p["kind"], "apps": labels(p),
+               "entry": lv["entry"]["name"], "step_count": len(lv["steps"])}
+        if want:
+            row["steps"] = [{"tool": st["name"], "why": st["why"],
+                             **({"write": True} if _purpose_write(st["name"], st["backend"], st["tool"], tool_of) else {}),
+                             **({"confirm": True} if st["confirm"] else {})} for st in lv["steps"]]
+            row["confirm_writes"] = [st["name"] for st in lv["steps"] if st["confirm"]]
+            row["samples"] = list(p["samples"])
+            if not lv["entry_live"]:
+                row["entry_note"] = "이 목적의 입구 도구가 이 박스 · 이 계정에 없어 살아 있는 첫 단계를 입구로 적었다"
+            if PURPOSE_PROMPTS_ON:
+                row["prompt"] = f"{PURPOSE_PROMPT_PREFIX}{p['key']}"
+            if PURPOSE_SKILLS_ON:
+                row["skill"] = f"{SKILL_URI_PREFIX}{p['key']}/{SKILL_FILE}"
+        elif include:
+            row["steps"] = [st["name"] for st in lv["steps"]]
+        if lv["missing"] or lv["hidden"]:
+            row["unavailable_steps"] = len(lv["missing"]) + lv["hidden"]       # 이 박스에 없거나 이 계정 시야 밖인 단계 수(이름은 싣지 않는다)
+        rows.append(row)
+    payload = {"purposes": rows, "purpose_count": len(rows),
+               "note": ("목적 = 여러 앱을 가로지르는 업무의 차례. 단계는 차례대로 부르되 이미 아는 것은 건너뛴다. write 는 게이트웨이가 쓰기로 판정한 도구, "
+                        "confirm 은 표가 '사람에게 무엇이 바뀌는지 보이고 확인받은 뒤 부른다' 고 적은 쓰기다. 목록에 없는 단계 도구도 invoke_tool 로 부른다. "
+                        "특정 목적의 단계 전부는 list_tool_apps(by='purpose', purpose='<키>')."),
+               "view": _view_info(groups)}
+    if want and not rows:
+        payload["error"] = (f"unknown purpose: {want} — 가능한 키: {', '.join(p['key'] for p, _lv in live)}" if want not in _purposes()["purposes"]
+                            else f"unavailable purpose: {want} — 이 박스 · 이 계정에는 그 목적의 단계가 하나도 없다")
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))])
 
 
 # ── 전문가 조직도 (클로드에서도 사람을 고르게 한다) ────────────────────────────────

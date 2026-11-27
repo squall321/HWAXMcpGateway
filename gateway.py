@@ -12938,7 +12938,75 @@ async def _list_resources():
     if _request_service() is not None:
         return []
     groups, muted, pnl = _request_groups(), _request_muted(), _request_panel()
-    return [r for k, r in _UI_RESOURCES.values() if _res_visible(k, groups, muted) and (pnl is None or k == pnl["app"])]
+    out = [r for k, r in _UI_RESOURCES.values() if _res_visible(k, groups, muted) and (pnl is None or k == pnl["app"])]
+    if PURPOSE_SKILLS_ON and pnl is None and _caller_bearer():
+        # 목적 skill(M3) — 사람 PAT 에만, ui 패널 뒤에. 짓다 실패하면 빼고 경고 한 줄(붙을 때 부르는 목록이라 터지면 연결이 오류로 보인다)
+        try:
+            out += _skill_resources(groups)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("resources/list — 목적 skill 을 짓지 못해 뺀다: %r", exc)
+    return out
+
+
+# ── 목적 skill 자원(HWAXPortal docs/mcp-modernize M3 — Skills over MCP 내보내기 준비) ─────────────────────────────────────────────────
+# Skills 확장(io.modelcontextprotocol/skills — skills/list · skills/get)은 SDK 2.x 뒤(M4)에 연다. 지금은 같은 글을 SDK 1.x 의 resources 로 낸다 — 확장이 권하는
+# 꼴(skill://<서버>/<skill>/SKILL.md · frontmatter name · description)이라 확장을 받는 클라이언트도 resources/read 로 같은 파일을 읽는다. 글은 목적 표에서
+# 이 박스 · 이 호출자의 노출 이름으로 짓는다(prompt 와 같은 차례 · 지킬 것). 사람 PAT 에만 보이고, 목록 · 읽기 모두 시야 밖 목적은 없는 주소와 같다.
+_SKILL_DESC_MAX = 1024                 # Agent Skills frontmatter description 의 상한
+
+
+def _skill_uri(key: str) -> str:
+    return f"{SKILL_URI_PREFIX}{key}/{SKILL_FILE}"
+
+
+def _purpose_skill_md(p: dict, lv: dict, tool_of: dict) -> str:
+    """목적 하나의 SKILL.md — frontmatter(name · description — JSON 문자열은 YAML 큰따옴표 스칼라다) + 언제 · 입구 · 차례 · 지킬 것."""
+    when = " · ".join(p["samples"][:3])
+    desc = _clip(f"{p['title']} — {p['summary']}" + (f" 이럴 때 쓴다: {when}" if when else ""), _SKILL_DESC_MAX)
+    lines = ["---", f"name: hwax-{p['key']}", f"description: {json.dumps(desc, ensure_ascii=False)}", "---", "",
+             f"# {p['title']}", "", p["summary"], "", "## 언제 쓰나", ""]
+    lines += [f"- {q}" for q in p["samples"]] or ["- (질의 예 없음)"]
+    lines += ["", f"질의 낱말 — {' · '.join(p['triggers'])}", "", "## 입구", "", f"`{lv['entry']['name']}` — {lv['entry']['why']}", "", "## 차례", ""]
+    for i, st in enumerate(lv["steps"], 1):
+        mark = (["쓰기"] if _purpose_write(st["name"], st["backend"], st["tool"], tool_of) else []) + (["확인 뒤"] if st["confirm"] else [])
+        lines.append(f"{i}. `{st['name']}` — {st['why']}" + (f" ({' · '.join(mark)})" if mark else ""))
+    confirm = [st["name"] for st in lv["steps"] if st["confirm"]]
+    lines += ["", "## 지킬 것", ""]
+    if confirm:
+        lines.append(f"- 확인할 쓰기({', '.join(f'`{n}`' for n in confirm)})는 부르기 전에 사용자에게 무엇이 바뀌는지 보이고 「예」 를 받는다.")
+    lines += ["- 이미 아는 것은 건너뛰고, 앞 단계 결과의 id 를 다음 단계 인자로 잇는다.",
+              "- 목록에 없는 도구는 HWAX 게이트웨이 `invoke_tool(name, arguments)` 로 부른다. 인자는 `search_tools(query=<도구 이름>, detail=true, limit=1)` 로 본다.",
+              "- 도구가 준 값 · id 만 근거로 적는다. 모르면 모른다고 적는다."]
+    if lv["missing"] or lv["hidden"]:
+        lines.append(f"- 이 박스 · 이 계정에서 쓸 수 없는 단계 {len(lv['missing']) + lv['hidden']}개는 뺐다.")
+    lines += ["", f"(HWAX 게이트웨이 목적 표 tool_purposes.json — {p['key']}. 같은 차례를 prompt `{PURPOSE_PROMPT_PREFIX}{p['key']}` 와 "
+              f"`list_tool_apps(by='purpose', purpose='{p['key']}')` 도 준다.)"]
+    return "\n".join(lines) + "\n"
+
+
+def _skill_resources(groups: list[str]) -> list[types.Resource]:
+    tool_of = {t.name: t for t in list(exposed_tools) + _local_tools()}
+    out = []
+    for p, lv in _purposes_for({t.name for t in _visible_tools(groups)}):
+        md = _purpose_skill_md(p, lv, tool_of)
+        out.append(types.Resource(uri=_skill_uri(p["key"]), name=f"hwax-{p['key']}", title=f"목적 skill — {p['title']}",
+                                  description=_clip(p["summary"], 300), mimeType="text/markdown", size=len(md.encode("utf-8"))))
+    return out
+
+
+async def _read_skill_resource(uri: str):
+    """resources/read skill://hwax/<목적 키>/SKILL.md — 사람 PAT · 그 호출자에게 단계가 보이는 목적만. 아니면 없는 주소와 같은 말(있다는 사실을 흘리지 않는다)."""
+    m = re.fullmatch(re.escape(SKILL_URI_PREFIX) + r"([a-z][a-z0-9-]{1,31})/" + re.escape(SKILL_FILE), uri)
+    hit = None
+    if m and _caller_bearer() and _request_panel() is None and _request_service() is None:
+        groups = _request_groups()
+        hit = next(((p, lv) for p, lv in _purposes_for({t.name for t in _visible_tools(groups)}) if p["key"] == m.group(1)), None)
+    if hit is None:
+        raise McpError(types.ErrorData(code=_RES_NOT_FOUND, message=f"Resource not found: {uri}"))
+    p, lv = hit
+    md = _purpose_skill_md(p, lv, {t.name: t for t in list(exposed_tools) + _local_tools()})
+    _adopt("resource", f"skill:{p['key']}")
+    return types.ServerResult(types.ReadResourceResult(contents=[types.TextResourceContents(uri=uri, mimeType="text/markdown", text=md)]))
 
 
 @_low.list_resource_templates()
@@ -12959,8 +13027,11 @@ def _res_bytes_of(res) -> int:
 
 
 async def _read_ui_resource(req: types.ReadResourceRequest):
-    """resources/read — 주소의 백엔드에서 그대로 받아 그대로 돌려준다(내용 · 결과의 `_meta` 를 고치지 않는다)."""
+    """resources/read — 주소의 백엔드에서 그대로 받아 그대로 돌려준다(내용 · 결과의 `_meta` 를 고치지 않는다). 목적 skill 주소(skill://hwax/…, M3)는
+    게이트웨이가 짓는다(_read_skill_resource)."""
     uri = str(req.params.uri)
+    if PURPOSE_SKILLS_ON and uri.startswith(SKILL_URI_PREFIX):
+        return await _read_skill_resource(uri)
     t0 = time.monotonic()
     hit = _UI_RESOURCES.get(uri)
     groups = _request_groups()

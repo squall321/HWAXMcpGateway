@@ -13990,7 +13990,8 @@ def test_SRC13_서비스_PAT_의_목록은_그_작업의_허용_도구뿐이고_
     assert asyncio.run(gw._list_tools(types.ListToolsRequest())) == [], "문을 지난 뒤 작업이 빠지면 아무것도 보이지 않는다"
     # 대조군 — 서비스가 아니면(사람 PAT) 같은 리소스 · 프롬프트가 보인다(위의 빈 답이 그 자리에 아무것도 없어서가 아니다)
     _set_request(monkeypatch, {gw.VIA_HEADER: "pat", "authorization": "Bearer person"}, "198.51.100.4")
-    assert [str(r.uri) for r in asyncio.run(gw._list_resources())] == ["ui://step_forge/panel"]
+    assert [str(r.uri) for r in asyncio.run(gw._list_resources()) if str(r.uri).startswith("ui://")] == ["ui://step_forge/panel"], \
+        "사람 PAT 에는 ui 패널이 보인다(목적 skill 자원 — M3 — 은 그 뒤에 붙는다)"
     assert _read("ui://step_forge/panel").root.contents
     asyncio.run(gw._list_prompts())
     assert asked, "사람 PAT 는 포털에 루틴 목록을 묻는다"
@@ -18219,3 +18220,51 @@ def test_M3_실제_목적_표의_프롬프트_글은_사람이_읽을_만큼_짧
               "entry": {"backend": p["entry"][0], "tool": p["entry"][1], "name": p["entry"][1],
                         "why": next(w for b, t, w in p["steps"] if (b, t) == p["entry"])}, "entry_live": True, "missing": [], "hidden": 0}
         assert len(gw._purpose_prompt_text(p, lv, "", {})) < 4000, p["key"]
+
+
+def test_M3_목적_skill_은_사람_PAT_의_자원_목록에_서고_읽으면_SKILL_md_를_준다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, groups=["g"], policy={"st": ["st-users"]}, ann={"run_job": {"readOnlyHint": False}})
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["g"])
+    monkeypatch.setattr(gw, "_UI_RESOURCES", {})
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
+    res = asyncio.run(gw._list_resources())
+    assert [(str(r.uri), r.name, r.mimeType) for r in res] == [("skill://hwax/drop-prep/SKILL.md", "hwax-drop-prep", "text/markdown"),
+                                                               ("skill://hwax/report-write/SKILL.md", "hwax-report-write", "text/markdown")]
+    out = _read("skill://hwax/drop-prep/SKILL.md")
+    c = out.root.contents[0]
+    assert (str(c.uri), c.mimeType) == ("skill://hwax/drop-prep/SKILL.md", "text/markdown") and res[0].size == len(c.text.encode())
+    head, fm, body = c.text.split("---\n", 2)
+    meta = {k: v for k, _sep, v in (ln.partition(": ") for ln in fm.strip().splitlines())}
+    assert head == "" and meta["name"] == "hwax-drop-prep" and json.loads(meta["description"]).startswith("낙하 해석 준비 — ")
+    assert "## 입구\n\n`heaxsf_list_projects` — 과제 특정" in body and "2. `run_job` — 잡 (쓰기 · 확인 뒤)" in body and "submit" not in body
+    for uri in ("skill://hwax/box-only/SKILL.md", "skill://hwax/nope/SKILL.md", "skill://hwax/drop-prep/other.md"):
+        with pytest.raises(gw.McpError) as ei:
+            _read(uri)
+        assert ei.value.error.code == -32002, uri
+    rows = gw._usage_rollup.adopt_query(gw.ADOPTION_PATH, "2000-01-01", "2999-12-31")
+    assert [(r["kind"], r["key"]) for r in rows] == [("resource", "skill:drop-prep")]
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    _set_request_headers(monkeypatch, {"authorization": "Bearer gw-secret"})
+    assert asyncio.run(gw._list_resources()) == [], "사람 PAT 가 아니면 skill 이 없다"
+    with pytest.raises(gw.McpError):
+        _read("skill://hwax/drop-prep/SKILL.md")
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
+    monkeypatch.setattr(gw, "PURPOSE_SKILLS_ON", False)
+    assert asyncio.run(gw._list_resources()) == [], "끄면 목록이 종전과 같다"
+    with pytest.raises(gw.McpError) as ei:
+        _read("skill://hwax/drop-prep/SKILL.md")
+    assert ei.value.error.message == "Resource not found: skill://hwax/drop-prep/SKILL.md", "끄면 종전처럼 모르는 주소"
+
+
+def test_M3_실제_목적_표의_SKILL_md_frontmatter_는_Agent_Skills_꼴이다():
+    d = gw._purposes_parse(json.loads(gw.TOOL_PURPOSES_PATH.read_text(encoding="utf-8")))
+    for p in d["purposes"].values():
+        lv = {"steps": [{"backend": b, "tool": t, "name": t, "why": w, "confirm": (b, t) in p["confirm"]} for b, t, w in p["steps"]],
+              "entry": {"backend": p["entry"][0], "tool": p["entry"][1], "name": p["entry"][1],
+                        "why": next(w for b, t, w in p["steps"] if (b, t) == p["entry"])}, "entry_live": True, "missing": [], "hidden": 0}
+        md = gw._purpose_skill_md(p, lv, {})
+        _h, fm, _b = md.split("---\n", 2)
+        meta = {k: v for k, _sep, v in (ln.partition(": ") for ln in fm.strip().splitlines())}
+        assert set(meta) == {"name", "description"} and gw.re.fullmatch(r"[a-z0-9-]{1,64}", meta["name"]), p["key"]
+        assert 0 < len(json.loads(meta["description"])) <= 1024, p["key"]

@@ -13073,6 +13073,9 @@ def _bearer_gate(app, pat_verifier=None):
                 _judged = {"write": sorted(_n for _n, _c in _cls.items() if _c[0] == "write"),
                            "routine_read": sorted(_n for _n, _c in _cls.items() if _c[0] == "read")}
                 _judged["panel_read"] = _judged["routine_read"]
+                # tools/list 사본에 게이트웨이가 readOnlyHint 를 실은 도구(앱은 표지를 안 적었다) — 품질 카드가 앱의 실제 표지 상태를 가리지 않게 뺀다
+                _gw_ann = sorted(_n for _n, _t in list(_tool_of.items()) + [(_k, _v) for _k, _v in _loc.items() if _map.get(_k) == "_gateway"]
+                                 if _exposed_ann(_t, *(route.get(_n) or ("_gateway", _n))[:2], _lists) is not None)
             else:
                 _judged = {
                     "write": sorted(_n for _n, (_bk, _orig) in route.items() if _tool_is_write(_tool_of.get(_n), _orig, _bk)),
@@ -13107,8 +13110,9 @@ def _bearer_gate(app, pat_verifier=None):
                 # 도구별 읽기 · 쓰기 부류와 근거(한 판정 — HWAXPortal docs/mcp-modernize MM-5) — {노출 이름: {class, source}}. class 는 read · write ·
                 # unknown, source 는 deny · app_annotation · override · confirmed_list · name_heuristic · none. 쓰는 쪽은 이것(또는 위 셋)을 읽고 제 정책을
                 # 얹는다. 끈 게이트웨이(GATEWAY_TOOL_CLASS_UNIFIED=0)에는 이 칸이 없다. 위 칸들은 그대로다.
-                **({"tool_class": {_n: {"class": _c[0], "source": _c[1]} for _n, _c in sorted(_cls_all.items())}}
-                   if TOOL_CLASS_UNIFIED else {}),
+                **({"tool_class": {_n: {"class": _c[0], "source": _c[1]} for _n, _c in sorted(_cls_all.items())},
+                    # 위 부류를 tools/list 사본의 readOnlyHint 로 실은 도구(앱이 표지를 안 적은 것만) — 품질 카드는 이것을 '앱 표지 없음' 으로 센다
+                    "gateway_annotated": _gw_ann} if TOOL_CLASS_UNIFIED else {}),
                 # 게이트웨이가 docstring 「Args:」 로 채운 인자 — {노출 이름: [인자 이름]}(대신 채우기 A — 임시). 품질 카드 · 점수판이 앱의 실제 상태를
                 # 가리지 않게 이것을 빼고 센다. 끈 게이트웨이(GATEWAY_ARG_DOC_FILL=0)에는 칸이 없다.
                 **({"gateway_filled": {_n: sorted(_v) for _n, _v in sorted(_GW_FILLED.items())}} if ARG_DOC_FILL is not False else {}),

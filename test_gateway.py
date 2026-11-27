@@ -6433,7 +6433,7 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     _aggregate_tools(monkeypatch, {"reportarchive": [leaky, _stool("ra_get", {"id": "보고서 id"})]})
     body = tools_map()
     assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read", "views",
-                          "panel_read", "orig"] + (["tool_class"] if gw.TOOL_CLASS_UNIFIED else []) + (
+                          "panel_read", "orig"] + (["tool_class", "gateway_annotated"] if gw.TOOL_CLASS_UNIFIED else []) + (
                           ["gateway_filled"] if gw.ARG_DOC_FILL is not False else []), \
         "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4) · 패널 확인용 읽기 목록(HA-20 B-2) · 원래 이름" \
         "(ontology-first F0)은 맨 뒤에 덧붙는다"
@@ -17368,9 +17368,13 @@ def test_한_판정은_tools_map_에_도구별_부류와_근거를_싣고_셋을
     assert set(body["write"]) == {n for n in back if tc[n]["class"] == "write"}
     assert set(body["routine_read"]) == set(body["panel_read"]) == {n for n in back if tc[n]["class"] == "read"}
     assert not set(body["write"]) & set(body["routine_read"]), "모순 0"
+    ga = set(body["gateway_annotated"])
+    assert {"listed", "boxed", "create_x", "kill", "search_tools"} <= ga, "앱이 readOnlyHint 를 안 적고 부류가 정해진 것"
+    assert not ga & {"d_ro", "ov", "w_hint", "r_hint", "declared_view", "get_x", "idem"}, "앱 표지가 있거나 모름이면 싣지 않는다"
     monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
     st, off = _gate_call(monkeypatch, "/tools-map")
-    assert "tool_class" not in off and "get_x" in off["routine_read"] and "get_x" not in off["panel_read"], "끄면 종전 칸 그대로"
+    assert "tool_class" not in off and "gateway_annotated" not in off, "끄면 종전 칸 그대로"
+    assert "get_x" in off["routine_read"] and "get_x" not in off["panel_read"]
 
 
 def _health_body(monkeypatch=None) -> dict:

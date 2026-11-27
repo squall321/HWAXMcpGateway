@@ -2079,6 +2079,23 @@ fm = FastMCP("hwax-mcp-gateway", instructions=_INSTRUCTIONS)
 fm.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 _low = fm._mcp_server
 
+# stateless(HWAXPortal docs/mcp-modernize MM-3 · MM-6 — 1단계, SDK 1.x 그대로) — 게이트웨이가 MCP 세션을 쥐지 않는다. 요청마다 새 전송 · 새 서버
+# 세션이 서고(SDK streamable_http_manager._handle_stateless_request) 응답에 mcp-session-id 를 싣지 않는다. 쥔 세션이 없으니 재기동해도 사람 쪽
+# 연결이 끊기지 않는다 — 세션 방식에서는 재기동 뒤 개인 Claude 의 다음 호출이 404 Session not found 였다. 옛 세션 머리를 실어 오는 클라이언트도
+# 받는다(stateless 전송은 그 머리를 보지 않는다 — streamable_http._validate_session). 요청에 묶인 알림(related_request_id 를 단 진행 · 로그)은
+# 그 POST 의 SSE 로 간다. 버리는 것 — 묶이지 않은 서버 발 알림(대기 GET 스트림 몫 — list_changed · FastMCP ctx.report_progress 는 SDK 1.28 에서
+# 묶지 않는다)과 서버 → 클라이언트 요청(sampling · elicitation — 답이 다른 요청 · 다른 서버 세션으로 온다). 게이트웨이는 서버 발 알림 · 요청을 하나도
+# 보내지 않고 백엔드의 진행 알림도 중계하지 않는다(progress_callback 없음).
+# 세션 번호에 기대던 것 — 근거 원장 열쇠(_request_session) · 재기동 막기(_bearer_gate 의 비우기)는 이 값을 보고 갈린다. 되돌리기 GATEWAY_STATELESS=0
+# (세션을 쥐는 종전 꼴 — 재기동 막기 · 근거 원장도 종전대로). 지금 값은 /health 의 stateless 와 기동 로그 한 줄에 보인다.
+STATELESS_HTTP = os.environ.get("GATEWAY_STATELESS", "1").strip() != "0"
+
+
+def _mcp_http_app():
+    """MCP 전송 앱(Starlette) — stateless 손잡이를 실은 뒤 짓는다. FastMCP 는 처음 부를 때 세션매니저를 한 번 짓고 그때의 설정을 쓴다."""
+    fm.settings.stateless_http = STATELESS_HTTP
+    return fm.streamable_http_app()
+
 
 def _parse_groups(raw: str | None) -> list[str]:
     """콤마 구분 헤더 → 그룹 리스트(공백·빈값 제거).
@@ -5156,7 +5173,10 @@ EVID_MAX_CHARS = int(os.environ.get("EVID_MAX_CHARS") or 1_048_576)
 
 
 def _request_session() -> str:
-    """현재 MCP 세션 id. 없으면 ''."""
+    """현재 MCP 세션 id. 없으면 ''. stateless(STATELESS_HTTP)면 늘 '' 이다 — 세션이 없다. 클라이언트가 옛 세션 머리를 실어 와도 SDK 는 보지 않으니
+    그 값은 검증되지 않은 글이다. 칸 이름으로 쓰면 같은 글을 고른 둘이 한 칸을 나눈다(_evid_key — 섞느니 안 쌓는다)."""
+    if STATELESS_HTTP:
+        return ""
     try:
         req = _low.request_context.request
     except LookupError:
@@ -5178,6 +5198,8 @@ def _evid_key() -> str:
     신원이 있으면 신원(한 사람의 근거는 세션을 넘어 이어져야 한다), 없으면 **세션**으로
     가른다. 둘 다 없으면 **빈 문자열** — 호출부가 기록도 조회도 안 한다.
     **섞느니 안 쌓는다.**
+    stateless(STATELESS_HTTP — 기본)에서는 세션이 없어(_request_session 이 늘 '') 신원 없는 호출은 빈 칸이다. 신원 없이 오는 것은 GW_TOKEN 분기의
+    사람 머리 없는 내부 호출 · 서비스 PAT(system:<작업>) · 이메일 없는 PAT 다 — verify_answer 를 쓰는 개인 Claude 는 PAT 의 이메일로 늘 신원이 있다.
     """
     u = _request_user()
     if u:
@@ -8975,7 +8997,8 @@ def _ix_drop(n: int) -> None:
 
 
 def _ix_client() -> str:
-    """이 세션의 initialize clientInfo — 'name/version'(판이 없으면 이름만), 모르면 ''."""
+    """이 세션의 initialize clientInfo — 'name/version'(판이 없으면 이름만), 모르면 ''. ⚠ stateless(STATELESS_HTTP)에서는 요청마다 새 서버 세션이라
+    initialize 가 아닌 호출의 세션은 clientInfo 를 모른다 — '' 다(HWAXPortal docs/mcp-modernize — 1단계의 알려진 손실)."""
     try:
         ci = getattr(getattr(getattr(_low.request_context, "session", None), "client_params", None), "clientInfo", None)
         name, ver = str(getattr(ci, "name", "") or "").strip(), str(getattr(ci, "version", "") or "").strip()
@@ -12382,6 +12405,42 @@ def _conn_platforms() -> dict[str, str]:
     return dict(sorted(out.items()))
 
 
+# 비우는 동안(stateless) initialize 인지 보려고 읽는 본문 상한 — initialize 는 수백 바이트다. 이보다 크면 initialize 가 아니라 보고 그대로 넘긴다.
+DRAIN_PEEK_MAX = 64 * 1024
+
+
+async def _drain_refuses(scope, receive):
+    """비우는 동안 온 stateless POST /mcp 가 새 연결(JSON-RPC initialize)인가 — (막을까, 앱에 넘길 receive).
+    2026 클라이언트의 Mcp-Method 머리가 있으면 그것만 본다(본문을 읽지 않는다). 없으면 본문을 DRAIN_PEEK_MAX 까지 읽어 method 를 본다 — 묶음
+    (배열)이면 하나라도 initialize 면 막는다. 다 못 읽었거나(상한을 넘었다) JSON 이 아니면 막지 않는다(그 판정은 SDK 가 한다). 읽은 메시지는 받은
+    차례 그대로 앱에 다시 넘기고, 그 뒤는 원래 receive 로 잇는다 — 앱은 본문을 처음 읽는 것과 같다."""
+    m = dict(scope.get("headers") or {}).get(b"mcp-method")
+    if m is not None:
+        return m.decode("latin-1").strip() == "initialize", receive
+    msgs, size = [], 0
+    while True:
+        msg = await receive()
+        msgs.append(msg)
+        if msg.get("type") != "http.request":
+            break                                   # 끊겼다(http.disconnect) — 앱에도 그대로 넘긴다
+        size += len(msg.get("body") or b"")
+        if not msg.get("more_body") or size > DRAIN_PEEK_MAX:
+            break
+    refuse = False
+    last = msgs[-1]
+    if last.get("type") == "http.request" and not last.get("more_body") and size <= DRAIN_PEEK_MAX:
+        try:
+            doc = json.loads(b"".join(x.get("body") or b"" for x in msgs))
+        except ValueError:
+            doc = None
+        refuse = any(isinstance(d, dict) and d.get("method") == "initialize" for d in (doc if isinstance(doc, list) else [doc]))
+    pending = list(msgs)
+
+    async def replay():
+        return pending.pop(0) if pending else await receive()
+    return refuse, replay
+
+
 def _bearer_gate(app, pat_verifier=None):
     """순수 ASGI 미들웨어: /mcp 인가. Bearer <GW_TOKEN>(내부 에이전트) 또는 포털 PAT(개인 Claude 등).
     PAT 로 들어오면 PAT 의 groups 를 x-hwax-groups 로 강제 주입해 그룹별 도구 필터가 적용된다."""
@@ -12391,9 +12450,17 @@ def _bearer_gate(app, pat_verifier=None):
         if scope["type"] != "http":
             await app(scope, receive, send)
             return
-        if (_DRAIN["on"] and scope.get("path") in ("/mcp", "/mcp/") and scope.get("method") == "POST"
-                and not dict(scope.get("headers") or {}).get(b"mcp-session-id")):
-            # 재기동 중 — 열린 연결로 오는 **새 세션**(세션 머리 없는 POST = initialize)은 받지 않는다. 열린 세션의 호출은 그대로 끝까지 간다(HG-11).
+        if _DRAIN["on"] and scope.get("path") in ("/mcp", "/mcp/") and scope.get("method") == "POST":
+            # 재기동 중 — 열린 연결로 오는 **새 연결(initialize)**은 받지 않는다. 진행 중 · 뒤이은 호출은 그대로 끝까지 간다(HG-11).
+            # 세션 방식은 세션 머리 없는 POST 가 곧 initialize 였다. stateless 는 모든 POST 에 세션 머리가 없어 그 셈이면 전부 503 이 된다 — 본문의
+            # JSON-RPC method 를 보고 initialize 만 막는다(_drain_refuses — 읽은 본문은 앱에 그대로 다시 넘긴다).
+            if STATELESS_HTTP:
+                _refuse, receive = await _drain_refuses(scope, receive)
+            else:
+                _refuse = not dict(scope.get("headers") or {}).get(b"mcp-session-id")
+        else:
+            _refuse = False
+        if _refuse:
             await send({"type": "http.response.start", "status": 503,
                         "headers": [(b"content-type", b"application/json"), (b"retry-after", b"1")]})
             await send({"type": "http.response.body", "body": json.dumps(
@@ -12440,6 +12507,8 @@ def _bearer_gate(app, pat_verifier=None):
                 # 상호작용 수집 창고(HWAXPortal docs/interaction-data contract §3) — 켰나 · 쌓인 바이트 · 조각 수 · 버린 줄 · 실패 · 가장 오래된 조각의 때(초).
                 # 포털 상태판 · update-all 이 '수집이 멈췄다(넘침 · 오래 묵음)' 를 이것으로 본다. 수만 싣는다
                 "interactions": _ix_health(),
+                # MCP 전송이 세션을 쥐나(GATEWAY_STATELESS — 기본 켬, HWAXPortal docs/mcp-modernize MM-6). 박스마다 지금 어느 꼴로 도는지 이것으로 본다
+                "stateless": STATELESS_HTTP,
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
@@ -12981,7 +13050,7 @@ def _limits_line() -> str:
 # uvicorn 기본은 열린 연결이 다 닫히기를 **한없이** 기다리고(MCP 의 대기 GET 스트림은 스스로 닫히지 않는다), 두 번째 신호가 오면 그 자리에서 전부
 # 끊는다. 순서를 바꾼다 —
 #   ① 리스너부터 닫는다 — start.sh restart 는 포트가 풀리기를 기다렸다가 새 프로세스를 띄운다(늦으면 kill -9 다).
-#   ② 열린 연결로 오는 새 세션은 503(게이트), 진행 중인 CallTool 이 0 이 될 때까지 GATEWAY_DRAIN_TIMEOUT 초까지 기다린다.
+#   ② 열린 연결로 오는 새 세션은 503(게이트 — stateless 면 JSON-RPC initialize 만), 진행 중인 CallTool 이 0 이 될 때까지 GATEWAY_DRAIN_TIMEOUT 초까지 기다린다.
 #   ③ 나머지(대기 스트림)는 GATEWAY_SHUTDOWN_TAIL 초 뒤 끊고 종전대로 내린다.
 DRAIN_TIMEOUT_S = float(os.environ.get("GATEWAY_DRAIN_TIMEOUT", "30"))
 SHUTDOWN_TAIL_S = float(os.environ.get("GATEWAY_SHUTDOWN_TAIL", "5"))
@@ -13007,7 +13076,7 @@ class _GracefulServer(uvicorn.Server):
 
 
 def main():
-    star = fm.streamable_http_app()
+    star = _mcp_http_app()
     # REST 프록시 라우트(/api/<site>/<path>) 를 MCP 마운트보다 먼저 매칭되게 삽입.
     if REST:
         from rest_proxy import RestProxy
@@ -13044,6 +13113,8 @@ def main():
                  else f"허용 목록 없음({SERVICE_TOOLS_LOCAL_PATH.name}) — 서비스 토큰은 문에서 403 이다")
     app = _bearer_gate(star, pat_verifier)
     log.info("starting hwax-mcp-gateway on %s:%d (path /mcp), %d backends", HOST, PORT, len(BACKENDS))
+    log.info("MCP 전송 — %s(GATEWAY_STATELESS)", "stateless(세션을 쥐지 않는다 · 비우는 동안 initialize 만 503)" if STATELESS_HTTP
+             else "세션 방식(mcp-session-id · 비우는 동안 세션 머리 없는 POST 는 503)")
     log.info("%s", _limits_line())
     log.info("%s", _fig_line())
     log.info("%s", _res_line())

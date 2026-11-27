@@ -11347,6 +11347,7 @@ def test_프롬프트_목록은_사람_PAT_로_루틴마다_하나이고_공유_
     단계 사슬, 인자는 루틴 변수다(필수 표시는 포털 목록의 required 를 따르고, 표시가 없는 옛 포털이면 필수로 적지 않는다 — 가져오기가 계획으로
     다시 본다). 보관한 루틴은 빠진다. 공유 비밀 · 익명은 사람이 아니라 포털에 묻지도 않고 빈 목록, 포털이 실패해도 빈 목록(경고 한 줄) —
     붙을 때 부르는 목록이라 터지면 연결이 오류로 보인다."""
+    monkeypatch.setattr(gw, "PURPOSE_PROMPTS_ON", False)      # 루틴 프롬프트만 본다 — 목적 프롬프트(M3)는 따로 시험한다(끄면 목록이 종전과 같다)
     seen, _ = _rt_kit(monkeypatch, extra={("GET", "/routines"): _RT_LIST})
     _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
     got = asyncio.run(gw._list_prompts())
@@ -11376,6 +11377,7 @@ def test_프롬프트_목록에서_권한_없음_403_은_정보로_남기고_다
     """분석 루틴 권한(feat:routines)이 없는 사람의 클라이언트도 붙을 때마다 prompts/list 를 부른다 — 포털의 403 은 정상 거절이라 경고로 두면
     로그가 그것으로 찬다. 403 만 정보(INFO)로 내리고 닿지 못함 · 5xx · 토큰 거절 같은 고장은 경고 그대로다. 포털 창구(_routine_portal)를
     진짜로 타서 포털의 HTTP 상태가 예외에 실려 오는지까지 본다(포털 AuthError 의 꼴 — JSON detail)."""
+    monkeypatch.setattr(gw, "PURPOSE_PROMPTS_ON", False)      # 루틴 프롬프트만 본다 — 목적 프롬프트(M3)는 따로 시험한다(끄면 목록이 종전과 같다)
     reply = {}
     real = httpx.AsyncClient
 
@@ -11459,6 +11461,7 @@ def test_진짜_클라이언트가_prompts_를_광고받고_목록과_가져오�
     """처리기를 바로 부르는 시험만으로는 등록(FastMCP 기본 처리기가 이기면 빈 목록) · 직렬화(title)가 빠져도 초록이다 — 메모리 전송으로
     진짜 ClientSession 을 붙여 initialize 의 capabilities 부터 본다. 메모리 전송에는 HTTP 요청이 없어 호출자 PAT 자리를 세운다."""
     from mcp.shared.memory import create_connected_server_and_client_session
+    monkeypatch.setattr(gw, "PURPOSE_PROMPTS_ON", False)      # 루틴 프롬프트만 본다 — 목적 프롬프트(M3)는 따로 시험한다(끄면 목록이 종전과 같다)
     _rt_kit(monkeypatch, extra={("GET", "/routines"): _RT_LIST, ("GET", "/routines/rt1/plan"): _RT_PROMPT_PLAN})
     monkeypatch.setattr(gw, "_caller_bearer", lambda: "Bearer pat-person")
 
@@ -18155,3 +18158,64 @@ def test_M3_목적_보기는_목록만_그_목적의_단계와_로컬_도구로_
     rows = gw._usage_rollup.adopt_query(gw.ADOPTION_PATH, "2000-01-01", "2999-12-31")
     assert sorted((r["kind"], r["key"]) for r in rows) == [("tools_list", "purpose"), ("view_purpose", "box-only"), ("view_purpose", "drop-prep"),
                                                            ("view_purpose", "nope")]
+
+
+def test_M3_목적_프롬프트는_사람_PAT_에만_목적마다_하나이고_포털이_죽어도_낸다(monkeypatch, tmp_path):
+    _rt_kit(monkeypatch, extra={("GET", "/routines"): _RT_LIST})
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, groups=["g"], policy={"st": ["st-users"]}, ann={"run_job": {"readOnlyHint": False}})
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["g"])
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
+    got = asyncio.run(gw._list_prompts())
+    assert [p.name for p in got] == ["routine-rt1", "purpose-drop-prep", "purpose-report-write"], "루틴 뒤에 목적 — 단계가 안 보이는 목적은 없다"
+    dp = got[1]
+    assert dp.title == "목적 — 낙하 해석 준비" and "heaxsf_list_projects → run_job → figure_list" in dp.description and "submit" not in dp.description
+    assert [(a.name, a.required) for a in dp.arguments] == [("task", False)]
+    async def down(method, path, **kw):
+        raise gw._RoutineError("포털에 닿지 못했다(ConnectError)")
+    monkeypatch.setattr(gw, "_routine_portal", down)
+    assert [p.name for p in asyncio.run(gw._list_prompts())] == ["purpose-drop-prep", "purpose-report-write"], "포털이 죽어도 목적 프롬프트는 낸다"
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    for headers in ({}, {"authorization": "Bearer gw-secret"}):
+        _set_request_headers(monkeypatch, headers)
+        assert asyncio.run(gw._list_prompts()) == [], "사람 PAT 가 아니면 빈 목록(종전 그대로)"
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
+    monkeypatch.setattr(gw, "PURPOSE_PROMPTS_ON", False)
+    assert asyncio.run(gw._list_prompts()) == [], "끄면 종전(포털이 죽으면 빈 목록)"
+
+
+def test_M3_목적_프롬프트_글은_입구_차례_확인할_쓰기를_이_박스의_노출_이름으로_말한다(monkeypatch, tmp_path):
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, groups=["g"], policy={"st": ["st-users"]}, ann={"run_job": {"readOnlyHint": False}})
+    monkeypatch.setattr(gw, "_request_groups", lambda: ["g"])
+    _set_request_headers(monkeypatch, {"authorization": "Bearer pat-person"})
+    res = asyncio.run(gw._get_prompt("purpose-drop-prep", {"task": "DV2 판으로\n전각도 «낙하» 준비"}))
+    text = res.messages[0].content.text
+    assert res.description == "업무 목적 — 낙하 해석 준비" and res.messages[0].role == "user"
+    assert "입구 — heaxsf_list_projects: 과제 특정" in text
+    assert "1. heaxsf_list_projects — 과제 특정" in text and "2. run_job — 잡 [쓰기 · 확인 뒤]" in text and "3. figure_list — 그림" in text
+    assert "확인할 쓰기(run_job)" in text and "쓸 수 없는 단계 2개는 뺐다" in text and "submit" not in text, "권한 없는 st 의 도구 이름은 말하지 않는다"
+    assert "«DV2 판으로 전각도 낙하 준비»" in text, "사람이 준 글은 한 줄 «…» 데이터"
+    for bad, msg in (("purpose-nope", "모르는 프롬프트"), ("purpose-box-only", "모르는 프롬프트")):
+        with pytest.raises(gw.McpError) as ei:
+            asyncio.run(gw._get_prompt(bad, {}))
+        assert msg in ei.value.error.message
+    with pytest.raises(gw.McpError) as ei:
+        asyncio.run(gw._get_prompt("purpose-drop-prep", {"x": "1"}))
+    assert "없는 입력: x" in ei.value.error.message
+    rows = gw._usage_rollup.adopt_query(gw.ADOPTION_PATH, "2000-01-01", "2999-12-31")
+    assert [(r["kind"], r["key"], r["n"]) for r in rows] == [("prompt", "purpose-drop-prep", 1)]
+    monkeypatch.setattr(gw, "PURPOSE_PROMPTS_ON", False)
+    with pytest.raises(gw.McpError) as ei:
+        asyncio.run(gw._get_prompt("purpose-drop-prep", {}))
+    assert ei.value.error.message == "모르는 프롬프트: purpose-drop-prep — 이 게이트웨이의 프롬프트는 routine-<루틴 id> 다", "끄면 종전 글"
+
+
+def test_M3_실제_목적_표의_프롬프트_글은_사람이_읽을_만큼_짧다():
+    """목적 프롬프트는 부를 때 한 번 싣는다 — 실제 표의 가장 긴 목적도 4,000자 안이다(단계가 스무 개인 보고서 쓰기 포함)."""
+    d = gw._purposes_parse(json.loads(gw.TOOL_PURPOSES_PATH.read_text(encoding="utf-8")))
+    for p in d["purposes"].values():
+        lv = {"steps": [{"backend": b, "tool": t, "name": t, "why": w, "confirm": (b, t) in p["confirm"]} for b, t, w in p["steps"]],
+              "entry": {"backend": p["entry"][0], "tool": p["entry"][1], "name": p["entry"][1],
+                        "why": next(w for b, t, w in p["steps"] if (b, t) == p["entry"])}, "entry_live": True, "missing": [], "hidden": 0}
+        assert len(gw._purpose_prompt_text(p, lv, "", {})) < 4000, p["key"]

@@ -4747,8 +4747,9 @@ def test_HG06_isError_와_예외는_종전대로고_구조화_본문만_있어�
     gw._audit("t", "b", True, None, 1, res=types.CallToolResult(
         content=[types.TextContent(type="text", text='{"error": "' + "x" * (gw._ENVELOPE_SCAN_MAX + 1) + '"}')]))
     rows = [json.loads(x) for x in f.read_text(encoding="utf-8").splitlines()]
+    # isError 줄은 봉투로 다시 판정하지 않는다(ok=false 그대로). 11-27 부터는 사유 칸이 비지 않는다 — 결과 글 앞부분을 가려 싣는다(mcp-modernize M0)
     assert [(r["ok"], r.get("error")) for r in rows] == [
-        (False, None), (False, "per-user: X"), (False, "envelope: 구조화만"), (True, None)], rows
+        (False, "isError: boom"), (False, "per-user: X"), (False, "envelope: 구조화만"), (True, None)], rows
 
 
 def test_HG06_판정이_포털_판정기와_같다():
@@ -9980,6 +9981,8 @@ def test_HG11_기다림에는_상한이_있다(monkeypatch):
 
 
 def test_HG11_비우는_동안_새_세션은_503_이고_열린_세션의_요청은_지나간다(monkeypatch):
+    # 세션 방식(GATEWAY_STATELESS=0)의 규칙 — 세션 머리 없는 POST 가 곧 새 세션이다. stateless 의 규칙(initialize 만)은 test_MM6_stateless_비우는_동안_… 이 본다
+    monkeypatch.setattr(gw, "STATELESS_HTTP", False)
     monkeypatch.setattr(gw, "_DRAIN", {"on": True})
     passed = []
 
@@ -13383,8 +13386,8 @@ def test_SP_0472_새_허브_도구의_쓰기_판정(original, write):
 
 def test_core_link_새_쓰기_낱말에_걸리는_읽기_둘은_읽기_목록이_지킨다(monkeypatch):
     """ste get_sync_settings 는 sync 가 쓰기 낱말이 되며 이름 꼴로 닫히고, DynaForge plan_task_links 는 조회 낱말이 없어 원래 닫혀 있었다 —
-    둘 다 쓰지 않는 조회라 읽기 목록(read_tools.json)에 넣었다(CK-5). 루틴 단계 · 읽기 전용 PAT 둘 다 연다. tools-map write 에는
-    get_sync_settings 가 남는다(이름 규칙은 읽기 목록을 보지 않는다 — AIDataHub get_record 와 같은 지금의 꼴)."""
+    둘 다 쓰지 않는 조회라 읽기 목록(read_tools.json)에 넣었다(CK-5). 루틴 단계 · 읽기 전용 PAT 둘 다 연다. 11-27 부터 쓰기 분류(검색 감점 ·
+    tools-map write)도 백엔드를 알면 읽기 목록을 이름 꼴보다 먼저 본다(HWAXPortal docs/mcp-modernize M2) — 백엔드를 모르면 이름 꼴 그대로다."""
     two = {"ste": "get_sync_settings", "heax-kooremapper_mcp": "plan_task_links"}
     assert {f"{bk}:{n}" for bk, n in two.items()} <= gw.READ_TOOLS, "추적 읽기 목록에 있다"
     _aggregate_tools(monkeypatch, {bk: [_tool(n)] for bk, n in two.items()})
@@ -13393,6 +13396,7 @@ def test_core_link_새_쓰기_낱말에_걸리는_읽기_둘은_읽기_목록이
         assert gw._routine_read(_tool(n), bk, n) is True, n
         assert gw._readonly_denial(n, {}) == "", n
     assert gw._tool_is_write(_tool("get_sync_settings"), "get_sync_settings") is True
+    assert gw._tool_is_write(_tool("get_sync_settings"), "get_sync_settings", "ste") is False, "백엔드를 알면 읽기 목록이 이름 꼴을 이긴다"
     assert gw._tool_is_write(_tool("plan_task_links"), "plan_task_links") is False, "links 는 link 낱말이 아니다"
     monkeypatch.setattr(gw, "READ_TOOLS", frozenset())
     assert gw._routine_read(_tool("get_sync_settings"), "ste", "get_sync_settings") is False, "읽기 목록이 없으면 이름 꼴(sync)로 닫힌다"
@@ -16923,3 +16927,288 @@ def test_상호작용_수집_health_와_기동_로그는_켬_끔을_말한다(mo
     assert _ix_health() == {"enabled": True, "spool_bytes": 8, "segments": 1, "dropped": 0, "errors": 0, "oldest_ts": 1700000000.5}
     line = gw._ix_log_line()
     assert line.startswith("상호작용 수집 켬") and str(gw.IX_DIR) in line and gw.IX_GET_PATH in line
+
+
+# ── stateless(HWAXPortal docs/mcp-modernize MM-6 — 1단계, SDK 1.x 그대로 stateless_http) ───────────────────────────────────────
+# 진짜 게이트웨이 앱(main 과 같은 _mcp_http_app → _bearer_gate)을 진짜 uvicorn 으로 빈 높은 포트에 띄우고 진짜 MCP 클라이언트 · 날 HTTP 로 본다
+# (가짜는 진짜 꼴로 — 전송 · 세션 판정은 SDK 가 한다). 떠 있는 9110 은 건드리지 않는다. 백엔드 lifespan 은 돌리지 않는다 — 로컬 도구로 본다.
+import contextlib as _sl_ctx  # noqa: E402
+import socket as _sl_socket  # noqa: E402
+
+_SL_HDR = {"Authorization": "Bearer gw-secret", "Accept": "application/json, text/event-stream", "Content-Type": "application/json",
+           "X-HWAX-User": "sl@corp.com"}
+_SL_INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "sl-test", "version": "1"}}}
+_SL_LIST = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+
+
+def _sl_call(text: str, rid: int = 3) -> dict:
+    return {"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": {"name": "verify_answer", "arguments": {"text": text}}}
+
+
+def _sl_rpc(r) -> dict:
+    """SSE 답의 마지막 data: 줄(JSON-RPC) — 없으면 본문 JSON."""
+    rows = [ln[5:].strip() for ln in r.text.splitlines() if ln.startswith("data:")]
+    return json.loads(rows[-1] if rows else r.text)
+
+
+@_sl_ctx.asynccontextmanager
+async def _sl_serve(monkeypatch, stateless: bool):
+    monkeypatch.setattr(gw, "STATELESS_HTTP", stateless)
+    monkeypatch.setattr(gw.fm, "_session_manager", None)                                  # FastMCP 는 세션매니저를 한 번 짓는다 — 시험마다 새로
+    monkeypatch.setattr(gw.fm.settings, "stateless_http", gw.fm.settings.stateless_http)  # _mcp_http_app 이 바꾼 값을 시험 뒤 되돌린다
+    monkeypatch.setattr(gw, "GW_TOKEN", "gw-secret")
+    monkeypatch.setattr(gw, "_EVID", gw.OrderedDict())
+    app = gw._bearer_gate(gw._mcp_http_app())
+    sock = _sl_socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    srv = gw.uvicorn.Server(gw.uvicorn.Config(app, log_level="warning", lifespan="on", timeout_graceful_shutdown=2))
+    task = asyncio.ensure_future(srv.serve(sockets=[sock]))
+    try:
+        for _ in range(250):
+            if srv.started:
+                break
+            await asyncio.sleep(0.02)
+        assert srv.started, "시험 서버가 뜨지 않았다"
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}/mcp"
+    finally:
+        srv.should_exit = True
+        await asyncio.wait_for(task, 15)
+        sock.close()
+
+
+def test_MM6_stateless_는_기본으로_켜지고_손잡이로_되돌린다():
+    import ast
+    src = open(gw.__file__, encoding="utf-8").read()
+    node = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Assign)
+                and any(getattr(t, "id", "") == "STATELESS_HTTP" for t in n.targets))
+    assert ast.get_source_segment(src, node).endswith('os.environ.get("GATEWAY_STATELESS", "1").strip() != "0"'), "기본 켬 · '0' 만 끔"
+    main = src[src.index("\ndef main():"):]
+    assert "star = _mcp_http_app()" in main and "fm.streamable_http_app()" not in main, "main 은 손잡이를 실은 뒤 앱을 짓는다"
+
+
+@pytest.mark.anyio
+async def test_MM6_stateless_는_initialize_뒤_세션_머리_없이_목록과_호출이_되고_옛_세션_머리도_받는다(monkeypatch):
+    async with _sl_serve(monkeypatch, True) as url:
+        async with httpx.AsyncClient(timeout=20) as cli:
+            r = await cli.post(url, headers=_SL_HDR, json=_SL_INIT)
+            assert r.status_code == 200 and "mcp-session-id" not in r.headers, (r.status_code, dict(r.headers))
+            assert _sl_rpc(r)["result"]["serverInfo"]["name"] == "hwax-mcp-gateway"
+            r = await cli.post(url, headers=_SL_HDR, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+            assert r.status_code == 202
+            r = await cli.post(url, headers=_SL_HDR, json=_SL_LIST)
+            assert r.status_code == 200 and "verify_answer" in {t["name"] for t in _sl_rpc(r)["result"]["tools"]}
+            r = await cli.post(url, headers=_SL_HDR, json=_sl_call("응력 48039.32 MPa"))
+            body = json.loads(_sl_rpc(r)["result"]["content"][0]["text"])
+            assert r.status_code == 200 and body["unsourced"] == ["48039.32"] and body["checked"] == 1, body
+            # 재기동 전에 받은 세션 머리를 그대로 실어 와도 된다 — stateless 전송은 머리를 보지 않는다(세션 방식이면 404 Session not found)
+            r = await cli.post(url, headers={**_SL_HDR, "mcp-session-id": "0123456789abcdef0123456789abcdef"}, json=_SL_LIST)
+            assert r.status_code == 200 and _sl_rpc(r)["result"]["tools"], r.text[:200]
+            # initialize 없이 곧바로 불러도 된다(어느 프로세스든 받는다)
+            r = await cli.post(url, headers=_SL_HDR, json=_sl_call("값 1250.5", 9))
+            assert r.status_code == 200 and json.loads(_sl_rpc(r)["result"]["content"][0]["text"])["checked"] == 1
+        # 진짜 MCP 클라이언트(웹 챗 에이전트 서버 · 심의가 쓰는 SDK 클라이언트)도 같다 — 세션 번호 없이 목록 · 호출
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+        async with streamablehttp_client(url, headers={k: v for k, v in _SL_HDR.items() if k in ("Authorization", "X-HWAX-User")}) as (rd, wr, sid):
+            async with ClientSession(rd, wr) as s:
+                await s.initialize()
+                assert "verify_answer" in {t.name for t in (await s.list_tools()).tools}
+                res = await s.call_tool("verify_answer", {"text": "두께 0.85 mm"})
+                assert not res.isError and json.loads(res.content[0].text)["unsourced"] == ["0.85"]
+                assert sid() is None, "stateless 는 세션 번호를 내지 않는다"
+
+
+@pytest.mark.anyio
+async def test_MM6_손잡이_0_이면_지금처럼_세션_머리를_내고_그_머리를_요구한다(monkeypatch):
+    async with _sl_serve(monkeypatch, False) as url:
+        async with httpx.AsyncClient(timeout=20) as cli:
+            r = await cli.post(url, headers=_SL_HDR, json=_SL_INIT)
+            sid = r.headers.get("mcp-session-id")
+            assert r.status_code == 200 and sid, dict(r.headers)
+            await cli.post(url, headers={**_SL_HDR, "mcp-session-id": sid}, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+            r = await cli.post(url, headers=_SL_HDR, json=_SL_LIST)
+            assert r.status_code == 400, "세션 방식은 세션 머리 없는 호출을 받지 않는다"
+            r = await cli.post(url, headers={**_SL_HDR, "mcp-session-id": "0123456789abcdef0123456789abcdef"}, json=_SL_LIST)
+            assert r.status_code == 404, "모르는 세션(재기동 전 번호)은 404 — stateless 가 없애는 끊김이다"
+            r = await cli.post(url, headers={**_SL_HDR, "mcp-session-id": sid}, json=_SL_LIST)
+            assert r.status_code == 200 and _sl_rpc(r)["result"]["tools"]
+            await cli.delete(url, headers={**_SL_HDR, "mcp-session-id": sid})
+
+
+@pytest.mark.anyio
+async def test_MM6_stateless_비우는_동안_initialize_만_503_이고_호출은_본문_그대로_지나간다(monkeypatch):
+    async with _sl_serve(monkeypatch, True) as url:
+        monkeypatch.setattr(gw, "_DRAIN", {"on": True})
+        async with httpx.AsyncClient(timeout=20) as cli:
+            r = await cli.post(url, headers=_SL_HDR, json=_SL_INIT)
+            assert r.status_code == 503 and r.headers.get("retry-after") == "1" and r.json()["error"] == "draining"
+            r = await cli.post(url, headers=_SL_HDR, json=[_SL_INIT])
+            assert r.status_code == 503, "묶음 안의 initialize 도 새 연결이다"
+            r = await cli.post(url, headers=_SL_HDR, json=_sl_call("응력 48039.32 MPa"))
+            assert r.status_code == 200 and json.loads(_sl_rpc(r)["result"]["content"][0]["text"])["unsourced"] == ["48039.32"]
+            # 상한(DRAIN_PEEK_MAX)보다 큰 본문은 여러 조각으로 온다 — 다 읽지 않고 넘기며, 읽은 조각과 나머지가 차례대로 앱에 닿는다
+            big = "1250.5 " + "가" * (gw.DRAIN_PEEK_MAX * 2)
+            r = await cli.post(url, headers=_SL_HDR, json=_sl_call(big, 4))
+            body = json.loads(_sl_rpc(r)["result"]["content"][0]["text"])
+            assert r.status_code == 200 and body["unsourced"] == ["1250.5"] and body["checked"] == 1, body
+            # 2026 클라이언트는 Mcp-Method 머리로 말한다 — 본문을 읽지 않고 그것을 본다
+            r = await cli.post(url, headers={**_SL_HDR, "Mcp-Method": "initialize"}, json=_sl_call("x", 5))
+            assert r.status_code == 503
+            r = await cli.post(url, headers={**_SL_HDR, "Mcp-Method": "tools/call"}, json=_sl_call("값 0.85", 6))
+            assert r.status_code == 200 and json.loads(_sl_rpc(r)["result"]["content"][0]["text"])["checked"] == 1
+        monkeypatch.setattr(gw, "_DRAIN", {"on": False})
+        async with httpx.AsyncClient(timeout=20) as cli:
+            assert (await cli.post(url, headers=_SL_HDR, json=_SL_INIT)).status_code == 200, "비우기가 끝나면(새 프로세스) 다시 받는다"
+
+
+def test_MM6_비우기_판정은_본문을_잃지_않고_JSON_이_아니면_막지_않는다():
+    def run(chunks, headers=()):
+        sent = list(chunks)
+
+        async def recv():
+            return sent.pop(0) if sent else {"type": "http.disconnect"}
+
+        async def go():
+            refuse, rcv = await gw._drain_refuses({"headers": list(headers)}, recv)
+            got = []
+            while True:
+                m = await rcv()
+                got.append(m)
+                if m.get("type") != "http.request" or not m.get("more_body"):
+                    return refuse, got
+        return asyncio.run(go())
+    init = json.dumps(_SL_INIT).encode()
+    parts = [{"type": "http.request", "body": init[:10], "more_body": True}, {"type": "http.request", "body": init[10:], "more_body": False}]
+    refuse, got = run(parts)
+    assert refuse and got == parts, "조각으로 와도 initialize 다 — 앱은 같은 조각을 같은 차례로 받는다"
+    for body in (b"{not json", b"", json.dumps(_sl_call("x")).encode(), b"\xff\xfe"):
+        msgs = [{"type": "http.request", "body": body, "more_body": False}]
+        assert run(msgs) == (False, msgs), body
+    gone = [{"type": "http.disconnect"}]
+    assert run(gone) == (False, gone), "끊긴 요청도 앱에 그대로 넘긴다"
+    assert run([], headers=[(b"mcp-method", b"initialize")])[0] is True
+
+
+def test_MM6_health_에_stateless_가_실린다(monkeypatch):
+    for on in (True, False):
+        monkeypatch.setattr(gw, "STATELESS_HTTP", on)
+        sent = []
+
+        async def send(m):
+            sent.append(m)
+        asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/health", "headers": []}, None, send))
+        assert json.loads(sent[1]["body"])["stateless"] is on
+
+
+def test_MM6_stateless_에서_근거_원장은_신원으로만_가르고_세션_머리는_칸이_되지_않는다(monkeypatch):
+    """세션 방식의 신원 없는 몫(세션으로 가르기)은 stateless 에서 빈 칸이다 — 클라이언트가 실어 온 세션 머리는 SDK 가 검증하지 않은 글이라
+    같은 글을 고른 둘이 한 칸을 나누게 된다(섞느니 안 쌓는다). 신원이 있으면 지금처럼 신원이다."""
+    monkeypatch.setattr(gw, "_EVID", gw.OrderedDict())
+    _set_request_headers(monkeypatch, {"mcp-session-id": "S1"})
+    monkeypatch.setattr(gw, "STATELESS_HTTP", True)
+    assert gw._request_session() == "" and gw._evid_key() == ""
+    gw._evid_keep("t", types.CallToolResult(content=[types.TextContent(type="text", text='{"v": 48039.32}')]))
+    assert len(gw._EVID) == 0, "칸을 못 정하면 쌓지 않는다"
+    body = json.loads(asyncio.run(gw._verify_answer({"text": "48039.32"})).content[0].text)
+    assert body["reason"] == "no_evidence_scope" and body["ok"] is False
+    _set_request_headers(monkeypatch, {"mcp-session-id": "S1", gw.USER_HEADER: "a%40corp.com"})
+    assert gw._evid_key() == "u:a@corp.com", "신원이 있으면 지금처럼 신원"
+    _set_request_headers(monkeypatch, {"mcp-session-id": "S1"})
+    monkeypatch.setattr(gw, "STATELESS_HTTP", False)
+    assert gw._request_session() == "S1" and gw._evid_key() == "s:S1", "손잡이 0(세션 방식)은 지금처럼 세션으로 가른다"
+
+
+# ── 쓰기 분류가 확인된 읽기 목록을 이름 꼴보다 먼저 본다(HWAXPortal docs/mcp-modernize M2 게이트웨이 일괄 — 조사 오판 넷) ─────────────────────
+def test_쓰기_분류는_확인된_읽기_목록을_이름_꼴보다_먼저_보고_앱_표지와_닫기_목록은_그대로_이긴다(monkeypatch, _fresh_scores, tmp_path):
+    """AIDataHub get_record · get_record_sections · describe_record_schema 와 ste get_sync_settings 는 추적 읽기 목록(read_tools.json)에 있는데
+    record · sync 낱말로 쓰기가 되어 search_tools 에서 0.5배 감점되고 /tools-map write 에 들었다. 목록에 있는 것만 풀고, 앱 표지(readOnlyHint=False ·
+    destructiveHint)와 닫기 목록(deny)은 그대로 이긴다. 박스 덧씌우기(read_tools.local.json)의 tools 도 같은 확인된 목록이다."""
+    ann = types.ToolAnnotations
+
+    def t(name, desc="레코드 조회 도구", **a):
+        return types.Tool(name=name, description=desc, inputSchema={"type": "object"}, **({"annotations": ann(**a)} if a else {}))
+    four = {"ai-data-hub": ["get_record", "get_record_sections", "describe_record_schema"], "ste": ["get_sync_settings"]}
+    assert {f"{bk}:{n}" for bk, ns in four.items() for n in ns} <= gw.READ_TOOLS, "추적 읽기 목록에 있다(조사의 넷)"
+    _aggregate_tools(monkeypatch, {"ai-data-hub": [t("get_record"), t("get_record_sections"), t("describe_record_schema"),
+                                                   t("update_record"), t("record_ingest")],
+                                   "ste": [t("get_sync_settings", "동기화 설정 조회")]})
+    for bk, ns in four.items():
+        for n in ns:
+            assert gw._tool_is_write(t(n), n, bk) is False, n
+            assert gw._tool_is_write(t(n), n) is True, ("백엔드를 모르면 이름 꼴 그대로", n)
+    assert gw._tool_is_write(t("update_record"), "update_record", "ai-data-hub") is True, "목록 밖은 이름 꼴 그대로"
+    assert gw._tool_is_write(t("get_record", readOnlyHint=False), "get_record", "ai-data-hub") is True, "앱 표지가 목록보다 먼저다"
+    assert gw._tool_is_write(t("get_record", destructiveHint=True), "get_record", "ai-data-hub") is True
+    st, body = _gate_call(monkeypatch, "/tools-map")
+    assert st == 200 and body["write"] == ["record_ingest", "update_record"], body["write"]
+    _no_embed(monkeypatch)
+    res = json.loads(asyncio.run(gw._search_tools({"query": "record", "limit": 10})).content[0].text)
+    flag = {m["tool"]: bool(m.get("write")) for m in res["matches"]}
+    assert flag["get_record"] is False and flag["get_record_sections"] is False and flag["describe_record_schema"] is False, flag
+    assert flag["update_record"] is True, "목록 밖 쓰기는 그대로 쓰기 표시 · 감점"
+    assert res["ranked"].index("get_record") < res["ranked"].index("update_record"), res["ranked"]
+    # 박스 덧씌우기 — tools 는 더하고 deny 는 뺀다(루틴 단계 · 읽기 전용 PAT 과 같은 목록)
+    local = tmp_path / "read_tools.local.json"
+    monkeypatch.setattr(gw, "READ_TOOLS_LOCAL_PATH", local)
+    local.write_text(json.dumps({"tools": ["ai-data-hub:update_record"], "deny": ["ai-data-hub:get_record"]}), encoding="utf-8")
+    assert gw._tool_is_write(t("update_record"), "update_record", "ai-data-hub") is False
+    assert gw._tool_is_write(t("get_record"), "get_record", "ai-data-hub") is True, "닫기 목록에 있으면 확인된 읽기가 아니다"
+
+
+# ── 감사 원장에 isError 의 사유(HWAXPortal docs/mcp-modernize M0 — 60일 실패 129 중 97이 사유 없이 error 가 비었다) ───────────────────────
+_IE_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJrb28ifQ.c2lnbmF0dXJlLXNpZ25hdHVyZQ"
+
+
+def test_isError_결과의_사유가_가린_앞_200자로_감사에_남는다(tmp_path, monkeypatch):
+    f = tmp_path / "a.jsonl"
+    monkeypatch.setattr(gw, "AUDIT_PATH", str(f))
+    monkeypatch.setattr(gw, "PII_MASK_ON", False)          # 결과 가림 손잡이를 꺼도 원장은 가린다(무기한 보존)
+
+    def err(text=None, **kw):
+        res = types.CallToolResult(content=[types.TextContent(type="text", text=text)] if text is not None else [], isError=True, **kw)
+        gw._audit("t", "b", False, None, 1, res=res)
+        return json.loads(f.read_text(encoding="utf-8").splitlines()[-1])["error"]
+    e = err("forbidden: hong.gildong@corp.example 의 토큰 Bearer sk-abcdef0123456789 거절 · host 10.1.2.3 · " + _IE_JWT)
+    assert e.startswith("isError: forbidden:"), e
+    assert "@" not in e and "sk-abcdef" not in e and "10.1.2.3" not in e and _IE_JWT[:20] not in e, e
+    assert "[가림:메일]" in e and "<가림:bearer>" in e and "[가림:IP]" in e and "<가림:jwt>" in e, e
+    long = err("가" * 5000)
+    assert long == "isError: " + "가" * 200 + "…(원문 5000자)", long
+    # 가린 다음에 자른다 — 200자 경계에 걸친 토큰도 반쪽이 남지 않는다
+    edge = err("x" * 185 + " " + _IE_JWT + " 뒤")
+    assert "eyJ" not in edge and "<가림:jwt>" in edge, edge
+    assert err('{"detail": "실패", "api_key": "k-123456789", "owner": "홍길동"}') == \
+        'isError: {"detail": "실패", "api_key": "<가림:api_key>", "owner": "[가림:이름]"}', "JSON 의 비밀 칸 · 사람 칸도 가린다"
+    assert err("줄1\n\n   줄2\t끝") == "isError: 줄1 줄2 끝", "공백은 접는다(앞 200자에 사유를 더 담는다)"
+    assert err() == "isError: (결과 글 없음)"
+    assert err(structuredContent={"reason": "판 두께가 0"}) == 'isError: {"reason": "판 두께가 0"}'
+    gw._audit("t", "b", False, "refused: no-identity", 1, res=types.CallToolResult(content=[types.TextContent(type="text", text="x")], isError=True))
+    assert json.loads(f.read_text(encoding="utf-8").splitlines()[-1])["error"] == "refused: no-identity", "호출부가 준 사유가 먼저다"
+
+
+def test_isError_사유는_소비처가_게이트웨이_막음으로_세지_않는다(tmp_path, monkeypatch):
+    """앱의 오류 글이 'forbidden …' · 'unauthorized …' 로 시작해도 머리 'isError: ' 가 있어 이용 통계(usage_rollup)와 플랫폼 피드백 보고서가 앱 쪽
+    실패로 센다 — 종전에 사유 없이 비었을 때와 같은 갈래다. 키 이름(error)은 그대로다."""
+    import usage_rollup
+    import platform_feedback_report as pfr
+    f = tmp_path / "a.jsonl"
+    monkeypatch.setattr(gw, "AUDIT_PATH", str(f))
+    for txt in ("forbidden: 권한 없음", "unauthorized — 토큰 만료", "unknown tool x", "refused: 앱이 거절"):
+        gw._audit("t", "b", False, None, 1, res=types.CallToolResult(content=[types.TextContent(type="text", text=txt)], isError=True))
+        row = json.loads(f.read_text(encoding="utf-8").splitlines()[-1])
+        assert usage_rollup._outcome(row) == "app" and not row["error"].startswith(pfr._GATE_SIDE), row
+        assert pfr._reason(row["error"]).startswith("isError:"), pfr._reason(row["error"])
+
+
+def test_isError_사유는_실제_호출_길에서도_남는다(monkeypatch):
+    b = _result_kit(monkeypatch, "")
+
+    async def _bad(original, args, read_timeout_seconds=None):
+        return types.CallToolResult(content=[types.TextContent(type="text", text="Error executing tool get_big: 연결 거부 a.b@corp.example")],
+                                    isError=True)
+    b.session.call_tool = _bad
+    res = asyncio.run(gw._call_tool("get_big", {}))
+    assert res.isError
+    row = [r for r in _audit_rows() if r["tool"] == "get_big"][-1]
+    assert row["ok"] is False and row["error"] == "isError: Error executing tool get_big: 연결 거부 [가림:메일]", row

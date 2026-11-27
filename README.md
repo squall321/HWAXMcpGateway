@@ -747,3 +747,19 @@ HWAXPortal `infra/services.yaml`에 `mcp-gateway`(tier 16)로 등록되어 오�
 # 게이트웨이 경유 도구 수 = 46 (RA 13 + SF 16 + MX 17), 무토큰/오토큰 401
 curl -s http://127.0.0.1:9009/health | python3 -c "import sys,json;print(len(json.load(sys.stdin)['tools']))"
 ```
+
+## MCP 현대화 M2 — 계약 정밀화(HWAXPortal docs/mcp-modernize M2 · MM-5)
+
+게이트웨이 한 곳에서 도구 계약을 다듬는다. 손잡이는 다섯이고 모두 띄운 셸의 환경이 먼저, 없으면 곁의 `provision.env` 줄을 읽는다(결과 손잡이와 같은
+규칙 — 바꾸면 게이트웨이를 다시 띄운다). 값은 `/health` 의 `contract` 에 보인다. 끄면 tools/list · `/tools-map` · 결과가 종전과 바이트까지 같다.
+
+| 손잡이 | 기본 | 뜻 |
+|---|---|---|
+| `GATEWAY_TOOL_CLASS_UNIFIED` | 켬 | 읽기 · 쓰기 한 판정(`_tool_class`) — 부류 read · write · unknown 과 근거(deny · app_annotation · override · confirmed_list · name_heuristic · none). 차례는 닫기 목록 → 앱 destructiveHint → override → 앱 readOnlyHint → 확인된 읽기 목록(read_tools.json ∪ 박스 덧씌우기 ∪ 선언 read_tools · 게이트웨이 자체 조회) → 이름의 쓰기 동사 → 모름. **이름은 읽기로 열지 않는다** — 루틴 단계 · 위임 · 상태 기다림 · 패널 · 읽기 전용 PAT 이 모두 이 부류의 read 만 연다. 검색 쓰기 감점 · `/tools-map` write 는 write. tools/list 사본에 부류를 싣는다(앱이 readOnlyHint 를 적었으면 앱 값 그대로 · read → `readOnlyHint: true` · write → `false` · 모름은 싣지 않는다). `/tools-map` 에 `tool_class`(도구별 class · source) · `gateway_annotated`(게이트웨이가 표지를 실은 도구) |
+| `GATEWAY_RESULT_DEDUP` | `1` | 구조 결과 두 벌 정리 — `1` 은 글 블록이 structuredContent 와 같은 JSON 이면 그 글을 촘촘한 JSON 으로(구조 · 출력 스키마 그대로), `drop` 은 빈 껍데기 출력 스키마(필드 이름 없는 FastMCP 자동 꼴)를 tools/list 에서 떼고 결과의 구조도 뗀다(글만), `0` 은 끔. 실패 · 다른 결과 · 패널 PAT · 패널 도구 · 게이트웨이 안쪽 호출은 원문. ⚠ `drop` 은 켜기 전에 받은 목록(출력 스키마 있음)을 쥔 Claude Code 세션이 구조 없는 결과를 거절한다 — 세션이 바뀌는 때(라운드)에 켠다 |
+| `GATEWAY_DESC_CLEANDOC` | 켬 | 노출 설명을 `inspect.cleandoc` 꼴로(앱 docstring 의 공통 들여쓰기 · 앞뒤 빈 줄 — 상대 들여쓰기는 그대로). 앱 원문은 그대로 |
+| `GATEWAY_ARG_DOC_FILL` | `1` | docstring 인자 설명 대신 채우기(임시) — 인자 설명이 비었고 도구 설명의 `Args:` · `Arguments:` · `Parameters:` · `인자:` 절 항목이 그 이름과 정확히 맞을 때만 노출 사본의 인자 설명을 채운다. 점수판 · 품질 카드는 채운 것을 앱의 설명으로 세지 않는다(`gateway_filled`). `0` 은 끔, 백엔드 키 쉼표 목록이면 그 앱만. 앱이 `Field(description=)` 로 옮기면 채울 것이 없어진다 |
+| `GATEWAY_ARG_SCORE_NESTED` | 켬 | 점수판(`/tools-map` arg_scores)에 `nested`(객체 · 배열 항목 · $defs 안의 인자 · 설명 · 자유형 객체) 칸, 지도가 tools/list 의 로컬 도구 전부(REST 다리 포함)를 싣는다. 도구 수 셋의 뜻은 `/health` 의 `contract.tool_counts` |
+
+검색(search_tools)의 작은 고침은 `search_tuning.json` 이다 — 쓰기 의도 낱말 '작성' · '쓰기', `switches.space_fold`(4자 이상 낱말을 빈칸 뺀 설명에서도
+센다 — 박스 덧씌우기로 끈다), 손 동의어 '지식카드'. 평가는 `tool_search_eval/README.md` 의 11-27 절.

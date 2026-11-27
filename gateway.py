@@ -80,6 +80,36 @@ for _noisy in ("httpx", "httpcore"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("hwax-mcp-gateway")
 
+
+def _provision_env_value(key: str, path: Path | None = None) -> str:
+    """게이트웨이 곁 provision.env(박스 파일 · gitignore)의 마지막 활성 줄 값 — 없거나 못 읽으면 ''. 이 리포의 start.sh 는 그 파일을 프로세스 환경으로
+    싣지 않아(provision-config.sh 가 설정 파일을 지을 때만 읽는다) 박스 스위치를 거기 적어도 먹지 않았다. 포털 update-all 이 같은 파일 · 같은 키를 읽어
+    「안 켠 것」 을 알리고, 그 파일이 바뀌면 게이트웨이를 다시 띄운다(지문 목록 identity). 줄 읽기는 포털 _envfile_value 와 같은 규칙 — `export ` 머리 ·
+    줄 끝 `#` 주석 · 따옴표를 뗀다."""
+    p = path or Path(__file__).with_name("provision.env")
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    val = ""
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("export "):
+            s = s[len("export "):].lstrip()
+        if not s.startswith(f"{key}="):
+            continue
+        v = s[len(key) + 1:]
+        v = re.sub(r"\s+#.*$", "", v).strip().strip("\"'")
+        val = v
+    return val
+
+
+def _env_knob(name: str, default: str) -> str:
+    """박스 손잡이 값 — 띄운 셸의 환경(비어 있지 않으면)이 먼저, 없으면 곁의 provision.env 줄(_provision_env_value — start.sh 는 그 파일을 환경으로
+    싣지 않는다), 그것도 없으면 기본값. 결과 손잡이(GATEWAY_RESULT_REFS)와 같은 규칙이다(HWAXPortal docs/mcp-modernize M2 의 손잡이들이 쓴다)."""
+    return os.environ.get(name, "").strip() or _provision_env_value(name) or default
+
+
 CONFIG_PATH = os.environ.get("GATEWAY_CONFIG", str(Path(__file__).with_name("gateway_config.json")))
 
 
@@ -1364,7 +1394,7 @@ def _arg_counts(tool: types.Tool) -> tuple[int, int, int]:
 # 객체 · 배열 항목 · $defs 안의 필드는 아예 안 보인다. 맨 위 수는 그대로 두고 nested 칸을 더한다 — 맨 위 아래(객체 속성 · 배열 항목의 속성 · anyOf
 # 갈래 · $ref 가 가리키는 $defs)의 인자 수 · 설명 있는 수, 그리고 맨 위를 포함한 자유형 객체(type object 인데 properties 없음) 수. 깊이 4 까지.
 # 끄기 GATEWAY_ARG_SCORE_NESTED=0 — 점수판 · /tools-map 이 종전과 같다(도구 수 칸도 — 아래 _toolmap_locals).
-ARG_SCORE_NESTED = os.environ.get("GATEWAY_ARG_SCORE_NESTED", "1").strip() != "0"
+ARG_SCORE_NESTED = _env_knob("GATEWAY_ARG_SCORE_NESTED", "1") != "0"
 
 
 def _schema_ref(node, root: dict):
@@ -1504,7 +1534,7 @@ def _arg_score_refresh() -> None:
 # 13,120 · RA 3,891). 노출 사본(exposed_tools)의 설명을 inspect.cleandoc 꼴로 걷는다 — 첫 줄 앞 공백 · 둘째 줄부터의 **공통** 들여쓰기 · 앞뒤 빈 줄만
 # 뗀다(상대 들여쓰기 — 목록 · 코드 블록 — 는 그대로). 낱말은 그대로라 검색 점수는 바뀌지 않는다(빈칸이 든 손 동의어가 줄머리 공백에 걸치지 않는 한 —
 # 평가셋으로 잰다). 앱 원문은 앱에 그대로다. 끄기 GATEWAY_DESC_CLEANDOC=0(설명이 앱 글 그대로). 값 · 걷은 글자 수는 /health 의 contract.desc_cleandoc.
-DESC_CLEANDOC = os.environ.get("GATEWAY_DESC_CLEANDOC", "1").strip() != "0"
+DESC_CLEANDOC = _env_knob("GATEWAY_DESC_CLEANDOC", "1") != "0"
 _DESC_CLEAN_STAT = {"tools": 0, "saved_chars": 0}          # 마지막 재집계에서 걷은 도구 수 · 글자 수
 
 
@@ -1528,7 +1558,7 @@ def _desc_clean(desc):
 # 글이 비면, 돌려주는 칸(Returns · Raises · 반환 … 절은 들여쓰기가 절 머리와 같아 절이 끝난다). 맨 위 인자만 본다. enum 은 넣지 않는다(MM-3).
 # 점수판은 앱의 실제 상태를 가리지 않는다 — 채운 인자는 '설명 있음' 에 세지 않고 gateway_filled 로 따로 센다(_GW_FILLED).
 # 손잡이 GATEWAY_ARG_DOC_FILL — 1(기본, 모든 앱) · 0(끔 — 스키마가 앱 그대로) · 백엔드 키 쉼표 목록(그 앱만). 값 · 채운 수는 /health 의 contract.arg_doc_fill.
-_ARG_FILL_RAW = os.environ.get("GATEWAY_ARG_DOC_FILL", "1").strip()
+_ARG_FILL_RAW = _env_knob("GATEWAY_ARG_DOC_FILL", "1")
 ARG_DOC_FILL: frozenset | bool = (False if _ARG_FILL_RAW in ("0", "") else True if _ARG_FILL_RAW == "1"
                                   else frozenset(x.strip() for x in _ARG_FILL_RAW.split(",") if x.strip()))
 _GW_FILLED: dict[str, frozenset] = {}                     # 노출 이름 → 게이트웨이가 채운 맨 위 인자 이름(마지막 재집계)
@@ -2328,7 +2358,7 @@ _low = fm._mcp_server
 # (세션을 쥐는 종전 꼴 — 재기동 막기 · 근거 원장도 종전대로). 지금 값은 /health 의 stateless 와 기동 로그 한 줄에 보인다.
 STATELESS_HTTP = os.environ.get("GATEWAY_STATELESS", "1").strip() != "0"
 # 읽기 · 쓰기 한 판정(HWAXPortal docs/mcp-modernize M2 · MM-5 — 설명은 _tool_class 머리말). 끄기 GATEWAY_TOOL_CLASS_UNIFIED=0.
-TOOL_CLASS_UNIFIED = os.environ.get("GATEWAY_TOOL_CLASS_UNIFIED", "1").strip() != "0"
+TOOL_CLASS_UNIFIED = _env_knob("GATEWAY_TOOL_CLASS_UNIFIED", "1") != "0"
 
 
 def _mcp_http_app():
@@ -8448,27 +8478,7 @@ async def _fig_download(scope, send, pat_verifier, gw_auth: str) -> None:
 #    GATEWAY_RESULT_REF_TTL_DAYS(7일) · 사람당 · 전체 상한(넘으면 오래된 것부터), 청소는 주기마다 디스크에서 다시 짓는다. 비밀이 원문 그대로 남는
 #    것은 지금 결과도 같다 — 새로 가리지 않고 주인만 · 기한 뒤 지운다.
 #  · 내부 창구 GET /internal/result/<ref> — 에이전트 서버(draft_section)가 근거 ref 를 읽는다(_res_internal_http).
-def _provision_env_value(key: str, path: Path | None = None) -> str:
-    """게이트웨이 곁 provision.env(박스 파일 · gitignore)의 마지막 활성 줄 값 — 없거나 못 읽으면 ''. 이 리포의 start.sh 는 그 파일을 프로세스 환경으로
-    싣지 않아(provision-config.sh 가 설정 파일을 지을 때만 읽는다) 박스 스위치를 거기 적어도 먹지 않았다. 포털 update-all 이 같은 파일 · 같은 키를 읽어
-    「안 켠 것」 을 알리고, 그 파일이 바뀌면 게이트웨이를 다시 띄운다(지문 목록 identity). 줄 읽기는 포털 _envfile_value 와 같은 규칙 — `export ` 머리 ·
-    줄 끝 `#` 주석 · 따옴표를 뗀다."""
-    p = path or Path(__file__).with_name("provision.env")
-    try:
-        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return ""
-    val = ""
-    for ln in lines:
-        s = ln.strip()
-        if s.startswith("export "):
-            s = s[len("export "):].lstrip()
-        if not s.startswith(f"{key}="):
-            continue
-        v = s[len(key) + 1:]
-        v = re.sub(r"\s+#.*$", "", v).strip().strip("\"'")
-        val = v
-    return val
+# _provision_env_value 는 파일 앞쪽(log 곁)에 있다 — 앞쪽의 박스 손잡이(_env_knob)도 import 때 그것을 읽는다(HWAXPortal docs/mcp-modernize M2).
 
 
 # 켜짐 — 띄운 셸의 환경이 먼저(비어 있지 않으면), 없으면 provision.env 의 줄. 값은 '1' 만 켬(계약 offload-v2 §2).
@@ -8877,7 +8887,7 @@ async def _res_keep(name: str, arguments, res):
 #  · 결과 손잡이를 청한 연결(X-HWAX-Result: ref)도 모드대로다 — 큰 결과는 결과 손잡이가 글 · 구조를 머리 + 손잡이로 바꾼다(_res_keep — 이 정리 뒤).
 #  · 건드리지 않는 것 — 실패 결과 · 구조와 글이 다른 결과(요약 글 + 데이터 구조) · 패널 PAT 호출 · 패널 도구(_meta.ui — 패널이 구조를 읽는다) ·
 #    게이트웨이 안쪽 호출(바깥 호출 _call_tool_entry 에서만 — 감사 · 근거 원장 · 응답 캐시 · 상호작용 수집은 원문). 끄기 GATEWAY_RESULT_DEDUP=0.
-RESULT_DEDUP = {"0": "0", "drop": "drop"}.get(os.environ.get("GATEWAY_RESULT_DEDUP", "1").strip().lower(), "1")
+RESULT_DEDUP = {"0": "0", "drop": "drop"}.get(_env_knob("GATEWAY_RESULT_DEDUP", "1").lower(), "1")
 _DEDUP_STAT = {"compacted": 0, "dropped": 0, "saved_chars": 0}      # 기동 뒤 — /health contract.result_dedup
 
 

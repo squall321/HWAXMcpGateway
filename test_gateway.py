@@ -17675,3 +17675,17 @@ def test_쓰기_의도_낱말_작성_쓰기면_쓰기_도구를_감점하지_않
     monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
     assert not gw._tool_is_write(gw.exposed_tools[2], "mesh_size_advice", "heax-step_forge"), "끈 박스는 종전(이름 꼴만)"
     assert rows["ranked"]
+
+
+def test_M2_손잡이는_띄운_셸의_환경이_먼저이고_없으면_provision_env_줄이며_그것도_없으면_기본값(monkeypatch, tmp_path):
+    env = tmp_path / "provision.env"
+    env.write_text("# 박스 파일\nexport GATEWAY_RESULT_DEDUP=drop  # 라운드 뒤 켬\nGATEWAY_DESC_CLEANDOC='0'\n", encoding="utf-8")
+    monkeypatch.setattr(gw, "_provision_env_value", lambda k, path=None, _real=gw._provision_env_value: _real(k, env))
+    for k in ("GATEWAY_RESULT_DEDUP", "GATEWAY_DESC_CLEANDOC", "GATEWAY_TOOL_CLASS_UNIFIED"):
+        monkeypatch.delenv(k, raising=False)
+    assert gw._env_knob("GATEWAY_RESULT_DEDUP", "1") == "drop" and gw._env_knob("GATEWAY_DESC_CLEANDOC", "1") == "0"
+    assert gw._env_knob("GATEWAY_TOOL_CLASS_UNIFIED", "1") == "1", "둘 다 없으면 기본값"
+    monkeypatch.setenv("GATEWAY_RESULT_DEDUP", "0")
+    assert gw._env_knob("GATEWAY_RESULT_DEDUP", "1") == "0", "띄운 셸의 환경이 먼저"
+    monkeypatch.setenv("GATEWAY_RESULT_DEDUP", "  ")
+    assert gw._env_knob("GATEWAY_RESULT_DEDUP", "1") == "drop", "빈 환경 값은 없는 것"

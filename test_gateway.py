@@ -4747,8 +4747,9 @@ def test_HG06_isError_와_예외는_종전대로고_구조화_본문만_있어�
     gw._audit("t", "b", True, None, 1, res=types.CallToolResult(
         content=[types.TextContent(type="text", text='{"error": "' + "x" * (gw._ENVELOPE_SCAN_MAX + 1) + '"}')]))
     rows = [json.loads(x) for x in f.read_text(encoding="utf-8").splitlines()]
+    # isError 줄은 봉투로 다시 판정하지 않는다(ok=false 그대로). 11-27 부터는 사유 칸이 비지 않는다 — 결과 글 앞부분을 가려 싣는다(mcp-modernize M0)
     assert [(r["ok"], r.get("error")) for r in rows] == [
-        (False, None), (False, "per-user: X"), (False, "envelope: 구조화만"), (True, None)], rows
+        (False, "isError: boom"), (False, "per-user: X"), (False, "envelope: 구조화만"), (True, None)], rows
 
 
 def test_HG06_판정이_포털_판정기와_같다():
@@ -17153,3 +17154,61 @@ def test_쓰기_분류는_확인된_읽기_목록을_이름_꼴보다_먼저_보
     local.write_text(json.dumps({"tools": ["ai-data-hub:update_record"], "deny": ["ai-data-hub:get_record"]}), encoding="utf-8")
     assert gw._tool_is_write(t("update_record"), "update_record", "ai-data-hub") is False
     assert gw._tool_is_write(t("get_record"), "get_record", "ai-data-hub") is True, "닫기 목록에 있으면 확인된 읽기가 아니다"
+
+
+# ── 감사 원장에 isError 의 사유(HWAXPortal docs/mcp-modernize M0 — 60일 실패 129 중 97이 사유 없이 error 가 비었다) ───────────────────────
+_IE_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJrb28ifQ.c2lnbmF0dXJlLXNpZ25hdHVyZQ"
+
+
+def test_isError_결과의_사유가_가린_앞_200자로_감사에_남는다(tmp_path, monkeypatch):
+    f = tmp_path / "a.jsonl"
+    monkeypatch.setattr(gw, "AUDIT_PATH", str(f))
+    monkeypatch.setattr(gw, "PII_MASK_ON", False)          # 결과 가림 손잡이를 꺼도 원장은 가린다(무기한 보존)
+
+    def err(text=None, **kw):
+        res = types.CallToolResult(content=[types.TextContent(type="text", text=text)] if text is not None else [], isError=True, **kw)
+        gw._audit("t", "b", False, None, 1, res=res)
+        return json.loads(f.read_text(encoding="utf-8").splitlines()[-1])["error"]
+    e = err("forbidden: hong.gildong@corp.example 의 토큰 Bearer sk-abcdef0123456789 거절 · host 10.1.2.3 · " + _IE_JWT)
+    assert e.startswith("isError: forbidden:"), e
+    assert "@" not in e and "sk-abcdef" not in e and "10.1.2.3" not in e and _IE_JWT[:20] not in e, e
+    assert "[가림:메일]" in e and "<가림:bearer>" in e and "[가림:IP]" in e and "<가림:jwt>" in e, e
+    long = err("가" * 5000)
+    assert long == "isError: " + "가" * 200 + "…(원문 5000자)", long
+    # 가린 다음에 자른다 — 200자 경계에 걸친 토큰도 반쪽이 남지 않는다
+    edge = err("x" * 185 + " " + _IE_JWT + " 뒤")
+    assert "eyJ" not in edge and "<가림:jwt>" in edge, edge
+    assert err('{"detail": "실패", "api_key": "k-123456789", "owner": "홍길동"}') == \
+        'isError: {"detail": "실패", "api_key": "<가림:api_key>", "owner": "[가림:이름]"}', "JSON 의 비밀 칸 · 사람 칸도 가린다"
+    assert err("줄1\n\n   줄2\t끝") == "isError: 줄1 줄2 끝", "공백은 접는다(앞 200자에 사유를 더 담는다)"
+    assert err() == "isError: (결과 글 없음)"
+    assert err(structuredContent={"reason": "판 두께가 0"}) == 'isError: {"reason": "판 두께가 0"}'
+    gw._audit("t", "b", False, "refused: no-identity", 1, res=types.CallToolResult(content=[types.TextContent(type="text", text="x")], isError=True))
+    assert json.loads(f.read_text(encoding="utf-8").splitlines()[-1])["error"] == "refused: no-identity", "호출부가 준 사유가 먼저다"
+
+
+def test_isError_사유는_소비처가_게이트웨이_막음으로_세지_않는다(tmp_path, monkeypatch):
+    """앱의 오류 글이 'forbidden …' · 'unauthorized …' 로 시작해도 머리 'isError: ' 가 있어 이용 통계(usage_rollup)와 플랫폼 피드백 보고서가 앱 쪽
+    실패로 센다 — 종전에 사유 없이 비었을 때와 같은 갈래다. 키 이름(error)은 그대로다."""
+    import usage_rollup
+    import platform_feedback_report as pfr
+    f = tmp_path / "a.jsonl"
+    monkeypatch.setattr(gw, "AUDIT_PATH", str(f))
+    for txt in ("forbidden: 권한 없음", "unauthorized — 토큰 만료", "unknown tool x", "refused: 앱이 거절"):
+        gw._audit("t", "b", False, None, 1, res=types.CallToolResult(content=[types.TextContent(type="text", text=txt)], isError=True))
+        row = json.loads(f.read_text(encoding="utf-8").splitlines()[-1])
+        assert usage_rollup._outcome(row) == "app" and not row["error"].startswith(pfr._GATE_SIDE), row
+        assert pfr._reason(row["error"]).startswith("isError:"), pfr._reason(row["error"])
+
+
+def test_isError_사유는_실제_호출_길에서도_남는다(monkeypatch):
+    b = _result_kit(monkeypatch, "")
+
+    async def _bad(original, args, read_timeout_seconds=None):
+        return types.CallToolResult(content=[types.TextContent(type="text", text="Error executing tool get_big: 연결 거부 a.b@corp.example")],
+                                    isError=True)
+    b.session.call_tool = _bad
+    res = asyncio.run(gw._call_tool("get_big", {}))
+    assert res.isError
+    row = [r for r in _audit_rows() if r["tool"] == "get_big"][-1]
+    assert row["ok"] is False and row["error"] == "isError: Error executing tool get_big: 연결 거부 [가림:메일]", row

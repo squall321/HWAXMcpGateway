@@ -644,6 +644,39 @@ def _looks_failed(res) -> bool:
     return False
 
 
+AUDIT_ERR_HEAD = 200               # isError 사유로 싣는 결과 글의 앞부분(가린 뒤 글자 수)
+AUDIT_ERR_WINDOW = 64 * 1024       # 가림을 돌리는 앞부분 — 줄바꿈 · 쉼표 · 따옴표(토큰 꼴에 들지 않는 글자)에서 끊는다
+
+
+def _iserror_reason(res) -> str:
+    """감사 원장용 — `isError` 결과의 사유(HWAXPortal docs/mcp-modernize M0 — 60일 실패 129 중 97이 사유 없이 `error` 가 비었다).
+    결과 글(글 블록을 줄바꿈으로 이은 것, 없으면 structuredContent JSON)을 가린 뒤 공백을 접어 앞 AUDIT_ERR_HEAD 자를 싣고, 잘랐으면 원문 길이를
+    붙인다. 가림 — 비밀 꼴(Bearer · JWT · PEM · 비밀 칸 이름 — 상호작용 수집의 _ix_mask_block), 개인정보 꼴(메일 · 사설 IP · IMEI · 계정 · 사람 칸 —
+    _pii_mask_text), 주소 쿼리의 비밀 · 외부 연결 토큰 접두(로그 형식기와 같은 것). 원장은 무기한이라 결과 가림 손잡이(GATEWAY_PII_MASK)와 무관하게
+    늘 가린다. 가린 **다음에** 자른다 — 앞에서 자르면 경계에 걸친 토큰(JWT 셋째 마디 · 메일 꼬리)이 꼴을 잃어 반쪽이 남는다.
+    머리 'isError: ' 는 소비처(usage_rollup GATE_ERRORS · platform_feedback_report _GATE_SIDE)가 앱의 오류 글('forbidden …')을 게이트웨이 막음으로
+    세지 않게 붙인다."""
+    texts = [t for t in (getattr(b, "text", None) for b in getattr(res, "content", None) or []) if isinstance(t, str)]
+    txt = "\n".join(texts).strip()
+    if not txt:
+        sc = getattr(res, "structuredContent", None)
+        txt = json.dumps(sc, ensure_ascii=False, default=str) if sc else ""
+    if not txt:
+        return "isError: (결과 글 없음)"
+    win = txt
+    if len(txt) > AUDIT_ERR_WINDOW:
+        m = _IX_CUT_RE.search(txt, AUDIT_ERR_WINDOW)
+        win = txt[: m.start()] if m else txt
+    out = _pii_mask_text(_ix_mask_block(win)[0])[0]
+    out = _SECRET_QUERY.sub(r"\1***", out)
+    if _CONN_TOKEN_MASK is not None:
+        out = _CONN_TOKEN_MASK.sub(_mask_conn_token, out)
+    out = " ".join(out.split())
+    if len(out) <= AUDIT_ERR_HEAD and win is txt:
+        return "isError: " + out
+    return f"isError: {out[:AUDIT_ERR_HEAD]}…(원문 {len(txt)}자)"
+
+
 def _envelope_reason(res) -> str | None:
     """감사 원장용 — `isError` 는 아닌데 본문이 실패를 말하면 그 사유, 아니면 None(HWAXPortal docs/request-1027 HG-06).
 
@@ -1086,15 +1119,23 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
       rid    : 선언 백엔드(외부 연결)에 실은 요청 ID(X-Request-Id — 호출마다 새 값). 바깥 팀의 기록과 이 값으로 맞춘다(HWAXPortal docs/siren-delib HG-27).
     `res` 를 준 자리에서 `isError` 는 아닌데 본문이 오류 봉투면 `ok` 를 false 로 고쳐 적고 사유를 `error` 에 싣는다
     (`_envelope_reason`, HG-06). 호출부의 `ok=not isError` 만으로는 점검기 · 사용 통계가 이 실패를 세지 못했다.
+    `res` 를 준 자리에서 `isError` 인데 호출부가 사유를 안 줬으면 결과 글의 앞 200자를 가려 `error` 에 싣는다 — 'isError: <가린 글>' 에 잘렸으면
+    원문 길이(`_iserror_reason`, HWAXPortal docs/mcp-modernize M0). 종전엔 `error` 가 비어 실패 사유를 원장으로 물을 수 없었다.
     corr·note·error 는 길이를 둔다(무기한 보존·한 호출 한 줄). 잘렸으면 원문 길이를 붙인다(`_clip`) — 실측으로 오류 1,423줄 중
     200자에 닿은 것은 1줄이었다.
     `caller`·`ip`·`via` 를 안 주면 요청 컨텍스트에서 읽는다 — 호출부마다 넘기게 하면 빠뜨린 자리가 빈 칸이 된다
     (대화 저장·검색 줄이 그래서 계정이 비어 있었다). REST 다리처럼 MCP 컨텍스트가 없는 곳은 직접 넘긴다.
     """
     try:
+        iserr = None
         if res is not None and ok and not err:
             err = _envelope_reason(res)
             ok = not err
+        elif res is not None and not ok and not err and getattr(res, "isError", False) is True:
+            try:
+                iserr = _iserror_reason(res)     # 가린 앞 200자 + 잘렸으면 원문 길이 — 이미 잘랐으니 아래 _clip 을 다시 타지 않는다
+            except Exception:  # noqa: BLE001 — 사유 하나 때문에 줄 전체를 잃지 않는다(D-4 와 같은 자세)
+                iserr = "isError: (사유를 읽지 못했다)"
         rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                "tool": tool, "backend": backend, "ok": ok, "ms": ms}
         caller = caller or _request_user()
@@ -1121,6 +1162,8 @@ def _audit(tool, backend, ok, err, ms, caller=None, mode=None, note=None, corr=N
             rec["note"] = _clip(note, 120)
         if err:
             rec["error"] = _clip(err, 200)
+        elif iserr:
+            rec["error"] = iserr
         if res is not None:
             rec["chars"] = _res_chars(res)
             _imgs, _img_bytes = _res_images(res) if FIG_STORE_ON else (0, 0)      # 끄면 감사 줄도 지금과 같다

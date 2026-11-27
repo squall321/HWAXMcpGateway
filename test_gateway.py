@@ -13385,8 +13385,8 @@ def test_SP_0472_새_허브_도구의_쓰기_판정(original, write):
 
 def test_core_link_새_쓰기_낱말에_걸리는_읽기_둘은_읽기_목록이_지킨다(monkeypatch):
     """ste get_sync_settings 는 sync 가 쓰기 낱말이 되며 이름 꼴로 닫히고, DynaForge plan_task_links 는 조회 낱말이 없어 원래 닫혀 있었다 —
-    둘 다 쓰지 않는 조회라 읽기 목록(read_tools.json)에 넣었다(CK-5). 루틴 단계 · 읽기 전용 PAT 둘 다 연다. tools-map write 에는
-    get_sync_settings 가 남는다(이름 규칙은 읽기 목록을 보지 않는다 — AIDataHub get_record 와 같은 지금의 꼴)."""
+    둘 다 쓰지 않는 조회라 읽기 목록(read_tools.json)에 넣었다(CK-5). 루틴 단계 · 읽기 전용 PAT 둘 다 연다. 11-27 부터 쓰기 분류(검색 감점 ·
+    tools-map write)도 백엔드를 알면 읽기 목록을 이름 꼴보다 먼저 본다(HWAXPortal docs/mcp-modernize M2) — 백엔드를 모르면 이름 꼴 그대로다."""
     two = {"ste": "get_sync_settings", "heax-kooremapper_mcp": "plan_task_links"}
     assert {f"{bk}:{n}" for bk, n in two.items()} <= gw.READ_TOOLS, "추적 읽기 목록에 있다"
     _aggregate_tools(monkeypatch, {bk: [_tool(n)] for bk, n in two.items()})
@@ -13395,6 +13395,7 @@ def test_core_link_새_쓰기_낱말에_걸리는_읽기_둘은_읽기_목록이
         assert gw._routine_read(_tool(n), bk, n) is True, n
         assert gw._readonly_denial(n, {}) == "", n
     assert gw._tool_is_write(_tool("get_sync_settings"), "get_sync_settings") is True
+    assert gw._tool_is_write(_tool("get_sync_settings"), "get_sync_settings", "ste") is False, "백엔드를 알면 읽기 목록이 이름 꼴을 이긴다"
     assert gw._tool_is_write(_tool("plan_task_links"), "plan_task_links") is False, "links 는 link 낱말이 아니다"
     monkeypatch.setattr(gw, "READ_TOOLS", frozenset())
     assert gw._routine_read(_tool("get_sync_settings"), "ste", "get_sync_settings") is False, "읽기 목록이 없으면 이름 꼴(sync)로 닫힌다"
@@ -17115,3 +17116,40 @@ def test_MM6_stateless_에서_근거_원장은_신원으로만_가르고_세션_
     _set_request_headers(monkeypatch, {"mcp-session-id": "S1"})
     monkeypatch.setattr(gw, "STATELESS_HTTP", False)
     assert gw._request_session() == "S1" and gw._evid_key() == "s:S1", "손잡이 0(세션 방식)은 지금처럼 세션으로 가른다"
+
+
+# ── 쓰기 분류가 확인된 읽기 목록을 이름 꼴보다 먼저 본다(HWAXPortal docs/mcp-modernize M2 게이트웨이 일괄 — 조사 오판 넷) ─────────────────────
+def test_쓰기_분류는_확인된_읽기_목록을_이름_꼴보다_먼저_보고_앱_표지와_닫기_목록은_그대로_이긴다(monkeypatch, _fresh_scores, tmp_path):
+    """AIDataHub get_record · get_record_sections · describe_record_schema 와 ste get_sync_settings 는 추적 읽기 목록(read_tools.json)에 있는데
+    record · sync 낱말로 쓰기가 되어 search_tools 에서 0.5배 감점되고 /tools-map write 에 들었다. 목록에 있는 것만 풀고, 앱 표지(readOnlyHint=False ·
+    destructiveHint)와 닫기 목록(deny)은 그대로 이긴다. 박스 덧씌우기(read_tools.local.json)의 tools 도 같은 확인된 목록이다."""
+    ann = types.ToolAnnotations
+
+    def t(name, desc="레코드 조회 도구", **a):
+        return types.Tool(name=name, description=desc, inputSchema={"type": "object"}, **({"annotations": ann(**a)} if a else {}))
+    four = {"ai-data-hub": ["get_record", "get_record_sections", "describe_record_schema"], "ste": ["get_sync_settings"]}
+    assert {f"{bk}:{n}" for bk, ns in four.items() for n in ns} <= gw.READ_TOOLS, "추적 읽기 목록에 있다(조사의 넷)"
+    _aggregate_tools(monkeypatch, {"ai-data-hub": [t("get_record"), t("get_record_sections"), t("describe_record_schema"),
+                                                   t("update_record"), t("record_ingest")],
+                                   "ste": [t("get_sync_settings", "동기화 설정 조회")]})
+    for bk, ns in four.items():
+        for n in ns:
+            assert gw._tool_is_write(t(n), n, bk) is False, n
+            assert gw._tool_is_write(t(n), n) is True, ("백엔드를 모르면 이름 꼴 그대로", n)
+    assert gw._tool_is_write(t("update_record"), "update_record", "ai-data-hub") is True, "목록 밖은 이름 꼴 그대로"
+    assert gw._tool_is_write(t("get_record", readOnlyHint=False), "get_record", "ai-data-hub") is True, "앱 표지가 목록보다 먼저다"
+    assert gw._tool_is_write(t("get_record", destructiveHint=True), "get_record", "ai-data-hub") is True
+    st, body = _gate_call(monkeypatch, "/tools-map")
+    assert st == 200 and body["write"] == ["record_ingest", "update_record"], body["write"]
+    _no_embed(monkeypatch)
+    res = json.loads(asyncio.run(gw._search_tools({"query": "record", "limit": 10})).content[0].text)
+    flag = {m["tool"]: bool(m.get("write")) for m in res["matches"]}
+    assert flag["get_record"] is False and flag["get_record_sections"] is False and flag["describe_record_schema"] is False, flag
+    assert flag["update_record"] is True, "목록 밖 쓰기는 그대로 쓰기 표시 · 감점"
+    assert res["ranked"].index("get_record") < res["ranked"].index("update_record"), res["ranked"]
+    # 박스 덧씌우기 — tools 는 더하고 deny 는 뺀다(루틴 단계 · 읽기 전용 PAT 과 같은 목록)
+    local = tmp_path / "read_tools.local.json"
+    monkeypatch.setattr(gw, "READ_TOOLS_LOCAL_PATH", local)
+    local.write_text(json.dumps({"tools": ["ai-data-hub:update_record"], "deny": ["ai-data-hub:get_record"]}), encoding="utf-8")
+    assert gw._tool_is_write(t("update_record"), "update_record", "ai-data-hub") is False
+    assert gw._tool_is_write(t("get_record"), "get_record", "ai-data-hub") is True, "닫기 목록에 있으면 확인된 읽기가 아니다"

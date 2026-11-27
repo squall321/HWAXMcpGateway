@@ -4106,7 +4106,17 @@ def _tool_is_write(t, original: str, backend: str | None = None) -> bool:
         return False       # 앱이 readOnlyHint=False 를 적었어도 포털이 읽기로 다루는 도구(read_tools.json override — 사용자 결정으로만)
     if getattr(ann, "readOnlyHint", None) is False:
         return True
-    return bool(_WRITE_NAME.search(original)) and not _READ_NAME_HINT.search(original)
+    if not _WRITE_NAME.search(original) or _READ_NAME_HINT.search(original):
+        return False
+    # 이름 꼴은 쓰기다 — 확인된 읽기 목록(read_tools.json tools ∪ 박스 덧씌우기 tools, 닫기 목록 deny 는 빼고)에 있으면 읽기다. 앱 표지 · override 는
+    # 위에서 이미 이겼다(앱 표지보다 느슨하게 바꾸지 않는다). get_record · get_record_sections · describe_record_schema(AIDataHub) · get_sync_settings(ste)
+    # 가 record · sync 낱말로 쓰기가 되어 검색에서 감점되고 /tools-map write 에 들던 어긋남이다(HWAXPortal docs/mcp-modernize M2 게이트웨이 일괄).
+    # 이름 꼴이 쓰기일 때만 목록을 본다 — 검색은 후보마다 이 판정을 부른다(박스 덧씌우기는 바뀐 시각을 본다).
+    if backend is not None:
+        key = f"{backend}:{original}"
+        if key in _routine_read_tools() and key not in _routine_read_deny():
+            return False
+    return True
 
 
 def _brief_desc(desc: str, n: int = 200) -> str:

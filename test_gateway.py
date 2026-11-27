@@ -6430,7 +6430,7 @@ def test_tools_map_은_점수판을_덧붙이고_있던_칸은_그대로다(monk
     _aggregate_tools(monkeypatch, {"reportarchive": [leaky, _stool("ra_get", {"id": "보고서 id"})]})
     body = tools_map()
     assert list(body) == ["map", "backends", "apps", "areas", "area_meta", "unclassified", "arg_scores", "write", "routine_read", "views",
-                          "panel_read", "orig"], \
+                          "panel_read", "orig"] + (["tool_class"] if gw.TOOL_CLASS_UNIFIED else []), \
         "있던 칸은 이름 · 순서 그대로이고 쓰기 목록(R3-D6) · 루틴 읽기 목록(R3 리뷰 #0) · 아는 보기(E-4) · 패널 확인용 읽기 목록(HA-20 B-2) · 원래 이름" \
         "(ontology-first F0)은 맨 뒤에 덧붙는다"
     assert body["map"]["ra_find"] == "reportarchive" and body["map"]["save_conversation"] == "_gateway"
@@ -8565,8 +8565,12 @@ def test_read_tools_deny_는_StepForge_mesh_size_advice_를_루틴_단계에서_
     assert data["deny"] == sorted(set(data["deny"])) and all(t.count(":") == 1 and all(t.split(":")) for t in data["deny"])
     assert "heax-step_forge:mesh_size_advice" in data["deny"] and gw.READ_DENY == frozenset(data["deny"])
     assert not gw._routine_read(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice")
+    assert gw._tool_class(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice") == ("write", "deny"), "한 판정 — 닫기 목록은 쓰기 부류"
     monkeypatch.setattr(gw, "READ_DENY", frozenset())
-    assert gw._routine_read(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice"), "닫기 목록이 없으면 이름 꼴(advice)로 열린다"
+    assert gw._tool_class(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice") == ("unknown", "none")
+    assert not gw._routine_read(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice"), "한 판정은 이름 꼴로 읽기를 열지 않는다"
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
+    assert gw._routine_read(_tool("mesh_size_advice"), "heax-step_forge", "mesh_size_advice"), "끈 박스 — 닫기 목록이 없으면 이름 꼴(advice)로 열린다"
 
 
 def test_read_tools_deny_는_리스크_앱_근거_묶음_만들기를_읽기로_보지_않는다(monkeypatch):
@@ -8576,7 +8580,13 @@ def test_read_tools_deny_는_리스크_앱_근거_묶음_만들기를_읽기로_
     key = "heax-hwax_risk:risk_build_evidence_bundle"
     assert key in json.load(open(gw.Path(gw.__file__).with_name("read_tools.json"), encoding="utf-8"))["deny"] and key in gw.READ_DENY
     assert not gw._routine_read(_tool("risk_build_evidence_bundle"), "heax-hwax_risk", "risk_build_evidence_bundle")
-    assert gw._routine_read(_tool("risk_get_evidence_bundle"), "heax-hwax_risk", "risk_get_evidence_bundle")
+    assert gw._tool_is_write(_tool("risk_build_evidence_bundle"), "risk_build_evidence_bundle", "heax-hwax_risk"), "한 판정 — 닫기 목록은 쓰기 부류"
+    ro = types.Tool(name="risk_get_evidence_bundle", inputSchema={"type": "object"}, annotations=types.ToolAnnotations(readOnlyHint=True))
+    assert gw._routine_read(ro, "heax-hwax_risk", "risk_get_evidence_bundle"), "받기는 앱 표지로 읽기다"
+    assert not gw._routine_read(_tool("risk_get_evidence_bundle"), "heax-hwax_risk", "risk_get_evidence_bundle"), "표지 없으면 한 판정은 모름"
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
+    assert not gw._routine_read(_tool("risk_build_evidence_bundle"), "heax-hwax_risk", "risk_build_evidence_bundle")
+    assert gw._routine_read(_tool("risk_get_evidence_bundle"), "heax-hwax_risk", "risk_get_evidence_bundle"), "끈 박스 — 이름 꼴(get)로 열린다"
     monkeypatch.setattr(gw, "READ_DENY", frozenset())
     assert gw._routine_read(_tool("risk_build_evidence_bundle"), "heax-hwax_risk", "risk_build_evidence_bundle"), "닫기 목록이 없으면 이름 꼴(evidence)로 열린다"
 
@@ -10268,7 +10278,11 @@ _RT_PLAN = {"run": {"id": "r1", "state": "running", "calls": 0},          # 포�
 def _rt_kit(monkeypatch, plan=None, result_text='{"rows": [1, 2]}', is_error=False, extra=None, annotations=None):
     """포털(/routines-api)은 가짜(부른 것을 적는다), 안쪽 도구 호출(_call_tool_body)도 가짜다 — 이름 · 인자 · 그때의 corr 를 적는다.
     노출 이름은 실제 꼴이다(겹침 별칭은 '<백엔드에서 하이픈 뺀 것>_<원래 이름>'). 노출 도구(exposed_tools)도 경로마다 하나씩 세운다 —
-    쓰기 판정(_tool_is_write)이 그 도구의 표지를 본다. annotations 는 {노출 이름: ToolAnnotations}(없으면 이름 꼴로만 가른다)."""
+    쓰기 판정(_tool_is_write)이 그 도구의 표지를 본다. annotations 는 {노출 이름: ToolAnnotations}(없으면 이름 꼴로만 가른다).
+    단계에 쓰는 읽기 둘(search_voc · defect_profile)은 기본으로 readOnlyHint=True 다 — 한 판정(MM-5)은 이름의 조회 낱말로 읽기를 열지 않는다(울타리
+    기계를 보는 시험이라 읽기임을 표지로 준다). annotations 로 덮을 수 있다."""
+    annotations = {"search_voc": types.ToolAnnotations(readOnlyHint=True),
+                   "signalforge_defect_profile": types.ToolAnnotations(readOnlyHint=True), **(annotations or {})}
     seen, inner = [], []
     replies = {("GET", "/runs/r1"): plan or _RT_PLAN, ("POST", "/runs/r1/calls"): {"call_id": "voc.c1"},
                ("GET", "/runs/r1/evidence"): {"evidence": [{"source": "signalforge:search_voc", "key": "voc.c1"}]},
@@ -10359,6 +10373,8 @@ def test_routine_call_은_원래_이름을_풀고_corr_를_달아_부른_뒤_원
 def test_두_백엔드에_같은_이름이면_백엔드_이름으로_부른다(monkeypatch):
     seen, inner = _rt_kit(monkeypatch)
     monkeypatch.setattr(gw, "route", {**gw.route, "failuretrace_search_voc": ("failuretrace", "search_voc")})
+    monkeypatch.setattr(gw, "exposed_tools", gw.exposed_tools + [types.Tool(name="failuretrace_search_voc", inputSchema={"type": "object"},
+                                                                            annotations=types.ToolAnnotations(readOnlyHint=True))])
     _, text = _rt_run("routine_call", {"run_id": "r1", "step": "two", "name": "search_voc"})
     assert "signalforge, failuretrace 에 다 있다" in text, "노출 이름 search_voc 는 signalforge 것이다 — 고르지 않고 묻는다"
     res, text = _rt_run("routine_call", {"run_id": "r1", "step": "two", "name": "failuretrace:search_voc"})
@@ -10496,8 +10512,16 @@ def test_루틴_도구는_정상_호출_경로에서_디스패치되고_읽기_�
 
 
 # ── 분석 루틴 R3(HWAXPortal docs/analysis-routines R3-design 3.4) — 이어서 · 대화 · 쓰기 거절 · 심의 차례 · 포털 오류 · 쓰기 목록 · prompts · 지침 ──────
-_RT_NOT_READ_MSG = ("ROUTINE_ERROR: 단계 안에서는 읽기로 확인된 도구만 부른다(v1) — '{}' 는 읽기로 확인되지 않았다(readOnlyHint · 읽기 목록 · "
-                    "이름 꼴). 읽기 도구라면 앱이 readOnlyHint 를 달거나 박스의 read_tools.local.json 에 더한다")
+# 한 판정(MM-5 — 기본 켬)이면 '이름 꼴로는 열지 않는다', 끈 박스는 종전 글 그대로다(_RT_NOT_READ_MSG_OFF)
+_RT_NOT_READ_MSG = ("ROUTINE_ERROR: 단계 안에서는 읽기로 확인된 도구만 부른다(v1) — '{}' 는 읽기로 확인되지 않았다(readOnlyHint · 읽기 목록 — "
+                    "이름 꼴로는 열지 않는다). 읽기 도구라면 앱이 readOnlyHint 를 달거나 박스의 read_tools.local.json 에 더한다")
+_RT_NOT_READ_MSG_OFF = ("ROUTINE_ERROR: 단계 안에서는 읽기로 확인된 도구만 부른다(v1) — '{}' 는 읽기로 확인되지 않았다(readOnlyHint · 읽기 목록 · "
+                        "이름 꼴). 읽기 도구라면 앱이 readOnlyHint 를 달거나 박스의 read_tools.local.json 에 더한다")
+
+
+def _rt_not_read(key: str) -> str:
+    """단계 울타리의 '읽기로 확인되지 않았다' 글 — 부를 때의 손잡이(gw.TOOL_CLASS_UNIFIED)를 따른다."""
+    return (_RT_NOT_READ_MSG if gw.TOOL_CLASS_UNIFIED else _RT_NOT_READ_MSG_OFF).format(key)
 
 
 def test_실행_시작에_run_id_를_주면_이어서를_부르고_나머지_인자는_보지_않는다(monkeypatch):
@@ -10589,7 +10613,7 @@ def test_routine_call_은_쓰기로_분류된_도구를_울타리_안에서도_�
     seen, inner = _rt_kit(monkeypatch, plan=plan)
     for name in ("submit_job", "signalforge:submit_job"):
         res, text = _rt_run("routine_call", {"run_id": "r1", "step": "voc", "name": name, "arguments": {"x": 1}})
-        assert res.isError and text == _RT_NOT_READ_MSG.format("signalforge:submit_job"), text
+        assert res.isError and text == _rt_not_read("signalforge:submit_job"), text
     assert inner == [] and not any(p.endswith("/calls") for _, p, _, _ in seen), "안쪽 도구도 원장도 건드리지 않는다"
     ann = types.ToolAnnotations
     seen, inner = _rt_kit(monkeypatch, plan=plan, annotations={"search_voc": ann(readOnlyHint=False),
@@ -10597,7 +10621,7 @@ def test_routine_call_은_쓰기로_분류된_도구를_울타리_안에서도_�
                                                                "submit_job": ann(readOnlyHint=True)})
     for name, orig in (("search_voc", "search_voc"), ("defect_profile", "defect_profile")):
         res, text = _rt_run("routine_call", {"run_id": "r1", "step": "voc", "name": name})
-        assert res.isError and text == _RT_NOT_READ_MSG.format(f"signalforge:{orig}"), text
+        assert res.isError and text == _rt_not_read(f"signalforge:{orig}"), text
     res, text = _rt_run("routine_call", {"run_id": "r1", "step": "voc", "name": "submit_job"})
     assert not res.isError and [i[0] for i in inner] == ["submit_job"], "앱이 단 readOnlyHint=True 가 이름 꼴을 이긴다"
 
@@ -10608,12 +10632,13 @@ def test_deliberate_start_는_심의_단계에서만_부른다(monkeypatch):
     plat = {"id": "plat", "kind": "platform", "state": "pending", "backends": ["hwax-deliberation"], "budget": {"calls": 3}, "calls": 0,
             "allowed": {"hwax-deliberation": ["deliberate_start", "deliberate_status"]}}
     delib = dict(_RT_PLAN["steps"][1], allowed={"hwax-deliberation": ["deliberate_start", "deliberate_cancel"]})
-    seen, inner = _rt_kit(monkeypatch, plan={**_RT_PLAN, "steps": [plat, delib]})
+    seen, inner = _rt_kit(monkeypatch, plan={**_RT_PLAN, "steps": [plat, delib]},
+                          annotations={"deliberate_status": types.ToolAnnotations(readOnlyHint=True)})   # 심의 서버가 단 표지(7a8187e)
     monkeypatch.setattr(gw, "route", {**gw.route, "deliberate_cancel": ("hwax-deliberation", "deliberate_cancel")})
     res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": "deliberate_start", "arguments": {"question": "왜"}})
-    assert res.isError and text == _RT_NOT_READ_MSG.format("hwax-deliberation:deliberate_start"), text
+    assert res.isError and text == _rt_not_read("hwax-deliberation:deliberate_start"), text
     res, text = _rt_run("routine_call", {"run_id": "r1", "step": "delib", "name": "deliberate_cancel", "arguments": {"job_id": "j"}})
-    assert res.isError and text == _RT_NOT_READ_MSG.format("hwax-deliberation:deliberate_cancel"), text
+    assert res.isError and text == _rt_not_read("hwax-deliberation:deliberate_cancel"), text
     assert inner == []
     res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": "deliberate_status", "arguments": {"job_id": "j"}})
     assert not res.isError, "읽기(상태)는 울타리 안이면 어느 단계에서나 된다"
@@ -10725,12 +10750,13 @@ def test_표지_없는_잡_쓰기_도구는_단계에서_막고_조회_이름은
     """R3 리뷰 #0 — 단계 울타리가 이름 꼴(_tool_is_write)만 보아 표지 없는 잡 제출(single_drop_simulation · docforge_convert) · 되돌릴 수 없는
     취소(risk_job_action) · 덮어쓰기(risk_repersist_panel)가 부르는 사람 이름으로 나갔다. 이제 읽기로 **확인된** 것만 연다(닫힌 쪽) — 이름의
     조회 낱말이 있고 쓰기 꼴이 아닌 도구는 표지 없이도 연다(데모 조회 도구가 그대로 묶이게)."""
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)      # 끈 박스의 종전 판정(이름의 조회 낱말로도 연다) — 한 판정은 test_한_판정_* 이 본다
     monkeypatch.setattr(gw, "READ_TOOLS", frozenset())
     seen, inner = _rt_platform_kit(monkeypatch, {**_RT_REAL_WRITES, **_RT_REAL_READS})
     for bk, names in _RT_REAL_WRITES.items():
         for n in names:
             res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": n, "arguments": {"action": "cancel"}})
-            assert res.isError and text == _RT_NOT_READ_MSG.format(f"{bk}:{n}"), (n, text)
+            assert res.isError and text == _rt_not_read(f"{bk}:{n}"), (n, text)
     assert inner == [] and not any(p.endswith("/calls") for _, p, _, _ in seen), "안쪽 도구도 원장도 건드리지 않는다"
     for names in _RT_REAL_READS.values():
         for n in names:
@@ -10754,12 +10780,12 @@ def test_루틴_읽기_판정은_앱_표지가_먼저이고_읽기_목록이_다
     for bk, n in (("signalforge", "search_voc"), ("signalforge", "defect_profile"), ("heax-step_forge", "list_parts"),
                   ("heax-hwax_risk", "risk_next_step")):
         res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": n})
-        assert res.isError and text == _RT_NOT_READ_MSG.format(f"{bk}:{n}"), (n, text)
+        assert res.isError and text == _rt_not_read(f"{bk}:{n}"), (n, text)
     monkeypatch.setattr(gw, "READ_TOOLS", frozenset({"heax-hwax_risk:risk_next_step", "signalforge:search_voc"}))
     res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": "risk_next_step"})
     assert not res.isError and inner[-1][0] == "risk_next_step", "읽기 목록이 이름 꼴을 이긴다"
     res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": "search_voc"})
-    assert res.isError and text == _RT_NOT_READ_MSG.format("signalforge:search_voc"), "앱의 readOnlyHint=False 가 읽기 목록을 이긴다"
+    assert res.isError and text == _rt_not_read("signalforge:search_voc"), "앱의 readOnlyHint=False 가 읽기 목록을 이긴다"
     assert [i[0] for i in inner] == ["risk_job_action", "risk_next_step"]
 
 
@@ -10770,7 +10796,7 @@ def test_박스_읽기_목록_덧씌우기는_바뀐_시각을_보고_재기동_
     monkeypatch.setattr(gw, "READ_TOOLS", frozenset())
     seen, inner = _rt_platform_kit(monkeypatch, {"heax-hwax_risk": ["risk_next_step"]})
     local = gw.READ_TOOLS_LOCAL_PATH                                  # autouse 가 tmp 로 건 자리
-    refused = _RT_NOT_READ_MSG.format("heax-hwax_risk:risk_next_step")
+    refused = _rt_not_read("heax-hwax_risk:risk_next_step")
 
     def call():
         return _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": "risk_next_step"})[1]
@@ -10813,7 +10839,7 @@ def test_이름_꼴로_막히던_조회_넷은_추적_읽기_목록으로_루틴
     for bk, names in four.items():
         for n in names:
             res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": n})
-            assert res.isError and text == _RT_NOT_READ_MSG.format(f"{bk}:{n}"), (n, text)
+            assert res.isError and text == _rt_not_read(f"{bk}:{n}"), (n, text)
             assert gw._readonly_denial(n, {}).startswith("read_only:"), n
 
 
@@ -10834,11 +10860,17 @@ def test_심의_단계는_심의_도구_셋을_표지와_무관하게_열고_그
         assert not res.isError, (n, text)
     assert [i[0] for i in inner] == trio
     res, text = _rt_run("routine_call", {"run_id": "r1", "step": "delib", "name": "deliberate_cancel", "arguments": {"job_id": "j"}})
-    assert res.isError and text == _RT_NOT_READ_MSG.format("hwax-deliberation:deliberate_cancel"), text
+    assert res.isError and text == _rt_not_read("hwax-deliberation:deliberate_cancel"), text
     for n in trio:
         res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": n, "arguments": {"job_id": "j"}})
-        assert res.isError and text == _RT_NOT_READ_MSG.format(f"hwax-deliberation:{n}"), (n, text)
-    seen, inner = _rt_kit(monkeypatch, plan={**_RT_PLAN, "steps": [delib, plat]})        # 표지 없음 — 이름 꼴로 가른다
+        assert res.isError and text == _rt_not_read(f"hwax-deliberation:{n}"), (n, text)
+    seen, inner = _rt_kit(monkeypatch, plan={**_RT_PLAN, "steps": [delib, plat]})        # 표지 없음 — 한 판정은 셋 다 모름이라 막는다
+    for n in trio:
+        res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": n, "arguments": {"job_id": "j"}})
+        assert res.isError and text == _rt_not_read(f"hwax-deliberation:{n}"), (n, text)
+    assert inner == []
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)                                  # 끈 박스 — 이름 꼴로 가른다
+    seen, inner = _rt_kit(monkeypatch, plan={**_RT_PLAN, "steps": [delib, plat]})
     for n, ok in (("deliberate_start", False), ("deliberate_status", True), ("deliberate_result", False)):
         res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": n, "arguments": {"job_id": "j"}})
         assert res.isError is (not ok), (n, text)
@@ -11004,6 +11036,7 @@ def test_tools_map_은_루틴_읽기_도구의_노출_이름을_routine_read_로
     ∪ 박스 덧씌우기) → 조회 낱말(쓰기 꼴이 아닐 때 — smart-twin-mcp 의 catalog_run 은 catalog 가 있어도 run 이라 아니다). 이름은 노출 이름(겹침
     접두 포함, 정렬)이고 로컬 도구는 없다. 표지 없는 잡 도구(risk_job_action · single_drop_simulation)는 write 에도 routine_read 에도 없다 —
     새 포털은 routine_read 밖을 묶지 않는다."""
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)      # 끈 박스의 종전 판정(이름의 조회 낱말로도 연다) — 한 판정은 test_한_판정_* 이 본다
     ann = types.ToolAnnotations
 
     def t(name, **a):
@@ -11031,6 +11064,7 @@ def test_tools_map_은_패널_첫_쓰기_확인의_읽기를_panel_read_로_싣�
     앱 표지(readOnlyHint=True · destructiveHint 아님)와 읽기 목록(read_tools.json ∪ 박스 덧씌우기)만 연다. routine_read 의 마지막 갈래(원래 이름의
     조회 낱말)는 쓰지 않는다 — 이름 규칙은 울타리가 아니다(반대 검토 10-31: job_info_cleanup · case_compare_export · mesh_preview_and_queue ·
     case_detail_archive 가 이름 낱말로 읽기가 되어 패널이 처음 불러도 포털이 확인을 묻지 않았다)."""
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)      # 끈 박스의 종전 판정(이름의 조회 낱말로도 연다) — 한 판정은 test_한_판정_* 이 본다
     ann = types.ToolAnnotations
 
     def t(name, **a):
@@ -11112,7 +11146,7 @@ def test_동사로도_쓰이는_fetch_resolve_trace_는_조회_낱말이_아니�
         for n in names:
             res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": n,
                                                  "arguments": {"model_id": "x/bge-reranker-v2-m3", "dest_root": "/opt/models", "force": True}})
-            assert res.isError and text == _RT_NOT_READ_MSG.format(f"{bk}:{n}"), (n, text)
+            assert res.isError and text == _rt_not_read(f"{bk}:{n}"), (n, text)
     assert inner == [] and not any(p.endswith("/calls") for _, p, _, _ in seen), "안쪽 도구도 원장도 건드리지 않는다"
     for bk, n in (("rootdesigndatahub", "object_resolve"), ("caegroupdatahub", "objects_resolve_many"), ("testscope", "resolve"),
                   ("reportarchive", "resolve"), ("failuretrace", "trace_chain")):
@@ -11141,6 +11175,7 @@ def test_닫기_목록은_표지_읽기_목록_이름_꼴보다_먼저_닫고_�
     read_tools.local.json 의 deny 를 _routine_read 가 맨 먼저 본다(앱의 readOnlyHint=True 보다도). routine_call 은 '이 박스가 닫았다' 로 거절하고
     (읽기 목록에 더하라는 안내는 틀린 길이다) 안쪽 도구도 원장도 건드리지 않는다. /tools-map 의 routine_read 에서도 빠진다. 덧씌우기는 바뀐 시각을
     보고 재기동 없이 다시 읽고, 깨지면 통째로 버린다(deny 도 빠진다 — 경고 한 줄). 11-17 부터 읽기 전용 PAT 도 같은 닫기 목록을 먼저 본다(R-7 · GW-02)."""
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)      # 끈 박스의 종전 판정(이름의 조회 낱말로도 연다) — 한 판정은 test_한_판정_* 이 본다
     ann = types.ToolAnnotations
     local = gw.READ_TOOLS_LOCAL_PATH                                  # autouse 가 tmp 로 건 자리
 
@@ -11207,6 +11242,7 @@ def test_쓰기_동사_이름은_status_history_preview_조각이_있어도_단�
     열렸다(R3-design §8 '쓰기 동사가 없을 때만 읽기' 와 어긋난다). 단계 이름 규칙은 쓰기 동사(_WRITE_NAME) 그대로다. 그 예외로만 열리던 진짜 읽기
     (upload_instructions · report_upload_instructions — 안내 글만 돌려준다, preview_publish — 게시하지 않는 미리보기, 소스로 확인)는 추적 읽기 목록이
     연다. _tool_is_write(검색 순위 · /tools-map 의 write)는 그대로다."""
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)      # 끈 박스의 종전 판정(이름의 조회 낱말로도 연다) — 한 판정은 test_한_판정_* 이 본다
     tracked = gw.READ_TOOLS
     writes = ["update_status", "delete_history", "apply_preview", "submit_estimate", "save_history", "set_view_state", "cancel_job_status",
               "update_instructions"]
@@ -11216,7 +11252,7 @@ def test_쓰기_동사_이름은_status_history_preview_조각이_있어도_단�
     for n in writes:
         assert gw._tool_is_write(_tool(n), n) is False, ("검색 순위의 쓰기 판정은 그대로다", n)
         res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": n, "arguments": {"x": 1}})
-        assert res.isError and text == _RT_NOT_READ_MSG.format(f"sf:{n}"), (n, text)
+        assert res.isError and text == _rt_not_read(f"sf:{n}"), (n, text)
     assert inner == [] and not any(p.endswith("/calls") for _, p, _, _ in seen), "안쪽 도구도 원장도 건드리지 않는다"
     for n in reads:
         res, text = _rt_run("routine_call", {"run_id": "r1", "step": "plat", "name": n})
@@ -14790,7 +14826,11 @@ def test_M1_박스_덧씌우기만으로는_앱이_쓰기로_적은_도구를_�
     why = gw._readonly_denial("w_view", {})
     assert why.startswith("read_only: 'w_view'") and "readOnlyHint=False" in why and "앱 표지가 이긴다" in why, why
     assert gw._readonly_denial("p_view", {}) == "", "표지가 없으면 덧씌우기로 연다"
-    assert gw._readonly_denial("t_view", {}) == "", "추적 목록은 지금 그대로(앱의 readOnlyHint=False 보다 먼저)"
+    why = gw._readonly_denial("t_view", {})
+    assert why.startswith("read_only: 't_view'") and "앱 표지가 이긴다" in why, "한 판정 — 추적 목록도 앱의 readOnlyHint=False 를 못 이긴다"
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
+    assert gw._readonly_denial("t_view", {}) == "", "끈 박스 — 추적 목록은 지금 그대로(앱의 readOnlyHint=False 보다 먼저)"
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", True)
     for n in ("d_view", "h_view"):
         w = gw._readonly_denial(n, {})
         assert w.startswith(f"read_only: '{n}'") and "destructiveHint" in w, (n, w)
@@ -14807,7 +14847,11 @@ def test_M1_PATCH_는_쓰기_파괴_표지가_달린_항목을_남기되_경고�
     assert [w.split("'")[1] for w in out["warnings"]] == ["sf:w_view", "sf:d_view"] and "열리지 않는다" in out["warnings"][0]
     rows = {e["tool"]: e for e in out["entries"]}
     assert rows["sf:w_view"]["blocked_by_label"] == "readOnlyHint=False" and rows["sf:d_view"]["blocked_by_label"] == "destructiveHint"
-    assert "blocked_by_label" not in rows["sf:t_view"] and "blocked_by_label" not in rows["sf:p_view"], "추적 항목은 지금 그대로 연다"
+    assert rows["sf:t_view"]["blocked_by_label"] == "readOnlyHint=False", "한 판정 — 추적 항목도 앱 표지가 막는다"
+    assert "blocked_by_label" not in rows["sf:p_view"]
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
+    rows_off = {e["tool"]: e for e in _http(monkeypatch, "/readonly-allowlist")[1]["entries"]}
+    assert "blocked_by_label" not in rows_off["sf:t_view"] and "blocked_by_label" not in rows_off["sf:p_view"], "끈 박스 — 추적 항목은 지금 그대로 연다"
     assert "루틴" in out["scope"] and "패널" in out["scope"], "같은 항목이 루틴 단계 · 패널 확인에도 든다고 말한다"
     assert _http(monkeypatch, "/readonly-allowlist")[1]["scope"] == out["scope"]
 
@@ -17212,3 +17256,121 @@ def test_isError_사유는_실제_호출_길에서도_남는다(monkeypatch):
     assert res.isError
     row = [r for r in _audit_rows() if r["tool"] == "get_big"][-1]
     assert row["ok"] is False and row["error"] == "isError: Error executing tool get_big: 연결 거부 [가림:메일]", row
+
+
+# ── 읽기 · 쓰기 한 판정(HWAXPortal docs/mcp-modernize M2 · MM-5) ─────────────────────────────────────────────────────────────
+
+def _cls_kit(monkeypatch):
+    """한 판정 시험의 도구 — {이름: 표지}, 백엔드는 sf. 추적 읽기 목록 · 닫기 · override 는 모듈 값을 바꿔 건다(파일을 읽지 않는다)."""
+    ann = types.ToolAnnotations
+    spec = {"d_ro": ann(readOnlyHint=True), "kill": ann(destructiveHint=True), "ov": ann(readOnlyHint=False), "ov_kill": ann(destructiveHint=True),
+            "w_hint": ann(readOnlyHint=False), "r_hint": ann(readOnlyHint=True), "listed": None, "boxed": None, "declared_view": ann(readOnlyHint=True),
+            "create_x": None, "get_x": None, "update_status": None, "upload_instructions": None, "idem": ann(idempotentHint=True)}
+    monkeypatch.setattr(gw, "exposed_tools", [types.Tool(name=n, description="", inputSchema={"type": "object"}, **({"annotations": a} if a else {}))
+                                              for n, a in spec.items()])
+    monkeypatch.setattr(gw, "route", {n: ("sf", n) for n in spec})
+    monkeypatch.setattr(gw, "READ_TOOLS", frozenset({"sf:listed", "sf:create_x", "sf:w_hint", "sf:ov", "sf:ov_kill"}))
+    monkeypatch.setattr(gw, "READ_OVERRIDE", frozenset({"sf:ov", "sf:ov_kill"}))
+    monkeypatch.setattr(gw, "READ_DENY", frozenset({"sf:d_ro"}))
+    monkeypatch.setattr(gw, "_DECLARED_READ", {("sf", "declared_view")})
+    gw.READ_TOOLS_LOCAL_PATH.write_text(json.dumps({"tools": ["sf:boxed"]}), encoding="utf-8")
+    return {t.name: t for t in gw.exposed_tools}
+
+
+def test_한_판정은_닫기_파괴_override_표지_목록_이름_차례로_가르고_이름은_읽기로_열지_않는다(monkeypatch):
+    tools = _cls_kit(monkeypatch)
+    want = {"d_ro": ("write", "deny"),                     # 닫기 목록이 앱의 readOnlyHint=True 보다 먼저다
+            "kill": ("write", "app_annotation"), "ov_kill": ("write", "app_annotation"),    # destructiveHint 는 override 도 이긴다
+            "ov": ("read", "override"),                     # override 는 앱의 readOnlyHint=False 를 이긴다(사용자 결정 RF-39)
+            "w_hint": ("write", "app_annotation"),          # 추적 목록이어도 앱의 readOnlyHint=False 가 이긴다
+            "r_hint": ("read", "app_annotation"), "declared_view": ("read", "confirmed_list"),
+            "listed": ("read", "confirmed_list"), "boxed": ("read", "confirmed_list"),
+            "create_x": ("read", "confirmed_list"),         # 확인된 읽기 목록이 이름의 쓰기 동사를 이긴다
+            "get_x": ("unknown", "none"),                   # 이름의 조회 낱말로는 읽기가 아니다
+            "update_status": ("unknown", "none"), "upload_instructions": ("unknown", "none"),   # 안내 · 상태 꼴은 쓰기로도 안 본다
+            "idem": ("unknown", "none")}
+    for n, w in want.items():
+        assert gw._tool_class(tools[n], "sf", n) == w, n
+    assert gw._tool_class(None, "sf", "delete_x") == ("write", "name_heuristic"), "도구가 없어도(목록 밖) 이름의 쓰기 동사로 쓰기다"
+    assert gw._tool_class(tools["create_x"], None, "create_x") == ("write", "name_heuristic"), "백엔드를 모르면 목록을 보지 않는다"
+    assert gw._tool_class(gw.SEARCH_TOOLS_TOOL, "_gateway", "search_tools") == ("read", "confirmed_list"), "게이트웨이 자체 조회(_LOCAL_READ)"
+    assert gw._tool_class(gw.SAVE_CONV_TOOL, "_gateway", "save_conversation")[0] == "write"
+    # 셋은 부류 위에 선다 — 한 도구가 쓰기이면서 읽기일 수 없다
+    for n, t in tools.items():
+        c = gw._tool_class(t, "sf", n)[0]
+        w, r, p = gw._tool_is_write(t, n, "sf"), gw._routine_read(t, "sf", n), gw._panel_read(t, "sf", n)
+        assert (w, r, p) == (c == "write", c == "read", c == "read") and not (w and r), n
+
+
+def test_한_판정을_끄면_종전_판정_셋_그대로다(monkeypatch):
+    tools = _cls_kit(monkeypatch)
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
+    assert gw._routine_read(tools["get_x"], "sf", "get_x") and not gw._panel_read(tools["get_x"], "sf", "get_x"), "종전 — 이름 낱말은 루틴만 연다"
+    assert not gw._tool_is_write(tools["d_ro"], "d_ro", "sf"), "종전 — 닫기 목록은 쓰기 분류에 들지 않았다"
+    assert gw._readonly_denial("w_hint", {}) == "", "종전 — 추적 목록이 앱의 readOnlyHint=False 보다 먼저"
+    listed = [tools["get_x"], tools["r_hint"]]
+    assert gw._class_listed(listed) is listed, "끄면 tools/list 사본을 만들지 않는다(같은 목록)"
+
+
+def test_한_판정은_읽기_전용_PAT_도_부류로_가른다(monkeypatch):
+    _cls_kit(monkeypatch)
+    monkeypatch.setattr(gw, "tool_readonly_hint", {})
+    for n in ("ov", "r_hint", "declared_view", "listed", "boxed", "create_x"):
+        assert gw._readonly_denial(n, {}) == "", n
+    assert "닫기(deny)" in gw._readonly_denial("d_ro", {})
+    assert "destructiveHint" in gw._readonly_denial("kill", {})
+    w = gw._readonly_denial("w_hint", {})
+    assert w.startswith("read_only: 'w_hint'") and "앱 표지가 이긴다" in w, w
+    for n in ("get_x", "update_status", "idem"):
+        assert gw._readonly_denial(n, {}).startswith(f"read_only: '{n}'") and "조회 도구만" in gw._readonly_denial(n, {}), n
+
+
+def test_한_판정은_tools_list_사본에_표지를_싣되_앱이_적은_값은_그대로다(monkeypatch):
+    tools = _cls_kit(monkeypatch)
+    out = {t.name: t for t in gw._class_listed(list(tools.values()))}
+    for n in ("d_ro", "ov", "w_hint", "r_hint", "declared_view"):
+        assert out[n] is tools[n], ("앱이 readOnlyHint 를 적었으면 사본을 만들지 않는다(느슨하게 바꾸지 않는다)", n)
+    for n in ("listed", "boxed", "create_x"):
+        assert out[n].annotations.readOnlyHint is True and out[n].annotations.destructiveHint is None, n
+    assert out["kill"].annotations.readOnlyHint is False and out["kill"].annotations.destructiveHint is True, "앱의 다른 표지는 그대로 둔다"
+    assert out["idem"] is tools["idem"] and out["get_x"] is tools["get_x"] and out["get_x"].annotations is None, "모르면 표지를 싣지 않는다"
+    out2 = {t.name: t for t in gw._class_listed([gw.exposed_tools[0], types.Tool(name="delete_y", inputSchema={"type": "object"})])}
+    assert out2["delete_y"].annotations.readOnlyHint is False and out2["delete_y"].annotations.destructiveHint is None, "쓰기는 False · 파괴는 모르면 없다"
+    assert tools["listed"].annotations is None, "집계 목록(exposed_tools)의 표지는 앱 값 그대로다 — 사본만 바뀐다"
+    # tools/list 처리기 — 사람 목록에 사본이 나간다(호출 검증용 req None 은 그대로)
+    listed = {t.name: t for t in asyncio.run(gw._list_tools(types.ListToolsRequest()))}
+    assert listed["listed"].annotations.readOnlyHint is True and listed["search_tools"].annotations.readOnlyHint is True
+    raw = {t.name: t for t in asyncio.run(gw._list_tools(None))}
+    assert raw["listed"].annotations is None
+
+
+def test_한_판정은_tools_map_에_도구별_부류와_근거를_싣고_셋을_그_위에_세운다(monkeypatch):
+    _cls_kit(monkeypatch)
+    monkeypatch.setattr(gw, "backends", {})
+    st, body = _gate_call(monkeypatch, "/tools-map")
+    assert st == 200
+    tc = body["tool_class"]
+    assert tc["ov"] == {"class": "read", "source": "override"} and tc["get_x"] == {"class": "unknown", "source": "none"}
+    assert tc["d_ro"] == {"class": "write", "source": "deny"} and tc["search_tools"] == {"class": "read", "source": "confirmed_list"}
+    back = {n for n, (bk, _o) in gw.route.items()}
+    assert set(body["write"]) == {n for n in back if tc[n]["class"] == "write"}
+    assert set(body["routine_read"]) == set(body["panel_read"]) == {n for n in back if tc[n]["class"] == "read"}
+    assert not set(body["write"]) & set(body["routine_read"]), "모순 0"
+    monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", False)
+    st, off = _gate_call(monkeypatch, "/tools-map")
+    assert "tool_class" not in off and "get_x" in off["routine_read"] and "get_x" not in off["panel_read"], "끄면 종전 칸 그대로"
+
+
+def _health_body(monkeypatch=None) -> dict:
+    sent = []
+
+    async def send(m):
+        sent.append(m)
+    asyncio.run(gw._bearer_gate(None, None)({"type": "http", "path": "/health", "headers": []}, None, send))
+    return json.loads(sent[1]["body"])
+
+
+def test_한_판정_손잡이가_health_의_contract_에_실린다(monkeypatch):
+    for on in (True, False):
+        monkeypatch.setattr(gw, "TOOL_CLASS_UNIFIED", on)
+        assert _health_body()["contract"]["tool_class_unified"] is on

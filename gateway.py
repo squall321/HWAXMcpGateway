@@ -1475,7 +1475,8 @@ async def _aggregate():
     # MaterialTwin · SignalForge 의 맨 이름(get_material 등)이 사라져 그 이름을 부르던 절차 · 핀 · 클라이언트가 unknown tool 이 된다.
     base_counts = Counter(t.name for k, t in collected if k not in _CONN_ACTIVE)
     tool_readonly_hint.clear()
-    declared_read: set[tuple[str, str]] = set()
+    declared_read = _DECLARED_READ                     # 한 판정(_tool_class)이 근거를 가른다 — 재집계마다 새로 채운다
+    declared_read.clear()
     for key, t in collected:
         app_hint = getattr(getattr(t, "annotations", None), "readOnlyHint", None)
         hint = bool(app_hint)
@@ -2132,6 +2133,8 @@ _low = fm._mcp_server
 # 세션 번호에 기대던 것 — 근거 원장 열쇠(_request_session) · 재기동 막기(_bearer_gate 의 비우기)는 이 값을 보고 갈린다. 되돌리기 GATEWAY_STATELESS=0
 # (세션을 쥐는 종전 꼴 — 재기동 막기 · 근거 원장도 종전대로). 지금 값은 /health 의 stateless 와 기동 로그 한 줄에 보인다.
 STATELESS_HTTP = os.environ.get("GATEWAY_STATELESS", "1").strip() != "0"
+# 읽기 · 쓰기 한 판정(HWAXPortal docs/mcp-modernize M2 · MM-5 — 설명은 _tool_class 머리말). 끄기 GATEWAY_TOOL_CLASS_UNIFIED=0.
+TOOL_CLASS_UNIFIED = os.environ.get("GATEWAY_TOOL_CLASS_UNIFIED", "1").strip() != "0"
 
 
 def _mcp_http_app():
@@ -4138,6 +4141,8 @@ def _named(names: set[str], v: str, q_flat: str) -> bool:
 
 
 def _tool_is_write(t, original: str, backend: str | None = None) -> bool:
+    if TOOL_CLASS_UNIFIED:
+        return _tool_class(t, backend, original)[0] == "write"       # 한 판정(MM-5) — 아래는 끈 박스의 종전 판정 그대로
     ann = getattr(t, "annotations", None)
     if getattr(ann, "readOnlyHint", None) is True:
         return False
@@ -6065,7 +6070,8 @@ ROUTINE_RUN_START_TOOL = _routine_tool(
 ROUTINE_CALL_TOOL = _routine_tool(
     "routine_call",
     "실행 중인 단계의 도구 하나를 부른다 — 그 단계의 플랫폼 · 허용 도구(계획의 allowed)만 된다(울타리 밖은 거절). 단계 안에서는 쓰지 않는다(v1) — "
-    "읽기로 확인된 도구(readOnlyHint · 읽기 목록 · 이름 꼴)만 부르고 나머지와 박스가 닫은 도구(deny)는 거절한다(심의 단계의 deliberate_start · "
+    f"읽기로 확인된 도구({'readOnlyHint · 읽기 목록' if TOOL_CLASS_UNIFIED else 'readOnlyHint · 읽기 목록 · 이름 꼴'})만 부르고 나머지와 박스가 "
+    "닫은 도구(deny)는 거절한다(심의 단계의 deliberate_start · "
     "deliberate_status · deliberate_result 는 예외). 호출과 결과는 원장에 "
     "call_id 로 남는다 — 단계 요약 · 보고서는 [call_id] 로 인용한다. 결과가 60,000자를 넘으면 앞쪽만 오고 나머지는 routine_get(run_id, "
     "call_id, page). 심의 단계의 차례는 셋이다 — 시작은 routine_call 로 deliberate_start(evidence 를 비워 두면 앞 단계(uses)의 원 근거를 "
@@ -9814,7 +9820,10 @@ def _routine_read(t, backend: str, original: str, *, by_name: bool = True) -> bo
     원래 이름의 조회 낱말(밑줄로 가른 조각) — 쓰기 동사(_WRITE_NAME)가 없을 때만이다. _tool_is_write 의 안내 · 미리보기 예외(_READ_NAME_HINT —
     status · history · preview …)는 쓰지 않는다 — update_status · delete_history · apply_preview 같은 쓰기가 읽기로 열렸다(R3 리뷰 2차 #5). 그 예외로만
     열리던 진짜 읽기(upload_instructions · report_upload_instructions · preview_publish — 소스로 확인)는 읽기 목록에 있다.
-    by_name 이 거짓이면 마지막 갈래(이름의 조회 낱말)를 건너뛴다 — 패널 첫 쓰기 확인의 판정이다(_panel_read)."""
+    by_name 이 거짓이면 마지막 갈래(이름의 조회 낱말)를 건너뛴다 — 패널 첫 쓰기 확인의 판정이다(_panel_read).
+    한 판정(GATEWAY_TOOL_CLASS_UNIFIED — 기본 켬)이면 부류가 read 인 것만 참이다 — 이름의 조회 낱말로는 열지 않는다(by_name 은 보지 않는다)."""
+    if TOOL_CLASS_UNIFIED:
+        return _tool_class(t, backend, original)[0] == "read"
     key = f"{backend}:{original}"
     if key in _routine_read_deny():
         return False
@@ -9838,6 +9847,91 @@ def _panel_read(t, backend: str, original: str) -> bool:
     쓰지 않는다 — 이름 규칙은 울타리가 아니다(job_info_cleanup · case_detail_archive 같은 쓰기 꼴이 조회 낱말로 읽기가 됐다 — 반대 검토 10-31).
     읽기가 아니면 포털은 그 패널 세션의 첫 호출에 확인을 묻는다(모르면 묻는다)."""
     return _routine_read(t, backend, original, by_name=False)
+
+
+# ── 읽기 · 쓰기 한 판정(HWAXPortal docs/mcp-modernize M2 · MM-3 · MM-5) ─────────────────────────────────────────────────────
+# 종전에는 같은 도구를 세 판정이 따로 갈랐다 — _tool_is_write(검색 감점 · /tools-map write · 운영자 알림)는 이름의 쓰기 동사, _routine_read(루틴 단계 ·
+# 위임 · 상태 기다림)는 이름의 조회 낱말로도 열고, _panel_read 는 이름을 보지 않았다. 그래서 한 도구가 쓰기이면서 읽기였고(11-27 조사 모순 6),
+# 이름의 조회 낱말만으로 루틴 · 위임에 열린 도구가 193개였다(앱 표지도 읽기 목록도 없이). 이제 부류 하나를 정하고 셋은 그 위에 선다.
+# 차례 — ① 닫기 목록(read_tools.json deny ∪ 박스 덧씌우기 deny — 박스가 쓰기로 닫은 것) ② 앱의 destructiveHint ③ override(앱이 readOnlyHint=False 를
+# 적었어도 포털이 읽기로 다루는 도구 — 사용자 결정 RF-29 · RF-39 · R-14, destructiveHint 와 deny 는 못 이긴다) ④ 앱의 readOnlyHint(거짓 · 참)
+# ⑤ 확인된 읽기 목록(read_tools.json tools ∪ 박스 덧씌우기 tools ∪ 선언 백엔드의 read_tools, 게이트웨이 자체 도구는 _LOCAL_READ) ⑥ 이름의 쓰기
+# 동사(_WRITE_NAME, 안내 · 미리보기 꼴 _READ_NAME_HINT 은 뺀다) — 쓰기로만 가른다 ⑦ 모름. **이름은 읽기로 열지 않는다** — 모르는 도구는 읽기가
+# 아니다(루틴 · 위임 · 패널 · 읽기 전용 PAT 이 닫는다). 쓰는 쪽마다의 정책(D-18 · 확인 카드 · 루틴 울타리 · 패널은 선언 백엔드만 …)은 이 부류
+# 위에 그대로다. 근거(source) — deny · app_annotation · override · confirmed_list · name_heuristic · none.
+# 노출 — tools/list 사본의 annotations 에 부류를 싣는다(_exposed_ann): 앱이 readOnlyHint 를 적었으면 앱 값 그대로(느슨하게 바꾸지 않는다 — override ·
+# deny 도 노출 표지는 앱 값), 안 적었으면 read → readOnlyHint=True · write → readOnlyHint=False(destructiveHint 는 모르면 싣지 않는다) · 모름 → 그대로.
+# 끄기 GATEWAY_TOOL_CLASS_UNIFIED=0 — 판정 셋 · tools/list · /tools-map 이 종전과 바이트까지 같다. 값은 /health 의 contract.tool_class_unified.
+# (손잡이 TOOL_CLASS_UNIFIED 는 앞쪽 STATELESS_HTTP 곁에 둔다 — 도구 설명(routine_call)이 import 때 그 값을 읽는다)
+# 선언 백엔드(박스 권한표 connect:)의 read_tools 로 읽기가 된 (백엔드, 원래 이름) — _aggregate 가 채운다. 노출 사본에는 readOnlyHint=True 가 이미
+# 붙어 있어(앱 표지와 꼴이 같다) 근거를 confirmed_list 로 가르려고 따로 쥔다.
+_DECLARED_READ: set[tuple[str, str]] = set()
+
+
+def _read_lists() -> tuple[frozenset, frozenset]:
+    """(확인된 읽기 목록, 닫기 목록) — 한 번에 여러 도구를 가르는 쪽(/tools-map · tools/list)이 파일 시각을 도구마다 보지 않게 한 번 읽는다."""
+    return _routine_read_tools(), _routine_read_deny()
+
+
+def _tool_class(t, backend: str | None, original: str, lists: tuple | None = None) -> tuple[str, str]:
+    """도구의 부류와 근거 — ('read' | 'write' | 'unknown', 'deny' | 'app_annotation' | 'override' | 'confirmed_list' | 'name_heuristic' | 'none').
+    차례는 위 머리말. t 는 노출 도구(없으면 None — 표지 없음), backend 가 None 이면 목록을 보지 않는다(표지와 이름만). lists 는 _read_lists() 의 값."""
+    ann = getattr(t, "annotations", None)
+    key = f"{backend}:{original}" if backend else None
+    if key is not None and backend != "_gateway":
+        _read_base_sync()
+        reads, deny = lists or _read_lists()
+        if key in deny:
+            return "write", "deny"
+    else:
+        reads = deny = frozenset()
+    if getattr(ann, "destructiveHint", None) is True:
+        return "write", "app_annotation"
+    if key is not None and key in READ_OVERRIDE:
+        return "read", "override"
+    hint = getattr(ann, "readOnlyHint", None)
+    if hint is False:
+        return "write", "app_annotation"
+    if key is not None and (backend, original) in _DECLARED_READ:
+        return "read", "confirmed_list"          # 노출 사본의 readOnlyHint=True 는 게이트웨이가 선언을 보고 단 것이다(_aggregate)
+    if hint is True:
+        return "read", "app_annotation"
+    if key is not None and (key in reads or (backend == "_gateway" and original in _LOCAL_READ)):
+        return "read", "confirmed_list"
+    if _WRITE_NAME.search(original) and not _READ_NAME_HINT.search(original):
+        return "write", "name_heuristic"
+    return "unknown", "none"
+
+
+def _exposed_ann(t, backend: str, original: str, lists: tuple | None = None):
+    """노출 사본에 실을 annotations — 바꿀 것이 없으면 None. 앱이 readOnlyHint 를 적었으면 늘 None(앱 값 그대로 — MM-5 '느슨하게 바꾸지 않는다')."""
+    ann = getattr(t, "annotations", None)
+    if getattr(ann, "readOnlyHint", None) is not None:
+        return None
+    cls = _tool_class(t, backend, original, lists)[0]
+    if cls == "unknown":
+        return None
+    flag = cls == "read"
+    return ann.model_copy(update={"readOnlyHint": flag}) if ann is not None else types.ToolAnnotations(readOnlyHint=flag)
+
+
+def _class_listed(tools: list) -> list:
+    """tools/list 사본 — 부류를 annotations 에 싣는다(_exposed_ann). 끈 박스는 목록 그대로(같은 객체). 백엔드 도구는 (백엔드, 원래 이름)으로,
+    게이트웨이 자체 도구는 ('_gateway', 이름)으로 가른다. 사본만 바꾼다 — 집계 목록(exposed_tools)의 표지는 앱 값 그대로다(판정이 앱 값을 본다)."""
+    if not TOOL_CLASS_UNIFIED:
+        return tools
+    lists = _read_lists()
+    out = []
+    for t in tools:
+        bk, orig = route.get(t.name, ("_gateway", t.name))[:2]
+        ann = _exposed_ann(t, bk, orig, lists)
+        out.append(t if ann is None else t.model_copy(update={"annotations": ann}))
+    return out
+
+
+def _contract_health() -> dict:
+    """/health 의 contract — MCP 현대화 M2(계약 정밀화)의 손잡이 값. 무인증 칸이라 값 · 수만 싣는다."""
+    return {"tool_class_unified": TOOL_CLASS_UNIFIED}
 
 
 async def _routine_call(a: dict) -> types.CallToolResult:
@@ -9895,7 +9989,9 @@ async def _routine_call(a: dict) -> types.CallToolResult:
                                 "(read_tools.json · read_tools.local.json 의 deny)")
         if not _routine_read(next((t for t in exposed_tools if t.name == exposed), None), *resolved):
             raise _RoutineError(f"단계 안에서는 읽기로 확인된 도구만 부른다(v1) — '{resolved[0]}:{resolved[1]}' 는 읽기로 확인되지 않았다"
-                                "(readOnlyHint · 읽기 목록 · 이름 꼴). 읽기 도구라면 앱이 readOnlyHint 를 달거나 박스의 read_tools.local.json 에 "
+                                + ("(readOnlyHint · 읽기 목록 — 이름 꼴로는 열지 않는다). " if TOOL_CLASS_UNIFIED else
+                                   "(readOnlyHint · 읽기 목록 · 이름 꼴). ")
+                                + "읽기 도구라면 앱이 readOnlyHint 를 달거나 박스의 read_tools.local.json 에 "
                                 "더한다")
     if spent and resolved != ("hwax-deliberation", "deliberate_result"):
         raise _RoutineError(spent_msg)          # 심의 단계 — 결과 읽기만 예산 밖이다(위)
@@ -10738,6 +10834,18 @@ def _readonly_denial(name: str, arguments: dict) -> str:
         return (f"read_only: '{name}' — {_RO_WHY}이 부를 수 없다 — 이 박스가 읽기 목록의 닫기(deny)에 '{k}' 를 적었다(게이트웨이 "
                 "read_tools.json · read_tools.local.json).")
     ann = getattr(_tool_by_route(key, orig), "annotations", None)
+    if TOOL_CLASS_UNIFIED:
+        # 한 판정(MM-5) — 부류가 read 면 연다. 종전 차례와 다른 것 하나: 추적 읽기 목록(read_tools.json tools)에 있어도 앱이 readOnlyHint=False 를
+        # 적었으면 막는다(앱 표지보다 느슨하게 바꾸지 않는다 — 루틴 · 패널 판정과 같다). override 는 그대로 연다(사용자 결정).
+        if _tool_class(_tool_by_route(key, orig), key, orig)[0] == "read":
+            return ""
+        if getattr(ann, "destructiveHint", None) is True:
+            return f"read_only: '{name}' — {_RO_WHY}은 부를 수 없다 — 앱이 이 도구에 destructiveHint(되돌리기 어려운 쓰기)를 달았다."
+        if getattr(ann, "readOnlyHint", None) is False and k in (READ_TOOLS | _read_tools_local()["tools"]):
+            return (f"read_only: '{name}' — {_RO_WHY}은 부를 수 없다 — 읽기 목록에 '{k}' 가 있지만 앱이 이 도구에 readOnlyHint=False(쓰기)를 "
+                    "달았다. 앱 표지가 이긴다 — 앱이 표지를 고치거나, 사용자 결정으로 추적 read_tools.json 의 override 에 둔다.")
+        return (f"read_only: '{name}' — {_RO_WHY}은 조회 도구만 부른다. 이 도구가 조회라면 운영자가 게이트웨이 "
+                f"read_tools.json(또는 박스 덧씌우기 read_tools.local.json — 재기동 없이 먹는다)에 '{k}' 를 더하거나, 앱이 그 도구에 readOnlyHint 를 단다.")
     if getattr(ann, "destructiveHint", None) is True:
         return f"read_only: '{name}' — {_RO_WHY}은 부를 수 없다 — 앱이 이 도구에 destructiveHint(되돌리기 어려운 쓰기)를 달았다."
     if k in READ_TOOLS:
@@ -10783,7 +10891,7 @@ def _readonly_allowlist_view(q: str = "") -> dict:
         # 앱 표지가 막으면 적는다 — destructiveHint 는 어느 출처든, readOnlyHint=False 는 박스 덧씌우기에만 있는 항목만(추적 항목은 지금 그대로 연다)
         bk, _sep, orig = k.partition(":")
         lb = _label_block(bk, orig)
-        if lb == "destructiveHint" or (lb and k not in READ_TOOLS):
+        if lb == "destructiveHint" or (lb and k not in (READ_OVERRIDE if TOOL_CLASS_UNIFIED else READ_TOOLS)):
             row["blocked_by_label"] = lb
         rows.append(row)
     drows = [{"tool": k, "source": (["read_tools.json"] if k in READ_DENY else []) + (["read_tools.local.json"] if k in ldeny else [])}
@@ -10801,9 +10909,13 @@ def _readonly_allowlist_view(q: str = "") -> dict:
                     "loaded_at": loc.get("loaded_at"), "error": loc.get("error"), "tools": len(ltools), "deny": len(ldeny)},
         "entries": rows, "deny": drows,
         "hinted_read_only": sum(1 for v in tool_readonly_hint.values() if v),
-        "rule": ("닫기(deny)가 맨 먼저다 — 거기 있으면 읽기 목록 · 앱 표지와 무관하게 막는다. 앱의 destructiveHint 도 막는다. 그다음 추적 읽기 목록"
-                 "(read_tools.json · override) · 박스 덧씌우기(앱이 readOnlyHint=False 를 적지 않았을 때만) · 앱의 readOnlyHint 면 연다. 두 파일은 바뀐 "
-                 "시각으로 다시 읽는다(재기동 없음) — 못 읽으면 마지막 값 그대로다."),
+        "rule": (("닫기(deny)가 맨 먼저다 — 거기 있으면 읽기 목록 · 앱 표지와 무관하게 막는다. 앱의 destructiveHint 도 막는다. 그다음 override 면 연다. "
+                  "앱이 readOnlyHint=False 를 적었으면 막고(추적 · 박스 목록 모두 — 앱 표지가 이긴다), 선언 읽기 · 앱의 readOnlyHint · 읽기 목록"
+                  "(read_tools.json · 박스 덧씌우기)이면 연다. 이름 꼴로는 열지 않는다(한 판정 — GATEWAY_TOOL_CLASS_UNIFIED). 두 파일은 바뀐 시각으로 다시 "
+                  "읽는다(재기동 없음) — 못 읽으면 마지막 값 그대로다.") if TOOL_CLASS_UNIFIED else
+                 ("닫기(deny)가 맨 먼저다 — 거기 있으면 읽기 목록 · 앱 표지와 무관하게 막는다. 앱의 destructiveHint 도 막는다. 그다음 추적 읽기 목록"
+                  "(read_tools.json · override) · 박스 덧씌우기(앱이 readOnlyHint=False 를 적지 않았을 때만) · 앱의 readOnlyHint 면 연다. 두 파일은 바뀐 "
+                  "시각으로 다시 읽는다(재기동 없음) — 못 읽으면 마지막 값 그대로다.")),
         "scope": ("이 목록은 읽기 전용 PAT 만이 아니다 — 같은 항목이 분석 루틴 단계의 읽기 판정(routine_call)에도 열리고, MCP Apps 패널의 첫 쓰기 확인도 "
                   "읽기로 보아 묻지 않는다. 더하면 세 곳에 함께 열린다 — 읽기를 확인한 것만 더한다."),
     }
@@ -11935,16 +12047,17 @@ async def _list_tools(req: types.ListToolsRequest):
     # 얹지 않고 세지도 않는다. 보기는 목록만 줄이고 호출은 지금 그대로여야 한다(목록 밖 도구를 이름으로 부를 때 출력 검증도 그대로다).
     # 패널 PAT 면 그 앱의 도구에서 막음 목록을 뺀 것만 보인다(HA-20) — 호출 관문(_panel_denial)과 같은 판정이다. 패널은 그 앱 안만 보므로
     # 개인 보기(E-4)는 얹지 않는다. 서비스 PAT 면 그 작업의 허용 목록만 보인다(호출 관문 _service_denial 과 같은 판정, HWAXPortal docs/core-link §3).
+    # 바깥 목록(서비스 · 패널 · 사람)에는 부류를 annotations 에 실은 사본을 낸다(_class_listed — MM-5, 끄면 같은 목록). 호출 검증용(req None)은 그대로다.
     svc = _request_service()
     if svc is not None:
-        return _service_listed(svc)
+        return _class_listed(_service_listed(svc))
     pnl = _request_panel()
     if pnl is not None:
-        return [t for t in _visible_tools(_request_groups()) if _panel_denial(t.name, pnl) is None]
+        return _class_listed([t for t in _visible_tools(_request_groups()) if _panel_denial(t.name, pnl) is None])
     if req is None:
         return _visible_tools(_request_groups())
     _VIEW_LISTS[_request_view()[0]] += 1
-    listed = _listed_tools(_request_groups())
+    listed = _class_listed(_listed_tools(_request_groups()))
     if RESULT_REFS_ON and _request_result_ref():
         # 결과 손잡이를 청한 연결 — 출력 스키마를 뗀다. 줄인 structuredContent({ref, chars, …, head})는 도구의 출력 스키마에 맞지 않아 Claude Code(MCP
         # TS SDK)가 결과를 거절한다. 떼면 클라이언트가 검증하지 않는다. 사본만 바꾼다 — 집계 목록 · 다른 연결의 목록은 그대로다.
@@ -12562,6 +12675,8 @@ def _bearer_gate(app, pat_verifier=None):
                 "interactions": _ix_health(),
                 # MCP 전송이 세션을 쥐나(GATEWAY_STATELESS — 기본 켬, HWAXPortal docs/mcp-modernize MM-6). 박스마다 지금 어느 꼴로 도는지 이것으로 본다
                 "stateless": STATELESS_HTTP,
+                # MCP 현대화 M2(계약 정밀화)의 손잡이 — 읽기 · 쓰기 한 판정(MM-5) 등. 박스마다 어느 꼴로 도는지 이것으로 본다(값 · 수만)
+                "contract": _contract_health(),
             }).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})
@@ -12614,6 +12729,21 @@ def _bearer_gate(app, pat_verifier=None):
             _areas = {n: _area_of(n, bk) for n, bk in _map.items()}
             _acnt = Counter(a for a in _areas.values() if a)
             _tool_of = {_t.name: _t for _t in exposed_tools}       # 노출 이름 → 도구(쓰기 판정이 표지를 본다)
+            # 한 판정(MM-5) — 도구마다 부류를 한 번 가르고 write · routine_read · panel_read 를 그 위에 세운다(한 도구가 쓰기이면서 읽기일 수 없다).
+            # 도구별 부류 · 근거(tool_class)는 백엔드 도구와 게이트웨이 자체 도구 모두다. 끄면 종전 판정 셋 그대로이고 tool_class 칸이 없다.
+            if TOOL_CLASS_UNIFIED:
+                _lists = _read_lists()
+                _cls = {_n: _tool_class(_tool_of.get(_n), _bk, _orig, _lists) for _n, (_bk, _orig) in route.items()}
+                _loc = {_t.name: _t for _t in _local_tools() + [READONLY_ALLOWLIST_TOOL]}
+                _cls_all = {**{_n: _tool_class(_t, "_gateway", _n) for _n, _t in _loc.items() if _map.get(_n) == "_gateway"}, **_cls}
+                _judged = {"write": sorted(_n for _n, _c in _cls.items() if _c[0] == "write"),
+                           "routine_read": sorted(_n for _n, _c in _cls.items() if _c[0] == "read")}
+                _judged["panel_read"] = _judged["routine_read"]
+            else:
+                _judged = {
+                    "write": sorted(_n for _n, (_bk, _orig) in route.items() if _tool_is_write(_tool_of.get(_n), _orig, _bk)),
+                    "routine_read": sorted(_n for _n, (_bk, _orig) in route.items() if _routine_read(_tool_of.get(_n), _bk, _orig)),
+                    "panel_read": sorted(_n for _n, (_bk, _orig) in route.items() if _panel_read(_tool_of.get(_n), _bk, _orig))}
             body = json.dumps({
                 "map": _map,
                 "backends": sorted(set(_map.values())),
@@ -12625,21 +12755,26 @@ def _bearer_gate(app, pat_verifier=None):
                 "arg_scores": _ARG_SCORE or _arg_scoreboard([]),
                 # 쓰기 도구의 노출 이름(정렬, 백엔드 도구만) — _tool_is_write(readOnlyHint · destructiveHint → 이름 낱말)로 가른다. routine_read 를
                 # 모르는 옛 포털이 이것을 뺀다(HWAXPortal docs/analysis-routines R3-D6). 위 칸들은 그대로다.
-                "write": sorted(_n for _n, (_bk, _orig) in route.items() if _tool_is_write(_tool_of.get(_n), _orig, _bk)),
+                "write": _judged["write"],
                 # 루틴 단계에서 부를 수 있는 읽기 도구의 노출 이름(정렬, 백엔드 도구만) — 닫힌 쪽 판정 _routine_read(표지 · 읽기 목록 · 조회 낱말),
                 # routine_call 과 같은 판정이다. 포털 계획은 이것과 겹치는 도구만 단계에 묶는다(R3 리뷰 #0 — 모르는 도구는 쓰기로 본다).
-                "routine_read": sorted(_n for _n, (_bk, _orig) in route.items() if _routine_read(_tool_of.get(_n), _bk, _orig)),
+                "routine_read": _judged["routine_read"],
                 # 이 게이트웨이가 아는 개인 보기(E-4) — 포털이 보기를 저장 · 보일 때 본다. 이 칸이 없는 옛 게이트웨이는 보기를 읽지 않아 늘 전체로 돈다
                 # (포털 화면이 '저장했습니다' 만 말하던 것을 막는다, 검토 10-31). 위 칸들은 그대로다.
                 "views": ["full", "bundle", "light"],
                 # 패널 첫 쓰기 확인이 읽기로 보는 도구의 노출 이름(정렬, 백엔드 도구만) — _panel_read(표지 · 읽기 목록, 이름 낱말 없이). 포털 패널 창구는
                 # routine_read 가 아니라 이것을 본다 — 이것 밖이면 그 패널 세션의 첫 호출에 확인을 묻는다(HWAXPortal docs/request-1027 HA-20 B-2).
-                "panel_read": sorted(_n for _n, (_bk, _orig) in route.items() if _panel_read(_tool_of.get(_n), _bk, _orig)),
+                "panel_read": _judged["panel_read"],
                 # 노출 이름 → 원래 이름(둘이 다른 것만 — 겹침 접두 · 허브 가족 접두, 백엔드 도구만). 원래 이름은 게이트웨이만 확실히 안다 — 노출 이름에서
                 # 접두를 떼어 짐작하면 원래 이름이 그 앱 키로 시작하는 도구에서 틀린다. 에이전트 서버의 좌석 자유 조회가 겹침 때문에 접두가 붙은 읽기를
                 # 원래 이름으로 판정하고(선언 백엔드 · 허브 가족 · 리스크 심사는 빼고), 챗 고정 몫이 (백엔드, 원래 이름)으로 노출 이름을 찾는다
                 # (HWAXPortal docs/ontology-first F0 · OF-4 · OF-5). 이 칸이 있으면 이 게이트웨이가 declared 를 안다. 위 칸들은 그대로다.
                 "orig": {_n: _orig for _n, (_bk, _orig) in sorted(route.items()) if _n != _orig},
+                # 도구별 읽기 · 쓰기 부류와 근거(한 판정 — HWAXPortal docs/mcp-modernize MM-5) — {노출 이름: {class, source}}. class 는 read · write ·
+                # unknown, source 는 deny · app_annotation · override · confirmed_list · name_heuristic · none. 쓰는 쪽은 이것(또는 위 셋)을 읽고 제 정책을
+                # 얹는다. 끈 게이트웨이(GATEWAY_TOOL_CLASS_UNIFIED=0)에는 이 칸이 없다. 위 칸들은 그대로다.
+                **({"tool_class": {_n: {"class": _c[0], "source": _c[1]} for _n, _c in sorted(_cls_all.items())}}
+                   if TOOL_CLASS_UNIFIED else {}),
             }, ensure_ascii=False).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json")]})

@@ -13,6 +13,7 @@
   "heax-kooremapper_mcp:download_result",
   "heax-kooremapper_mcp:get_job",
   "heax-kooremapper_mcp:inspect_file",
+  "heax-kooremapper_mcp:list_session_files",
   "heax-kooremapper_mcp:material_usage",
   "heax-kooremapper_mcp:operation_usage",
   "heax-kooremapper_mcp:plan_task_links",

@@ -4772,7 +4772,12 @@ def test_리스크_앱의_위임_토큰_수명이_게이트웨이_호출_한도�
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(gw.__file__))), "HWAXRisk", "backend", "app", "config.py")
     if not os.path.exists(path):
         pytest.skip("HWAXRisk 리포가 옆에 없다")
-    m = re.search(r'"HWAXRISK_SSO_TTL_S",\s*"(\d+)"', open(path, encoding="utf-8").read())
+    cfg = open(path, encoding="utf-8").read()
+    m = re.search(r'"HWAXRISK_SSO_TTL_S",\s*"(\d+)"', cfg)
+    if not m:
+        # 리스크 앱이 기본값을 상수로 뺐다(RK-11 — DEFAULT_SSO_TTL_S, 11-28) — env.get("…", str(DEFAULT_SSO_TTL_S)) 꼴이면 그 상수를 읽는다
+        if re.search(r'"HWAXRISK_SSO_TTL_S",\s*str\(DEFAULT_SSO_TTL_S\)', cfg):
+            m = re.search(r"^DEFAULT_SSO_TTL_S\s*(?::\s*int)?\s*=\s*(\d+)", cfg, re.M)
     assert m, "HWAXRisk 에서 HWAXRISK_SSO_TTL_S 기본값을 못 읽었다 — 이름이 바뀌었나"
     src = open(gw.__file__, encoding="utf-8").read()
     call = int(re.findall(r"\d+", re.search(r"^CALL_TIMEOUT_S\s*=.*$", src, re.M).group(0))[-1])

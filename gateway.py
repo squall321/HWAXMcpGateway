@@ -7279,23 +7279,26 @@ ONTO_LOOKUP_MAX_TYPES = 3
 def _onto_lookup_rows(d: dict) -> tuple:
     """어휘표 ontology.lookup → ((백엔드 키, 원래 이름, args 틀, 받는 타입 또는 None), …) — 어휘표 차례(PLAN §12 · OF-32). ontology_lookup 만 읽는다(검색
     순위 · 웹 챗은 읽지 않는다 — 에이전트 서버는 ontology 에서 apps 만 읽는다). 줄마다 거르고 예외를 내지 않는다(_onto_entries 와 같은 까닭 — 덧씌우기
-    전체를 잃지 않게). 받는 칸 tool · args · types(고를 칸 — 없으면 어느 타입이든, OF-35) · _doc."""
+    전체를 잃지 않게). 받는 칸 tool · args · types(고를 칸 — 없으면 어느 타입이든, OF-35) · _doc. 앱 하나에 줄 하나(사전) 또는 여럿(사전의 목록 — 차례
+    대로, 줄마다 types 로 거른다)이다 — 부품 X 의 결함 목록처럼 한 앱에서 둘째 걸음까지 next 로 싣는다(HWAXPortal docs/request-1125 OL-6). 목록 안의
+    틀린 줄만 버린다."""
     onto = d.get("ontology")
     rows = onto.get("lookup") if isinstance(onto, dict) else None
     out = []
-    for key, row in (rows.items() if isinstance(rows, dict) else ()):
-        if not (isinstance(key, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,79}", key) and isinstance(row, dict)):
+    for key, val in (rows.items() if isinstance(rows, dict) else ()):
+        if not (isinstance(key, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,79}", key)):
             continue
-        if any(k not in ("tool", "args", "types", "_doc") for k in row):
-            continue
-        tool, args, typs = row.get("tool"), row.get("args"), row.get("types")
-        if not (isinstance(tool, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,120}", tool)
-                and isinstance(args, dict) and args and all(isinstance(k, str) and k for k in args)):
-            continue
-        if typs is not None and not (isinstance(typs, list) and typs
-                                     and all(isinstance(t, str) and re.fullmatch(r"[a-z0-9_]{1,80}", t) for t in typs)):
-            continue
-        out.append((key, tool, args, tuple(typs) if typs else None))
+        for row in (val if isinstance(val, list) else [val]):
+            if not isinstance(row, dict) or any(k not in ("tool", "args", "types", "_doc") for k in row):
+                continue
+            tool, args, typs = row.get("tool"), row.get("args"), row.get("types")
+            if not (isinstance(tool, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,120}", tool)
+                    and isinstance(args, dict) and args and all(isinstance(k, str) and k for k in args)):
+                continue
+            if typs is not None and not (isinstance(typs, list) and typs
+                                         and all(isinstance(t, str) and re.fullmatch(r"[a-z0-9_]{1,80}", t) for t in typs)):
+                continue
+            out.append((key, tool, args, tuple(typs) if typs else None))
     return tuple(out)
 
 
@@ -7373,6 +7376,24 @@ def _onto_fill(v, obj: dict):
     return obj.get(m.group(1)) if m else _ONTO_SLOT.sub(lambda mm: str(obj.get(mm.group(1)) or ""), v)
 
 
+def _onto_slots(v) -> set:
+    """args 틀 한 칸이 쓰는 틀 이름 — 글이면 그 안의 '{slot}', 목록 · 사전이면 안쪽 글까지 모은다(OL-6 — conditions 목록 안의 '{key}')."""
+    if isinstance(v, str):
+        return {m.group(1) for m in _ONTO_SLOT.finditer(v)}
+    if isinstance(v, (list, dict)):
+        return set().union(*(_onto_slots(x) for x in (v.values() if isinstance(v, dict) else v)))
+    return set()
+
+
+def _onto_fill_deep(v, obj: dict):
+    """_onto_fill 을 목록 · 사전 안쪽 글까지 — 맨 위 글자 칸은 _onto_fill 과 같다(OL-6)."""
+    if isinstance(v, list):
+        return [_onto_fill_deep(x, obj) for x in v]
+    if isinstance(v, dict):
+        return {k: _onto_fill_deep(x, obj) for k, x in v.items()}
+    return _onto_fill(v, obj)
+
+
 def _onto_next(obj: dict, rows: tuple, want_apps: set, vocab: dict) -> tuple[list, list]:
     """exact 개체로 앱마다 부를 다음 호출 — (next, skipped). 호출자에게 보이고(권한 · 숨김 · 시험 사본 아님) 이 박스에 그 도구가 있는 앱만이다 — 보이지
     않는 앱은 이름조차 싣지 않는다. 차례는 허브 가족(정본 → 형제, 어휘표 차례) → 그 밖(표 차례). 비코어는 role 을 단다. 칸이 비는 틀(key 없는 개체에
@@ -7390,12 +7411,12 @@ def _onto_next(obj: dict, rows: tuple, want_apps: set, vocab: dict) -> tuple[lis
         exposed = _rt_exposed(app, tool)
         if exposed is None:
             continue
-        need = {m.group(1) for v in args.values() if isinstance(v, str) for m in _ONTO_SLOT.finditer(v)}
+        need = _onto_slots(args)
         empty = sorted(s for s in need if not obj.get(s))
         if empty:
             skipped.append({"app": app, "tool": exposed, "why": f"개체에 {' · '.join(empty)} 가 없다"})
             continue
-        line = {"tool": exposed, "app": app, "args": {k: _onto_fill(v, obj) for k, v in args.items()}}
+        line = {"tool": exposed, "app": app, "args": {k: _onto_fill_deep(v, obj) for k, v in args.items()}}
         role = _app_role(app)
         if role and role[0] != "canonical":
             line["role"] = role[0]

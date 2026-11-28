@@ -7993,6 +7993,56 @@ def test_OL1_타입을_모르면_정본_검색을_후보로_준다(monkeypatch, 
     assert out["candidates"][0]["key"] == "FM-1" and out["types"] == [{"type_slug": "failure_mode", "count": 1}]
 
 
+# OL-6 — 앱 줄 여럿(사전의 목록 · 줄마다 types) · 안쪽 칸(conditions 목록 안의 '{key}')까지 채우기(HWAXPortal docs/request-1125 OL-6 · HP-82)
+_OL6_FT = [{"tool": "object_resolve", "args": {"type_slug": "{type_slug}", "name": "{key}"}},
+           {"tool": "objects_list", "types": ["part"],
+            "args": {"type_slug": "pd_defect", "limit": 20, "conditions": [{"field": "ref.part.key", "op": "eq", "value": "{key}"}]},
+            "_doc": "그 부품의 PLM 결함 — 수는 total, 묶음은 objects_summary"}]
+_OL6_PART = {"id": "p-1", "key": "PRT-SHIELD_CAN", "label": "실드캔", "type_slug": "part", "matched_by": "label"}
+
+
+def test_OL6_앱_줄은_사전의_목록도_받고_줄마다_거른다():
+    rows = gw._onto_lookup_rows({"ontology": {"lookup": {
+        "failuretrace": [*_OL6_FT, {"tool": "x y", "args": {"a": 1}}, "줄이 아니다", {"tool": "objects_summary", "args": {"q": "{key}"}, "w": 1}],
+        "heax-step_forge": {"tool": "onto_search", "args": {"q": "{key}"}, "types": ["plm_task"]}, "a1": []}}})
+    assert [(r[0], r[1], r[3]) for r in rows] == [("failuretrace", "object_resolve", None), ("failuretrace", "objects_list", ("part",)),
+                                                  ("heax-step_forge", "onto_search", ("plm_task",))], "목록 안의 틀린 줄만 버린다 · 차례 그대로"
+    assert gw._onto_slots({"a": "{type_slug}", "c": [{"v": "{key}", "n": 3}, "x {name}"], "d": None}) == {"type_slug", "key", "name"}
+    assert gw._onto_slots(7) == set() and gw._onto_slots([]) == set() and gw._onto_slots({}) == set()
+    obj = {"type_slug": "part", "key": "K-1", "name": "이름", "object_id": "u"}
+    assert gw._onto_fill_deep({"c": [{"v": "{key}"}, "pre-{name}"], "n": 20, "t": "{type_slug}"}, obj) == {
+        "c": [{"v": "K-1"}, "pre-이름"], "n": 20, "t": "part"}
+    assert gw._onto_fill_deep("{object_id}", obj) == gw._onto_fill("{object_id}", obj) == "u", "맨 위 글자 칸은 _onto_fill 그대로"
+
+
+def test_OL6_부품_결함_목록_줄이_next_에_서고_conditions_안_value_가_채워진다(monkeypatch, tmp_path):
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: {"match": "exact", "object": {**_OL6_PART, "type_slug": a["type_slug"]}},
+                             lookup={**_OL_LOOKUP, "failuretrace": _OL6_FT})
+    out = lookup({"query": "실드캔", "type": "part"})
+    assert out["match"] == "exact" and out["object"]["key"] == "PRT-SHIELD_CAN"
+    ft = [x for x in out["next"] if x["app"] == "failuretrace"]
+    assert [x["tool"] for x in ft] == [gw._rt_exposed("failuretrace", "object_resolve"), gw._rt_exposed("failuretrace", "objects_list")]
+    assert ft[0]["args"] == {"type_slug": "part", "name": "PRT-SHIELD_CAN"}
+    assert ft[1]["args"] == {"type_slug": "pd_defect", "limit": 20,
+                             "conditions": [{"field": "ref.part.key", "op": "eq", "value": "PRT-SHIELD_CAN"}]}
+    out = lookup({"query": "TASK-A", "type": "plm_task"})
+    assert [x["tool"] for x in out["next"] if x["app"] == "failuretrace"] == [gw._rt_exposed("failuretrace", "object_resolve")], \
+        "types [part] 줄은 부품이 아닌 개체에 싣지 않는다"
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: {"match": "exact", "object": {**_OL6_PART, "key": None}},
+                             lookup={"failuretrace": _OL6_FT})
+    out = lookup({"query": "실드캔", "type": "part"})
+    assert not [x for x in out["next"] if x["app"] == "failuretrace"] and {s["tool"] for s in out["skipped"] if s["app"] == "failuretrace"} == {
+        gw._rt_exposed("failuretrace", "object_resolve"), gw._rt_exposed("failuretrace", "objects_list")}, "안쪽 '{key}' 도 빈 칸이면 부르지 않는다"
+
+
+def test_OL6_사전_꼴_줄은_목록_하나로_적어도_결과가_같다(monkeypatch, tmp_path):
+    ans = lambda n, a: {"match": "exact", "object": _OL_OBJ}  # noqa: E731
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, ans)
+    before = lookup({"query": "TASK-A", "type": "plm_task"})
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, ans, lookup={k: [v] for k, v in _OL_LOOKUP.items()})
+    assert lookup({"query": "TASK-A", "type": "plm_task"}) == before
+
+
 # OL-2 — search_tools
 _OL_QS = ("온톨로지 조회", "온톨로지 검색", "ontology lookup", "고장모드 목록", "StepForge 온톨로지 검색", "파트 이름 찾기", "DynaForge 해석 리포트 과제 이름")
 

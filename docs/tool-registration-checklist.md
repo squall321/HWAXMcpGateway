@@ -22,6 +22,9 @@ HWAXPortal `docs/request-1117` GW-04 — 사용자 결정은 **점검표 문서 
 - [ ] **읽기 · 쓰기 표지** — 앱이 `readOnlyHint` · `destructiveHint` 를 단다. 못 달면 게이트웨이 `read_tools.json`(박스는 `read_tools.local.json` —
   재기동 없이 먹는다, GW-02)에 읽기를 확인한 것만 더한다.
 - [ ] **인자 설명** — 모든 인자에 설명(단위 · 범위). `/tools-map` 의 `arg_scores` 로 본다.
+- [ ] **영역** — 게이트웨이 `tool_areas.json` 의 `apps` 에 그 앱 줄(영역 키 하나 — 같은 파일 `areas` 의 키)이 있나. 값은 앱 주인이 정한다(짐작 값을
+  넣지 않는다). 줄이 없으면 그 앱 도구가 통째로 `/tools-map` 의 `unclassified` 로 가서 개인 Claude 묶음 보기 · 도구 고르기 묶음에서 빠진다 —
+  앱이 붙을 때마다 빠져 쌓였다(HWAXPortal docs/request-1125 CT-01 ~ CT-03). 훑기가 영역 없는 앱을 짚는다. 파일은 재기동 없이 먹는다.
 - [ ] **이름 · 앱 키** — 다른 앱과 겹치지 않게. 앱 키를 바꾸면 옛 키를 `app_keys.json` 의 `retired` 에 남긴다(옛 이름으로 부르면 새 이름을 안내한다 — GW-05).
 - [ ] **환경** — 박스가 `app_keys.local.json` 에 그 앱의 `env`(`dev` · `prod` 둘뿐 — 사용자 결정 D5)를 적었나. 시험 사본이면 `canonical: false`.
 - [ ] **큰 파일** — MCP 로 나르지 않는다. 앱이 적재 경로(바깥 경로 · 메서드 · 받는 자격 종류 · 크기 상한 · 포털 로그인 문)를 공식으로 밝히고,
@@ -53,7 +56,8 @@ HWAXPortal `docs/request-1117` GW-04 — 사용자 결정은 **점검표 문서 
 ## 훑기 — `tool_registration_scan.py`
 
 읽기만 한다(파일 · 원장 · 게이트웨이에 아무것도 쓰지 않고 감사 원장도 읽지 않는다). 앱마다 표 하나 — 도구 · 원래 이름 · 데이터 주인(추정) · 보고만
-의심 · 까닭. 끝에 질의 점검(D1)과 옛 키로 아직 붙어 있는 앱(GW-05).
+의심 · 까닭. 끝에 질의 점검(D1) · 옛 키로 아직 붙어 있는 앱(GW-05) · 영역 없는 앱(`/tools-map` 의 `unclassified` 를 앱마다 센 것 — CT-03, 그 칸이 없는
+옛 게이트웨이면 '모른다').
 
 ```bash
 python3 tool_registration_scan.py                                  # 이 박스 게이트웨이(127.0.0.1:9110)의 /tools-map — 박스 안에서 돌린다

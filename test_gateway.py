@@ -15501,11 +15501,28 @@ def test_BG3_큰_파일도_StepForge_진짜_조각_크기로_흘려_sha256_이_�
     async def real_shape(name, args):                       # 진짜 _call_tool_body 의 결과 손질 — _evid_keep(이름, _pii_mask(결과, tool=…))
         return gw._evid_keep(name, gw._pii_mask(await inner(name, args), tool=("heax-step_forge", "download_artifact")))
     monkeypatch.setattr(gw, "_call_tool_body", real_shape)
+    monkeypatch.setattr(gw, "_EVID", gw.OrderedDict())
     out, err = run(filename="project_full.step")
     assert err is False and out["ok"] is True, out
     assert out["bytes"] == len(data) and out["sha256"] == sha and out["ste_verified"] is True, "ste 가 디스크에 쓴 파일의 sha256 까지 맞는다"
     assert hashlib.sha256(rec["stored"]["project_full.step"]).hexdigest() == sha
     assert [a["offset"] for _n, a in rec["sf"]] == list(range(0, len(data), 1_000_000)), "조각을 차례로 · 한 번씩"
+    _exp, calls, _trim = gw._EVID.get("u:a@x.com", (0, [], None))
+    assert len(calls) == len(rec["sf"]) and all(len(t) < 300 for _tool, t in calls), \
+        "파일 조각의 base64 는 근거 원장의 숫자 줄기로 쌓지 않는다(조각 칸의 수만 — 앞선 조회를 밀어내고 지어낸 정수를 통과시켰다)"
+
+
+def test_BG3_근거_원장은_base64_덩어리를_숫자로_쌓지_않고_사람이_읽는_수는_그대로(monkeypatch):
+    monkeypatch.setattr(gw, "_EVID", gw.OrderedDict())
+    monkeypatch.setattr(gw, "_request_user", lambda: "v@x.com")
+    blob = base64.b64encode(os.urandom(6000)).decode("ascii")
+    txt = json.dumps({"thickness_mm": 1250.47, "count": 408, "data_base64": blob, "sha": "ab" * 32, "note": "두께 0.85 mm"})
+    gw._evid_record("download_artifact", types.CallToolResult(content=[types.TextContent(type="text", text=txt)]))
+    _exp, calls, _trim = gw._EVID["u:v@x.com"]
+    dig = calls[0][1].split()
+    assert {"1250.47", "408", "0.85"} <= set(dig) and len(dig) < 60, dig[:80]
+    assert gw._EVID_BLOB_RE.sub(" ", "값 " + "1" * 300 + " 끝") != "값 " + "1" * 300 + " 끝", "빈칸 없이 256자 넘게 잇단 덩어리만 뗀다"
+    assert gw._EVID_BLOB_RE.sub(" ", "PRT-SHIELD_CAN 12345 abcdef") == "PRT-SHIELD_CAN 12345 abcdef"
 
 
 def test_P1_full_을_모르는_StepForge_는_접힌_답이라_ste_를_열지_않는다(monkeypatch):

@@ -6179,6 +6179,10 @@ def _evid_key() -> str:
 
 
 _EVID_COMMA_RUN_RE = re.compile(r"[\d.,]+")
+# base64 덩어리(파일 조각 data_base64 · 글로 실린 그림) — 숫자가 아니라 바이트다. 숫자 줄기로 쌓으면 파일 한 번 옮기기(artifact_to_ste_upload — 1 MB 조각
+# 수십 ~ 백여 개)가 칸(EVID_MAX_CHARS)을 무작위 숫자로 채워 앞선 진짜 조회를 밀어내고, 지어낸 정수(408 · 1250)를 '조회 결과에 있다' 로 통과시켰다
+# (HWAXPortal docs/request-1125 BG-3 곁). 빈칸 없이 256자 넘게 잇단 base64 글자만 뗀다 — 사람이 읽는 수는 그런 덩어리 안에 없다.
+_EVID_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{256,}={0,2}")
 
 
 def _evid_digest(txt: str) -> str:
@@ -6231,6 +6235,7 @@ def _evid_record(tool: str, res) -> None:
         txt = "".join(getattr(c, "text", "") or "" for c in (getattr(res, "content", None) or []))
         if not txt:
             return
+        txt = _EVID_BLOB_RE.sub(" ", txt)
         key = _evid_key()
         if not key:
             return          # 누구 것인지 모르면 안 쌓는다 — 남의 칸에 들어가느니 없는 게 낫다

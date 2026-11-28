@@ -2356,9 +2356,9 @@ async def _backends_lifespan():
 #   안내, 6번 · 1번의 덧말(기억으로 채운 값을 거기서 잡는다 · 그래야 클라이언트가 패널을 띄운다). 규칙은 하나도 빼지 않았다.
 _INSTRUCTIONS = """HWAX 엔지니어링 허브 — 사내 설계·해석·품질 데이터와 도구 게이트웨이. 아래는 실제로 났던 실패를 막는 순서다.
 
-1. 도구가 수백 개다. 목록을 훑지 말고 `search_tools("하려는 일")` 로 찾아(`detail` 은 필요할 때만) `invoke_tool` 로
-불러라. 목록에 안 보이는 도구도 invoke_tool 로 즉시 호출된다. 단 **패널 도구**(목록의 `_meta.ui` 가 달린 도구 —
-SimFlow · ARP 의 open_* 등)는 invoke_tool 이 아니라 그 이름으로 직접 불러라.
+1. 도구가 수백 개다 — 한 길로 부른다. 목록에 있는 이름은 바로 부르고, 없거나 모르면 `search_tools("하려는 일")` 한 번
+(`detail` 은 필요할 때만) → `invoke_tool`. 클라이언트의 도구 검색(ToolSearch)으로 낱말을 찾지 마라 — 스키마만 문맥에 쌓인다.
+단 **패널 도구**(목록의 `_meta.ui` 가 달린 도구 — SimFlow · ARP 의 open_* 등)는 invoke_tool 이 아니라 그 이름으로 직접 불러라.
 2. **수치·이름·ID 를 기억으로 채우지 마라.** 이 허브의 가장 위험한 실패는 도구를 부르지 않고
 그럴듯한 값을 서술하는 것이다(표면이 완벽해 사용자가 진짜 데이터로 믿는다). 답에 쓰는 값은
 도구 결과에 있던 값이어야 하고, 결과의 record_id·section_id 를 함께 인용하라.
@@ -2376,10 +2376,7 @@ SimFlow · ARP 의 open_* 등)는 invoke_tool 이 아니라 그 이름으로 직
 `use_experts(keys=[...])` 로 역할·도구를 받아 그 전문가로서 답하라(첫 명이 주 전문가). `list_agents` 는 `compact=true` 로.
 8. 도구가 실패하면 인자만 바꿔 반복하지 마라. 응답이 '인자 문제가 아니다' 라고 말하면
 연결·시간초과이므로 다른 방법을 찾거나 사용자에게 알려라.
-9. 권한 없는 앱은 `list_tool_apps` 의 `denied_apps` 에만 있다 — 도구 이름을 지어내거나 `invoke_tool` 로 우회하지 말고
-그 `how` 를 따르라(`portal_access` 만 `/access?need=<권한>` 에서 요청하고, `gateway_group` · `policy_not_ready` 는 요청하라고 하지 마라).
-10. `list_tool_apps` 의 `muted_apps` 는 사용자가 포털에서 **꺼 둔** 앱이다(권한 문제가 아니다 — 요청하라고 하지 마라).
-사용자가 그 앱을 쓰라고 할 때만 `list_tool_apps(app='<키>')` 로 도구를 보고 `invoke_tool` 로 부른다.
+9. 권한 없는 앱(`denied_apps`) · 꺼 둔 앱(`muted_apps`)은 `list_tool_apps` 답의 `note` · `how` 를 따른다 — 도구 이름을 지어내지 마라.
 12. 분석 루틴은 routine_list 설명의 차례로 돈다 — 단계 도구는 routine_call 로만(울타리 밖 금지), 키는 결과에 나온 값만 쓴다.
 """
 # 11번은 리스크 앱 길잡이(risk_next_step)가 **카탈로그에 있을 때만** 싣는다(`_instructions`). 위임을 모르는 옛 앱(HWAXRisk main)에는
@@ -2403,6 +2400,9 @@ _INSTR_RISK_LLM = " `risk_start_job` 은 `llm=glm`(Claude 로 품질을 잴 때�
 # 문구 그대로, 넘으면 짧은 꼴 — 13번 · 11번이 모두 실린 가장 긴 조합(2,031자)에는 문구 전체가 들어가지 않는다. 전체 문구는 share_conversation 설명에 있다.
 _INSTR_IX = "14. 이 포털을 거친 대화와 도구 호출은 기록되어 품질 개선과 지식 정리에 쓰입니다. 원문은 본인과 지정 분석가만 보며, 언제든 지우기를 청할 수 있습니다.\n"
 _INSTR_IX_SHORT = "14. 호출은 기록된다.\n"
+# 15번 — 결과 손잡이를 켠 박스만(GATEWAY_RESULT_REFS — HWAXPortal docs/request-1125 G-2). 9 · 10번(권한 없는 앱 · 꺼 둔 앱)을 list_tool_apps 답의 note 로
+# 옮겨 생긴 자리에 싣는다 — 줄인 결과를 같은 호출의 되풀이로 다시 받으면 줄인 몫이 사라진다. 자리가 없으면 싣지 않는다(도구 설명이 같은 말을 한다).
+_INSTR_RES = "15. 큰 결과가 머리 + `ref` 로 오면 `result_ask` 로 묻거나 `result_get` 으로 쪽을 받는다 — 같은 호출을 되풀이하지 마라.\n"
 _INSTR_MAX = 2048                          # Claude Code 가 서버 지침을 자르는 자리 — 이것보다 짧아야 한다
 
 
@@ -2420,6 +2420,8 @@ def _instructions() -> str:
                 + (_INSTR_DELIB_VIEW if "view" in _tool_props("deliberate_result") else "") + "\n")
     if "risk_next_step" in route:
         out += _INSTR_RISK_NEXT.rstrip("\n") + (_INSTR_RISK_LLM if "llm" in _tool_props("risk_start_job") else "") + "\n"
+    if RESULT_REFS_ON and len(out) + len(_INSTR_RES) < _INSTR_MAX:
+        out += _INSTR_RES
     if INTERACTION_CAPTURE_ON:
         out += _INSTR_IX if len(out) + len(_INSTR_IX) < _INSTR_MAX else _INSTR_IX_SHORT
     return out
@@ -5750,7 +5752,10 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         "note": "여기 있는 앱은 모두 내 권한으로 호출 가능하다(reachable=백엔드 연결 정상). status=needs_connect 는 그 앱의 내 토큰을 "
                 "포털 '외부 연결'(/tokens?tab=connect)에 등록해야 부를 수 있다는 뜻이다. "
                 "권한 없는 앱은 목록에 없고 denied_apps 에 라벨·사유·필요 권한·요청 경로만 있다 — 각 항목의 "
-                "reason/how 를 따른다(portal_access 만 포털 '내 권한' 요청, policy_not_ready 는 잠시 뒤 재시도). "
+                "reason/how 를 따른다(portal_access 만 포털 '내 권한'(/access?need=<권한>)에서 요청, gateway_group 은 요청하라고 하지 않는다, "
+                "policy_not_ready 는 잠시 뒤 재시도). 도구 이름을 지어내거나 invoke_tool 로 우회하지 않는다. "
+                "muted_apps 는 사용자가 포털에서 꺼 둔 앱이다 — 권한 문제가 아니니 요청하라고 하지 말고, 사용자가 그 앱을 쓰라고 할 때만 "
+                "list_tool_apps(app='<키>') 로 도구를 보고 invoke_tool 로 부른다. "
                 "특정 앱의 도구 설명은 list_tool_apps(app='<키>') 로 조회.",
         # 이 연결의 개인 보기(E-4) — tools/list 에 실은 수 · 보기로 뺀 수(목록 밖도 search_tools → invoke_tool 로 닿는다)
         "view": _view_info(groups),

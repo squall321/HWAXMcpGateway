@@ -808,7 +808,8 @@ def test_list_tool_apps_거부_안내는_포털_권한키와_요청_경로를_�
     assert d["app"] == "ste" and d["needs"] == ["plat:smarttwin"] and d["request"] == "/access?need=plat:smarttwin"
     assert d["reason"] == "portal_access"
     assert "ste_submit_job" not in json.dumps(body), "거부 안내에 도구 이름이 새면 모델이 계획에 넣는다"
-    assert "denied_apps" in gw._INSTRUCTIONS and "/access?need=" in gw._INSTRUCTIONS
+    # 지침은 '답의 note · how 를 따른다' 한 줄이고(G-2 — 9 · 10번을 답으로 옮겼다), 요청 경로는 그 답이 말한다
+    assert "denied_apps" in gw._INSTRUCTIONS and "/access?need=" in body["note"] and "invoke_tool 로 우회하지 않는다" in body["note"]
 
 
 def _noop_async(value):
@@ -849,7 +850,7 @@ def test_거부_사유가_다르면_안내도_다르다(monkeypatch):
     one = json.loads(asyncio.run(gw._list_tool_apps({"app": "ste"})).content[0].text)
     assert one["error"].startswith("not_ready:") and "권한이 없는 앱" not in one["error"]
     assert "일시" in gw._deny_text("ste", ["plat:smarttwin"])
-    assert "policy_not_ready" in gw._INSTRUCTIONS and "gateway_group" in gw._INSTRUCTIONS
+    assert "policy_not_ready" in body["note"] and "gateway_group 은 요청하라고 하지 않는다" in body["note"], "지침에서 옮긴 안내(G-2)"
     assert "재시도" in body["note"] or "policy_not_ready" in body["note"]
     # 정책이 오면 같은 호출자가 바로 열린다 — 일시 상태였다는 증거.
     monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
@@ -2503,9 +2504,29 @@ def test_포털이_알리면_불통_때_쓰는_직전_권한도_그_사람_것�
     assert post(b"") == 200 and gw._ENT_LAST == {}, "이메일 없이 부르면 전부 비운다(다른 캐시와 같다)"
 
 
-def test_지침이_끈_앱을_권한_문제와_구분하라고_말한다():
-    assert "muted_apps" in gw._INSTRUCTIONS and "요청하라고 하지 마라" in gw._INSTRUCTIONS
+def test_지침이_끈_앱을_권한_문제와_구분하라고_말한다(monkeypatch):
+    """9 · 10번은 list_tool_apps 답의 note 로 옮겼다(HWAXPortal docs/request-1125 G-2 — 2,048자 안에 자리를 만든다). 지침은 그 답을 따르라는 한 줄이다."""
+    assert "muted_apps" in gw._INSTRUCTIONS and "note" in gw._INSTRUCTIONS and "지어내지 마라" in gw._INSTRUCTIONS
     assert len(gw._INSTRUCTIONS) < 2048, "Claude Code 는 서버 지침을 2048자에서 자른다"
+    monkeypatch.setattr(gw, "backends", {})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    note = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["note"]
+    assert "muted_apps 는 사용자가 포털에서 꺼 둔 앱이다" in note and "요청하라고 하지 말고" in note and "list_tool_apps(app='<키>')" in note
+
+
+def test_G2_지침_1번은_한_길이고_ToolSearch_낱말_찾기를_막고_결과_손잡이를_켠_박스에만_15번(monkeypatch):
+    first = gw._INSTRUCTIONS.split("\n1. ", 1)[1].split("\n2. ")[0]
+    assert "한 길" in first
+    assert "바로 부르고" in first and "search_tools" in first and "한 번" in first and "ToolSearch" in first and "invoke_tool" in first
+    monkeypatch.setattr(gw._low, "instructions", gw._low.instructions)
+    monkeypatch.setattr(gw, "POLICY", {})
+    _aggregate_tools(monkeypatch, {})
+    assert "15. " not in gw._instructions(), "끈 박스는 지금과 같다"
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", True)
+    on = gw._instructions()
+    assert on == gw._INSTRUCTIONS + gw._INSTR_RES and "result_ask" in on and len(on) < 2048
 
 
 def test_포털이_찍는_챗_PAT_표지와_게이트웨이가_보는_값이_같다():
@@ -17422,11 +17443,16 @@ def test_지침_14번은_수집을_켰을_때만_맨_뒤에_붙고_가장_긴_�
     assert "14. " not in off
     monkeypatch.setattr(gw, "INTERACTION_CAPTURE_ON", True)
     on = served(full)
-    assert on == off + gw._INSTR_IX_SHORT and len(on) < 2048, len(on)
+    want = gw._INSTR_IX if len(off) + len(gw._INSTR_IX) < 2048 else gw._INSTR_IX_SHORT
+    assert on == off + want and len(on) < 2048, len(on)
+    assert want is gw._INSTR_IX, "9 · 10번을 답으로 옮긴 뒤(G-2)에는 가장 긴 조합에도 계약 문구 전체가 든다"
     small = served({})
     assert small == gw._INSTRUCTIONS + gw._INSTR_IX and "언제든 지우기를 청할 수 있습니다" in small, "자리가 있으면 계약 문구 그대로"
     assert len(gw._INSTRUCTIONS + gw._INSTR_DELIB + gw._INSTR_DELIB_WAIT + gw._INSTR_DELIB_VIEW + "\n" + gw._INSTR_RISK_NEXT.rstrip("\n")
                + gw._INSTR_RISK_LLM + "\n" + gw._INSTR_IX_SHORT) < 2048, "가장 긴 조합 + 짧은 꼴"
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", True)
+    both = served(full)
+    assert both == off + gw._INSTR_RES + gw._INSTR_IX and len(both) < 2048, ("결과 손잡이 15번 + 수집 14번(맨 뒤) — 가장 긴 조합", len(both))
 
 
 def test_상호작용_수집_켜짐은_환경이_먼저고_없으면_provision_env_다(tmp_path):

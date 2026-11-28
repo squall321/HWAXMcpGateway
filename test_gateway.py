@@ -15835,6 +15835,79 @@ def test_PTR3_list_tool_apps_는_허브가_준_판만_싣는다(monkeypatch):
     assert "build" not in by["fmea"] and "build" not in by["reportarchive"] and "build" not in by["_gateway"], "허브가 모르면 칸이 없다"
 
 
+# ── 허브가 띄우지 않은 앱의 판 · 인스턴스(HWAXPortal docs/request-1125 PT-2) — 그 앱의 system_status 가 출처 ─────────────────────────────
+_PT2_STATUS = {"status": "ok", "version": "0.9", "projects": 3, "app": "step_forge",
+               "build": {"sha": "3404c449", "at": "2026-11-20T01:02:03Z", "source": "build-hook"}, "env": "prod", "env_raw": "prod",
+               "instance": {"server": "srv-token-zzz", "pid": 41, "host": "prod-node-07"}}
+
+
+class _PT2Sess:
+    def __init__(self, answer):
+        self.answer, self.calls = answer, []
+
+    async def call_tool(self, name, arguments=None, **kw):
+        self.calls.append((name, arguments))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return types.CallToolResult(content=[types.TextContent(type="text", text=self.answer)])
+
+
+def _pt2_kit(monkeypatch, answer, *, hub_build=None, ann=True, required=False):
+    from types import SimpleNamespace as NS
+    sess = _PT2Sess(answer if isinstance(answer, Exception) else (answer if isinstance(answer, str) else json.dumps(answer)))
+    st = types.Tool(name="heaxstep_forge_system_status", description="서버 상태", inputSchema={"type": "object", "properties": {},
+                    **({"required": ["x"]} if required else {})}, **({"annotations": types.ToolAnnotations(readOnlyHint=True)} if ann else {}))
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": NS(session=sess)})
+    monkeypatch.setattr(gw, "exposed_tools", [st])
+    monkeypatch.setattr(gw, "route", {"heaxstep_forge_system_status": ("heax-step_forge", "system_status")})
+    monkeypatch.setattr(gw, "DISCOVERED_META", {"heax-step_forge": {"label": "StepForge", "description": "", "build": hub_build}})
+    monkeypatch.setattr(gw, "_APP_STATUS", {})
+    monkeypatch.setattr(gw, "_read_lists", lambda: (frozenset(), frozenset()))
+    return sess
+
+
+def test_PT2_허브가_판을_모르는_앱은_system_status_의_판과_인스턴스를_목록_한_번에(monkeypatch):
+    sess = _pt2_kit(monkeypatch, _PT2_STATUS)
+    asyncio.run(gw._app_status_refresh())
+    asyncio.run(gw._app_status_refresh())
+    assert sess.calls == [("system_status", {})], "앱마다 TTL 에 한 번 — 인자 없이"
+    got = gw._APP_STATUS["heax-step_forge"]
+    assert got["build"]["commit"] == "3404c449" and got["build"]["built_at"] == "2026-11-20T01:02:03Z" and got["build"]["source"] == "app_status"
+    assert {k: got["instance"][k] for k in ("host", "env", "source")} == {"host": "prod-node-07", "env": "prod", "source": "app_status"}
+    assert "srv-token-zzz" not in json.dumps(got) and "pid" not in got["instance"], "서버 토큰 · pid 는 싣지 않는다"
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    body = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    row = next(a for a in body["apps"] if a["app"] == "heax-step_forge")
+    assert row["build"]["commit"] == "3404c449" and row["instance"]["host"] == "prod-node-07" and row["instance"]["env"] == "prod"
+    assert "env" in row, "운영본 여부(env · canonical — app_keys)는 종전 칸 그대로 함께 선다"
+
+
+def test_PT2_허브가_판을_주면_부르지_않고_꼴_밖이거나_못_받으면_칸이_없다(monkeypatch):
+    sess = _pt2_kit(monkeypatch, _PT2_STATUS, hub_build={"commit": "27b2132"})
+    asyncio.run(gw._app_status_refresh())
+    assert sess.calls == [] and "heax-step_forge" not in gw._APP_STATUS, "허브 build 가 먼저 — 부르지 않는다"
+    for answer in ({**_PT2_STATUS, "build": {"sha": None, "source": "unknown"}, "instance": {}, "env": "staging"}, "JSON 아님", [1, 2],
+                   RuntimeError("down")):
+        sess = _pt2_kit(monkeypatch, answer)
+        asyncio.run(gw._app_status_refresh())
+        assert len(sess.calls) == 1 and gw._APP_STATUS["heax-step_forge"]["build"] is None, answer
+        assert gw._APP_STATUS["heax-step_forge"]["instance"] is None, answer
+    for kw in ({"ann": False}, {"required": True}):
+        sess = _pt2_kit(monkeypatch, _PT2_STATUS, **kw)
+        asyncio.run(gw._app_status_refresh())
+        assert sess.calls == [], f"읽기로 확인되지 않았거나 인자가 필요한 상태 도구는 부르지 않는다 {kw}"
+    sess = _pt2_kit(monkeypatch, _PT2_STATUS)
+    monkeypatch.setattr(gw, "APP_STATUS_TTL_S", 0)
+    asyncio.run(gw._app_status_refresh())
+    assert sess.calls == [], "GATEWAY_APP_STATUS_TTL=0 이면 끔"
+    assert gw._app_status_parse(json.dumps({"build": "abc1234", "instance": {"host": "a b;rm"}}), "t") == (
+        {"commit": "abc1234", "source": "app_status", "checked_at": "t"}, None), "커밋 글자 꼴도 받고 · 호스트 꼴 밖은 뺀다"
+
+
 # ── Report Archive 초안의 템플릿 id · 판(HWAXPortal docs/leftovers-1121 L21-6 ①) ─────────────────────────────
 def test_RA_템플릿은_박스_파일이_없으면_종전_그대로이고_있으면_그_줄을_쓴다(monkeypatch, tmp_path):
     assert gw._ra_format_args("deliberation") == {"template_id": "deliberation", "template_version": 1}

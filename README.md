@@ -267,6 +267,7 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 | `GATEWAY_USER_PAT_TTL` | 43200 | 사람별 위임 토큰 캐시. 응답의 `expires_in` − 120초가 더 짧으면 그것 |
 | `GATEWAY_AFF_PROOF_TTL` | 120 | 소속 증명의 재전송 창(앱은 요청이 도착할 때 본다) |
 | `GATEWAY_CONN_TTL` | 300 | 포털 등록 토큰 캐시(조회 실패·미등록은 30초) |
+| `GATEWAY_APP_STATUS_TTL` | 600 | 허브가 판(build)을 모르는 앱(원격 노드 · 프록시 앱)의 판 · 인스턴스 — 그 앱의 `system_status`(인자 없음 · 읽기로 확인된 것만, 상주 세션)를 앱마다 이 주기에 한 번 불러 `list_tool_apps` 줄의 `build`(`source: app_status`)와 `instance`(그 앱이 말한 호스트 · 배포 환경)로 싣는다. 허브가 준 build 가 먼저 · 못 받으면 칸이 없다 · 0 이면 끔(provision.env 로도 — HWAXPortal docs/request-1125 PT-2) |
 | `GATEWAY_ACCESS_POLICY_TTL` · `GATEWAY_ACCESS_ENT_TTL` | 60 · 60 | 포털 권한 정책 갱신 주기 · 사람별 권한 캐시(포털이 불통이면 직전 값) |
 | `GATEWAY_CACHE_TTL` | 300 | 읽기 전용 응답 캐시. 상태·잡·`deliberate_*`·`risk_*` 는 캐시하지 않아 폴링이 실제 상태를 본다 |
 | `EVID_TTL_S` | 1800 | `verify_answer` 의 조회 기록. 지나면 `조회 기록이 만료됐다 … (EVID_TTL_S)` |

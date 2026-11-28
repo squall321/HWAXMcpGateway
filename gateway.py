@@ -1876,6 +1876,72 @@ def _hub_build(v) -> dict | None:
     return out
 
 
+# ── 허브가 띄우지 않은 앱의 판 · 인스턴스(HWAXPortal docs/request-1125 PT-2) ─────────────────────────────────────────────────────
+# 허브 서버 목록의 build 는 허브가 띄운 인스턴스에만 있다 — 운영 박스의 StepForge 는 원격 운영 노드에 잇기만 해서 list_tool_apps 줄에 build 가 없었고,
+# 판은 그 앱의 system_status 를 따로 불러야 보였다(11-23 답). 출처를 그 앱 자신의 system_status 로 둔다 — 허브가 build 를 준 앱은 부르지 않고, 인자 없이
+# 부를 수 있고 게이트웨이가 읽기로 확인한(_tool_class) system_status 가 있는 앱만, 상주 세션(서비스 시야)으로 앱마다 TTL 에 한 번이다. 판은 꼴이 맞을
+# 때만(허브 build 와 같은 16진 커밋 — 판을 틀리게 말하느니 말하지 않는다), 인스턴스는 그 앱이 스스로 말한 호스트 · 배포 환경만 싣는다(운영 노드인지 · 되돌림용
+# 동결 사본인지를 그것으로 가른다). 못 받으면 칸이 없다. 끄기 GATEWAY_APP_STATUS_TTL=0.
+APP_STATUS_TOOL = "system_status"
+APP_STATUS_TTL_S = float(_env_knob("GATEWAY_APP_STATUS_TTL", "600"))
+_APP_STATUS: dict[str, dict] = {}       # {백엔드: {"at": 단조 시각, "build": {...} | None, "instance": {...} | None}}
+
+
+def _app_status_parse(text: str, checked_at: str) -> tuple[dict | None, dict | None]:
+    """system_status 답(JSON 객체) → (build, instance). build 는 {commit, built_at?, source, checked_at} — build 칸이 {sha | commit, at?} 이거나 커밋 글자일 때,
+    instance 는 {host?, env?, source, checked_at} — 그 앱이 말한 instance.host · env(dev · prod)만. 꼴 밖이면 None."""
+    try:
+        d = json.loads(text)
+    except (TypeError, ValueError):
+        return None, None
+    if not isinstance(d, dict):
+        return None, None
+    b = d.get("build")
+    sha = (b.get("sha") or b.get("commit")) if isinstance(b, dict) else b
+    build = None
+    if isinstance(sha, str) and _HUB_COMMIT_RX.fullmatch(sha):
+        build = {"commit": sha}
+        at = b.get("at") if isinstance(b, dict) else None
+        if isinstance(at, str) and 0 < len(at) <= 40:
+            build["built_at"] = at
+        build.update(source="app_status", checked_at=checked_at)
+    inst: dict = {}
+    host = (d.get("instance") or {}).get("host") if isinstance(d.get("instance"), dict) else None
+    if isinstance(host, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}", host):
+        inst["host"] = host
+    if d.get("env") in APP_ENVS:
+        inst["env"] = d["env"]
+    return build, ({**inst, "source": "app_status", "checked_at": checked_at} if inst else None)
+
+
+async def _app_status_refresh() -> None:
+    """허브가 판을 모르는 백엔드마다 system_status 를 TTL 에 한 번 부른다(PT-2). 앱 하나가 늦거나 실패해도 나머지는 돈다 — 그 앱 칸은 비운다."""
+    if APP_STATUS_TTL_S <= 0:
+        return
+    for key, b in list(backends.items()):
+        if b.session is None or (DISCOVERED_META.get(key) or {}).get("build"):
+            _APP_STATUS.pop(key, None)
+            continue
+        exposed = _rt_exposed(key, APP_STATUS_TOOL)
+        t = next((x for x in exposed_tools if x.name == exposed), None) if exposed else None
+        if t is None or ((getattr(t, "inputSchema", None) or {}).get("required")) or _tool_class(t, key, APP_STATUS_TOOL)[0] != "read":
+            _APP_STATUS.pop(key, None)
+            continue
+        now = time.monotonic()
+        got = _APP_STATUS.get(key)
+        if got and now - got["at"] < APP_STATUS_TTL_S:
+            continue
+        build = inst = None
+        try:
+            with anyio.fail_after(LIVENESS_TIMEOUT_S):
+                res = await b.session.call_tool(APP_STATUS_TOOL, {})
+            if not getattr(res, "isError", False):
+                build, inst = _app_status_parse(_rt_text(res), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        except Exception as exc:  # noqa: BLE001 — 판 칸은 보조다. 다음 TTL 에 다시 묻는다
+            log.debug("backend %s %s 못 받음: %r", key, APP_STATUS_TOOL, exc)
+        _APP_STATUS[key] = {"at": now, "build": build, "instance": inst}
+
+
 # heax registry 연속 폴링 실패 횟수 — 일시적 불통과 '정말 사라짐'을 구분하기 위한 상태.
 # 레지스트리에 안 보인 연속 횟수. 한 번 빠졌다고 떼면 앱 재기동마다 카탈로그가 출렁인다.
 # 백엔드별 **직전 성공** 도구 목록과 연속 실패 횟수.
@@ -2198,6 +2264,11 @@ async def _revive_once_locked(tg) -> bool:
             await _aggregate()
         except Exception as exc:  # noqa: BLE001
             log.warning("re-aggregate after revive failed: %r", exc)
+    # 허브가 판을 모르는 앱의 판 · 인스턴스(PT-2) — 그 앱의 system_status 로(앱마다 GATEWAY_APP_STATUS_TTL 에 한 번). 실패는 패스를 막지 않는다
+    try:
+        await _app_status_refresh()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("app status refresh skipped: %r", exc)
     return revived
 
 
@@ -5628,10 +5699,14 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             "status": "ok" if (accessible and reachable) else
                       ("no_access" if not accessible else "backend_down"),
         }
-        # 떠 있는 판(PT-R3) — 허브가 적은 커밋 · 뜬 시각 그대로. 허브가 모르면(프록시 앱 · 커밋 없는 SIF) 칸이 없다 — 지어내지 않는다
-        _build = None if local else (DISCOVERED_META.get(key) or {}).get("build")
+        # 떠 있는 판(PT-R3) — 허브가 적은 커밋 · 뜬 시각 그대로. 허브가 모르면(프록시 앱 · 원격 노드 · 커밋 없는 SIF) 그 앱 system_status 가 말한 판(PT-2 —
+        # source app_status)과 인스턴스(호스트 · 배포 환경), 그것도 없으면 칸이 없다 — 지어내지 않는다
+        _st = None if local else _APP_STATUS.get(key)
+        _build = None if local else ((DISCOVERED_META.get(key) or {}).get("build") or (_st or {}).get("build"))
         if _build:
             entry["build"] = _build
+        if _st and _st.get("instance"):
+            entry["instance"] = _st["instance"]
         # 환경 · 정본 · 옛 키(GW-05) — 앱마다 env 가 dev · prod 로 찬다(박스가 app_keys.local.json · GATEWAY_ENV 로 적는다 — 없으면 unknown)
         entry.update(_app_env_entry(key))
         role = None if local else _app_role(key)

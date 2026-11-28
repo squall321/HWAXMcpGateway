@@ -7444,14 +7444,17 @@ def test_E2_1_역할을_다_읽고_health_가_키마다_이_박스에_있는지_
     monkeypatch.setattr(gw, "CORE_VOCAB_PATH", _REAL_CORE_VOCAB)
     _vocab_overlay(monkeypatch, tmp_path, {"apps": {"newhub": {"role": "sibling", "label": "새 허브"}}})
     d = gw._core_vocab()
-    assert d["family"] == ("rootdesigndatahub", "failuretrace", "caegroupdatahub", "newhub"), "정본이 앞, 형제는 어휘표 차례"
+    real = json.loads(_REAL_CORE_VOCAB.read_text(encoding="utf-8"))
+    sibs = tuple(k for k, v in (real.get("apps") or {}).items() if (v or {}).get("role") == "sibling")   # 포털이 형제를 더해도(HPO-1 · 11-28) 표를 따른다
+    assert sibs and sibs[0] == "failuretrace"
+    assert d["family"] == ("rootdesigndatahub", *sibs, "newhub"), "정본이 앞, 형제는 어휘표 차례"
     assert set(d["noncore"]) == {"reportarchive", "matnexus", "componentcore", "fmea", "arp", "odb-hub"}
     assert d["noncore"]["fmea"] == "사내 규격 · 사례" and d["noncore"]["matnexus"] == ""
     assert d["staging"] == frozenset() and d["sib_tags"] == {}, "기본 표의 형제 소개 줄은 비었다(문안은 운영자 몫 — Q-3)"
     assert d["core_reads"] == {"object_resolve", "objects_list", "objects_summary", "graph_neighbors", "object_get"}
     monkeypatch.setattr(gw, "backends", {"rootdesigndatahub": _B([]), "failuretrace": _B([]), "fmea": _B([])})
     roles = gw._core_vocab_health()["roles"]
-    assert roles["family"] == {"rootdesigndatahub": True, "failuretrace": True, "caegroupdatahub": False, "newhub": False}
+    assert roles["family"] == {"rootdesigndatahub": True, "failuretrace": True, **{k: False for k in sibs[1:]}, "newhub": False}
     assert roles["noncore"]["fmea"] is True and roles["noncore"]["arp"] is False and len(roles["noncore"]) == 6
     assert roles["sibling_taglines"] == [] and roles["family_prefixed"] == {"count": 0, "names": []}
 
@@ -8024,8 +8027,18 @@ def test_OL1_exact_면_개체와_next_를_주고_정본_판정을_그대로_넘�
     assert out["match"] == "exact" and out["object"] == {"type_slug": "plm_task", "key": "TASK-A", "name": "과제 A", "object_id": "u-1",
                                                           "matched_by": "key"}
     nxt = {x["app"]: x for x in out["next"]}
-    assert list(nxt) == ["failuretrace", "caegroupdatahub", "heax-kooremapper_mcp", "heax-step_forge", "reportarchive"], \
-        "허브 가족 먼저(어휘표 차례 — 실제 표의 caegroupdatahub 줄이 덧씌우기와 합쳐진다) — 그다음 표 차례"
+    # 차례 규칙 — 허브 가족 먼저(어휘표 차례 — 실제 표의 caegroupdatahub 줄이 덧씌우기와 합쳐진다), 그다음 표 차례. 포털 표가 줄을 더해도(HPO-1 · HPO-4 · 11-28)
+    # 규칙으로 본다 — 줄 이름을 박아 두면 표가 바뀔 때마다 붉어진다
+    real = json.loads(_REAL_CORE_VOCAB.read_text(encoding="utf-8"))
+    fam = [k for k, v in (real.get("apps") or {}).items() if (v or {}).get("role") == "sibling"]
+    order = list(((real.get("ontology") or {}).get("lookup") or {}).keys())
+    got = list(nxt)
+    assert got[:2] == ["failuretrace", "caegroupdatahub"] and {"heax-kooremapper_mcp", "heax-step_forge", "reportarchive"} <= set(got), got
+    fam_part = [a for a in got if a in fam]
+    assert got[:len(fam_part)] == fam_part and fam_part == [a for a in fam if a in got], "허브 가족 먼저 · 어휘표 차례"
+    rest = [a for a in got if a not in fam]
+    in_table = [a for a in rest if a in order]
+    assert in_table == sorted(in_table, key=order.index), "가족 밖은 표 차례"
     assert nxt["failuretrace"] == {"tool": gw._rt_exposed("failuretrace", "object_resolve"), "app": "failuretrace",
                                    "args": {"type_slug": "plm_task", "name": "TASK-A"}, "role": "sibling"}
     assert nxt["heax-step_forge"]["args"] == {"q": "TASK-A", "type_slug": "plm_task", "resolve": True}
@@ -8080,10 +8093,12 @@ def test_OL1_next_에서_보이지_않는_앱과_꺼_둔_앱이_빠진다(monkey
     monkeypatch.setattr(gw, "POLICY", {"heax-kooremapper_mcp": ["dyna-only"]})
     monkeypatch.setattr(gw, "_request_muted", lambda: {"reportarchive"})
     apps = [x["app"] for x in lookup({"query": "TASK-A", "type": "plm_task"})["next"]]
-    assert apps == ["failuretrace", "caegroupdatahub", "heax-step_forge"], apps
+    # 권한 밖(kooremapper) · 끈 앱(reportarchive)은 빠지고 나머지는 차례 그대로 — 포털 표가 조회 줄을 더하면(odb-hub 등 · 11-28) 그 줄도 뒤에 선다
+    assert apps[:3] == ["failuretrace", "caegroupdatahub", "heax-step_forge"], apps
+    assert "heax-kooremapper_mcp" not in apps and "reportarchive" not in apps, apps
     lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: {"match": "exact", "object": {**_OL_OBJ, "key": None}})
     out = lookup({"query": "과제 A", "type": "plm_task"})
-    assert [x["app"] for x in out["next"]] == ["reportarchive"] and {s["app"] for s in out["skipped"]} == {
+    assert [x["app"] for x in out["next"]] == ["reportarchive"] and {s["app"] for s in out["skipped"]} >= {
         "failuretrace", "caegroupdatahub", "heax-kooremapper_mcp", "heax-step_forge"}, "key 없는 개체는 '{key}' 틀을 부르지 않는다"
 
 

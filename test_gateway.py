@@ -8292,6 +8292,7 @@ _HUB_READS = {f"rootdesigndatahub_{n}" for n in ("object_resolve", "objects_list
 
 
 def test_E4_가벼운_보기는_두_도구만_싣고_검색은_전체_보기와_바이트까지_같다(monkeypatch):
+    monkeypatch.setattr(gw, "VIEW_PANELS_ON", False)       # G-1 손잡이를 끈 판 — 종전 그대로(켠 판은 test_G1_*)
     _view_kit(monkeypatch, "full")
     full_list = _listed()
     queries = ("고장모드 목록", "규격 실패모드", "심의 시작", "철판 낙하 기준")
@@ -8342,6 +8343,68 @@ def test_E4_끈_앱은_어느_보기에서도_빠진다(monkeypatch):
         _view_kit(monkeypatch, view, muted="smart-twin-mcp,rootdesigndatahub")
         got = _listed()
         assert got and not [n for n in got if gw.route.get(n, ("",))[0] in {"smart-twin-mcp", "rootdesigndatahub"}], (view, got)
+
+
+# ── 줄인 보기의 패널 · 공통 도구(HWAXPortal docs/request-1125 G-1 · 사용자 결정 11-28) ──────────────────────────────────────────────────────
+# 패널은 클라이언트가 tools/list 에서 `_meta.ui` 를 본 도구를 그 이름으로 부를 때만 열린다 — 두 도구뿐이던 가벼운 보기 · 단계만 싣던 목적 보기에서는
+# 패널이 안 열렸다. 켠 박스(GATEWAY_VIEW_PANELS — 기본 켬)는 가벼운 보기에 list_tool_apps · verify_answer · 시야 안의 패널 도구를, 목적 보기에 그 목적
+# 앱의 패널 도구를 더한다. 끄면 종전과 같다. 보기는 여전히 tools/list 만 줄인다(검색 · 호출은 그대로).
+_G1_OTHER = {**_CORE_OTHER, "simflow": ("SimFlow", [("open_workflow_panel", "워크플로 패널을 연다."), ("list_runs", "실행 목록을 준다.")])}
+_G1_PANELS = {"open_workflow_panel": {"ui": {"resourceUri": "ui://simflow/workflow"}},
+              "compare_items": {"ui/resourceUri": "ui://arp/compare"}}            # 옛 키도 패널이다(HG-07)
+_G1_LIGHT = {"open_workflow_panel", "compare_items", "list_tool_apps", "search_tools", "invoke_tool", "verify_answer"}
+
+
+def _g1_mark_panels(monkeypatch, metas: dict):
+    """카탈로그의 그 이름 도구에 패널 표지(_meta)를 단다 — 집계가 옮긴 꼴 그대로(HG-07). 경로표는 그대로다."""
+    monkeypatch.setattr(gw, "exposed_tools", [t.model_copy(update={"meta": metas[t.name]}) if t.name in metas else t for t in gw.exposed_tools])
+
+
+def _g1_view_kit(monkeypatch, view, *, muted=""):
+    """_view_kit 과 같은 합성 카탈로그 + SimFlow(패널 하나 · 패널 아닌 것 하나) · ARP 의 패널 하나(옛 키)."""
+    _role_catalog(monkeypatch, other=_G1_OTHER)
+    _g1_mark_panels(monkeypatch, _G1_PANELS)
+    _set_request_headers(monkeypatch, {gw.GROUPS_HEADER: "", gw.MUTED_HEADER: muted, gw.VIEW_HEADER: view})
+
+
+def test_G1_가벼운_보기는_두_도구에_앱_목록_답_검증_패널_도구를_더하고_검색은_그대로다(monkeypatch):
+    assert gw.VIEW_PANELS_ON, "기본은 켬(사용자 결정 11-28)"
+    _g1_view_kit(monkeypatch, "full")
+    full_list = _listed()
+    queries = ("워크플로 패널", "고장모드 목록", "심의 시작")
+    full = {q: asyncio.run(gw._search_tools({"query": q, "limit": 20})).content[0].text for q in queries}
+    _g1_view_kit(monkeypatch, "light")
+    got = _listed()
+    assert got == [n for n in full_list if n in _G1_LIGHT] and set(got) == _G1_LIGHT, "시야 차례 그대로 — 빼기만 한다"
+    assert "list_runs" not in got and "search_data" not in got, "패널이 아닌 도구는 같은 앱이라도 싣지 않는다"
+    listed = {t.name: t.model_dump(by_alias=True, exclude_none=True) for t in asyncio.run(gw._list_tools(types.ListToolsRequest()))}
+    assert listed["open_workflow_panel"]["_meta"] == {"ui": {"resourceUri": "ui://simflow/workflow"}}, "패널 표지가 실려야 클라이언트가 패널을 연다"
+    assert listed["compare_items"]["_meta"] == {"ui/resourceUri": "ui://arp/compare"}
+    for q in queries:
+        assert asyncio.run(gw._search_tools({"query": q, "limit": 20})).content[0].text == full[q], "보기는 검색 시야를 줄이지 않는다"
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert v["mode"] == "light" and v["listed"] == len(_G1_LIGHT) and v["hidden_by_view"] == len(full_list) - len(_G1_LIGHT)
+
+
+def test_G1_가벼운_보기의_패널도_권한과_끈_앱을_따른다(monkeypatch):
+    _g1_view_kit(monkeypatch, "light", muted="simflow")
+    got = _listed()
+    assert "open_workflow_panel" not in got and "compare_items" in got, "끈 앱의 패널은 빠진다(끄기가 더 세다)"
+    _g1_view_kit(monkeypatch, "light")
+    monkeypatch.setattr(gw, "POLICY", {"arp": ["arp-only"]})
+    got = _listed()
+    assert "compare_items" not in got and "open_workflow_panel" in got, "권한 없는 앱의 패널은 빠진다(시야 안만)"
+    assert {"list_tool_apps", "search_tools", "invoke_tool", "verify_answer"} <= set(got)
+
+
+def test_G1_손잡이를_끄면_가벼운_보기는_종전_두_도구_그대로다(monkeypatch):
+    monkeypatch.setattr(gw, "VIEW_PANELS_ON", False)
+    _g1_view_kit(monkeypatch, "light")
+    got = gw._listed_tools([])
+    assert len(got) == 2 and all(a is b for a, b in zip(got, gw._VIEW_LIGHT_TOOLS)), "종전과 같은 두 객체 — 패널이 있어도 싣지 않는다"
+    assert _listed() == ["search_tools", "invoke_tool"]
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert v["listed"] == 2
 
 
 def _view_gate(monkeypatch, portal_view):
@@ -8443,7 +8506,7 @@ def test_E4_SDK_목록_처리기는_요청이면_보기를_얹고_캐시_채우�
     monkeypatch.setattr(gw, "_VIEW_LISTS", {"full": 0, "bundle": 0, "light": 0})
     _view_kit(monkeypatch, "light")
     res = asyncio.run(handler(types.ListToolsRequest()))
-    assert [t.name for t in res.root.tools] == ["search_tools", "invoke_tool"]
+    assert [t.name for t in res.root.tools] == ["list_tool_apps", "search_tools", "invoke_tool", "verify_answer"], "가벼운 보기(G-1 — 패널 없는 카탈로그)"
     res = asyncio.run(handler(None))
     assert len(res.root.tools) == len(gw._visible_tools([])) > 2
     _view_kit(monkeypatch, "bundle:sim")
@@ -18625,6 +18688,39 @@ def test_M3_목적_보기는_목록만_그_목적의_단계와_로컬_도구로_
     rows = gw._usage_rollup.adopt_query(gw.ADOPTION_PATH, "2000-01-01", "2999-12-31")
     assert sorted((r["kind"], r["key"]) for r in rows) == [("tools_list", "purpose"), ("view_purpose", "box-only"), ("view_purpose", "drop-prep"),
                                                            ("view_purpose", "nope")]
+
+
+def test_G1_목적_보기는_그_목적_앱의_패널_도구를_더하고_끄면_종전과_같다(monkeypatch, tmp_path):
+    """HWAXPortal docs/request-1125 G-1 · 사용자 결정 11-28 — 목적 보기(purpose:<키>)는 단계만 실어, 그 목적 앱의 패널(_meta.ui)이 목록에 없어 패널 화면이
+    안 열렸다. 켠 박스는 고른 목적(이 박스 · 이 호출자에게 산 것)의 apps 가 가진 패널 도구를 더한다 — 시야 안만 · 패널이 아닌 도구는 아니다."""
+    _p_table(monkeypatch, tmp_path)
+    _p_catalog(monkeypatch, groups=["g"], policy={"st": ["st-users"]})
+    extra = [("sf", "sf_viewer", True), ("st", "st_panel", True), ("ra", "ra_panel", True), ("other", "other_panel", True),
+             ("cluster", "cluster_panel", True), ("sf", "sf_plain", False)]
+    monkeypatch.setattr(gw, "exposed_tools", gw.exposed_tools + [_panel_tool(n, f"ui://{b}/{n}") if ui else _tool(n) for b, n, ui in extra])
+    monkeypatch.setattr(gw, "route", {**gw.route, **{n: (b, n) for b, n, _ui in extra}})
+    monkeypatch.setattr(gw, "backends", {**gw.backends, "cluster": type("B", (), {"session": object()})()})
+    local = {t.name for t in gw._local_tools()}
+
+    def backend(view, groups=("g",)):
+        _set_request_headers(monkeypatch, {gw.GROUPS_HEADER: ",".join(groups), gw.VIEW_HEADER: view, gw.VIEW_SRC_HEADER: "header"})
+        monkeypatch.setattr(gw, "_request_groups", lambda: list(groups))
+        got = _listed()
+        assert local <= set(got), "게이트웨이 공통(로컬 도구)은 다 싣는다"
+        return [n for n in got if n not in local]
+    assert backend("purpose:drop-prep,nope,box-only") == ["heaxsf_list_projects", "run_job", "sf_viewer", "cluster_panel"], \
+        "그 목적 앱(sf · st · cluster — 단계가 이 박스에 없는 앱도 apps 에 있으면)의 패널만 — 권한 없는 st · 다른 목적의 ra · 목적 밖 other 는 아니다"
+    assert backend("purpose:box-only") == [], "산 목적이 아니면(단계가 하나도 안 보인다 — view 의 unknown_purposes) 그 앱의 패널도 싣지 않는다"
+    assert backend("purpose:drop-prep", ("g", "st-users")) == ["heaxsf_list_projects", "run_job", "submit", "sf_viewer", "st_panel",
+                                                                "cluster_panel"]
+    assert backend("purpose:report-write") == ["ra_guide", "create_report_draft", "ra_panel"]
+    v = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["view"]
+    assert v["mode"] == "purpose" and v["listed"] == len(local) + 3
+    found = json.loads(asyncio.run(gw._search_tools({"query": "패널을 연다"}, embed=False, log_query=False)).content[0].text)
+    assert {"other_panel", "sf_viewer"} <= set(found["ranked"]), "보기는 검색 시야를 줄이지 않는다"
+    monkeypatch.setattr(gw, "VIEW_PANELS_ON", False)
+    assert backend("purpose:drop-prep,nope,box-only") == ["heaxsf_list_projects", "run_job"], "끄면 종전 — 단계와 로컬 도구만"
+    assert backend("purpose:report-write") == ["ra_guide", "create_report_draft"]
 
 
 def test_M3_목적_프롬프트는_사람_PAT_에만_목적마다_하나이고_포털이_죽어도_낸다(monkeypatch, tmp_path):

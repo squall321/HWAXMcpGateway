@@ -7827,9 +7827,9 @@ _OL_LOOKUP = {"failuretrace": {"tool": "object_resolve", "args": {"type_slug": "
               "reportarchive": {"tool": "search_objects", "args": {"q": "{name}"}}}
 
 
-def _ol_kit(monkeypatch, tmp_path, answers, *, lookup=_OL_LOOKUP):
+def _ol_kit(monkeypatch, tmp_path, answers, *, lookup=_OL_LOOKUP, other=_OL_OTHER):
     """실제 어휘표 + 합성 카탈로그 + 가짜 정본 — answers(노출 이름, 인자) → 정본 답(사전 · 예외 글은 오류 답). 부른 것을 calls 에 적는다."""
-    _role_kit(monkeypatch, other=_OL_OTHER)
+    _role_kit(monkeypatch, other=other)
     _vocab_overlay(monkeypatch, tmp_path, {"ontology": {"lookup": lookup}})
     calls = []
 
@@ -8041,6 +8041,51 @@ def test_OL6_사전_꼴_줄은_목록_하나로_적어도_결과가_같다(monke
     before = lookup({"query": "TASK-A", "type": "plm_task"})
     lookup, _calls = _ol_kit(monkeypatch, tmp_path, ans, lookup={k: [v] for k, v in _OL_LOOKUP.items()})
     assert lookup({"query": "TASK-A", "type": "plm_task"}) == before
+
+
+# OL-7 — none 답에 CAD 파트 이름이면 StepForge identify_part 로 다시 가라는 한 줄(HWAXPortal docs/request-1125 OL-7)
+_OL7_OTHER = {**_OL_OTHER, "heax-step_forge": ("StepForge", [*_OL_OTHER["heax-step_forge"][1],
+                                                             ("identify_part", "파트 이름으로 무엇인지 · 무엇을 하는지 · 치수를 알아본다.")])}
+
+
+def _ol7_answers(n, a):
+    return {"items": [], "types": []} if n.endswith("search") else {"match": "none", "object": None, "candidates": []}
+
+
+def _ol7_kit(monkeypatch, tmp_path, answers, other=_OL7_OTHER):
+    """_ol_kit + 정본 허브에 search(타입을 모를 때의 길) — 실제 정본 허브는 search 를 낸다."""
+    lookup, calls = _ol_kit(monkeypatch, tmp_path, answers, other=other)
+    hub = [types.Tool(name=n, description=d, inputSchema={"type": "object", "properties": {}})
+           for n, d in (*_CORE_HUB_TOOLS, ("search", "이름 · 식별자 · 별칭으로 전부 찾는다."))]
+    _aggregate_tools(monkeypatch, {**{k: list(hub) for k, _l in _CORE_HUBS},
+                                   **{k: [types.Tool(name=n, description=d, inputSchema={"type": "object", "properties": {}}) for n, d in ts]
+                                      for k, (_l, ts) in other.items()}})
+    return lookup, calls
+
+
+def test_OL7_CAD_이름_꼴이나_부품_타입의_none_답에_identify_part_로_다시_가라는_한_줄(monkeypatch, tmp_path):
+    lookup, _calls = _ol7_kit(monkeypatch, tmp_path, _ol7_answers)
+    ident = gw._rt_exposed("heax-step_forge", "identify_part")
+    out = lookup({"query": "BRKT_0012"})
+    assert out["match"] == "none" and out["via"] == "search" and ident in out["retry"] and "core_part" in out["retry"], out
+    out = lookup({"query": "실드캔", "type": "part"})
+    assert out["match"] == "none" and ident in out["retry"] and "type='part'" in out["retry"], "부품 타입이면 이름 꼴과 상관없이"
+    for q, t in (("솔더 크랙", "고장모드"), ("brkt_12", ""), ("PRT-SHIELD_CAN", "plm_task"), ("TASK-A", "plm_task")):
+        assert "retry" not in lookup({"query": q, **({"type": t} if t else {})}), (q, t)
+    lookup, _calls = _ol7_kit(monkeypatch, tmp_path, lambda n, a: {"match": "exact", "object": {**_OL6_PART, "key": "BRKT_0012"}})
+    assert "retry" not in lookup({"query": "BRKT_0012", "type": "part"}), "exact 에는 붙이지 않는다"
+
+
+def test_OL7_StepForge_가_보이지_않거나_도구가_없으면_이름을_말하지_않는다(monkeypatch, tmp_path):
+    lookup, _calls = _ol7_kit(monkeypatch, tmp_path, _ol7_answers)
+    monkeypatch.setattr(gw, "_request_muted", lambda: {"heax-step_forge"})
+    assert "retry" not in lookup({"query": "BRKT_0012"}), "꺼 둔 앱"
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    monkeypatch.setattr(gw, "POLICY", {"heax-step_forge": ["sf-only"]})
+    assert "retry" not in lookup({"query": "BRKT_0012"}), "권한 밖 앱(L7)"
+    lookup, _calls = _ol7_kit(monkeypatch, tmp_path, _ol7_answers, other=_OL_OTHER)
+    out = lookup({"query": "BRKT_0012"})
+    assert out["match"] == "none" and "retry" not in out, "이 박스 StepForge 에 identify_part 가 없다"
 
 
 # OL-2 — search_tools

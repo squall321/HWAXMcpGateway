@@ -7274,6 +7274,10 @@ ONTO_LOOKUP_TOOL = types.Tool(
 _ONTO_STOP = frozenset(("온톨로지", "ontology", "조회", "검색", "찾기", "찾아줘", "lookup", "정본", "코어"))
 _ONTO_SLOT = re.compile(r"\{(type_slug|key|name|object_id)\}")
 ONTO_LOOKUP_MAX_TYPES = 3
+# CAD 파트 이름 꼴(영문 대문자 · 밑줄 · 번호 — 「BRKT_0012」 · 「SHIELD_CAN_01」)과 그 이름을 코어 부품으로 푸는 앱(OL-7). 정본에는 CAD 이름이 없어 none 이
+# 맞지만 다음 걸음을 말하지 않았다 — StepForge identify_part 가 그 파트의 core_part(코어 부품 key)를 준다(D-710 ST-26).
+_ONTO_CAD_NAME = re.compile(r"[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)*_[A-Z0-9]*[0-9][A-Z0-9_-]*")
+ONTO_CAD_APP = "heax-step_forge"
 
 
 def _onto_lookup_rows(d: dict) -> tuple:
@@ -7449,6 +7453,20 @@ def _onto_fold_neighbors(body, focus_id: str, allowed: set, chars: int) -> dict:
     return {"rows": rows, "total": len(nodes), "shown": len(rows), "hub_truncated": body.get("truncated") is True}
 
 
+def _onto_cad_retry(name: str, chosen: list, vocab: dict) -> dict:
+    """none 답에 붙일 다음 걸음 한 줄(OL-7) — 타입이 부품(part)이거나 이름이 CAD 파트 이름 꼴이면 StepForge identify_part 로 core_part 를 얻고 그 key 로
+    다시 부르라고 한다. 호출자에게 보이는(권한 · 숨김 · 시험 사본 아님) StepForge 에 그 도구가 있을 때만 — 보이지 않는 앱은 이름조차 말하지 않는다."""
+    if not ("part" in chosen or _ONTO_CAD_NAME.fullmatch(name)):
+        return {}
+    if ONTO_CAD_APP in (_request_muted() | (vocab.get("staging") or frozenset())) or not _backend_allowed(ONTO_CAD_APP, _request_groups()):
+        return {}
+    exposed = _rt_exposed(ONTO_CAD_APP, "identify_part")
+    if exposed is None:
+        return {}
+    return {"retry": (f"CAD 파트 이름이면 정본에 없는 것이 맞다 — StepForge {exposed}(project_id, part=그 이름)로 core_part 를 얻고 그 key 로 "
+                      f"{ONTO_LOOKUP_TOOL.name}(query=core_part.key, type='part')를 다시 부른다(core_part 가 null 이면 core_part_why 를 사람에게 보인다)")}
+
+
 async def _onto_lookup(a: dict) -> types.CallToolResult:
     """ontology_lookup 의 몸 — PLAN §12 · OF-33 ~ OF-39. 답은 촘촘한 JSON 한 블록이다(오류도 match: refused 로 — 모델이 한 꼴만 읽게)."""
     t0 = time.monotonic()
@@ -7493,7 +7511,8 @@ async def _onto_lookup(a: dict) -> types.CallToolResult:
             return done("refused", ok=False, why=why, via="search")
         items = [x for x in body.get("items") or [] if isinstance(x, dict)]
         if not items:
-            return done("none", via="search", tried=[], hint="정본 검색에도 없다 — 짐작하지 말고 사람에게 묻는다(오타 · 아직 없는 것)")
+            return done("none", via="search", tried=[], hint="정본 검색에도 없다 — 짐작하지 말고 사람에게 묻는다(오타 · 아직 없는 것)",
+                        **_onto_cad_retry(name, chosen, vocab))
         types_n = [{"type_slug": str(t.get("slug") or t.get("type_slug") or ""), "count": t.get("count")}
                    for t in body.get("types") or [] if isinstance(t, dict)]
         return done("candidates", via="search", ask_user=True, candidates=[_onto_hit(x) for x in items[:limit]], types=types_n,
@@ -7539,7 +7558,8 @@ async def _onto_lookup(a: dict) -> types.CallToolResult:
     if refused and not exact and not cands:
         return done("refused", ok=False, why=" · ".join(f"{r['type_slug']}: {r['why']}" for r in refused)[:600], refused_types=refused,
                     tried=tried, hint="정본에 닿지 못했거나 권한이 없다 — '없다' 가 아니다")
-    return done("none", tried=tried, hint="정본에 그런 이름이 없다 — 짐작하지 말고 사람에게 묻는다(오타 · 아직 없는 것 · 다른 타입)")
+    return done("none", tried=tried, hint="정본에 그런 이름이 없다 — 짐작하지 말고 사람에게 묻는다(오타 · 아직 없는 것 · 다른 타입)",
+                **_onto_cad_retry(name, tried, vocab))
 
 
 # ── StepForge 산출물 → ste 업로드(HWAXPortal docs/ste-stepforge-1117 P-1 · 결정 SS-2) ─────────────────────────────────────────────

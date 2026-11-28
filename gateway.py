@@ -3397,11 +3397,45 @@ def _app_meta(key: str) -> dict:
 # 메시·재료가 섞여 있고, '해석 결과'는 앱 셋에 흩어져 있다. 사용자는 영역으로 찾는다.
 # ⚠ gateway_config.json 에 두지 않는다(gitignore·--force 재생성에 날아감). 이 파일은 git 으로 간다.
 _AREAS_PATH = Path(__file__).resolve().parent / "tool_areas.json"
+# 박스 덧씌우기(HWAXPortal docs/request-1125 CT-02) — dev 에 없는 사내 앱(mountsoldatahub · ncdevdatahub · testscope 등)의 영역은 그 앱 주인이 정하고
+# 운영 박스가 커밋 없이 적는다(dev 가 짐작 값을 넣지 않는다 — HE팀 운영자 덧씌우기와 같은 자세). 받는 칸은 apps · tools 둘(앱 · 도구 → 영역 키)이고 값은
+# 추적 표 areas 의 키여야 한다 — 틀린 줄만 버리고 경고한다, 파일이 깨지면 통째로 버린다. 덧씌우기가 이긴다. 재기동 없이 먹는다(바뀐 시각).
+_AREAS_LOCAL_PATH = Path(__file__).resolve().parent / "tool_areas.local.json"
 _AREAS_CACHE: dict = {"mtime": None, "data": {}}
 
 
+def _areas_overlay(raw: dict) -> dict:
+    """추적 표 raw 에 박스 덧씌우기의 apps · tools 줄을 얹은 사본 — 없거나 깨지면 raw 그대로."""
+    try:
+        over = json.loads(_AREAS_LOCAL_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return raw
+    except (OSError, ValueError) as exc:
+        log.warning("tool_areas.local.json 을 못 읽었다 — 덧씌우기 없이 간다: %r", exc)
+        return raw
+    if not isinstance(over, dict):
+        log.warning("tool_areas.local.json 은 객체여야 한다 — 덧씌우기 없이 간다")
+        return raw
+    keys = {a.get("key") for a in (raw.get("areas") or []) if isinstance(a, dict)}
+    out, dropped = dict(raw), []
+    for part in ("apps", "tools"):
+        add = over.get(part)
+        if add is None:
+            continue
+        if not isinstance(add, dict):
+            dropped.append(part)
+            continue
+        good = {k: v for k, v in add.items() if isinstance(k, str) and k and v in keys}
+        dropped += [f"{part}.{k}" for k in add if k not in good]
+        out[part] = {**(raw.get(part) or {}), **good}
+    dropped += [k for k in over if k not in ("apps", "tools", "_doc")]
+    if dropped:
+        log.warning("tool_areas.local.json 에서 버린 줄(영역 키가 추적 표 areas 에 없거나 받지 않는 칸): %s", ", ".join(map(str, dropped[:20])))
+    return out
+
+
 def _tool_areas() -> dict:
-    """영역 분류표 — mtime 캐시라 파일을 고치면 재기동 없이 반영된다.
+    """영역 분류표 — mtime 캐시라 파일을 고치면 재기동 없이 반영된다(추적 표 + 박스 덧씌우기 _areas_overlay).
 
     읽기 실패는 게이트웨이를 죽이지 않는다(분류 없이 동작). 대신 **경고를 남기고** /tools-map 의
     unclassified 가 전량으로 차서 UI 에 '미분류 N' 으로 드러난다 — 조용히 틀린 분류를 내지 않는다."""
@@ -3409,9 +3443,13 @@ def _tool_areas() -> dict:
         mt = _AREAS_PATH.stat().st_mtime
     except OSError:
         return {}
+    try:
+        mt = (mt, _AREAS_LOCAL_PATH.stat().st_mtime_ns)
+    except OSError:
+        mt = (mt, None)
     if _AREAS_CACHE["mtime"] != mt:
         try:
-            raw = json.loads(_AREAS_PATH.read_text(encoding="utf-8"))
+            raw = _areas_overlay(json.loads(_AREAS_PATH.read_text(encoding="utf-8")))
             raw["_patterns"] = [(re.compile(p), a) for p, a in (raw.get("patterns") or [])]
             _AREAS_CACHE.update({"mtime": mt, "data": raw})
         except (OSError, ValueError, re.error) as exc:

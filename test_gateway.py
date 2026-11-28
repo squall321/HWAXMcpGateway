@@ -75,6 +75,11 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "ADOPTION_ON", True)
     monkeypatch.setattr(gw, "_ADOPT_HEALTH", {"at": -1e9, "data": None})
     monkeypatch.setattr(gw, "_ADOPT_WARN", {"at": -1e9, "errors": 0})
+    # 도구 영역 표의 박스 덧씌우기도 같다(HWAXPortal docs/request-1125 CT-02) — 박스에 tool_areas.local.json 이 있으면 '추적 파일 그대로' 시험이 그 값으로 돈다
+    monkeypatch.setattr(gw, "_AREAS_LOCAL_PATH", tmp_path / "tool_areas.local.json")
+    monkeypatch.setattr(gw, "_AREAS_CACHE", {"mtime": None, "data": {}})
+    # 원격 앱의 판 · 인스턴스(PT-2) — 앞 시험이 채운 칸이 목록 시험에 새지 않게
+    monkeypatch.setattr(gw, "_APP_STATUS", {})
 
 
 @pytest.fixture(autouse=True)
@@ -595,6 +600,26 @@ def test_knox_bridge_와_plm_defect_도구는_미분류로_떨어지지_않는�
     assert by["quality"]["tools"] == ["plm_case_detail"]
     # 영역이 정의돼 있어야 라벨이 선다 — apps 줄만 먼저 나가면 UI 에 라벨 없는 칸이 생긴다
     assert by["quality"]["label"] == "품질·불량 이력" and "PLM" in by["quality"]["description"]
+
+
+def test_CT02_영역_박스_덧씌우기는_apps_tools_만_받고_추적_표의_영역_키만_받는다(monkeypatch, tmp_path, caplog):
+    """HWAXPortal docs/request-1125 CT-02 — dev 에 없는 사내 앱(mountsoldatahub · ncdevdatahub · testscope)의 영역은 앱 주인이 정하고 운영 박스가 커밋 없이
+    tool_areas.local.json 에 적는다(dev 는 짐작 값을 넣지 않는다). 틀린 줄만 버리고, 깨진 파일은 통째로 버린다. 재기동 없이 먹는다."""
+    import logging
+    local = gw._AREAS_LOCAL_PATH                                 # autouse 가 tmp 로 건 자리
+    assert gw._area_of("ts_list_tests", "testscope") == "", "덧씌우기가 없으면 추적 표 그대로(미분류)"
+    local.write_text(json.dumps({"_doc": "운영 박스", "apps": {"testscope": "quality", "mountsoldatahub": "data", "ncdevdatahub": "없는영역"},
+                                 "tools": {"ts_special": "report"}, "patterns": [["x", "cad"]]}), encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        assert gw._area_of("ts_list_tests", "testscope") == "quality" and gw._area_of("mount_a", "mountsoldatahub") == "data"
+    assert gw._area_of("nc_a", "ncdevdatahub") == "", "추적 표 areas 에 없는 영역 키는 버린다"
+    assert gw._area_of("ts_special", "testscope") == "report", "도구 지정이 앱 기본값을 이긴다(덧씌우기 안에서도)"
+    assert gw._area_of("find_parts", "heax-step_forge") == "cad", "추적 표의 다른 줄은 그대로"
+    said = " ".join(r.getMessage() for r in caplog.records)
+    assert "apps.ncdevdatahub" in said and "patterns" in said, "버린 줄을 경고한다(조용히 안 먹지 않게)"
+    local.write_text("{ 깨진", encoding="utf-8")
+    gw.os.utime(local, ns=(local.stat().st_atime_ns, local.stat().st_mtime_ns + 1_000_000_000))
+    assert gw._area_of("ts_list_tests", "testscope") == "" and gw._area_of("find_parts", "heax-step_forge") == "cad", "깨지면 통째로 버리고 추적 표로"
 
 
 @pytest.mark.parametrize("app, tool, want", [

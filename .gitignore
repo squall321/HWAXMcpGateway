@@ -45,3 +45,6 @@ interaction_spool/
 tool_purposes.local.json
 # 채택 셈 원장(HWAXPortal docs/mcp-modernize M0 · M3 — 보기 · prompts · 자원 읽기의 날마다 수) — 이용 통계 표 곁에 생긴다. 원장이 리포 안이면 리포 안이다
 usage-adoption.sqlite*
+# 도구 영역 표의 박스 덧씌우기(HWAXPortal docs/request-1125 CT-02) — dev 에 없는 사내 앱의 영역은 그 앱 주인이 정하고 박스가 커밋 없이 적는다. 무시 목록에
+# 없으면 deploy-all · update-all 의 git stash -u 가 치운다
+tool_areas.local.json

@@ -25,6 +25,7 @@ HWAXPortal `docs/request-1117` GW-04 — 사용자 결정은 **점검표 문서 
 - [ ] **영역** — 게이트웨이 `tool_areas.json` 의 `apps` 에 그 앱 줄(영역 키 하나 — 같은 파일 `areas` 의 키)이 있나. 값은 앱 주인이 정한다(짐작 값을
   넣지 않는다). 줄이 없으면 그 앱 도구가 통째로 `/tools-map` 의 `unclassified` 로 가서 개인 Claude 묶음 보기 · 도구 고르기 묶음에서 빠진다 —
   앱이 붙을 때마다 빠져 쌓였다(HWAXPortal docs/request-1125 CT-01 ~ CT-03). 훑기가 영역 없는 앱을 짚는다. 파일은 재기동 없이 먹는다.
+  dev 에 없는 사내 앱은 운영 박스가 박스 덧씌우기 `tool_areas.local.json`(apps · tools 두 칸, 값은 `areas` 의 키)에 그 앱 주인이 정한 값을 적는다(CT-02).
 - [ ] **이름 · 앱 키** — 다른 앱과 겹치지 않게. 앱 키를 바꾸면 옛 키를 `app_keys.json` 의 `retired` 에 남긴다(옛 이름으로 부르면 새 이름을 안내한다 — GW-05).
 - [ ] **환경** — 박스가 `app_keys.local.json` 에 그 앱의 `env`(`dev` · `prod` 둘뿐 — 사용자 결정 D5)를 적었나. 시험 사본이면 `canonical: false`.
 - [ ] **큰 파일** — MCP 로 나르지 않는다. 앱이 적재 경로(바깥 경로 · 메서드 · 받는 자격 종류 · 크기 상한 · 포털 로그인 문)를 공식으로 밝히고,

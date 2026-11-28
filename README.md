@@ -236,8 +236,8 @@ GET · HEAD 는 지금 그대로(`inject` — 허브 서비스 토큰)이고, St
 
 TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 방식 중 하나로 붙는다 — TestScope 코드는 여기서 손대지 않는다. **기본(`TESTSCOPE_SSO_SECRET` 없음)** 은 이 등록 토큰 길이고, **비밀이 있으면** `per_user_sso.testscope` 가 생겨 위 우선순위대로 그쪽이 먼저 탄다(등록할 것 없음). 위임은 TestScope 가 `POST /api/auth/sso`(위 계약)를 갖춘 뒤에만 켠다 — 그 전에 비밀이 생기면 발급이 실패해 신원 있는 TestScope 호출이 전부 거부되고 등록 토큰으로 돌아가지 않는다. 그래서 비밀은 자동으로 만들지 않고 사람이 넣는다. 백엔드는 두 방식이 같다 — `provision-config.sh` 가 `TESTSCOPE_MCP_URL`(> 직전 config 주소)로 만든다(`streamable_http`, 서비스 `Authorization` 없음 — tools/list 는 토큰 없이 된다). 기본 호스트가 없어 주소를 모르면 만들지 않는다.
 
-## 시간 한도 — 손잡이는 프로세스 env, 기본값은 코드
-게이트웨이는 `.env` 를 읽지 않고 HWAXPortal `infra/services.yaml` 의 `mcp-gateway` 항목도 env 를 넘기지 않는다 — **`gateway.py` 의 기본값이 곧 운영값**이다. 바꾸려면 `start.sh` 를 부르는 환경에 export 한다(값은 초). 닿았는지는 기동 로그의 한 줄(`시간 한도(초) — GATEWAY_CALL_TIMEOUT=600 · …`)로 본다 — 이 프로세스에 실제로 걸린 값이다.
+## 시간 한도 — 손잡이는 프로세스 env(박스는 provision.env), 기본값은 코드
+게이트웨이는 `.env` 를 읽지 않고 HWAXPortal `infra/services.yaml` 의 `mcp-gateway` 항목도 env 를 넘기지 않는다 — **`gateway.py` 의 기본값이 곧 운영값**이다. 바꾸려면 `start.sh` 를 부르는 환경에 export 하거나(값은 초), **박스에서는 곁의 `provision.env` 에 한 줄 적는다** — `start.sh` 가 아래 표의 손잡이(기동 로그 줄의 열셋)만, 숫자 값만 그 파일에서 환경에 싣는다(띄운 셸의 값이 먼저 · 토큰 줄은 싣지 않는다 · 싣는 값은 `· 박스 시간 한도(provision.env): …` 한 줄로 찍는다, HWAXPortal docs/request-1125 HG-24). 종전엔 셸 환경뿐이라 `~/.bashrc` · crontab 환경 줄에 적었고, 그 줄을 안 읽는 셸로 띄우면 말없이 기본값으로 돌았다 — 박스는 그 우회 줄을 걷는다. `provision.env` 는 포털 update-all 의 게이트웨이 지문이라 바꾸면 다음 update-all 이 다시 띄운다(손으로는 `./start.sh restart`). 닿았는지는 기동 로그의 한 줄(`시간 한도(초) — GATEWAY_CALL_TIMEOUT=600 · …`)로 본다 — 이 프로세스에 실제로 걸린 값이다.
 
 원칙은 셋이다. ① 안쪽 한도가 그것을 감싸는 한도보다 작다. ② 느린 도구(시간 초과)와 죽은 상대(연결 실패)를 가른다 — 시간 초과는 **한 번으로 끝내고**(재시도·세션 교체·토큰 재발급 없음) 연결 실패만 한 번 다시 건다. ③ 만료 문구는 몇 초였고 어느 손잡이인지 말한다.
 
@@ -267,6 +267,7 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 | `GATEWAY_USER_PAT_TTL` | 43200 | 사람별 위임 토큰 캐시. 응답의 `expires_in` − 120초가 더 짧으면 그것 |
 | `GATEWAY_AFF_PROOF_TTL` | 120 | 소속 증명의 재전송 창(앱은 요청이 도착할 때 본다) |
 | `GATEWAY_CONN_TTL` | 300 | 포털 등록 토큰 캐시(조회 실패·미등록은 30초) |
+| `GATEWAY_APP_STATUS_TTL` | 600 | 허브가 판(build)을 모르는 앱(원격 노드 · 프록시 앱)의 판 · 인스턴스 — 그 앱의 `system_status`(인자 없음 · 읽기로 확인된 것만, 상주 세션)를 앱마다 이 주기에 한 번 불러 `list_tool_apps` 줄의 `build`(`source: app_status`)와 `instance`(그 앱이 말한 호스트 · 배포 환경)로 싣는다. 허브가 준 build 가 먼저 · 못 받으면 칸이 없다 · 0 이면 끔(provision.env 로도 — HWAXPortal docs/request-1125 PT-2) |
 | `GATEWAY_ACCESS_POLICY_TTL` · `GATEWAY_ACCESS_ENT_TTL` | 60 · 60 | 포털 권한 정책 갱신 주기 · 사람별 권한 캐시(포털이 불통이면 직전 값) |
 | `GATEWAY_CACHE_TTL` | 300 | 읽기 전용 응답 캐시. 상태·잡·`deliberate_*`·`risk_*` 는 캐시하지 않아 폴링이 실제 상태를 본다 |
 | `EVID_TTL_S` | 1800 | `verify_answer` 의 조회 기록. 지나면 `조회 기록이 만료됐다 … (EVID_TTL_S)` |
@@ -729,12 +730,18 @@ svg 만). 감사 줄에는 그 결과의 `images` · `image_bytes` 가 붙는다
 
 Claude Code · Desktop 이 세션마다 읽는 글이다(`_INSTRUCTIONS` + `_instructions()`). 세션마다 값을 치르므로 짧게 두고, 전체가 2048자 안이어야 한다 — Claude Code 가 거기서 자른다(시험이 가장 긴 조합을 잰다 — 11-02 에 2,031자).
 
-- 본문(1 ~ 10 · 12번)은 늘 실린다. 붙는 항목은 재집계(`_aggregate`)마다 지금 카탈로그로 다시 짓고 뒤에만 붙는다 — 13번(새 심의는 서버 엔진 `deliberate_start`)은 그 도구가 있을 때, 11번(리스크 심사는 `risk_next_step` 부터)은 그 도구가 있을 때. 이미 열린 세션은 그때 받은 글을 쓴다.
+- 본문(1 ~ 9 · 12번)은 늘 실린다. 붙는 항목은 재집계(`_aggregate`)마다 지금 카탈로그로 다시 짓고 뒤에만 붙는다 — 13번(새 심의는 서버 엔진 `deliberate_start`)은 그 도구가 있을 때, 11번(리스크 심사는 `risk_next_step` 부터)은 그 도구가 있을 때. 이미 열린 세션은 그때 받은 글을 쓴다.
 - 서버 엔진을 기본 길로(사용자 결정 11-02, HWAXPortal docs/token-saving TS-5) — 13번 · 11번 끝 문장. Claude 가 좌석 · 판단 과제마다 직접 도는 워크플로(`hwax-*`)는 품질을 따로 잴 때만이다. 13번의 두 문장(`deliberate_status` 는 `wait_s` 로 한 번 기다린다 · 결과는 `deliberate_result(view="summary")` 부터)과 11번 끝 문장(`risk_start_job` 은 `llm=glm`)은 **그 인자가 지금 스키마에 있을 때만** 싣는다 — 에이전트 서버에 `wait_s` · `view` 가 아직 없는 판이면 13번에는 '고리로 되풀이해 묻지 마라' 만 남는다. 그래서 게이트웨이와 에이전트 서버의 배포 차례가 없다.
 - 본문의 토큰 습관 — `search_tools` 는 `detail` 을 필요할 때만, `list_agents` 는 `compact=true`.
+- 1번은 한 길이다(HWAXPortal docs/request-1125 G-2) — 목록에 있는 이름은 바로, 없거나 모르면 `search_tools` 한 번 → `invoke_tool`, 클라이언트의 도구 검색
+  (ToolSearch)으로 낱말을 찾지 않는다(11-24 비교에서 ToolSearch 로 스키마를 불러온 도구가 315개 · 약 33만 자). 종전 9 · 10번(권한 없는 앱 · 꺼 둔 앱의
+  자세한 안내)은 `list_tool_apps` 답의 `note` 로 옮기고 9번은 그 답을 따르라는 한 줄이다 — 그 앱들은 그 답에만 나오므로 거기서 읽힌다. 그래서 가장 긴 조합이
+  2,031자에서 1,811자로 줄었다.
+- 15번(결과 손잡이를 켠 박스만 — `GATEWAY_RESULT_REFS=1`) — 머리 + `ref` 로 온 큰 결과는 `result_ask` · `result_get` 으로, 같은 호출을 되풀이하지 않는다.
+  14번 앞에 붙고, 자리가 없으면 싣지 않는다.
 - 14번(상호작용 수집을 켠 박스만 — HWAXPortal docs/interaction-data contract §7, 문구는 초안) — 맨 뒤에 붙는다. 2048자 안에 들면 계약 문구 그대로(「이 포털을
-  거친 대화와 도구 호출은 기록되어 … 언제든 지우기를 청할 수 있습니다.」), 넘으면 짧은 꼴 「14. 호출은 기록된다.」 — 13번 · 11번이 모두 실린 가장 긴
-  조합(2,031자)에는 문구 전체가 들어가지 않는다. 전체 문구는 `share_conversation` 설명에도 있다.
+  거친 대화와 도구 호출은 기록되어 … 언제든 지우기를 청할 수 있습니다.」), 넘으면 짧은 꼴 「14. 호출은 기록된다.」 — 9 · 10번을 옮긴 뒤로는(G-2) 13번 · 11번 · 15번이
+  모두 실린 가장 긴 조합에도 문구 전체가 든다. 전체 문구는 `share_conversation` 설명에도 있다.
 
 ## 실행
 ```bash

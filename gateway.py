@@ -1685,6 +1685,9 @@ async def _aggregate():
             continue
         _LIVENESS_MISS.pop(key, None)
         _LAST_TOOLS[key] = (list(res.tools), 0)
+        # 지문은 카탈로그를 지은 목록으로 씨를 뿌린다(MEMORY-1) — 종전엔 재활 패스의 첫 탐침이 씨앗만 뿌려, 부팅 집계 몇 초 뒤 새 판으로 뜬 앱
+        # (11-18 에이전트 서버 8 → 13 도구)의 새 도구가 다음 변경 전까지 카탈로그에 안 올라왔다. 이제 첫 탐침도 이 목록과 견준다.
+        _FP[key] = _tools_fp(res.tools)
         for t in res.tools:
             collected.append((key, t))
         log.info("backend %s -> %d tools", key, len(res.tools))
@@ -1871,6 +1874,72 @@ def _hub_build(v) -> dict | None:
     if isinstance(v.get("started_at"), str) and 0 < len(v["started_at"]) <= 40:
         out["started_at"] = v["started_at"]
     return out
+
+
+# ── 허브가 띄우지 않은 앱의 판 · 인스턴스(HWAXPortal docs/request-1125 PT-2) ─────────────────────────────────────────────────────
+# 허브 서버 목록의 build 는 허브가 띄운 인스턴스에만 있다 — 운영 박스의 StepForge 는 원격 운영 노드에 잇기만 해서 list_tool_apps 줄에 build 가 없었고,
+# 판은 그 앱의 system_status 를 따로 불러야 보였다(11-23 답). 출처를 그 앱 자신의 system_status 로 둔다 — 허브가 build 를 준 앱은 부르지 않고, 인자 없이
+# 부를 수 있고 게이트웨이가 읽기로 확인한(_tool_class) system_status 가 있는 앱만, 상주 세션(서비스 시야)으로 앱마다 TTL 에 한 번이다. 판은 꼴이 맞을
+# 때만(허브 build 와 같은 16진 커밋 — 판을 틀리게 말하느니 말하지 않는다), 인스턴스는 그 앱이 스스로 말한 호스트 · 배포 환경만 싣는다(운영 노드인지 · 되돌림용
+# 동결 사본인지를 그것으로 가른다). 못 받으면 칸이 없다. 끄기 GATEWAY_APP_STATUS_TTL=0.
+APP_STATUS_TOOL = "system_status"
+APP_STATUS_TTL_S = float(_env_knob("GATEWAY_APP_STATUS_TTL", "600"))
+_APP_STATUS: dict[str, dict] = {}       # {백엔드: {"at": 단조 시각, "build": {...} | None, "instance": {...} | None}}
+
+
+def _app_status_parse(text: str, checked_at: str) -> tuple[dict | None, dict | None]:
+    """system_status 답(JSON 객체) → (build, instance). build 는 {commit, built_at?, source, checked_at} — build 칸이 {sha | commit, at?} 이거나 커밋 글자일 때,
+    instance 는 {host?, env?, source, checked_at} — 그 앱이 말한 instance.host · env(dev · prod)만. 꼴 밖이면 None."""
+    try:
+        d = json.loads(text)
+    except (TypeError, ValueError):
+        return None, None
+    if not isinstance(d, dict):
+        return None, None
+    b = d.get("build")
+    sha = (b.get("sha") or b.get("commit")) if isinstance(b, dict) else b
+    build = None
+    if isinstance(sha, str) and _HUB_COMMIT_RX.fullmatch(sha):
+        build = {"commit": sha}
+        at = b.get("at") if isinstance(b, dict) else None
+        if isinstance(at, str) and 0 < len(at) <= 40:
+            build["built_at"] = at
+        build.update(source="app_status", checked_at=checked_at)
+    inst: dict = {}
+    host = (d.get("instance") or {}).get("host") if isinstance(d.get("instance"), dict) else None
+    if isinstance(host, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}", host):
+        inst["host"] = host
+    if d.get("env") in APP_ENVS:
+        inst["env"] = d["env"]
+    return build, ({**inst, "source": "app_status", "checked_at": checked_at} if inst else None)
+
+
+async def _app_status_refresh() -> None:
+    """허브가 판을 모르는 백엔드마다 system_status 를 TTL 에 한 번 부른다(PT-2). 앱 하나가 늦거나 실패해도 나머지는 돈다 — 그 앱 칸은 비운다."""
+    if APP_STATUS_TTL_S <= 0:
+        return
+    for key, b in list(backends.items()):
+        if b.session is None or (DISCOVERED_META.get(key) or {}).get("build"):
+            _APP_STATUS.pop(key, None)
+            continue
+        exposed = _rt_exposed(key, APP_STATUS_TOOL)
+        t = next((x for x in exposed_tools if x.name == exposed), None) if exposed else None
+        if t is None or ((getattr(t, "inputSchema", None) or {}).get("required")) or _tool_class(t, key, APP_STATUS_TOOL)[0] != "read":
+            _APP_STATUS.pop(key, None)
+            continue
+        now = time.monotonic()
+        got = _APP_STATUS.get(key)
+        if got and now - got["at"] < APP_STATUS_TTL_S:
+            continue
+        build = inst = None
+        try:
+            with anyio.fail_after(LIVENESS_TIMEOUT_S):
+                res = await b.session.call_tool(APP_STATUS_TOOL, {})
+            if not getattr(res, "isError", False):
+                build, inst = _app_status_parse(_rt_text(res), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        except Exception as exc:  # noqa: BLE001 — 판 칸은 보조다. 다음 TTL 에 다시 묻는다
+            log.debug("backend %s %s 못 받음: %r", key, APP_STATUS_TOOL, exc)
+        _APP_STATUS[key] = {"at": now, "build": build, "instance": inst}
 
 
 # heax registry 연속 폴링 실패 횟수 — 일시적 불통과 '정말 사라짐'을 구분하기 위한 상태.
@@ -2148,12 +2217,20 @@ async def _revive_once_locked(tg) -> bool:
             #   /refresh 가 changed:false 를 냈다). 지문으로 비교한다.
             now = _tools_fp(res.tools)
             prev = _FP.get(key)
-            if prev != now:
-                _FP[key] = now
-                if prev is not None:
-                    log.info("backend %s 도구 구성·메타 변경 (%d→%d) — 재집계",
-                             key, len(prev), len(now))
+            if prev is None:
+                # 씨앗이 없다 — 이 백엔드의 목록으로 카탈로그를 지은 적이 없다(재집계가 지문을 뿌린다). 카탈로그가 실은 목록(직전 성공 —
+                # 없으면 빈 목록)과 견준다. 종전엔 여기서 씨앗만 뿌려, 부팅 집계 뒤 새 판으로 뜬 앱의 도구가 다음 변경까지 안 보였다(MEMORY-1).
+                last = _LAST_TOOLS.get(key)
+                prev = _tools_fp(last[0]) if last else {}
+                if prev != now:
+                    log.info("backend %s 첫 탐침의 목록이 카탈로그와 다르다 (%d→%d) — 재집계", key, len(prev), len(now))
                     revived = True
+                _FP[key] = now
+            elif prev != now:
+                _FP[key] = now
+                log.info("backend %s 도구 구성·메타 변경 (%d→%d) — 재집계",
+                         key, len(prev), len(now))
+                revived = True
         except Exception as exc:  # noqa: BLE001 — 죽은 세션 → 아래 재연결 루프가 처리
             _probe_missed(key, b, exc)
 
@@ -2187,6 +2264,11 @@ async def _revive_once_locked(tg) -> bool:
             await _aggregate()
         except Exception as exc:  # noqa: BLE001
             log.warning("re-aggregate after revive failed: %r", exc)
+    # 허브가 판을 모르는 앱의 판 · 인스턴스(PT-2) — 그 앱의 system_status 로(앱마다 GATEWAY_APP_STATUS_TTL 에 한 번). 실패는 패스를 막지 않는다
+    try:
+        await _app_status_refresh()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("app status refresh skipped: %r", exc)
     return revived
 
 
@@ -2274,9 +2356,9 @@ async def _backends_lifespan():
 #   안내, 6번 · 1번의 덧말(기억으로 채운 값을 거기서 잡는다 · 그래야 클라이언트가 패널을 띄운다). 규칙은 하나도 빼지 않았다.
 _INSTRUCTIONS = """HWAX 엔지니어링 허브 — 사내 설계·해석·품질 데이터와 도구 게이트웨이. 아래는 실제로 났던 실패를 막는 순서다.
 
-1. 도구가 수백 개다. 목록을 훑지 말고 `search_tools("하려는 일")` 로 찾아(`detail` 은 필요할 때만) `invoke_tool` 로
-불러라. 목록에 안 보이는 도구도 invoke_tool 로 즉시 호출된다. 단 **패널 도구**(목록의 `_meta.ui` 가 달린 도구 —
-SimFlow · ARP 의 open_* 등)는 invoke_tool 이 아니라 그 이름으로 직접 불러라.
+1. 도구가 수백 개다 — 한 길로 부른다. 목록에 있는 이름은 바로 부르고, 없거나 모르면 `search_tools("하려는 일")` 한 번
+(`detail` 은 필요할 때만) → `invoke_tool`. 클라이언트의 도구 검색(ToolSearch)으로 낱말을 찾지 마라 — 스키마만 문맥에 쌓인다.
+단 **패널 도구**(목록의 `_meta.ui` 가 달린 도구 — SimFlow · ARP 의 open_* 등)는 invoke_tool 이 아니라 그 이름으로 직접 불러라.
 2. **수치·이름·ID 를 기억으로 채우지 마라.** 이 허브의 가장 위험한 실패는 도구를 부르지 않고
 그럴듯한 값을 서술하는 것이다(표면이 완벽해 사용자가 진짜 데이터로 믿는다). 답에 쓰는 값은
 도구 결과에 있던 값이어야 하고, 결과의 record_id·section_id 를 함께 인용하라.
@@ -2294,10 +2376,7 @@ SimFlow · ARP 의 open_* 등)는 invoke_tool 이 아니라 그 이름으로 직
 `use_experts(keys=[...])` 로 역할·도구를 받아 그 전문가로서 답하라(첫 명이 주 전문가). `list_agents` 는 `compact=true` 로.
 8. 도구가 실패하면 인자만 바꿔 반복하지 마라. 응답이 '인자 문제가 아니다' 라고 말하면
 연결·시간초과이므로 다른 방법을 찾거나 사용자에게 알려라.
-9. 권한 없는 앱은 `list_tool_apps` 의 `denied_apps` 에만 있다 — 도구 이름을 지어내거나 `invoke_tool` 로 우회하지 말고
-그 `how` 를 따르라(`portal_access` 만 `/access?need=<권한>` 에서 요청하고, `gateway_group` · `policy_not_ready` 는 요청하라고 하지 마라).
-10. `list_tool_apps` 의 `muted_apps` 는 사용자가 포털에서 **꺼 둔** 앱이다(권한 문제가 아니다 — 요청하라고 하지 마라).
-사용자가 그 앱을 쓰라고 할 때만 `list_tool_apps(app='<키>')` 로 도구를 보고 `invoke_tool` 로 부른다.
+9. 권한 없는 앱(`denied_apps`) · 꺼 둔 앱(`muted_apps`)은 `list_tool_apps` 답의 `note` · `how` 를 따른다 — 도구 이름을 지어내지 마라.
 12. 분석 루틴은 routine_list 설명의 차례로 돈다 — 단계 도구는 routine_call 로만(울타리 밖 금지), 키는 결과에 나온 값만 쓴다.
 """
 # 11번은 리스크 앱 길잡이(risk_next_step)가 **카탈로그에 있을 때만** 싣는다(`_instructions`). 위임을 모르는 옛 앱(HWAXRisk main)에는
@@ -2321,6 +2400,9 @@ _INSTR_RISK_LLM = " `risk_start_job` 은 `llm=glm`(Claude 로 품질을 잴 때�
 # 문구 그대로, 넘으면 짧은 꼴 — 13번 · 11번이 모두 실린 가장 긴 조합(2,031자)에는 문구 전체가 들어가지 않는다. 전체 문구는 share_conversation 설명에 있다.
 _INSTR_IX = "14. 이 포털을 거친 대화와 도구 호출은 기록되어 품질 개선과 지식 정리에 쓰입니다. 원문은 본인과 지정 분석가만 보며, 언제든 지우기를 청할 수 있습니다.\n"
 _INSTR_IX_SHORT = "14. 호출은 기록된다.\n"
+# 15번 — 결과 손잡이를 켠 박스만(GATEWAY_RESULT_REFS — HWAXPortal docs/request-1125 G-2). 9 · 10번(권한 없는 앱 · 꺼 둔 앱)을 list_tool_apps 답의 note 로
+# 옮겨 생긴 자리에 싣는다 — 줄인 결과를 같은 호출의 되풀이로 다시 받으면 줄인 몫이 사라진다. 자리가 없으면 싣지 않는다(도구 설명이 같은 말을 한다).
+_INSTR_RES = "15. 큰 결과가 머리 + `ref` 로 오면 `result_ask` 로 묻거나 `result_get` 으로 쪽을 받는다 — 같은 호출을 되풀이하지 마라.\n"
 _INSTR_MAX = 2048                          # Claude Code 가 서버 지침을 자르는 자리 — 이것보다 짧아야 한다
 
 
@@ -2338,6 +2420,8 @@ def _instructions() -> str:
                 + (_INSTR_DELIB_VIEW if "view" in _tool_props("deliberate_result") else "") + "\n")
     if "risk_next_step" in route:
         out += _INSTR_RISK_NEXT.rstrip("\n") + (_INSTR_RISK_LLM if "llm" in _tool_props("risk_start_job") else "") + "\n"
+    if RESULT_REFS_ON and len(out) + len(_INSTR_RES) < _INSTR_MAX:
+        out += _INSTR_RES
     if INTERACTION_CAPTURE_ON:
         out += _INSTR_IX if len(out) + len(_INSTR_IX) < _INSTR_MAX else _INSTR_IX_SHORT
     return out
@@ -2757,6 +2841,52 @@ CONV_INSIGHTS_MAX = 60
 CONV_INSIGHTS_UNKNOWN = "unknown"
 _CONV_INSIGHT_ID_RE = re.compile(r"ins:(?:web|delib|wf):[^\s'\"\\]{1,290}")
 _CONV_CHAIR_RE = re.compile(r"[a-z0-9-]{1,40}")
+# 발언의 도구 활동(HWAXPortal docs/request-1125 WD-04) — MCP 로 저장한 대화는 meta 에 rebut · non_negotiable 만 남아 웹에서 다시 열면 근거가 0건이었다.
+# 웹 챗 중계가 남기는 활동 꼴(포털 routes.py 의 activity — 화면 ActivityItem)로 바꿔 meta.activity 에 싣는다 — 포털 화면이 그것으로 앞 턴 근거를 되살린다
+# (conversations.api.ts · history.ts turnEvidence — 결과는 result_full, 인자는 detail). 결과는 자르지 않는다 — 상한을 넘는 항목은 통째로 빼고 답에 센다.
+CONV_ACTIVITY_MAX = 100                  # 발언 하나의 활동 항목 수
+CONV_ACTIVITY_CHARS = 1_048_576          # 발언 하나의 활동 글자 합(인자 + 결과) — 넘는 항목은 통째로 뺀다
+CONV_ACTIVITY_PREVIEW = 220              # 활동 패널 미리보기(화면 표시용 — 근거는 result_full)
+CONV_ACTIVITY_DETAIL = 400               # 활동 패널 인자 칸(웹 중계와 같은 400 — 넘으면 원문은 detail_full)
+
+
+def _conv_activity(raw, index: int, now_ms: int) -> tuple[list[dict], dict | None]:
+    """발언 하나의 activity([{tool, args?, result?, ok?}]) → (meta.activity 항목들, 뺀 것 보고 또는 None). 도구 이름이 없는 항목 · 상한을 넘는 항목은
+    빼고 센다(결과를 자르지 않는다 — 원문 그대로 인용하는 근거다)."""
+    if raw is None:
+        return [], None
+    if not isinstance(raw, list):
+        return [], {"index": index, "dropped": 1, "why": "activity 는 [{tool, args, result, ok}] 목록이다"}
+    out, used, bad, over = [], 0, 0, 0
+    for k, a in enumerate(raw):
+        tool = a.get("tool") if isinstance(a, dict) else None
+        if not (isinstance(tool, str) and tool.strip()):
+            bad += 1
+            continue
+        args, res = a.get("args"), a.get("result")
+        args_s = args if isinstance(args, str) else ("" if args is None else json.dumps(args, ensure_ascii=False, separators=(",", ":"), default=str))
+        res_s = res if isinstance(res, str) else ("" if res is None else json.dumps(res, ensure_ascii=False, default=str))
+        if len(out) >= CONV_ACTIVITY_MAX or used + len(args_s) + len(res_s) > CONV_ACTIVITY_CHARS:
+            over += 1
+            continue
+        used += len(args_s) + len(res_s)
+        e = {"ts": now_ms, "step": "MCP 대화의 도구 호출", "tool": tool.strip()[:200], "call": f"mcp-{index}-{k}"}
+        if isinstance(a.get("ok"), bool):
+            e["ok"] = a["ok"]
+        if args_s:
+            e["detail"] = args_s[:CONV_ACTIVITY_DETAIL]
+            if len(args_s) > CONV_ACTIVITY_DETAIL:
+                e["detail_full"] = args_s
+        if res_s:
+            e["result_preview"] = res_s[:CONV_ACTIVITY_PREVIEW]
+            if len(res_s) > CONV_ACTIVITY_PREVIEW:
+                e["result_full"] = res_s
+        out.append(e)
+    if not (bad or over):
+        return out, None
+    why = " · ".join(x for x in (f"도구 이름 없는 항목 {bad}" if bad else "",
+                                 f"상한(항목 {CONV_ACTIVITY_MAX} · 글자 {CONV_ACTIVITY_CHARS:,})을 넘는 항목 {over} — 통째로 뺐다" if over else "") if x)
+    return out, {"index": index, "dropped": bad + over, "why": why}
 
 
 def _conv_subject(raw) -> tuple[dict | None, str]:
@@ -2785,6 +2915,8 @@ SAVE_CONV_TOOL = types.Tool(
         "심의/대화 로그를 포털 서버 대화 저장소에 저장한다(웹 챗에서 이어보기·GLM 이어가기용). "
         "messages: [{role: user|assistant|system|persona, content, persona?, round?, meta?}] 순서대로. "
         "meta 는 심의 발언의 {rebut:[{target,quote,counter,basis}], non_negotiable} — 웹 관계도·이어하기가 쓴다. "
+        "activity 는 그 발언(assistant 답)에서 부른 도구의 [{tool, args, result, ok}] — 웹에서 그 대화를 다시 열면 앞 턴 근거로 되살아나 "
+        "'원 도구 결과' 를 원문 그대로 인용할 수 있다(결과는 자르지 않는다 — 발언 하나에 100건 · 합 1,048,576자를 넘는 항목은 빼고 답에 센다). "
         "성공 시 conversation_id 반환, 포털 미가용/인증 불가면 CONV_UNAVAILABLE. "
         "발언은 자르지 않는다 — 포털 한 칸(20,000자)을 넘으면 이어지는 메시지로 나눠 싣고(split), 200건을 넘으면 나머지를 "
         "덧붙인다. 덧붙이다 멈추면 CONV_PARTIAL(어디까지 들어갔는지) — 그때는 다시 보내지 마라(같은 대화가 두 벌 생긴다). "
@@ -2808,6 +2940,21 @@ SAVE_CONV_TOOL = types.Tool(
                         "round": {"type": "integer"},
                         "meta": {"type": "object",
                                  "description": "심의 발언 구조 — {rebut:[{target,quote,counter,basis}], non_negotiable}"},
+                        "activity": {
+                            "type": "array",
+                            "description": ("이 발언에서 부른 도구 — 차례대로. 웹이 대화(chat)의 assistant 답에서 앞 턴 근거로 되살린다. "
+                                            "결과는 받은 원문 그대로 준다(요약하지 않는다)"),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "tool": {"type": "string", "description": "부른 도구 이름(이 게이트웨이의 노출 이름)"},
+                                    "args": {"description": "부른 인자 — 객체 또는 JSON 글"},
+                                    "result": {"type": "string", "description": "도구 결과 원문"},
+                                    "ok": {"type": "boolean", "description": "호출이 성공했나(모르면 뺀다)"},
+                                },
+                                "required": ["tool"],
+                            },
+                        },
                     },
                     "required": ["role", "content"],
                 },
@@ -2887,6 +3034,9 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
     # 꼬리 199 만 남겼다 — 1백만 토큰 창의 발언·결정문과 20석 다회차 심의에서 이어하기가 잘린 글을 정본으로 읽었다.
     split: list[dict] = []
     clipped: list[dict] = []
+    act_saved: list[int] = []
+    act_dropped: list[dict] = []
+    now_ms = int(time.time() * 1000)
 
     def _msgs(i: int, m: dict) -> list[dict]:
         role = m.get("role")
@@ -2915,8 +3065,8 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
         # 포털 입력 모델은 meta 에 한도가 없다 — 알려진 두 칸만 옮기되(관계도·이어하기 조항 승계가 읽는 칸) 자르지 않는다.
         # 임의 dict 를 통째로 넘기지 않는 것은 그대로다. 첫 조각에만 싣는다.
         meta = m.get("meta")
+        mo: dict = {}
         if isinstance(meta, dict):
-            mo: dict = {}
             if meta.get("non_negotiable"):
                 mo["non_negotiable"] = str(meta["non_negotiable"])
             if isinstance(meta.get("rebut"), list):
@@ -2924,8 +3074,16 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
                       for r in meta["rebut"] if isinstance(r, dict)]
                 if rb:
                     mo["rebut"] = rb
-            if mo:
-                out[0]["meta"] = mo
+        # 도구 활동(WD-04) — 발언의 activity(없으면 meta.activity). 웹 중계와 같은 꼴로 meta.activity 에 — 포털 화면이 근거로 되살린다
+        raw_act = m.get("activity") if m.get("activity") is not None else (meta.get("activity") if isinstance(meta, dict) else None)
+        acts, dropped = _conv_activity(raw_act, i, now_ms)
+        if acts:
+            mo["activity"] = acts
+            act_saved.append(len(acts))
+        if dropped:
+            act_dropped.append(dropped)
+        if mo:
+            out[0]["meta"] = mo
         return out
 
     msgs: list[dict] = []
@@ -2957,7 +3115,7 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
         subject_dropped = (subject_dropped + " · " if subject_dropped else "") + "chair_template 은 소문자 · 숫자 · - 40자다"
     rest = msgs[CONV_BATCH_MAX:]
     note = " ".join(x for x in (f"split:{len(split)}" if split else "", f"clipped:{len(clipped)}" if clipped else "",
-                                f"appended:{len(rest)}" if rest else "") if x) or None
+                                f"appended:{len(rest)}" if rest else "", f"activity:{sum(act_saved)}" if act_saved else "") if x) or None
     hdrs = {"Authorization": auth}
 
     def _partial(cid, saved: int, why: str) -> types.CallToolResult:
@@ -2998,6 +3156,10 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
             out["split"] = split      # 포털 한 칸(CONV_CONTENT_MAX)을 넘어 이어지는 메시지로 나눈 발언 — 글은 다 들어갔다
         if clipped:
             out["clipped"] = clipped  # 포털 한도로 자른 이름·제목(원문 길이 chars, 남긴 길이 kept)
+        if act_saved:
+            out["activity_saved"] = sum(act_saved)    # meta.activity 로 남긴 도구 활동 항목 수 — 웹에서 다시 열면 근거로 되살아난다
+        if act_dropped:
+            out["activity_dropped"] = act_dropped     # 뺀 활동(발언 차례 index · 수 · 까닭) — 결과를 자르지 않고 통째로 뺐다
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=json.dumps(out, ensure_ascii=False))],
         )
@@ -3235,11 +3397,45 @@ def _app_meta(key: str) -> dict:
 # 메시·재료가 섞여 있고, '해석 결과'는 앱 셋에 흩어져 있다. 사용자는 영역으로 찾는다.
 # ⚠ gateway_config.json 에 두지 않는다(gitignore·--force 재생성에 날아감). 이 파일은 git 으로 간다.
 _AREAS_PATH = Path(__file__).resolve().parent / "tool_areas.json"
+# 박스 덧씌우기(HWAXPortal docs/request-1125 CT-02) — dev 에 없는 사내 앱(mountsoldatahub · ncdevdatahub · testscope 등)의 영역은 그 앱 주인이 정하고
+# 운영 박스가 커밋 없이 적는다(dev 가 짐작 값을 넣지 않는다 — HE팀 운영자 덧씌우기와 같은 자세). 받는 칸은 apps · tools 둘(앱 · 도구 → 영역 키)이고 값은
+# 추적 표 areas 의 키여야 한다 — 틀린 줄만 버리고 경고한다, 파일이 깨지면 통째로 버린다. 덧씌우기가 이긴다. 재기동 없이 먹는다(바뀐 시각).
+_AREAS_LOCAL_PATH = Path(__file__).resolve().parent / "tool_areas.local.json"
 _AREAS_CACHE: dict = {"mtime": None, "data": {}}
 
 
+def _areas_overlay(raw: dict) -> dict:
+    """추적 표 raw 에 박스 덧씌우기의 apps · tools 줄을 얹은 사본 — 없거나 깨지면 raw 그대로."""
+    try:
+        over = json.loads(_AREAS_LOCAL_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return raw
+    except (OSError, ValueError) as exc:
+        log.warning("tool_areas.local.json 을 못 읽었다 — 덧씌우기 없이 간다: %r", exc)
+        return raw
+    if not isinstance(over, dict):
+        log.warning("tool_areas.local.json 은 객체여야 한다 — 덧씌우기 없이 간다")
+        return raw
+    keys = {a.get("key") for a in (raw.get("areas") or []) if isinstance(a, dict)}
+    out, dropped = dict(raw), []
+    for part in ("apps", "tools"):
+        add = over.get(part)
+        if add is None:
+            continue
+        if not isinstance(add, dict):
+            dropped.append(part)
+            continue
+        good = {k: v for k, v in add.items() if isinstance(k, str) and k and v in keys}
+        dropped += [f"{part}.{k}" for k in add if k not in good]
+        out[part] = {**(raw.get(part) or {}), **good}
+    dropped += [k for k in over if k not in ("apps", "tools", "_doc")]
+    if dropped:
+        log.warning("tool_areas.local.json 에서 버린 줄(영역 키가 추적 표 areas 에 없거나 받지 않는 칸): %s", ", ".join(map(str, dropped[:20])))
+    return out
+
+
 def _tool_areas() -> dict:
-    """영역 분류표 — mtime 캐시라 파일을 고치면 재기동 없이 반영된다.
+    """영역 분류표 — mtime 캐시라 파일을 고치면 재기동 없이 반영된다(추적 표 + 박스 덧씌우기 _areas_overlay).
 
     읽기 실패는 게이트웨이를 죽이지 않는다(분류 없이 동작). 대신 **경고를 남기고** /tools-map 의
     unclassified 가 전량으로 차서 UI 에 '미분류 N' 으로 드러난다 — 조용히 틀린 분류를 내지 않는다."""
@@ -3247,9 +3443,13 @@ def _tool_areas() -> dict:
         mt = _AREAS_PATH.stat().st_mtime
     except OSError:
         return {}
+    try:
+        mt = (mt, _AREAS_LOCAL_PATH.stat().st_mtime_ns)
+    except OSError:
+        mt = (mt, None)
     if _AREAS_CACHE["mtime"] != mt:
         try:
-            raw = json.loads(_AREAS_PATH.read_text(encoding="utf-8"))
+            raw = _areas_overlay(json.loads(_AREAS_PATH.read_text(encoding="utf-8")))
             raw["_patterns"] = [(re.compile(p), a) for p, a in (raw.get("patterns") or [])]
             _AREAS_CACHE.update({"mtime": mt, "data": raw})
         except (OSError, ValueError, re.error) as exc:
@@ -5539,10 +5739,14 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
             "status": "ok" if (accessible and reachable) else
                       ("no_access" if not accessible else "backend_down"),
         }
-        # 떠 있는 판(PT-R3) — 허브가 적은 커밋 · 뜬 시각 그대로. 허브가 모르면(프록시 앱 · 커밋 없는 SIF) 칸이 없다 — 지어내지 않는다
-        _build = None if local else (DISCOVERED_META.get(key) or {}).get("build")
+        # 떠 있는 판(PT-R3) — 허브가 적은 커밋 · 뜬 시각 그대로. 허브가 모르면(프록시 앱 · 원격 노드 · 커밋 없는 SIF) 그 앱 system_status 가 말한 판(PT-2 —
+        # source app_status)과 인스턴스(호스트 · 배포 환경), 그것도 없으면 칸이 없다 — 지어내지 않는다
+        _st = None if local else _APP_STATUS.get(key)
+        _build = None if local else ((DISCOVERED_META.get(key) or {}).get("build") or (_st or {}).get("build"))
         if _build:
             entry["build"] = _build
+        if _st and _st.get("instance"):
+            entry["instance"] = _st["instance"]
         # 환경 · 정본 · 옛 키(GW-05) — 앱마다 env 가 dev · prod 로 찬다(박스가 app_keys.local.json · GATEWAY_ENV 로 적는다 — 없으면 unknown)
         entry.update(_app_env_entry(key))
         role = None if local else _app_role(key)
@@ -5586,7 +5790,10 @@ async def _list_tool_apps(arguments: dict) -> types.CallToolResult:
         "note": "여기 있는 앱은 모두 내 권한으로 호출 가능하다(reachable=백엔드 연결 정상). status=needs_connect 는 그 앱의 내 토큰을 "
                 "포털 '외부 연결'(/tokens?tab=connect)에 등록해야 부를 수 있다는 뜻이다. "
                 "권한 없는 앱은 목록에 없고 denied_apps 에 라벨·사유·필요 권한·요청 경로만 있다 — 각 항목의 "
-                "reason/how 를 따른다(portal_access 만 포털 '내 권한' 요청, policy_not_ready 는 잠시 뒤 재시도). "
+                "reason/how 를 따른다(portal_access 만 포털 '내 권한'(/access?need=<권한>)에서 요청, gateway_group 은 요청하라고 하지 않는다, "
+                "policy_not_ready 는 잠시 뒤 재시도). 도구 이름을 지어내거나 invoke_tool 로 우회하지 않는다. "
+                "muted_apps 는 사용자가 포털에서 꺼 둔 앱이다 — 권한 문제가 아니니 요청하라고 하지 말고, 사용자가 그 앱을 쓰라고 할 때만 "
+                "list_tool_apps(app='<키>') 로 도구를 보고 invoke_tool 로 부른다. "
                 "특정 앱의 도구 설명은 list_tool_apps(app='<키>') 로 조회.",
         # 이 연결의 개인 보기(E-4) — tools/list 에 실은 수 · 보기로 뺀 수(목록 밖도 search_tools → invoke_tool 로 닿는다)
         "view": _view_info(groups),
@@ -6015,6 +6222,10 @@ def _evid_key() -> str:
 
 
 _EVID_COMMA_RUN_RE = re.compile(r"[\d.,]+")
+# base64 덩어리(파일 조각 data_base64 · 글로 실린 그림) — 숫자가 아니라 바이트다. 숫자 줄기로 쌓으면 파일 한 번 옮기기(artifact_to_ste_upload — 1 MB 조각
+# 수십 ~ 백여 개)가 칸(EVID_MAX_CHARS)을 무작위 숫자로 채워 앞선 진짜 조회를 밀어내고, 지어낸 정수(408 · 1250)를 '조회 결과에 있다' 로 통과시켰다
+# (HWAXPortal docs/request-1125 BG-3 곁). 빈칸 없이 256자 넘게 잇단 base64 글자만 뗀다 — 사람이 읽는 수는 그런 덩어리 안에 없다.
+_EVID_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{256,}={0,2}")
 
 
 def _evid_digest(txt: str) -> str:
@@ -6067,6 +6278,7 @@ def _evid_record(tool: str, res) -> None:
         txt = "".join(getattr(c, "text", "") or "" for c in (getattr(res, "content", None) or []))
         if not txt:
             return
+        txt = _EVID_BLOB_RE.sub(" ", txt)
         key = _evid_key()
         if not key:
             return          # 누구 것인지 모르면 안 쌓는다 — 남의 칸에 들어가느니 없는 게 낫다
@@ -7263,28 +7475,35 @@ ONTO_LOOKUP_TOOL = types.Tool(
 _ONTO_STOP = frozenset(("온톨로지", "ontology", "조회", "검색", "찾기", "찾아줘", "lookup", "정본", "코어"))
 _ONTO_SLOT = re.compile(r"\{(type_slug|key|name|object_id)\}")
 ONTO_LOOKUP_MAX_TYPES = 3
+# CAD 파트 이름 꼴(영문 대문자 · 밑줄 · 번호 — 「BRKT_0012」 · 「SHIELD_CAN_01」)과 그 이름을 코어 부품으로 푸는 앱(OL-7). 정본에는 CAD 이름이 없어 none 이
+# 맞지만 다음 걸음을 말하지 않았다 — StepForge identify_part 가 그 파트의 core_part(코어 부품 key)를 준다(D-710 ST-26).
+_ONTO_CAD_NAME = re.compile(r"[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)*_[A-Z0-9]*[0-9][A-Z0-9_-]*")
+ONTO_CAD_APP = "heax-step_forge"
 
 
 def _onto_lookup_rows(d: dict) -> tuple:
     """어휘표 ontology.lookup → ((백엔드 키, 원래 이름, args 틀, 받는 타입 또는 None), …) — 어휘표 차례(PLAN §12 · OF-32). ontology_lookup 만 읽는다(검색
     순위 · 웹 챗은 읽지 않는다 — 에이전트 서버는 ontology 에서 apps 만 읽는다). 줄마다 거르고 예외를 내지 않는다(_onto_entries 와 같은 까닭 — 덧씌우기
-    전체를 잃지 않게). 받는 칸 tool · args · types(고를 칸 — 없으면 어느 타입이든, OF-35) · _doc."""
+    전체를 잃지 않게). 받는 칸 tool · args · types(고를 칸 — 없으면 어느 타입이든, OF-35) · _doc. 앱 하나에 줄 하나(사전) 또는 여럿(사전의 목록 — 차례
+    대로, 줄마다 types 로 거른다)이다 — 부품 X 의 결함 목록처럼 한 앱에서 둘째 걸음까지 next 로 싣는다(HWAXPortal docs/request-1125 OL-6). 목록 안의
+    틀린 줄만 버린다."""
     onto = d.get("ontology")
     rows = onto.get("lookup") if isinstance(onto, dict) else None
     out = []
-    for key, row in (rows.items() if isinstance(rows, dict) else ()):
-        if not (isinstance(key, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,79}", key) and isinstance(row, dict)):
+    for key, val in (rows.items() if isinstance(rows, dict) else ()):
+        if not (isinstance(key, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,79}", key)):
             continue
-        if any(k not in ("tool", "args", "types", "_doc") for k in row):
-            continue
-        tool, args, typs = row.get("tool"), row.get("args"), row.get("types")
-        if not (isinstance(tool, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,120}", tool)
-                and isinstance(args, dict) and args and all(isinstance(k, str) and k for k in args)):
-            continue
-        if typs is not None and not (isinstance(typs, list) and typs
-                                     and all(isinstance(t, str) and re.fullmatch(r"[a-z0-9_]{1,80}", t) for t in typs)):
-            continue
-        out.append((key, tool, args, tuple(typs) if typs else None))
+        for row in (val if isinstance(val, list) else [val]):
+            if not isinstance(row, dict) or any(k not in ("tool", "args", "types", "_doc") for k in row):
+                continue
+            tool, args, typs = row.get("tool"), row.get("args"), row.get("types")
+            if not (isinstance(tool, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,120}", tool)
+                    and isinstance(args, dict) and args and all(isinstance(k, str) and k for k in args)):
+                continue
+            if typs is not None and not (isinstance(typs, list) and typs
+                                         and all(isinstance(t, str) and re.fullmatch(r"[a-z0-9_]{1,80}", t) for t in typs)):
+                continue
+            out.append((key, tool, args, tuple(typs) if typs else None))
     return tuple(out)
 
 
@@ -7362,6 +7581,24 @@ def _onto_fill(v, obj: dict):
     return obj.get(m.group(1)) if m else _ONTO_SLOT.sub(lambda mm: str(obj.get(mm.group(1)) or ""), v)
 
 
+def _onto_slots(v) -> set:
+    """args 틀 한 칸이 쓰는 틀 이름 — 글이면 그 안의 '{slot}', 목록 · 사전이면 안쪽 글까지 모은다(OL-6 — conditions 목록 안의 '{key}')."""
+    if isinstance(v, str):
+        return {m.group(1) for m in _ONTO_SLOT.finditer(v)}
+    if isinstance(v, (list, dict)):
+        return set().union(*(_onto_slots(x) for x in (v.values() if isinstance(v, dict) else v)))
+    return set()
+
+
+def _onto_fill_deep(v, obj: dict):
+    """_onto_fill 을 목록 · 사전 안쪽 글까지 — 맨 위 글자 칸은 _onto_fill 과 같다(OL-6)."""
+    if isinstance(v, list):
+        return [_onto_fill_deep(x, obj) for x in v]
+    if isinstance(v, dict):
+        return {k: _onto_fill_deep(x, obj) for k, x in v.items()}
+    return _onto_fill(v, obj)
+
+
 def _onto_next(obj: dict, rows: tuple, want_apps: set, vocab: dict) -> tuple[list, list]:
     """exact 개체로 앱마다 부를 다음 호출 — (next, skipped). 호출자에게 보이고(권한 · 숨김 · 시험 사본 아님) 이 박스에 그 도구가 있는 앱만이다 — 보이지
     않는 앱은 이름조차 싣지 않는다. 차례는 허브 가족(정본 → 형제, 어휘표 차례) → 그 밖(표 차례). 비코어는 role 을 단다. 칸이 비는 틀(key 없는 개체에
@@ -7379,12 +7616,12 @@ def _onto_next(obj: dict, rows: tuple, want_apps: set, vocab: dict) -> tuple[lis
         exposed = _rt_exposed(app, tool)
         if exposed is None:
             continue
-        need = {m.group(1) for v in args.values() if isinstance(v, str) for m in _ONTO_SLOT.finditer(v)}
+        need = _onto_slots(args)
         empty = sorted(s for s in need if not obj.get(s))
         if empty:
             skipped.append({"app": app, "tool": exposed, "why": f"개체에 {' · '.join(empty)} 가 없다"})
             continue
-        line = {"tool": exposed, "app": app, "args": {k: _onto_fill(v, obj) for k, v in args.items()}}
+        line = {"tool": exposed, "app": app, "args": {k: _onto_fill_deep(v, obj) for k, v in args.items()}}
         role = _app_role(app)
         if role and role[0] != "canonical":
             line["role"] = role[0]
@@ -7415,6 +7652,20 @@ def _onto_fold_neighbors(body, focus_id: str, allowed: set, chars: int) -> dict:
         rows.append(r)
         used += size
     return {"rows": rows, "total": len(nodes), "shown": len(rows), "hub_truncated": body.get("truncated") is True}
+
+
+def _onto_cad_retry(name: str, chosen: list, vocab: dict) -> dict:
+    """none 답에 붙일 다음 걸음 한 줄(OL-7) — 타입이 부품(part)이거나 이름이 CAD 파트 이름 꼴이면 StepForge identify_part 로 core_part 를 얻고 그 key 로
+    다시 부르라고 한다. 호출자에게 보이는(권한 · 숨김 · 시험 사본 아님) StepForge 에 그 도구가 있을 때만 — 보이지 않는 앱은 이름조차 말하지 않는다."""
+    if not ("part" in chosen or _ONTO_CAD_NAME.fullmatch(name)):
+        return {}
+    if ONTO_CAD_APP in (_request_muted() | (vocab.get("staging") or frozenset())) or not _backend_allowed(ONTO_CAD_APP, _request_groups()):
+        return {}
+    exposed = _rt_exposed(ONTO_CAD_APP, "identify_part")
+    if exposed is None:
+        return {}
+    return {"retry": (f"CAD 파트 이름이면 정본에 없는 것이 맞다 — StepForge {exposed}(project_id, part=그 이름)로 core_part 를 얻고 그 key 로 "
+                      f"{ONTO_LOOKUP_TOOL.name}(query=core_part.key, type='part')를 다시 부른다(core_part 가 null 이면 core_part_why 를 사람에게 보인다)")}
 
 
 async def _onto_lookup(a: dict) -> types.CallToolResult:
@@ -7461,7 +7712,8 @@ async def _onto_lookup(a: dict) -> types.CallToolResult:
             return done("refused", ok=False, why=why, via="search")
         items = [x for x in body.get("items") or [] if isinstance(x, dict)]
         if not items:
-            return done("none", via="search", tried=[], hint="정본 검색에도 없다 — 짐작하지 말고 사람에게 묻는다(오타 · 아직 없는 것)")
+            return done("none", via="search", tried=[], hint="정본 검색에도 없다 — 짐작하지 말고 사람에게 묻는다(오타 · 아직 없는 것)",
+                        **_onto_cad_retry(name, chosen, vocab))
         types_n = [{"type_slug": str(t.get("slug") or t.get("type_slug") or ""), "count": t.get("count")}
                    for t in body.get("types") or [] if isinstance(t, dict)]
         return done("candidates", via="search", ask_user=True, candidates=[_onto_hit(x) for x in items[:limit]], types=types_n,
@@ -7507,7 +7759,8 @@ async def _onto_lookup(a: dict) -> types.CallToolResult:
     if refused and not exact and not cands:
         return done("refused", ok=False, why=" · ".join(f"{r['type_slug']}: {r['why']}" for r in refused)[:600], refused_types=refused,
                     tried=tried, hint="정본에 닿지 못했거나 권한이 없다 — '없다' 가 아니다")
-    return done("none", tried=tried, hint="정본에 그런 이름이 없다 — 짐작하지 말고 사람에게 묻는다(오타 · 아직 없는 것 · 다른 타입)")
+    return done("none", tried=tried, hint="정본에 그런 이름이 없다 — 짐작하지 말고 사람에게 묻는다(오타 · 아직 없는 것 · 다른 타입)",
+                **_onto_cad_retry(name, tried, vocab))
 
 
 # ── StepForge 산출물 → ste 업로드(HWAXPortal docs/ste-stepforge-1117 P-1 · 결정 SS-2) ─────────────────────────────────────────────

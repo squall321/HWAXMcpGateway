@@ -121,6 +121,42 @@ except Exception:
   esac
 fi
 
+# ── 박스 시간 한도(HWAXPortal docs/request-1125 HG-24) ───────────────────────────────────────────────────────────
+# 시간 한도 손잡이(기동 로그 「시간 한도(초)」 줄의 열셋)를 곁의 provision.env(박스 파일 · gitignore · 0600)에서도 받는다. 종전엔 띄운 셸의
+# 환경뿐이라 10-31 에 GATEWAY_CALL_TIMEOUT=2400 을 ~/.bashrc · crontab 환경 줄에 넣었고, 그 줄을 안 읽는 셸로 띄우면 말없이 600 으로 돌았다.
+#   · 띄운 셸의 환경이 먼저다(비어 있지 않으면) — gateway.py _env_knob 과 같은 차례. 파일에서는 이 열셋만, 숫자 값만 싣는다(토큰은 싣지 않는다).
+#   · 줄 읽기는 gateway.py _provision_env_value 와 같다 — 마지막 활성 줄 · `export ` 머리 · 줄 끝 `#` 주석 · 따옴표를 뗀다.
+#   · provision.env 는 포털 update-all 의 게이트웨이 지문(identity)이라 바꾸면 다음 update-all 이 다시 띄운다. 닿았는지는 기동 로그 줄로 본다.
+BOX_ENV="$HERE/provision.env"
+if [ -r "$BOX_ENV" ]; then
+  BOX_SET=""
+  while IFS='=' read -r _k _v; do
+    [ -n "$_k" ] || continue
+    [ -n "${!_k:-}" ] && continue                     # 띄운 셸의 값이 이긴다
+    export "$_k=$_v"
+    BOX_SET="$BOX_SET $_k=$_v"
+  done < <("$PY" - "$BOX_ENV" <<'PYBOX' 2>/dev/null || true
+import re, sys
+KEYS = ("GATEWAY_CALL_TIMEOUT", "GATEWAY_RECONNECT_TIMEOUT", "GATEWAY_BACKEND_READ_TIMEOUT", "GATEWAY_BACKEND_HTTP_TIMEOUT",
+        "GATEWAY_LIVENESS_TIMEOUT", "GATEWAY_LIVENESS_STRIKES", "GATEWAY_REVIVE_INTERVAL", "GATEWAY_AGG_STALE_ROUNDS",
+        "GATEWAY_HEAX_MISS_DROP", "GATEWAY_REST_CALL_TIMEOUT", "REST_PROXY_UPSTREAM_TIMEOUT_S", "GATEWAY_PORTAL_SAVE_TIMEOUT",
+        "GATEWAY_JWKS_TIMEOUT")
+vals = {}
+for ln in open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines():
+    s = ln.strip()
+    if s.startswith("export "):
+        s = s[len("export "):].lstrip()
+    k, sep, v = s.partition("=")
+    if sep and k in KEYS:
+        vals[k] = re.sub(r"\s+#.*$", "", v).strip().strip("\"'")
+for k in KEYS:
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", vals.get(k, "")):
+        print(f"{k}={vals[k]}")
+PYBOX
+)
+  if [ -n "$BOX_SET" ]; then echo "· 박스 시간 한도(provision.env):$BOX_SET"; fi
+fi
+
 if [ "$BG" = "1" ]; then
   LOG="${GATEWAY_LOG:-$HERE/gateway.log}"
   PIDF="${GATEWAY_PIDFILE:-$HERE/gateway.pid}"

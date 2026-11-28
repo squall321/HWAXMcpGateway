@@ -10,6 +10,8 @@
   · 규칙 — 사용자 결정으로 굳은 것만 주인을 바꾼다(INTENT_RULES · DOMAIN_RULES — 지금은 D1: 낙하 · 부분 충격 해석 결과의 저장 · 조회는 DynaForge 만).
     보고 · 형식 낱말(report · summary · export · 그림 · 발표 …)이 든 도구가 게이트웨이 자체이거나 데이터 주인이 다른 앱이면 '보고만 의심' 이다.
   · 옛 키(app_keys.json 의 retired — GW-05)로 아직 붙어 있는 앱은 따로 짚는다.
+  · 영역(tool_areas.json apps 줄)이 없는 앱 — /tools-map 의 unclassified 를 앱마다 센다(HWAXPortal docs/request-1125 CT-03). 값은 앱 주인이 정한다 —
+    훑기는 짚기만 하고 영역을 짐작하지 않는다.
 
     python3 tool_registration_scan.py                                    # 이 박스 게이트웨이(127.0.0.1:9110)의 /tools-map
     python3 tool_registration_scan.py --tools-map map.json --snapshot tool_search_eval/catalog.local.json --flagged
@@ -122,7 +124,24 @@ def scan(tmap: dict, snapshot: dict | None = None, app_filter: str = "") -> dict
     retired = _retired()
     live = sorted({a for a in (tmap.get("map") or {}).values()} & set(retired))
     return {"apps": apps, "labels": labels, "intents": intents,
-            "retired_live": [{"app": a, "now": retired[a].get("now")} for a in live]}
+            "retired_live": [{"app": a, "now": retired[a].get("now")} for a in live],
+            "unclassified_apps": _unclassified_apps(tmap, labels, app_filter)}
+
+
+def _unclassified_apps(tmap: dict, labels: dict, app_filter: str = "") -> list | None:
+    """영역 없는 도구를 앱마다 센다 — [{app, label, count}](많은 것부터). /tools-map 에 unclassified 칸이 없으면(옛 게이트웨이 · 손으로 만든 파일)
+    None — '없다(0)' 와 '모른다' 를 섞지 않는다. 앱마다 세는 까닭: 앱이 붙을 때 apps 줄 하나가 빠지면 그 앱 도구가 통째로 미분류다(CT-01 · CT-02)."""
+    raw = tmap.get("unclassified")
+    if not isinstance(raw, list):
+        return None
+    amap = tmap.get("map") or {}
+    cnt: dict[str, int] = {}
+    for name in raw:
+        app = amap.get(name) or "?"
+        if app_filter and app != app_filter:
+            continue
+        cnt[app] = cnt.get(app, 0) + 1
+    return [{"app": a, "label": labels.get(a) or "", "count": n} for a, n in sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))]
 
 
 def _cell(s: str) -> str:
@@ -157,6 +176,16 @@ def render(res: dict, flagged_only: bool = False) -> str:
     if res["retired_live"]:
         out += ["## 옛 키로 아직 붙어 있는 앱(GW-05)", ""]
         out += [f"- {x['app']} → 지금 키 {x['now']}" for x in res["retired_live"]] + [""]
+    ua = res.get("unclassified_apps")
+    out += ["## 영역 없는 앱(tool_areas.json apps 줄 — CT-03)", ""]
+    if ua is None:
+        out += ["- 모른다 — 이 /tools-map 에 unclassified 칸이 없다(옛 게이트웨이 · 손으로 만든 파일)", ""]
+    elif not ua:
+        out += ["- 없음 — 모든 도구에 영역이 있다", ""]
+    else:
+        out += [f"- {x['app']}" + (f"({x['label']})" if x["label"] else "") + f" — 미분류 {x['count']}개" for x in ua]
+        out += ["", "고칠 곳 — 게이트웨이 `tool_areas.json` 의 `apps` 에 그 앱 줄 하나(`areas` 의 키). 값은 그 앱 주인이 정한다 — 짐작 값을 넣지 않는다. "
+                "줄이 없으면 개인 Claude 묶음 보기 · 도구 고르기 묶음에서 그 앱 도구가 빠진다.", ""]
     return "\n".join(out)
 
 

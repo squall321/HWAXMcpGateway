@@ -75,6 +75,11 @@ def _no_prod_audit(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "ADOPTION_ON", True)
     monkeypatch.setattr(gw, "_ADOPT_HEALTH", {"at": -1e9, "data": None})
     monkeypatch.setattr(gw, "_ADOPT_WARN", {"at": -1e9, "errors": 0})
+    # 도구 영역 표의 박스 덧씌우기도 같다(HWAXPortal docs/request-1125 CT-02) — 박스에 tool_areas.local.json 이 있으면 '추적 파일 그대로' 시험이 그 값으로 돈다
+    monkeypatch.setattr(gw, "_AREAS_LOCAL_PATH", tmp_path / "tool_areas.local.json")
+    monkeypatch.setattr(gw, "_AREAS_CACHE", {"mtime": None, "data": {}})
+    # 원격 앱의 판 · 인스턴스(PT-2) — 앞 시험이 채운 칸이 목록 시험에 새지 않게
+    monkeypatch.setattr(gw, "_APP_STATUS", {})
 
 
 @pytest.fixture(autouse=True)
@@ -386,6 +391,83 @@ def test_save_conversation_meta_를_옮긴다(monkeypatch):
     assert out[1]["meta"]["non_negotiable"] == "양산 금형 변경 불가"
 
 
+def test_WD04_save_conversation_은_도구_활동을_웹_중계와_같은_꼴로_meta_activity_에_싣는다(monkeypatch):
+    """HWAXPortal docs/request-1125 WD-04 — MCP 로 저장한 대화는 meta 에 rebut · non_negotiable 만 남아 웹에서 열고 '원 도구 결과가 있니?' 라고
+    물으면 근거가 0건이었다. 활동을 웹 중계 꼴(ts · step · tool · call · ok · detail · result_preview · result_full)로 남기면 포털 화면이 앞 턴 근거로
+    되살린다. 결과는 자르지 않는다."""
+    big = "결과 원문 " * 3000
+    out = _drive_save(monkeypatch, [
+        {"role": "user", "content": "실드캔 두께?"},
+        {"role": "assistant", "content": "0.15 mm 입니다", "activity": [
+            {"tool": "heaxstep_forge_identify_part", "args": {"project_id": "p1", "part": "SHIELD_CAN_01"}, "result": big, "ok": True},
+            {"tool": "verify_answer", "args": '{"text":"0.15"}', "result": {"ok": True}},
+            {"args": {"x": 1}, "result": "이름 없는 항목"},
+        ]},
+        {"role": "assistant", "content": "둘째", "meta": {"non_negotiable": "조항", "activity": [{"tool": "t2", "result": "r"}]}},
+    ])
+    acts = out[1]["meta"]["activity"]
+    assert [a["tool"] for a in acts] == ["heaxstep_forge_identify_part", "verify_answer"], "도구 이름 없는 항목은 뺀다"
+    a = acts[0]
+    assert a["result_full"] == big and a["result_preview"] == big[:220], "결과는 자르지 않는다(근거는 result_full)"
+    assert json.loads(a["detail"]) == {"project_id": "p1", "part": "SHIELD_CAN_01"} and a["ok"] is True and a["call"] == "mcp-1-0"
+    assert isinstance(a["ts"], int) and a["step"]
+    assert acts[1]["detail"] == '{"text":"0.15"}' and json.loads(acts[1]["result_preview"]) == {"ok": True} and "ok" not in acts[1]
+    assert "result_full" not in acts[1], "짧은 결과는 미리보기가 곧 원문이다(웹 중계와 같다)"
+    assert "meta" not in out[0]
+    assert out[2]["meta"] == {"non_negotiable": "조항", "activity": [{**out[2]["meta"]["activity"][0]}]} and \
+        out[2]["meta"]["activity"][0]["result_preview"] == "r", "meta.activity 로 실어 와도 받는다"
+
+
+def test_WD04_활동_상한을_넘는_항목은_통째로_빼고_답에_센다(monkeypatch):
+    import asyncio
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+        def json(self): return {"id": "c-9"}
+
+    class _Cli:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None):
+            sent["body"] = json
+            return _Resp()
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    monkeypatch.setattr(gw, "_audit", lambda *a, **k: None)
+    # 요청 문맥 자리는 SDK 판마다 다르다(1.x _low.request_context · 2.x _request_context) — 넘기는 자격 하나만 바꿔 둘 다에서 돈다
+    monkeypatch.setattr(gw, "_portal_forward_auth", lambda: ("http://portal", "Bearer t", ""))
+    monkeypatch.setattr(gw, "CONV_ACTIVITY_MAX", 3)
+    monkeypatch.setattr(gw, "CONV_ACTIVITY_CHARS", 1000)
+    msgs = [{"role": "assistant", "content": "a", "activity": [{"tool": f"t{k}", "result": "x" * 100} for k in range(5)]},
+            {"role": "assistant", "content": "b", "activity": [{"tool": "huge", "result": "y" * 2000}, {"tool": "small", "result": "z"}]},
+            {"role": "assistant", "content": "c", "activity": "목록이 아니다"}]
+    res = asyncio.run(gw._save_conversation({"title": "대화", "kind": "chat", "messages": msgs}))
+    body = json.loads(res.content[0].text)
+    got = sent["body"]["messages"]
+    assert [x["tool"] for x in got[0]["meta"]["activity"]] == ["t0", "t1", "t2"]
+    assert [x["tool"] for x in got[1]["meta"]["activity"]] == ["small"] and got[1]["meta"]["activity"][0]["result_preview"] == "z"
+    assert "meta" not in got[2]
+    assert body["ok"] is True and body["activity_saved"] == 4
+    assert [(d["index"], d["dropped"]) for d in body["activity_dropped"]] == [(0, 2), (1, 1), (2, 1)]
+    assert "통째로" in body["activity_dropped"][0]["why"] and "목록" in body["activity_dropped"][2]["why"]
+    res = asyncio.run(gw._save_conversation({"title": "대화", "messages": [{"role": "user", "content": "q"}]}))
+    assert "activity_saved" not in json.loads(res.content[0].text), "활동이 없으면 답이 종전과 같다"
+
+
+def test_WD04_포털_화면이_meta_activity_에서_근거를_되살리는_칸과_맞는다():
+    """게이트웨이가 남기는 칸 이름이 포털 화면이 읽는 칸과 같아야 한다 — 다시 열 때 activity 를 되살리는 곳(conversations.api.ts)과 앞 턴 근거로
+    모으는 곳(history.ts turnEvidence — 결과는 result_full ?? result_preview, 인자는 detail, 짝 키 call · 성패 ok)."""
+    root = gw.Path(gw.__file__).resolve().parent.parent / "HWAXPortal" / "frontend" / "src"
+    if not root.exists():
+        pytest.skip("형제 HWAXPortal 리포가 없다")
+    conv = (root / "api" / "conversations.api.ts").read_text(encoding="utf-8")
+    hist = (root / "components" / "chat" / "history.ts").read_text(encoding="utf-8")
+    assert "(m.meta as { activity?: ActivityItem[] } | null)?.activity" in conv
+    for want in ("a.result_full ?? a.result_preview", "a.detail", "a.call", "a.ok === false", "a.tool"):
+        assert want in hist, want
+
+
 def test_save_conversation_meta_는_알려진_칸만_자르지_않고(monkeypatch):
     """알려진 두 칸(rebut·non_negotiable)만 옮긴다 — 임의 dict 는 넘기지 않는다. 다만 자르지 않는다: 종전엔 웹 경로처럼
     반박 4건·요지 160자·조항 1,200자로 잘랐는데, 포털 입력 모델은 meta 에 한도가 없고 이어하기는 그 조항을 다음 심의에 넘긴다."""
@@ -519,6 +601,26 @@ def test_knox_bridge_와_plm_defect_도구는_미분류로_떨어지지_않는�
     assert by["quality"]["label"] == "품질·불량 이력" and "PLM" in by["quality"]["description"]
 
 
+def test_CT02_영역_박스_덧씌우기는_apps_tools_만_받고_추적_표의_영역_키만_받는다(monkeypatch, tmp_path, caplog):
+    """HWAXPortal docs/request-1125 CT-02 — dev 에 없는 사내 앱(mountsoldatahub · ncdevdatahub · testscope)의 영역은 앱 주인이 정하고 운영 박스가 커밋 없이
+    tool_areas.local.json 에 적는다(dev 는 짐작 값을 넣지 않는다). 틀린 줄만 버리고, 깨진 파일은 통째로 버린다. 재기동 없이 먹는다."""
+    import logging
+    local = gw._AREAS_LOCAL_PATH                                 # autouse 가 tmp 로 건 자리
+    assert gw._area_of("ts_list_tests", "testscope") == "", "덧씌우기가 없으면 추적 표 그대로(미분류)"
+    local.write_text(json.dumps({"_doc": "운영 박스", "apps": {"testscope": "quality", "mountsoldatahub": "data", "ncdevdatahub": "없는영역"},
+                                 "tools": {"ts_special": "report"}, "patterns": [["x", "cad"]]}), encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="hwax-mcp-gateway"):
+        assert gw._area_of("ts_list_tests", "testscope") == "quality" and gw._area_of("mount_a", "mountsoldatahub") == "data"
+    assert gw._area_of("nc_a", "ncdevdatahub") == "", "추적 표 areas 에 없는 영역 키는 버린다"
+    assert gw._area_of("ts_special", "testscope") == "report", "도구 지정이 앱 기본값을 이긴다(덧씌우기 안에서도)"
+    assert gw._area_of("find_parts", "heax-step_forge") == "cad", "추적 표의 다른 줄은 그대로"
+    said = " ".join(r.getMessage() for r in caplog.records)
+    assert "apps.ncdevdatahub" in said and "patterns" in said, "버린 줄을 경고한다(조용히 안 먹지 않게)"
+    local.write_text("{ 깨진", encoding="utf-8")
+    gw.os.utime(local, ns=(local.stat().st_atime_ns, local.stat().st_mtime_ns + 1_000_000_000))
+    assert gw._area_of("ts_list_tests", "testscope") == "" and gw._area_of("find_parts", "heax-step_forge") == "cad", "깨지면 통째로 버리고 추적 표로"
+
+
 @pytest.mark.parametrize("app, tool, want", [
     # 코어 허브의 읽기 도구는 '사내 지식 검색' — 10-27 cae00 그 영역(55개)에 코어 허브 도구가 0개였다(HWAXPortal docs/request-1027 HG-05)
     ("rootdesigndatahub", "rootdesigndatahub_object_resolve", "knowledge"),
@@ -531,6 +633,8 @@ def test_knox_bridge_와_plm_defect_도구는_미분류로_떨어지지_않는�
     ("simengbay", "list_engines", "sim"), ("ste", "ste_submit_job", "sim"), ("dynaforge-prod", "dynaforgeprod_whoami", "system"),
     ("dynaforge-prod", "report_summary", "result"), ("stepforge-prod", "list_parts", "cad"),
     ("matnexus", "voc_breakdown", "voc"),                                  # voc_* 는 어느 앱이든 VOC
+    # 운영 쪽 앱 CircuitTrace(주인이 운영 쪽 — 값도 그쪽이 정했다) 도구 여섯이 미분류였다(HWAXPortal docs/request-1125 CT-01)
+    ("circuittrace", "trace_board_defects", "quality"),
 ])
 def test_HG05_코어_허브_읽기는_지식_검색이고_앱_기본값이_미분류를_메운다(monkeypatch, app, tool, want):
     monkeypatch.setattr(gw, "_AREAS_CACHE", {"mtime": None, "data": {}})     # 추적 파일 그대로
@@ -728,7 +832,8 @@ def test_list_tool_apps_거부_안내는_포털_권한키와_요청_경로를_�
     assert d["app"] == "ste" and d["needs"] == ["plat:smarttwin"] and d["request"] == "/access?need=plat:smarttwin"
     assert d["reason"] == "portal_access"
     assert "ste_submit_job" not in json.dumps(body), "거부 안내에 도구 이름이 새면 모델이 계획에 넣는다"
-    assert "denied_apps" in gw._INSTRUCTIONS and "/access?need=" in gw._INSTRUCTIONS
+    # 지침은 '답의 note · how 를 따른다' 한 줄이고(G-2 — 9 · 10번을 답으로 옮겼다), 요청 경로는 그 답이 말한다
+    assert "denied_apps" in gw._INSTRUCTIONS and "/access?need=" in body["note"] and "invoke_tool 로 우회하지 않는다" in body["note"]
 
 
 def _noop_async(value):
@@ -769,7 +874,7 @@ def test_거부_사유가_다르면_안내도_다르다(monkeypatch):
     one = json.loads(asyncio.run(gw._list_tool_apps({"app": "ste"})).content[0].text)
     assert one["error"].startswith("not_ready:") and "권한이 없는 앱" not in one["error"]
     assert "일시" in gw._deny_text("ste", ["plat:smarttwin"])
-    assert "policy_not_ready" in gw._INSTRUCTIONS and "gateway_group" in gw._INSTRUCTIONS
+    assert "policy_not_ready" in body["note"] and "gateway_group 은 요청하라고 하지 않는다" in body["note"], "지침에서 옮긴 안내(G-2)"
     assert "재시도" in body["note"] or "policy_not_ready" in body["note"]
     # 정책이 오면 같은 호출자가 바로 열린다 — 일시 상태였다는 증거.
     monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
@@ -2423,9 +2528,29 @@ def test_포털이_알리면_불통_때_쓰는_직전_권한도_그_사람_것�
     assert post(b"") == 200 and gw._ENT_LAST == {}, "이메일 없이 부르면 전부 비운다(다른 캐시와 같다)"
 
 
-def test_지침이_끈_앱을_권한_문제와_구분하라고_말한다():
-    assert "muted_apps" in gw._INSTRUCTIONS and "요청하라고 하지 마라" in gw._INSTRUCTIONS
+def test_지침이_끈_앱을_권한_문제와_구분하라고_말한다(monkeypatch):
+    """9 · 10번은 list_tool_apps 답의 note 로 옮겼다(HWAXPortal docs/request-1125 G-2 — 2,048자 안에 자리를 만든다). 지침은 그 답을 따르라는 한 줄이다."""
+    assert "muted_apps" in gw._INSTRUCTIONS and "note" in gw._INSTRUCTIONS and "지어내지 마라" in gw._INSTRUCTIONS
     assert len(gw._INSTRUCTIONS) < 2048, "Claude Code 는 서버 지침을 2048자에서 자른다"
+    monkeypatch.setattr(gw, "backends", {})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "route", {})
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    note = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)["note"]
+    assert "muted_apps 는 사용자가 포털에서 꺼 둔 앱이다" in note and "요청하라고 하지 말고" in note and "list_tool_apps(app='<키>')" in note
+
+
+def test_G2_지침_1번은_한_길이고_ToolSearch_낱말_찾기를_막고_결과_손잡이를_켠_박스에만_15번(monkeypatch):
+    first = gw._INSTRUCTIONS.split("\n1. ", 1)[1].split("\n2. ")[0]
+    assert "한 길" in first
+    assert "바로 부르고" in first and "search_tools" in first and "한 번" in first and "ToolSearch" in first and "invoke_tool" in first
+    monkeypatch.setattr(gw._low, "instructions", gw._low.instructions)
+    monkeypatch.setattr(gw, "POLICY", {})
+    _aggregate_tools(monkeypatch, {})
+    assert "15. " not in gw._instructions(), "끈 박스는 지금과 같다"
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", True)
+    on = gw._instructions()
+    assert on == gw._INSTRUCTIONS + gw._INSTR_RES and "result_ask" in on and len(on) < 2048
 
 
 def test_포털이_찍는_챗_PAT_표지와_게이트웨이가_보는_값이_같다():
@@ -4303,6 +4428,47 @@ def test_레지스트리에서_빠진_앱은_열_패스째에_뗀다(monkeypatch
     assert len(seen) == 10 and seen == [True] * 9 + [False] and stopped == [1]
 
 
+def test_MEMORY1_부팅_집계_몇_초_뒤_새_판으로_뜬_앱의_도구가_첫_탐침에서_오른다(monkeypatch):
+    """HWAXPortal docs/request-1125 MEMORY-1 — 11-18 에 게이트웨이가 옛 에이전트(8도구)로 카탈로그를 지은 3초 뒤 새 판(13도구)이 떴는데, 재활 패스의
+    첫 탐침은 지문 씨앗만 뿌려 다음 변경 전까지 새 심의 도구가 안 보였다. 이제 재집계가 지은 목록으로 씨를 뿌리고, 씨앗이 없으면 카탈로그가 실은
+    목록과 견준다 — 첫 탐침에서 오르고(60초 한 패스 안), 같은 판이면 재집계하지 않는다."""
+    b = _B([_tool("delib_a"), _tool("delib_b")])
+    monkeypatch.setattr(gw, "HEAX", {})
+    monkeypatch.setattr(gw, "backends", {"hwax-deliberation": b})
+    for name in ("route", "alias_route", "_REAGG", "_FP", "_LAST_TOOLS", "_LIVENESS_MISS", "DISCOVERED_META", "POLICY"):
+        monkeypatch.setattr(gw, name, {})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+
+    async def go():
+        await gw._aggregate()                                  # 부팅 집계 — 옛 판(2도구)
+        boot = set(gw.route)
+        b.session = _Sess([_tool("delib_a"), _tool("delib_b"), _tool("delib_new")])   # 첫 탐침 전에 새 판이 떴다
+        changed = await gw._revive_once(object())             # 첫 탐침에서 바로 오른다
+        same = await gw._revive_once(object())                 # 같은 판 — 재집계 없음
+        return boot, changed, set(gw.route), same
+    boot, changed, after, same = asyncio.run(asyncio.wait_for(go(), 5))
+    assert boot == {"delib_a", "delib_b"}
+    assert changed is True and "delib_new" in after, "첫 탐침이 씨앗만 뿌리고 지나갔다(MEMORY-1)"
+    assert same is False and gw._FP["hwax-deliberation"] == gw._tools_fp(b.session._t)
+
+
+def test_MEMORY1_씨앗이_없으면_카탈로그가_실은_목록과_견준다(monkeypatch):
+    """재집계가 이 백엔드의 목록을 받은 적이 없다(지문 씨앗 없음) — 카탈로그가 실은 직전 목록(없으면 빈 목록)과 다르면 재집계, 같으면 씨앗만."""
+    b = _B([_tool("x1"), _tool("x2")])
+    monkeypatch.setattr(gw, "HEAX", {})
+    monkeypatch.setattr(gw, "backends", {"signalforge": b})
+    for name in ("route", "alias_route", "_REAGG", "_FP", "_LIVENESS_MISS", "DISCOVERED_META", "POLICY"):
+        monkeypatch.setattr(gw, name, {})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "_LAST_TOOLS", {"signalforge": ([_tool("x1"), _tool("x2")], 0)})
+    assert asyncio.run(asyncio.wait_for(gw._revive_once(object()), 5)) is False, "카탈로그가 실은 목록과 같다 — 씨앗만"
+    assert gw._FP["signalforge"] == gw._tools_fp(b.session._t)
+    monkeypatch.setattr(gw, "_FP", {})
+    monkeypatch.setattr(gw, "_LAST_TOOLS", {})
+    assert asyncio.run(asyncio.wait_for(gw._revive_once(object()), 5)) is True, "카탈로그에 이 백엔드 도구가 없다 — 재집계"
+    assert {"x1", "x2"} <= set(gw.route)
+
+
 # ── save_conversation — 수 시간의 전사를 남기는 한 번의 쓰기(결정표 gateway-15) ──────────────────────────────
 def _save_kit(monkeypatch, post):
     """`_save_conversation` 을 실제로 태우고 포털 POST 만 `post` 로 바꾼다 → (결과, 클라이언트를 만든 timeout)."""
@@ -4654,6 +4820,80 @@ def test_기동할_때_그_줄을_남긴다():
     src = open(gw.__file__, encoding="utf-8").read()
     main = src[src.index("\ndef main():"):]
     assert 'log.info("%s", _limits_line())' in main[:main.index("_GracefulServer(uvicorn.Config(")], "main() 이 기동 전에 시간 한도 줄을 남겨야 한다"
+
+
+# ── HG-24 — 시간 한도를 박스 파일(provision.env)로 ─────────────────────────────────────────────────────────────
+# 10-31 에 GATEWAY_CALL_TIMEOUT=2400 을 ~/.bashrc · crontab 환경 줄에 넣었다 — 그 줄을 안 읽는 셸로 띄우면 말없이 600 으로 돌았다.
+# start.sh 가 곁의 provision.env 에서 시간 한도 열셋만(숫자 값만) 환경에 싣는다. 띄운 셸의 값이 먼저다(gateway.py _env_knob 과 같은 차례).
+_HG24_GW_PROBE = """
+import json, os, sys
+sys.path.insert(0, os.environ["HG24_REAL_GW"])
+import gateway as gw
+print("HG24=" + json.dumps({"line": gw._limits_line(), "rat": os.environ.get("RAT_TOKEN"), "jwks": os.environ.get("GATEWAY_JWKS_TIMEOUT")}))
+"""
+
+
+def _hg24_start(tmp_path, box_env: str, **env):
+    """start.sh 사본을 진짜 게이트웨이 import 로 끝나는 판에서 돌린다 — 진짜 gateway.py 가 그 환경으로 읽은 시간 한도 줄을 돌려준다(서버는 띄우지 않는다)."""
+    import shutil
+    import socket
+    d = tmp_path / "HWAXMcpGateway"
+    d.mkdir(exist_ok=True)
+    shutil.copy(os.path.join(os.path.dirname(os.path.abspath(gw.__file__)), "start.sh"), d / "start.sh")
+    (d / "gateway.py").write_text(_HG24_GW_PROBE, encoding="utf-8")
+    (d / "provision.env").write_text(box_env, encoding="utf-8")
+    vbin = tmp_path / "HWAXAgentServer" / ".venv" / "bin"
+    vbin.mkdir(parents=True, exist_ok=True)
+    (vbin / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+    (vbin / "python").chmod(0o755)
+    (tmp_path / "cfg.json").write_text(json.dumps({"_gateway": {"token": "gw-test-token"}}), encoding="utf-8")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    full = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "REST_PROXY_", "RAT_"))}
+    full.update(GATEWAY_PORT=str(port), GATEWAY_CONFIG=str(tmp_path / "cfg.json"), GATEWAY_AUDIT=str(tmp_path / "audit.jsonl"),
+                HG24_REAL_GW=os.path.dirname(os.path.abspath(gw.__file__)), PYTHONDONTWRITEBYTECODE="1", **env)
+    run = subprocess.run(["bash", str(d / "start.sh")], env=full, capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    got = next(ln for ln in run.stdout.splitlines() if ln.startswith("HG24="))
+    return json.loads(got[len("HG24="):]), run.stdout
+
+
+def test_HG24_셸_줄_없이_손으로_띄워도_provision_env_의_시간_한도가_기동_줄에_선다(tmp_path):
+    box = ("RAT_TOKEN=rat_secret\nexport GATEWAY_CALL_TIMEOUT='1800'\nGATEWAY_CALL_TIMEOUT=2400   # 10-31 카드 검색 30분\n"
+           "GATEWAY_JWKS_TIMEOUT=abc\nGATEWAY_RECONNECT_TIMEOUT=\nGATEWAY_PORTAL_SAVE_TIMEOUT=\"300\"\n")
+    got, out = _hg24_start(tmp_path, box)
+    line = got["line"]
+    assert "GATEWAY_CALL_TIMEOUT=2400 " in line and "GATEWAY_BACKEND_READ_TIMEOUT=2460 " in line, line
+    assert "GATEWAY_PORTAL_SAVE_TIMEOUT=300 " in line and "GATEWAY_RECONNECT_TIMEOUT=30 " in line, "빈 값은 없는 것"
+    assert line.endswith("GATEWAY_JWKS_TIMEOUT=5") and got["jwks"] is None, "숫자가 아닌 값은 싣지 않는다"
+    assert got["rat"] is None, "시간 한도 열셋 밖(토큰)은 환경에 싣지 않는다"
+    assert "· 박스 시간 한도(provision.env): GATEWAY_CALL_TIMEOUT=2400 GATEWAY_PORTAL_SAVE_TIMEOUT=300" in out
+    got, _out = _hg24_start(tmp_path, box, GATEWAY_CALL_TIMEOUT="900")
+    assert "GATEWAY_CALL_TIMEOUT=900 " in got["line"] and "GATEWAY_PORTAL_SAVE_TIMEOUT=300 " in got["line"], "띄운 셸의 값이 먼저다"
+    got, out = _hg24_start(tmp_path, "# 비었다\n")
+    assert "GATEWAY_CALL_TIMEOUT=600 " in got["line"] and "박스 시간 한도" not in out
+
+
+def test_HG24_start_sh_의_손잡이는_기동_줄의_손잡이와_같고_줄_읽기는_provision_env_읽기와_같다(tmp_path):
+    import re as _r
+    here = os.path.dirname(os.path.abspath(gw.__file__))
+    sh = open(os.path.join(here, "start.sh"), encoding="utf-8").read()
+    keys = set(_r.findall(r'"([A-Z][A-Z0-9_]+)"', sh[sh.index("KEYS = ("):sh.index("vals = {}")]))
+    src = open(gw.__file__, encoding="utf-8").read()
+    fn = src[src.index("def _limits_line()"):src.index("\n\n\n", src.index("def _limits_line()"))]
+    names = set(_r.findall(r"([A-Z][A-Z0-9_]+)=%", fn)) | {"GATEWAY_REVIVE_INTERVAL"}       # 주기는 '(주기 %d)' 로 적힌다
+    assert keys == names, (sorted(keys - names), sorted(names - keys))
+    # 줄 읽기 — 같은 파일에서 start.sh 가 싣는 값과 gateway._provision_env_value 가 읽는 값이 같다(숫자 값)
+    p = tmp_path / "provision.env"
+    p.write_text("GATEWAY_CALL_TIMEOUT=100\n  export GATEWAY_CALL_TIMEOUT=\"1200\"  # 주석\nGATEWAY_CALL_TIMEOUTX=7\n#GATEWAY_LIVENESS_TIMEOUT=99\n"
+                 "GATEWAY_LIVENESS_TIMEOUT='12.5'\n", encoding="utf-8")
+    body = sh[sh.index("<<'PYBOX'") + len("<<'PYBOX'"):sh.index("\nPYBOX\n")]
+    body = body[body.index("\n") + 1:]
+    run = subprocess.run([sys.executable, "-", str(p)], input=body, capture_output=True, text=True, timeout=60)
+    shell = dict(ln.split("=", 1) for ln in run.stdout.split())
+    assert shell == {"GATEWAY_CALL_TIMEOUT": "1200", "GATEWAY_LIVENESS_TIMEOUT": "12.5"}, run.stdout + run.stderr
+    assert all(gw._provision_env_value(k, p) == v for k, v in shell.items())
 
 
 # ── 1백만 토큰 창 — 게이트웨이는 도구 결과를 자르지 않고, 남는 절단은 조용하지 않다(리스크 심사 재설계 M1) ─────────
@@ -7710,9 +7950,9 @@ _OL_LOOKUP = {"failuretrace": {"tool": "object_resolve", "args": {"type_slug": "
               "reportarchive": {"tool": "search_objects", "args": {"q": "{name}"}}}
 
 
-def _ol_kit(monkeypatch, tmp_path, answers, *, lookup=_OL_LOOKUP):
+def _ol_kit(monkeypatch, tmp_path, answers, *, lookup=_OL_LOOKUP, other=_OL_OTHER):
     """실제 어휘표 + 합성 카탈로그 + 가짜 정본 — answers(노출 이름, 인자) → 정본 답(사전 · 예외 글은 오류 답). 부른 것을 calls 에 적는다."""
-    _role_kit(monkeypatch, other=_OL_OTHER)
+    _role_kit(monkeypatch, other=other)
     _vocab_overlay(monkeypatch, tmp_path, {"ontology": {"lookup": lookup}})
     calls = []
 
@@ -7874,6 +8114,101 @@ def test_OL1_타입을_모르면_정본_검색을_후보로_준다(monkeypatch, 
     out = json.loads(asyncio.run(gw._onto_lookup({"query": "솔더"})).content[0].text)
     assert out["match"] == "candidates" and out["via"] == "search" and out["ask_user"] is True, "한 줄이어도 검색은 판정이 아니다"
     assert out["candidates"][0]["key"] == "FM-1" and out["types"] == [{"type_slug": "failure_mode", "count": 1}]
+
+
+# OL-6 — 앱 줄 여럿(사전의 목록 · 줄마다 types) · 안쪽 칸(conditions 목록 안의 '{key}')까지 채우기(HWAXPortal docs/request-1125 OL-6 · HP-82)
+_OL6_FT = [{"tool": "object_resolve", "args": {"type_slug": "{type_slug}", "name": "{key}"}},
+           {"tool": "objects_list", "types": ["part"],
+            "args": {"type_slug": "pd_defect", "limit": 20, "conditions": [{"field": "ref.part.key", "op": "eq", "value": "{key}"}]},
+            "_doc": "그 부품의 PLM 결함 — 수는 total, 묶음은 objects_summary"}]
+_OL6_PART = {"id": "p-1", "key": "PRT-SHIELD_CAN", "label": "실드캔", "type_slug": "part", "matched_by": "label"}
+
+
+def test_OL6_앱_줄은_사전의_목록도_받고_줄마다_거른다():
+    rows = gw._onto_lookup_rows({"ontology": {"lookup": {
+        "failuretrace": [*_OL6_FT, {"tool": "x y", "args": {"a": 1}}, "줄이 아니다", {"tool": "objects_summary", "args": {"q": "{key}"}, "w": 1}],
+        "heax-step_forge": {"tool": "onto_search", "args": {"q": "{key}"}, "types": ["plm_task"]}, "a1": []}}})
+    assert [(r[0], r[1], r[3]) for r in rows] == [("failuretrace", "object_resolve", None), ("failuretrace", "objects_list", ("part",)),
+                                                  ("heax-step_forge", "onto_search", ("plm_task",))], "목록 안의 틀린 줄만 버린다 · 차례 그대로"
+    assert gw._onto_slots({"a": "{type_slug}", "c": [{"v": "{key}", "n": 3}, "x {name}"], "d": None}) == {"type_slug", "key", "name"}
+    assert gw._onto_slots(7) == set() and gw._onto_slots([]) == set() and gw._onto_slots({}) == set()
+    obj = {"type_slug": "part", "key": "K-1", "name": "이름", "object_id": "u"}
+    assert gw._onto_fill_deep({"c": [{"v": "{key}"}, "pre-{name}"], "n": 20, "t": "{type_slug}"}, obj) == {
+        "c": [{"v": "K-1"}, "pre-이름"], "n": 20, "t": "part"}
+    assert gw._onto_fill_deep("{object_id}", obj) == gw._onto_fill("{object_id}", obj) == "u", "맨 위 글자 칸은 _onto_fill 그대로"
+
+
+def test_OL6_부품_결함_목록_줄이_next_에_서고_conditions_안_value_가_채워진다(monkeypatch, tmp_path):
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: {"match": "exact", "object": {**_OL6_PART, "type_slug": a["type_slug"]}},
+                             lookup={**_OL_LOOKUP, "failuretrace": _OL6_FT})
+    out = lookup({"query": "실드캔", "type": "part"})
+    assert out["match"] == "exact" and out["object"]["key"] == "PRT-SHIELD_CAN"
+    ft = [x for x in out["next"] if x["app"] == "failuretrace"]
+    assert [x["tool"] for x in ft] == [gw._rt_exposed("failuretrace", "object_resolve"), gw._rt_exposed("failuretrace", "objects_list")]
+    assert ft[0]["args"] == {"type_slug": "part", "name": "PRT-SHIELD_CAN"}
+    assert ft[1]["args"] == {"type_slug": "pd_defect", "limit": 20,
+                             "conditions": [{"field": "ref.part.key", "op": "eq", "value": "PRT-SHIELD_CAN"}]}
+    out = lookup({"query": "TASK-A", "type": "plm_task"})
+    assert [x["tool"] for x in out["next"] if x["app"] == "failuretrace"] == [gw._rt_exposed("failuretrace", "object_resolve")], \
+        "types [part] 줄은 부품이 아닌 개체에 싣지 않는다"
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, lambda n, a: {"match": "exact", "object": {**_OL6_PART, "key": None}},
+                             lookup={"failuretrace": _OL6_FT})
+    out = lookup({"query": "실드캔", "type": "part"})
+    assert not [x for x in out["next"] if x["app"] == "failuretrace"] and {s["tool"] for s in out["skipped"] if s["app"] == "failuretrace"} == {
+        gw._rt_exposed("failuretrace", "object_resolve"), gw._rt_exposed("failuretrace", "objects_list")}, "안쪽 '{key}' 도 빈 칸이면 부르지 않는다"
+
+
+def test_OL6_사전_꼴_줄은_목록_하나로_적어도_결과가_같다(monkeypatch, tmp_path):
+    ans = lambda n, a: {"match": "exact", "object": _OL_OBJ}  # noqa: E731
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, ans)
+    before = lookup({"query": "TASK-A", "type": "plm_task"})
+    lookup, _calls = _ol_kit(monkeypatch, tmp_path, ans, lookup={k: [v] for k, v in _OL_LOOKUP.items()})
+    assert lookup({"query": "TASK-A", "type": "plm_task"}) == before
+
+
+# OL-7 — none 답에 CAD 파트 이름이면 StepForge identify_part 로 다시 가라는 한 줄(HWAXPortal docs/request-1125 OL-7)
+_OL7_OTHER = {**_OL_OTHER, "heax-step_forge": ("StepForge", [*_OL_OTHER["heax-step_forge"][1],
+                                                             ("identify_part", "파트 이름으로 무엇인지 · 무엇을 하는지 · 치수를 알아본다.")])}
+
+
+def _ol7_answers(n, a):
+    return {"items": [], "types": []} if n.endswith("search") else {"match": "none", "object": None, "candidates": []}
+
+
+def _ol7_kit(monkeypatch, tmp_path, answers, other=_OL7_OTHER):
+    """_ol_kit + 정본 허브에 search(타입을 모를 때의 길) — 실제 정본 허브는 search 를 낸다."""
+    lookup, calls = _ol_kit(monkeypatch, tmp_path, answers, other=other)
+    hub = [types.Tool(name=n, description=d, inputSchema={"type": "object", "properties": {}})
+           for n, d in (*_CORE_HUB_TOOLS, ("search", "이름 · 식별자 · 별칭으로 전부 찾는다."))]
+    _aggregate_tools(monkeypatch, {**{k: list(hub) for k, _l in _CORE_HUBS},
+                                   **{k: [types.Tool(name=n, description=d, inputSchema={"type": "object", "properties": {}}) for n, d in ts]
+                                      for k, (_l, ts) in other.items()}})
+    return lookup, calls
+
+
+def test_OL7_CAD_이름_꼴이나_부품_타입의_none_답에_identify_part_로_다시_가라는_한_줄(monkeypatch, tmp_path):
+    lookup, _calls = _ol7_kit(monkeypatch, tmp_path, _ol7_answers)
+    ident = gw._rt_exposed("heax-step_forge", "identify_part")
+    out = lookup({"query": "BRKT_0012"})
+    assert out["match"] == "none" and out["via"] == "search" and ident in out["retry"] and "core_part" in out["retry"], out
+    out = lookup({"query": "실드캔", "type": "part"})
+    assert out["match"] == "none" and ident in out["retry"] and "type='part'" in out["retry"], "부품 타입이면 이름 꼴과 상관없이"
+    for q, t in (("솔더 크랙", "고장모드"), ("brkt_12", ""), ("PRT-SHIELD_CAN", "plm_task"), ("TASK-A", "plm_task")):
+        assert "retry" not in lookup({"query": q, **({"type": t} if t else {})}), (q, t)
+    lookup, _calls = _ol7_kit(monkeypatch, tmp_path, lambda n, a: {"match": "exact", "object": {**_OL6_PART, "key": "BRKT_0012"}})
+    assert "retry" not in lookup({"query": "BRKT_0012", "type": "part"}), "exact 에는 붙이지 않는다"
+
+
+def test_OL7_StepForge_가_보이지_않거나_도구가_없으면_이름을_말하지_않는다(monkeypatch, tmp_path):
+    lookup, _calls = _ol7_kit(monkeypatch, tmp_path, _ol7_answers)
+    monkeypatch.setattr(gw, "_request_muted", lambda: {"heax-step_forge"})
+    assert "retry" not in lookup({"query": "BRKT_0012"}), "꺼 둔 앱"
+    monkeypatch.setattr(gw, "_request_muted", lambda: set())
+    monkeypatch.setattr(gw, "POLICY", {"heax-step_forge": ["sf-only"]})
+    assert "retry" not in lookup({"query": "BRKT_0012"}), "권한 밖 앱(L7)"
+    lookup, _calls = _ol7_kit(monkeypatch, tmp_path, _ol7_answers, other=_OL_OTHER)
+    out = lookup({"query": "BRKT_0012"})
+    assert out["match"] == "none" and "retry" not in out, "이 박스 StepForge 에 identify_part 가 없다"
 
 
 # OL-2 — search_tools
@@ -15198,6 +15533,43 @@ def test_P1_조각을_그_사람_명의로_받아_ste_업로드에_흘려_넣고
     assert rec["mints"] == [("ste", "a@x.com")]
 
 
+@pytest.mark.parametrize("mb", [3.5, *([float(os.environ["GATEWAY_BIG_UPLOAD_MB"])] if os.environ.get("GATEWAY_BIG_UPLOAD_MB") else [])])
+def test_BG3_큰_파일도_StepForge_진짜_조각_크기로_흘려_sha256_이_맞는다(monkeypatch, mb):
+    """HWAXPortal docs/request-1125 BG-3 — 11-17 과제 전체 STEP(129.7 MB)급. StepForge 조각 상한(STEPFORGE_MCP_DOWNLOAD_MAX 기본 1,000,000 바이트)으로
+    받고, 조각 답은 진짜 _call_tool_body 가 거는 결과 손질(개인정보 가림 · 근거 원장)을 지난다 — 무작위 바이트의 base64 가 가림에 걸려 바뀌면
+    sha256 이 어긋난다. 기본은 3.5 MB(조각 넷), GATEWAY_BIG_UPLOAD_MB=130 이면 그 크기로 한 번 더 돈다(손으로 — 스위트에는 무겁다)."""
+    data = os.urandom(int(mb * 1_000_000)) + b"END;"
+    monkeypatch.setitem(globals(), "_STE_CHUNK", 1_000_000)
+    run, rec, data, sha = _a2s_kit(monkeypatch, data, ste_ver="new")
+    inner = gw._call_tool_body
+
+    async def real_shape(name, args):                       # 진짜 _call_tool_body 의 결과 손질 — _evid_keep(이름, _pii_mask(결과, tool=…))
+        return gw._evid_keep(name, gw._pii_mask(await inner(name, args), tool=("heax-step_forge", "download_artifact")))
+    monkeypatch.setattr(gw, "_call_tool_body", real_shape)
+    monkeypatch.setattr(gw, "_EVID", gw.OrderedDict())
+    out, err = run(filename="project_full.step")
+    assert err is False and out["ok"] is True, out
+    assert out["bytes"] == len(data) and out["sha256"] == sha and out["ste_verified"] is True, "ste 가 디스크에 쓴 파일의 sha256 까지 맞는다"
+    assert hashlib.sha256(rec["stored"]["project_full.step"]).hexdigest() == sha
+    assert [a["offset"] for _n, a in rec["sf"]] == list(range(0, len(data), 1_000_000)), "조각을 차례로 · 한 번씩"
+    _exp, calls, _trim = gw._EVID.get("u:a@x.com", (0, [], None))
+    assert len(calls) == len(rec["sf"]) and all(len(t) < 300 for _tool, t in calls), \
+        "파일 조각의 base64 는 근거 원장의 숫자 줄기로 쌓지 않는다(조각 칸의 수만 — 앞선 조회를 밀어내고 지어낸 정수를 통과시켰다)"
+
+
+def test_BG3_근거_원장은_base64_덩어리를_숫자로_쌓지_않고_사람이_읽는_수는_그대로(monkeypatch):
+    monkeypatch.setattr(gw, "_EVID", gw.OrderedDict())
+    monkeypatch.setattr(gw, "_request_user", lambda: "v@x.com")
+    blob = base64.b64encode(os.urandom(6000)).decode("ascii")
+    txt = json.dumps({"thickness_mm": 1250.47, "count": 408, "data_base64": blob, "sha": "ab" * 32, "note": "두께 0.85 mm"})
+    gw._evid_record("download_artifact", types.CallToolResult(content=[types.TextContent(type="text", text=txt)]))
+    _exp, calls, _trim = gw._EVID["u:v@x.com"]
+    dig = calls[0][1].split()
+    assert {"1250.47", "408", "0.85"} <= set(dig) and len(dig) < 60, dig[:80]
+    assert gw._EVID_BLOB_RE.sub(" ", "값 " + "1" * 300 + " 끝") != "값 " + "1" * 300 + " 끝", "빈칸 없이 256자 넘게 잇단 덩어리만 뗀다"
+    assert gw._EVID_BLOB_RE.sub(" ", "PRT-SHIELD_CAN 12345 abcdef") == "PRT-SHIELD_CAN 12345 abcdef"
+
+
 def test_P1_full_을_모르는_StepForge_는_접힌_답이라_ste_를_열지_않는다(monkeypatch):
     def old(args, out):
         out = dict(out)
@@ -15543,6 +15915,79 @@ def test_PTR3_list_tool_apps_는_허브가_준_판만_싣는다(monkeypatch):
     by, _asked, _b = _hg10(monkeypatch)
     assert by["heax-step_forge"]["build"] == {"commit": "27b2132", "started_at": "2026-11-17T08:12:03Z"}
     assert "build" not in by["fmea"] and "build" not in by["reportarchive"] and "build" not in by["_gateway"], "허브가 모르면 칸이 없다"
+
+
+# ── 허브가 띄우지 않은 앱의 판 · 인스턴스(HWAXPortal docs/request-1125 PT-2) — 그 앱의 system_status 가 출처 ─────────────────────────────
+_PT2_STATUS = {"status": "ok", "version": "0.9", "projects": 3, "app": "step_forge",
+               "build": {"sha": "3404c449", "at": "2026-11-20T01:02:03Z", "source": "build-hook"}, "env": "prod", "env_raw": "prod",
+               "instance": {"server": "srv-token-zzz", "pid": 41, "host": "prod-node-07"}}
+
+
+class _PT2Sess:
+    def __init__(self, answer):
+        self.answer, self.calls = answer, []
+
+    async def call_tool(self, name, arguments=None, **kw):
+        self.calls.append((name, arguments))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return types.CallToolResult(content=[types.TextContent(type="text", text=self.answer)])
+
+
+def _pt2_kit(monkeypatch, answer, *, hub_build=None, ann=True, required=False):
+    from types import SimpleNamespace as NS
+    sess = _PT2Sess(answer if isinstance(answer, Exception) else (answer if isinstance(answer, str) else json.dumps(answer)))
+    st = types.Tool(name="heaxstep_forge_system_status", description="서버 상태", inputSchema={"type": "object", "properties": {},
+                    **({"required": ["x"]} if required else {})}, **({"annotations": types.ToolAnnotations(readOnlyHint=True)} if ann else {}))
+    monkeypatch.setattr(gw, "backends", {"heax-step_forge": NS(session=sess)})
+    monkeypatch.setattr(gw, "exposed_tools", [st])
+    monkeypatch.setattr(gw, "route", {"heaxstep_forge_system_status": ("heax-step_forge", "system_status")})
+    monkeypatch.setattr(gw, "DISCOVERED_META", {"heax-step_forge": {"label": "StepForge", "description": "", "build": hub_build}})
+    monkeypatch.setattr(gw, "_APP_STATUS", {})
+    monkeypatch.setattr(gw, "_read_lists", lambda: (frozenset(), frozenset()))
+    return sess
+
+
+def test_PT2_허브가_판을_모르는_앱은_system_status_의_판과_인스턴스를_목록_한_번에(monkeypatch):
+    sess = _pt2_kit(monkeypatch, _PT2_STATUS)
+    asyncio.run(gw._app_status_refresh())
+    asyncio.run(gw._app_status_refresh())
+    assert sess.calls == [("system_status", {})], "앱마다 TTL 에 한 번 — 인자 없이"
+    got = gw._APP_STATUS["heax-step_forge"]
+    assert got["build"]["commit"] == "3404c449" and got["build"]["built_at"] == "2026-11-20T01:02:03Z" and got["build"]["source"] == "app_status"
+    assert {k: got["instance"][k] for k in ("host", "env", "source")} == {"host": "prod-node-07", "env": "prod", "source": "app_status"}
+    assert "srv-token-zzz" not in json.dumps(got) and "pid" not in got["instance"], "서버 토큰 · pid 는 싣지 않는다"
+    monkeypatch.setattr(gw, "POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY", {})
+    monkeypatch.setattr(gw, "_ACCESS_POLICY_READY", True)
+    monkeypatch.setattr(gw, "_request_groups", lambda: [])
+    monkeypatch.setattr(gw, "_request_user", lambda: "")
+    body = json.loads(asyncio.run(gw._list_tool_apps({})).content[0].text)
+    row = next(a for a in body["apps"] if a["app"] == "heax-step_forge")
+    assert row["build"]["commit"] == "3404c449" and row["instance"]["host"] == "prod-node-07" and row["instance"]["env"] == "prod"
+    assert "env" in row, "운영본 여부(env · canonical — app_keys)는 종전 칸 그대로 함께 선다"
+
+
+def test_PT2_허브가_판을_주면_부르지_않고_꼴_밖이거나_못_받으면_칸이_없다(monkeypatch):
+    sess = _pt2_kit(monkeypatch, _PT2_STATUS, hub_build={"commit": "27b2132"})
+    asyncio.run(gw._app_status_refresh())
+    assert sess.calls == [] and "heax-step_forge" not in gw._APP_STATUS, "허브 build 가 먼저 — 부르지 않는다"
+    for answer in ({**_PT2_STATUS, "build": {"sha": None, "source": "unknown"}, "instance": {}, "env": "staging"}, "JSON 아님", [1, 2],
+                   RuntimeError("down")):
+        sess = _pt2_kit(monkeypatch, answer)
+        asyncio.run(gw._app_status_refresh())
+        assert len(sess.calls) == 1 and gw._APP_STATUS["heax-step_forge"]["build"] is None, answer
+        assert gw._APP_STATUS["heax-step_forge"]["instance"] is None, answer
+    for kw in ({"ann": False}, {"required": True}):
+        sess = _pt2_kit(monkeypatch, _PT2_STATUS, **kw)
+        asyncio.run(gw._app_status_refresh())
+        assert sess.calls == [], f"읽기로 확인되지 않았거나 인자가 필요한 상태 도구는 부르지 않는다 {kw}"
+    sess = _pt2_kit(monkeypatch, _PT2_STATUS)
+    monkeypatch.setattr(gw, "APP_STATUS_TTL_S", 0)
+    asyncio.run(gw._app_status_refresh())
+    assert sess.calls == [], "GATEWAY_APP_STATUS_TTL=0 이면 끔"
+    assert gw._app_status_parse(json.dumps({"build": "abc1234", "instance": {"host": "a b;rm"}}), "t") == (
+        {"commit": "abc1234", "source": "app_status", "checked_at": "t"}, None), "커밋 글자 꼴도 받고 · 호스트 꼴 밖은 뺀다"
 
 
 # ── Report Archive 초안의 템플릿 id · 판(HWAXPortal docs/leftovers-1121 L21-6 ①) ─────────────────────────────
@@ -17022,11 +17467,16 @@ def test_지침_14번은_수집을_켰을_때만_맨_뒤에_붙고_가장_긴_�
     assert "14. " not in off
     monkeypatch.setattr(gw, "INTERACTION_CAPTURE_ON", True)
     on = served(full)
-    assert on == off + gw._INSTR_IX_SHORT and len(on) < 2048, len(on)
+    want = gw._INSTR_IX if len(off) + len(gw._INSTR_IX) < 2048 else gw._INSTR_IX_SHORT
+    assert on == off + want and len(on) < 2048, len(on)
+    assert want is gw._INSTR_IX, "9 · 10번을 답으로 옮긴 뒤(G-2)에는 가장 긴 조합에도 계약 문구 전체가 든다"
     small = served({})
     assert small == gw._INSTRUCTIONS + gw._INSTR_IX and "언제든 지우기를 청할 수 있습니다" in small, "자리가 있으면 계약 문구 그대로"
     assert len(gw._INSTRUCTIONS + gw._INSTR_DELIB + gw._INSTR_DELIB_WAIT + gw._INSTR_DELIB_VIEW + "\n" + gw._INSTR_RISK_NEXT.rstrip("\n")
                + gw._INSTR_RISK_LLM + "\n" + gw._INSTR_IX_SHORT) < 2048, "가장 긴 조합 + 짧은 꼴"
+    monkeypatch.setattr(gw, "RESULT_REFS_ON", True)
+    both = served(full)
+    assert both == off + gw._INSTR_RES + gw._INSTR_IX and len(both) < 2048, ("결과 손잡이 15번 + 수집 14번(맨 뒤) — 가장 긴 조합", len(both))
 
 
 def test_상호작용_수집_켜짐은_환경이_먼저고_없으면_provision_env_다(tmp_path):

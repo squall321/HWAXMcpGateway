@@ -72,3 +72,25 @@ def test_명령줄은_파일만_읽고_아무것도_쓰지_않는다(tmp_path):
     bad = subprocess.run([sys.executable, str(HERE / "tool_registration_scan.py"), "--tools-map", str(tmp_path / "none.json")],
                          capture_output=True, text=True, timeout=60)
     assert bad.returncode == 2 and "읽지 못했다" in bad.stderr
+
+
+def test_CT03_영역_없는_앱을_앱마다_세고_칸이_없으면_모른다고_한다():
+    """HWAXPortal docs/request-1125 CT-03 — 앱이 붙을 때마다 tool_areas.json apps 줄이 빠져 미분류가 쌓였다. 훑기는 /tools-map 의 unclassified 를
+    앱마다 세서 짚기만 한다(영역을 짐작하지 않는다). 칸이 없는 옛 게이트웨이면 '없다' 가 아니라 '모른다' 다."""
+    tmap = {**TMAP, "map": {**TMAP["map"], "ct_a": "circuittrace", "ct_b": "circuittrace", "ts_a": "testscope"},
+            "unclassified": ["ct_a", "ct_b", "ts_a"], "apps": [*TMAP["apps"], {"app": "testscope", "label": "TestScope"}]}
+    res = trs.scan(tmap, SNAP)
+    assert res["unclassified_apps"] == [{"app": "circuittrace", "label": "", "count": 2}, {"app": "testscope", "label": "TestScope", "count": 1}]
+    md = trs.render(res, flagged_only=True)
+    assert "## 영역 없는 앱" in md and "- circuittrace — 미분류 2개" in md and "- testscope(TestScope) — 미분류 1개" in md
+    assert "tool_areas.json" in md and "짐작 값을 넣지 않는다" in md
+    assert trs.scan(tmap, SNAP, app_filter="testscope")["unclassified_apps"] == [{"app": "testscope", "label": "TestScope", "count": 1}]
+    assert trs.scan({**tmap, "unclassified": []})["unclassified_apps"] == []
+    assert "- 없음 — 모든 도구에 영역이 있다" in trs.render(trs.scan({**tmap, "unclassified": []}))
+    assert trs.scan(TMAP)["unclassified_apps"] is None and "- 모른다" in trs.render(trs.scan(TMAP))
+
+
+def test_CT03_점검표에_영역_줄이_있다():
+    doc = (HERE / "docs" / "tool-registration-checklist.md").read_text(encoding="utf-8")
+    line = next((ln for ln in doc.splitlines() if ln.startswith("- [ ] **영역**")), "")
+    assert "tool_areas.json" in line and "apps" in line, "점검 항목에 영역(tool_areas.json apps 줄) 한 줄"

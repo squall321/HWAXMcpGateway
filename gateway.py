@@ -11542,13 +11542,20 @@ def _visible_tools(groups: list[str]) -> list[types.Tool]:
 
 # 가벼운 보기의 두 도구(E-4 · L-A) — 찾고 부른다. 앱 목록 · 패널 도구 · 그 밖은 invoke_tool 로 닿는다(파괴 · 제어 도구 막이는 그대로다).
 _VIEW_LIGHT_TOOLS = (SEARCH_TOOLS_TOOL, INVOKE_TOOL)
+# 줄인 보기의 패널 · 공통 도구(HWAXPortal docs/request-1125 G-1 · 사용자 결정 11-28) — 패널 화면은 클라이언트가 tools/list 에서 `_meta.ui` 를 본 도구를
+# 그 이름으로 부를 때만 열린다(invoke_tool 로 감싸면 안 열린다 — 서버 지침 1번). 두 도구뿐이던 가벼운 보기 · 단계만 싣던 목적 보기에서는 패널이 안 열렸다.
+#   · 가벼운 — 두 도구 + list_tool_apps · verify_answer + 시야 안의 패널 도구 전부.
+#   · 목적 — 단계 + 로컬 도구 + 고른 목적의 앱(tool_purposes.json 의 apps)이 가진 패널 도구.
+# 보기는 여전히 빼기만 한다(시야 _visible_tools 안 · 시야 차례 · 검색과 호출은 그대로). 끄면(0) 두 보기의 목록이 종전과 바이트까지 같다.
+VIEW_PANELS_ON = _env_knob("GATEWAY_VIEW_PANELS", "1") != "0"
 
 
 def _listed_tools(groups: list[str]) -> list[types.Tool]:
     """tools/list 가 내는 목록 — 검색 시야(_visible_tools)에 이 요청의 보기를 얹는다(HWAXPortal docs/request-1029 E-4). **보기는 빼기만 한다** —
     이름을 바꾸지 않고, 검색 · 평가 · 앱 목록은 _visible_tools 를 그대로 쓴다(여기에 걸면 가벼운 보기의 search_tools 가 빈손이 된다).
       · 전체 — 지금 그대로(형제 사본도 싣는다 — 결정 Q-4).
-      · 가벼운 — search_tools · invoke_tool 둘.
+      · 가벼운 — search_tools · invoke_tool 둘(GATEWAY_VIEW_PANELS 를 켠 박스는 list_tool_apps · verify_answer · 패널 도구를 더한다 — G-1).
+      · 목적 — 고른 목적의 단계 + 로컬 도구(켠 박스는 그 목적 앱의 패널 도구를 더한다 — G-1).
       · 묶음 — 고른 영역(tool_areas.json)의 백엔드 도구 + 정본 읽기 도구(어휘표 검색 칸의 도구 — (정본 키, 원래 이름)으로 고른다) + 로컬 도구
         전부. 형제 사본은 싣지 않는다(X-B — 정본이 대표하고, 형제는 search_tools 에서 앱 이름을 부르면 나온다). 미분류 도구는 어느 묶음에도
         들지 않는다(찾기로 닿는다).
@@ -11558,13 +11565,18 @@ def _listed_tools(groups: list[str]) -> list[types.Tool]:
     if mode == "full":
         return vis
     if mode == "light":
-        return list(_VIEW_LIGHT_TOOLS)
+        if not VIEW_PANELS_ON:
+            return list(_VIEW_LIGHT_TOOLS)
+        keep = {id(t) for t in (*_VIEW_LIGHT_TOOLS, LIST_APPS_TOOL, VERIFY_TOOL)}
+        return [t for t in vis if id(t) in keep or _ui_uri(t)]
     if mode == "purpose":
         # 목적 보기(M3) — 고른 목적들의 단계 도구(이 호출자 시야 안) + 로컬 도구 전부. 차례는 시야 차례 그대로(이름을 바꾸지 않는다 — 빼기만 한다)
         want = set(areas)
-        names = {st["name"] for p, lv in _purposes_for({t.name for t in vis}) if p["key"] in want for st in lv["steps"]}
+        live = [(p, lv) for p, lv in _purposes_for({t.name for t in vis}) if p["key"] in want]
+        names = {st["name"] for _p, lv in live for st in lv["steps"]}
         local = {id(t) for t in _local_tools()} | {id(READONLY_ALLOWLIST_TOOL)}
-        return [t for t in vis if id(t) in local or t.name in names]
+        apps = {a for p, _lv in live for a in p["apps"]} if VIEW_PANELS_ON else set()      # G-1 — 그 목적 앱의 패널 도구
+        return [t for t in vis if id(t) in local or t.name in names or (route.get(t.name, ("",))[0] in apps and _ui_uri(t))]
     d = _CORE_VOCAB["data"] or {}
     canon, sib, reads = d.get("canonical"), d.get("siblings") or frozenset(), d.get("core_reads") or frozenset()
     want, local = set(areas), {id(t) for t in _local_tools()} | {id(READONLY_ALLOWLIST_TOOL)}

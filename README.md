@@ -351,11 +351,13 @@ TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 
 |---|---|
 | `full`(기본) | 지금 그대로 — 권한 안의 백엔드 도구 − 끈 앱 − 시험 앱 + 로컬 도구(형제 사본 포함) |
 | `bundle:<영역>,…` | 고른 영역(`tool_areas.json`)의 백엔드 도구 + 정본 읽기 도구(어휘표 검색 칸의 도구 — (정본 키, 원래 이름)) + 로컬 도구 전부. 형제 사본은 뺀다 · 미분류 도구는 안 든다 |
-| `light` | `search_tools` · `invoke_tool` 둘 |
+| `light` | `search_tools` · `invoke_tool` · `list_tool_apps` · `verify_answer` + 시야 안의 **패널 도구**(`_meta.ui`) 전부(G-1 — 끈 박스는 앞의 둘만) |
+| `purpose:<목적 키>,…` | 고른 목적의 단계 + 로컬 도구 + 그 목적 앱(`tool_purposes.json` 의 `apps`)의 **패널 도구**(G-1 — 끈 박스는 패널 없이). 아래 'MCP 현대화 M3' 절 |
 
 - 정하는 차례 — 연결 머리 `X-HWAX-View` 가 보기 글이면 그것, `portal` 이면 포털 사람 설정(`/internal/access/entitlements` 의 `view`), 머리가 없으면 전체. 포털 설정은 머리로 청한 연결에만 얹는다 — 포털 등록 배치 · 명령이 Claude Code · Desktop 에 `X-HWAX-View: portal` 을 단다. 머리 없는 개인 PAT 에도 얹던 때는 사람의 토큰으로 tools/list 를 읽는 서버 앱(리스크 심사 · MXWP 위키)과 스크립트가 그 사람의 보기로 도구를 잃었다(검토 10-31). 게이트웨이가 PAT 분기에서 정해 `x-hwax-view` · `x-hwax-view-src` 를 갈아 끼운다(클라이언트 사본은 버린다). 웹 챗 · 절차 PAT 는 늘 전체, GW_TOKEN 분기는 두 머리를 버린다. 틀린 꼴의 머리는 전체로 간다(`view.error`).
 - 리포 `.mcp.json`(HWAXPortal)은 `X-HWAX-View: ${HWAX_GATEWAY_VIEW:-full}` 이다 — 리포 파이프라인은 사람 설정과 상관없이 늘 전체다.
 - `list_tool_apps`(앱 · 영역 둘 다)의 `view` — 보기 · 영역 · 목록에 실은 수(`listed`) · 보기로 뺀 수(`hidden_by_view`) · 모르는 영역 · 출처 · 틀린 머리(`error`) · 안내. `/health` 의 `tools_list_by_view` 는 기동 뒤 보기별 tools/list 수다(SDK 가 호출 검증 캐시를 채우려 부르는 길은 세지 않고 보기도 얹지 않는다).
+- **패널 도구는 줄인 보기에도 싣는다**(HWAXPortal docs/request-1125 G-1 · 사용자 결정 11-28) — 패널 화면은 클라이언트가 tools/list 에서 `_meta.ui` 를 본 도구를 그 이름으로 부를 때만 열린다(invoke_tool 로 감싸면 안 열린다 — 서버 지침 1번). 두 도구뿐이던 `light` · 단계만 싣던 `purpose:` 에서 패널이 안 열렸다. 가벼운 보기는 앱 목록 · 답 검증 · 시야 안 패널 전부를, 목적 보기는 그 목적 앱의 패널을 더한다(단계가 하나도 안 보이는 목적 — `view.unknown_purposes` — 은 그 앱의 패널도 없다). 여전히 빼기만 한다 — 시야(`_visible_tools`) 안 · 시야 차례 · 검색 · 호출 · 권한은 그대로다. 손잡이 `GATEWAY_VIEW_PANELS`(기본 켬 — 띄운 셸 환경이 먼저, 없으면 곁의 `provision.env` 줄) — `0` 이면 두 보기의 목록이 종전과 바이트까지 같다(바꾸면 다시 띄운다). `bundle:` 은 바꾸지 않았다(고른 영역에 든 패널 도구는 이미 실린다 — 다른 영역의 패널은 아니다).
 - 끈 앱은 어느 보기에서도 빠진다. 열린 세션의 목록은 재연결해야 바뀐다(listChanged 를 알리지 않는다). 보기 글의 꼴은 포털 `backend/app/access/hub_view.py` 와 같다(시험이 맞댄다).
 - `/tools-map` 의 `views`(`["full", "bundle", "light"]`)가 이 게이트웨이가 보기를 안다고 말한다 — 포털 보기 화면이 이것이 없는 옛 게이트웨이와 붙으면 '저장했지만 아직 전체로 돈다' 고 알린다.
 
@@ -792,7 +794,7 @@ curl -s http://127.0.0.1:9009/health | python3 -c "import sys,json;print(len(jso
 | `list_tool_apps(by='purpose', purpose=?)` · 앱 줄 `entry` | `GATEWAY_PURPOSE_LIST`(켬) | 업무 목적마다 차례 · 입구 · 단계 수, 목적을 고르면 단계마다 도구 · 까닭 · 쓰기(게이트웨이 판정) · 확인(표) · 질의 예 · prompt · skill. 앱 줄마다 처음 부를 도구. 시야 밖 단계는 수만(`unavailable_steps`) |
 | search_tools 목적 층 | `switches.purpose_boost`(켬) | 질의가 목적 트리거에 맞으면(띄어 쓴 조각이 모두 빈칸 뺀 질의에 든다) 덮음 ≥ `purpose_hint_cover` 이면 답의 `ranked` 바로 뒤에 `purpose`(차례 · 입구 · 확인 · 더 볼 곳 · prompt), ≥ `purpose_cover` 이면 그 목적 단계에 `purpose_step` 을 곱셈 보정 뒤에 더하고 목적 가중 전 상위 셋에 그 목적 단계가 없을 때만 입구를 첫 줄로 |
 | search_tools 앱 입구 | `switches.app_entry_first`(켬) | 앱 하나의 이름을 부른 질의 — 그 앱 입구에 `app_entry`, 앱 이름과 일반 낱말(`app_entry_generic`)뿐이면 입구를 첫 줄로 |
-| 보기 `purpose:<키>,…` | `GATEWAY_PURPOSE_VIEW`(켬) | 연결 머리 `X-HWAX-View` 로 tools/list 를 그 목적들의 단계 + 게이트웨이 공통으로(보기 셋과 같은 규칙 — 목록만 줄인다). 포털 사람 설정 저장은 아직 세 보기 |
+| 보기 `purpose:<키>,…` | `GATEWAY_PURPOSE_VIEW`(켬) | 연결 머리 `X-HWAX-View` 로 tools/list 를 그 목적들의 단계 + 게이트웨이 공통 + 그 목적 앱의 패널 도구로(패널은 `GATEWAY_VIEW_PANELS` — G-1, 보기 셋과 같은 규칙 — 목록만 줄인다). 포털 사람 설정 저장은 아직 세 보기 |
 | MCP prompts `purpose-<키>` | `GATEWAY_PURPOSE_PROMPTS`(켬) | 사람 PAT 에만 · 루틴 뒤. 가져오면 입구 · 차례 · 확인할 쓰기 글(선택 인자 `task`). 부를 때까지 문맥을 먹지 않는다 — 서버 지침(2,048자)에 못 싣는 길 안내 |
 | 자원 `skill://hwax/<키>/SKILL.md` | `GATEWAY_PURPOSE_SKILLS`(켬) | Skills over MCP 내보내기 준비(확장 skills/list 는 SDK 2.x 뒤 M4) — frontmatter `name: hwax-<키>` · `description`, 본문 언제 · 입구 · 차례 · 지킬 것. 사람 PAT 에만 |
 | `/tools-map` `purposes` · `/health` `purposes` | `GATEWAY_PURPOSES`(켬 — 0 이면 표를 읽지 않고 모든 표면이 꺼진다) | 단계마다 (백엔드, 원래 이름) · 노출 이름 · 까닭 · 확인 · 쓰기 판정과 앱 입구 / 지문 · 덧씌우기 · 목적 수 · 산 목적 · 없는 단계 · 입구 없음 · 입구 쓰기 · 손잡이 |

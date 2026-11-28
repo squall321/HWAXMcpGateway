@@ -8136,8 +8136,13 @@ def test_E4_포털이_저장하는_보기_글을_게이트웨이가_같은_뜻�
     spec = importlib.util.spec_from_file_location("portal_hub_view", src)
     hv = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(hv)
-    assert tuple(hv.MODES) == ("full", "bundle", "light")
-    for mode, areas in (("full", ()), ("light", ()), ("bundle", ("cad",)), ("bundle", ("cad", "mesh", "data"))):
+    modes = tuple(hv.MODES)
+    # 포털이 목적 보기를 더했으면(HWAXPortal docs/mcp-modernize MM-10) 앞 셋 + purpose — 게이트웨이도 그 글을 같은 뜻으로 읽어야 한다(M3 보기 purpose:)
+    assert modes in (("full", "bundle", "light"), ("full", "bundle", "light", "purpose")), modes
+    cases = [("full", ()), ("light", ()), ("bundle", ("cad",)), ("bundle", ("cad", "mesh", "data"))]
+    if "purpose" in modes and gw.PURPOSE_VIEW_ON:
+        cases += [("purpose", ("drop-prep",)), ("purpose", ("drop-prep", "report-write"))]
+    for mode, areas in cases:
         text = hv.format_view(mode, list(areas))
         assert gw._parse_view(text) == (mode, areas) and hv.parse_view(text) == (mode, list(areas)), text
     for bad in ("bundle:", "everything", "bundle:CAD!", gw.VIEW_PORTAL):

@@ -4699,6 +4699,80 @@ def test_기동할_때_그_줄을_남긴다():
     assert 'log.info("%s", _limits_line())' in main[:main.index("_GracefulServer(uvicorn.Config(")], "main() 이 기동 전에 시간 한도 줄을 남겨야 한다"
 
 
+# ── HG-24 — 시간 한도를 박스 파일(provision.env)로 ─────────────────────────────────────────────────────────────
+# 10-31 에 GATEWAY_CALL_TIMEOUT=2400 을 ~/.bashrc · crontab 환경 줄에 넣었다 — 그 줄을 안 읽는 셸로 띄우면 말없이 600 으로 돌았다.
+# start.sh 가 곁의 provision.env 에서 시간 한도 열셋만(숫자 값만) 환경에 싣는다. 띄운 셸의 값이 먼저다(gateway.py _env_knob 과 같은 차례).
+_HG24_GW_PROBE = """
+import json, os, sys
+sys.path.insert(0, os.environ["HG24_REAL_GW"])
+import gateway as gw
+print("HG24=" + json.dumps({"line": gw._limits_line(), "rat": os.environ.get("RAT_TOKEN"), "jwks": os.environ.get("GATEWAY_JWKS_TIMEOUT")}))
+"""
+
+
+def _hg24_start(tmp_path, box_env: str, **env):
+    """start.sh 사본을 진짜 게이트웨이 import 로 끝나는 판에서 돌린다 — 진짜 gateway.py 가 그 환경으로 읽은 시간 한도 줄을 돌려준다(서버는 띄우지 않는다)."""
+    import shutil
+    import socket
+    d = tmp_path / "HWAXMcpGateway"
+    d.mkdir(exist_ok=True)
+    shutil.copy(os.path.join(os.path.dirname(os.path.abspath(gw.__file__)), "start.sh"), d / "start.sh")
+    (d / "gateway.py").write_text(_HG24_GW_PROBE, encoding="utf-8")
+    (d / "provision.env").write_text(box_env, encoding="utf-8")
+    vbin = tmp_path / "HWAXAgentServer" / ".venv" / "bin"
+    vbin.mkdir(parents=True, exist_ok=True)
+    (vbin / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+    (vbin / "python").chmod(0o755)
+    (tmp_path / "cfg.json").write_text(json.dumps({"_gateway": {"token": "gw-test-token"}}), encoding="utf-8")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    full = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "REST_PROXY_", "RAT_"))}
+    full.update(GATEWAY_PORT=str(port), GATEWAY_CONFIG=str(tmp_path / "cfg.json"), GATEWAY_AUDIT=str(tmp_path / "audit.jsonl"),
+                HG24_REAL_GW=os.path.dirname(os.path.abspath(gw.__file__)), PYTHONDONTWRITEBYTECODE="1", **env)
+    run = subprocess.run(["bash", str(d / "start.sh")], env=full, capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    got = next(ln for ln in run.stdout.splitlines() if ln.startswith("HG24="))
+    return json.loads(got[len("HG24="):]), run.stdout
+
+
+def test_HG24_셸_줄_없이_손으로_띄워도_provision_env_의_시간_한도가_기동_줄에_선다(tmp_path):
+    box = ("RAT_TOKEN=rat_secret\nexport GATEWAY_CALL_TIMEOUT='1800'\nGATEWAY_CALL_TIMEOUT=2400   # 10-31 카드 검색 30분\n"
+           "GATEWAY_JWKS_TIMEOUT=abc\nGATEWAY_RECONNECT_TIMEOUT=\nGATEWAY_PORTAL_SAVE_TIMEOUT=\"300\"\n")
+    got, out = _hg24_start(tmp_path, box)
+    line = got["line"]
+    assert "GATEWAY_CALL_TIMEOUT=2400 " in line and "GATEWAY_BACKEND_READ_TIMEOUT=2460 " in line, line
+    assert "GATEWAY_PORTAL_SAVE_TIMEOUT=300 " in line and "GATEWAY_RECONNECT_TIMEOUT=30 " in line, "빈 값은 없는 것"
+    assert line.endswith("GATEWAY_JWKS_TIMEOUT=5") and got["jwks"] is None, "숫자가 아닌 값은 싣지 않는다"
+    assert got["rat"] is None, "시간 한도 열셋 밖(토큰)은 환경에 싣지 않는다"
+    assert "· 박스 시간 한도(provision.env): GATEWAY_CALL_TIMEOUT=2400 GATEWAY_PORTAL_SAVE_TIMEOUT=300" in out
+    got, _out = _hg24_start(tmp_path, box, GATEWAY_CALL_TIMEOUT="900")
+    assert "GATEWAY_CALL_TIMEOUT=900 " in got["line"] and "GATEWAY_PORTAL_SAVE_TIMEOUT=300 " in got["line"], "띄운 셸의 값이 먼저다"
+    got, out = _hg24_start(tmp_path, "# 비었다\n")
+    assert "GATEWAY_CALL_TIMEOUT=600 " in got["line"] and "박스 시간 한도" not in out
+
+
+def test_HG24_start_sh_의_손잡이는_기동_줄의_손잡이와_같고_줄_읽기는_provision_env_읽기와_같다(tmp_path):
+    import re as _r
+    here = os.path.dirname(os.path.abspath(gw.__file__))
+    sh = open(os.path.join(here, "start.sh"), encoding="utf-8").read()
+    keys = set(_r.findall(r'"([A-Z][A-Z0-9_]+)"', sh[sh.index("KEYS = ("):sh.index("vals = {}")]))
+    src = open(gw.__file__, encoding="utf-8").read()
+    fn = src[src.index("def _limits_line()"):src.index("\n\n\n", src.index("def _limits_line()"))]
+    names = set(_r.findall(r"([A-Z][A-Z0-9_]+)=%", fn)) | {"GATEWAY_REVIVE_INTERVAL"}       # 주기는 '(주기 %d)' 로 적힌다
+    assert keys == names, (sorted(keys - names), sorted(names - keys))
+    # 줄 읽기 — 같은 파일에서 start.sh 가 싣는 값과 gateway._provision_env_value 가 읽는 값이 같다(숫자 값)
+    p = tmp_path / "provision.env"
+    p.write_text("GATEWAY_CALL_TIMEOUT=100\n  export GATEWAY_CALL_TIMEOUT=\"1200\"  # 주석\nGATEWAY_CALL_TIMEOUTX=7\n#GATEWAY_LIVENESS_TIMEOUT=99\n"
+                 "GATEWAY_LIVENESS_TIMEOUT='12.5'\n", encoding="utf-8")
+    body = sh[sh.index("<<'PYBOX'") + len("<<'PYBOX'"):sh.index("\nPYBOX\n")]
+    body = body[body.index("\n") + 1:]
+    run = subprocess.run([sys.executable, "-", str(p)], input=body, capture_output=True, text=True, timeout=60)
+    shell = dict(ln.split("=", 1) for ln in run.stdout.split())
+    assert shell == {"GATEWAY_CALL_TIMEOUT": "1200", "GATEWAY_LIVENESS_TIMEOUT": "12.5"}, run.stdout + run.stderr
+    assert all(gw._provision_env_value(k, p) == v for k, v in shell.items())
+
+
 # ── 1백만 토큰 창 — 게이트웨이는 도구 결과를 자르지 않고, 남는 절단은 조용하지 않다(리스크 심사 재설계 M1) ─────────
 # 운영 모델은 GLM-5.2·창 1,048,576 토큰이다. 실사용 팀은 Claude 에서 이 게이트웨이를 거쳐 도구를 부르고 그 결과로 심의한다 —
 # 여기서 잘리면 잘린 근거로 심의한다. 작은 창이 필요한 소비자(에이전트 서버의 웹 챗)는 자기 쪽에서 자른다(TOOL_RESULT_MAX).

@@ -236,8 +236,8 @@ GET · HEAD 는 지금 그대로(`inject` — 허브 서비스 토큰)이고, St
 
 TestScope 는 다른 조직의 포털(제 주소로 노출)이라 RA 처럼 두 방식 중 하나로 붙는다 — TestScope 코드는 여기서 손대지 않는다. **기본(`TESTSCOPE_SSO_SECRET` 없음)** 은 이 등록 토큰 길이고, **비밀이 있으면** `per_user_sso.testscope` 가 생겨 위 우선순위대로 그쪽이 먼저 탄다(등록할 것 없음). 위임은 TestScope 가 `POST /api/auth/sso`(위 계약)를 갖춘 뒤에만 켠다 — 그 전에 비밀이 생기면 발급이 실패해 신원 있는 TestScope 호출이 전부 거부되고 등록 토큰으로 돌아가지 않는다. 그래서 비밀은 자동으로 만들지 않고 사람이 넣는다. 백엔드는 두 방식이 같다 — `provision-config.sh` 가 `TESTSCOPE_MCP_URL`(> 직전 config 주소)로 만든다(`streamable_http`, 서비스 `Authorization` 없음 — tools/list 는 토큰 없이 된다). 기본 호스트가 없어 주소를 모르면 만들지 않는다.
 
-## 시간 한도 — 손잡이는 프로세스 env, 기본값은 코드
-게이트웨이는 `.env` 를 읽지 않고 HWAXPortal `infra/services.yaml` 의 `mcp-gateway` 항목도 env 를 넘기지 않는다 — **`gateway.py` 의 기본값이 곧 운영값**이다. 바꾸려면 `start.sh` 를 부르는 환경에 export 한다(값은 초). 닿았는지는 기동 로그의 한 줄(`시간 한도(초) — GATEWAY_CALL_TIMEOUT=600 · …`)로 본다 — 이 프로세스에 실제로 걸린 값이다.
+## 시간 한도 — 손잡이는 프로세스 env(박스는 provision.env), 기본값은 코드
+게이트웨이는 `.env` 를 읽지 않고 HWAXPortal `infra/services.yaml` 의 `mcp-gateway` 항목도 env 를 넘기지 않는다 — **`gateway.py` 의 기본값이 곧 운영값**이다. 바꾸려면 `start.sh` 를 부르는 환경에 export 하거나(값은 초), **박스에서는 곁의 `provision.env` 에 한 줄 적는다** — `start.sh` 가 아래 표의 손잡이(기동 로그 줄의 열셋)만, 숫자 값만 그 파일에서 환경에 싣는다(띄운 셸의 값이 먼저 · 토큰 줄은 싣지 않는다 · 싣는 값은 `· 박스 시간 한도(provision.env): …` 한 줄로 찍는다, HWAXPortal docs/request-1125 HG-24). 종전엔 셸 환경뿐이라 `~/.bashrc` · crontab 환경 줄에 적었고, 그 줄을 안 읽는 셸로 띄우면 말없이 기본값으로 돌았다 — 박스는 그 우회 줄을 걷는다. `provision.env` 는 포털 update-all 의 게이트웨이 지문이라 바꾸면 다음 update-all 이 다시 띄운다(손으로는 `./start.sh restart`). 닿았는지는 기동 로그의 한 줄(`시간 한도(초) — GATEWAY_CALL_TIMEOUT=600 · …`)로 본다 — 이 프로세스에 실제로 걸린 값이다.
 
 원칙은 셋이다. ① 안쪽 한도가 그것을 감싸는 한도보다 작다. ② 느린 도구(시간 초과)와 죽은 상대(연결 실패)를 가른다 — 시간 초과는 **한 번으로 끝내고**(재시도·세션 교체·토큰 재발급 없음) 연결 실패만 한 번 다시 건다. ③ 만료 문구는 몇 초였고 어느 손잡이인지 말한다.
 

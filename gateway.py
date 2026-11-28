@@ -2768,6 +2768,52 @@ CONV_INSIGHTS_MAX = 60
 CONV_INSIGHTS_UNKNOWN = "unknown"
 _CONV_INSIGHT_ID_RE = re.compile(r"ins:(?:web|delib|wf):[^\s'\"\\]{1,290}")
 _CONV_CHAIR_RE = re.compile(r"[a-z0-9-]{1,40}")
+# 발언의 도구 활동(HWAXPortal docs/request-1125 WD-04) — MCP 로 저장한 대화는 meta 에 rebut · non_negotiable 만 남아 웹에서 다시 열면 근거가 0건이었다.
+# 웹 챗 중계가 남기는 활동 꼴(포털 routes.py 의 activity — 화면 ActivityItem)로 바꿔 meta.activity 에 싣는다 — 포털 화면이 그것으로 앞 턴 근거를 되살린다
+# (conversations.api.ts · history.ts turnEvidence — 결과는 result_full, 인자는 detail). 결과는 자르지 않는다 — 상한을 넘는 항목은 통째로 빼고 답에 센다.
+CONV_ACTIVITY_MAX = 100                  # 발언 하나의 활동 항목 수
+CONV_ACTIVITY_CHARS = 1_048_576          # 발언 하나의 활동 글자 합(인자 + 결과) — 넘는 항목은 통째로 뺀다
+CONV_ACTIVITY_PREVIEW = 220              # 활동 패널 미리보기(화면 표시용 — 근거는 result_full)
+CONV_ACTIVITY_DETAIL = 400               # 활동 패널 인자 칸(웹 중계와 같은 400 — 넘으면 원문은 detail_full)
+
+
+def _conv_activity(raw, index: int, now_ms: int) -> tuple[list[dict], dict | None]:
+    """발언 하나의 activity([{tool, args?, result?, ok?}]) → (meta.activity 항목들, 뺀 것 보고 또는 None). 도구 이름이 없는 항목 · 상한을 넘는 항목은
+    빼고 센다(결과를 자르지 않는다 — 원문 그대로 인용하는 근거다)."""
+    if raw is None:
+        return [], None
+    if not isinstance(raw, list):
+        return [], {"index": index, "dropped": 1, "why": "activity 는 [{tool, args, result, ok}] 목록이다"}
+    out, used, bad, over = [], 0, 0, 0
+    for k, a in enumerate(raw):
+        tool = a.get("tool") if isinstance(a, dict) else None
+        if not (isinstance(tool, str) and tool.strip()):
+            bad += 1
+            continue
+        args, res = a.get("args"), a.get("result")
+        args_s = args if isinstance(args, str) else ("" if args is None else json.dumps(args, ensure_ascii=False, separators=(",", ":"), default=str))
+        res_s = res if isinstance(res, str) else ("" if res is None else json.dumps(res, ensure_ascii=False, default=str))
+        if len(out) >= CONV_ACTIVITY_MAX or used + len(args_s) + len(res_s) > CONV_ACTIVITY_CHARS:
+            over += 1
+            continue
+        used += len(args_s) + len(res_s)
+        e = {"ts": now_ms, "step": "MCP 대화의 도구 호출", "tool": tool.strip()[:200], "call": f"mcp-{index}-{k}"}
+        if isinstance(a.get("ok"), bool):
+            e["ok"] = a["ok"]
+        if args_s:
+            e["detail"] = args_s[:CONV_ACTIVITY_DETAIL]
+            if len(args_s) > CONV_ACTIVITY_DETAIL:
+                e["detail_full"] = args_s
+        if res_s:
+            e["result_preview"] = res_s[:CONV_ACTIVITY_PREVIEW]
+            if len(res_s) > CONV_ACTIVITY_PREVIEW:
+                e["result_full"] = res_s
+        out.append(e)
+    if not (bad or over):
+        return out, None
+    why = " · ".join(x for x in (f"도구 이름 없는 항목 {bad}" if bad else "",
+                                 f"상한(항목 {CONV_ACTIVITY_MAX} · 글자 {CONV_ACTIVITY_CHARS:,})을 넘는 항목 {over} — 통째로 뺐다" if over else "") if x)
+    return out, {"index": index, "dropped": bad + over, "why": why}
 
 
 def _conv_subject(raw) -> tuple[dict | None, str]:
@@ -2796,6 +2842,8 @@ SAVE_CONV_TOOL = types.Tool(
         "심의/대화 로그를 포털 서버 대화 저장소에 저장한다(웹 챗에서 이어보기·GLM 이어가기용). "
         "messages: [{role: user|assistant|system|persona, content, persona?, round?, meta?}] 순서대로. "
         "meta 는 심의 발언의 {rebut:[{target,quote,counter,basis}], non_negotiable} — 웹 관계도·이어하기가 쓴다. "
+        "activity 는 그 발언(assistant 답)에서 부른 도구의 [{tool, args, result, ok}] — 웹에서 그 대화를 다시 열면 앞 턴 근거로 되살아나 "
+        "'원 도구 결과' 를 원문 그대로 인용할 수 있다(결과는 자르지 않는다 — 발언 하나에 100건 · 합 1,048,576자를 넘는 항목은 빼고 답에 센다). "
         "성공 시 conversation_id 반환, 포털 미가용/인증 불가면 CONV_UNAVAILABLE. "
         "발언은 자르지 않는다 — 포털 한 칸(20,000자)을 넘으면 이어지는 메시지로 나눠 싣고(split), 200건을 넘으면 나머지를 "
         "덧붙인다. 덧붙이다 멈추면 CONV_PARTIAL(어디까지 들어갔는지) — 그때는 다시 보내지 마라(같은 대화가 두 벌 생긴다). "
@@ -2819,6 +2867,21 @@ SAVE_CONV_TOOL = types.Tool(
                         "round": {"type": "integer"},
                         "meta": {"type": "object",
                                  "description": "심의 발언 구조 — {rebut:[{target,quote,counter,basis}], non_negotiable}"},
+                        "activity": {
+                            "type": "array",
+                            "description": ("이 발언에서 부른 도구 — 차례대로. 웹이 대화(chat)의 assistant 답에서 앞 턴 근거로 되살린다. "
+                                            "결과는 받은 원문 그대로 준다(요약하지 않는다)"),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "tool": {"type": "string", "description": "부른 도구 이름(이 게이트웨이의 노출 이름)"},
+                                    "args": {"description": "부른 인자 — 객체 또는 JSON 글"},
+                                    "result": {"type": "string", "description": "도구 결과 원문"},
+                                    "ok": {"type": "boolean", "description": "호출이 성공했나(모르면 뺀다)"},
+                                },
+                                "required": ["tool"],
+                            },
+                        },
                     },
                     "required": ["role", "content"],
                 },
@@ -2898,6 +2961,9 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
     # 꼬리 199 만 남겼다 — 1백만 토큰 창의 발언·결정문과 20석 다회차 심의에서 이어하기가 잘린 글을 정본으로 읽었다.
     split: list[dict] = []
     clipped: list[dict] = []
+    act_saved: list[int] = []
+    act_dropped: list[dict] = []
+    now_ms = int(time.time() * 1000)
 
     def _msgs(i: int, m: dict) -> list[dict]:
         role = m.get("role")
@@ -2926,8 +2992,8 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
         # 포털 입력 모델은 meta 에 한도가 없다 — 알려진 두 칸만 옮기되(관계도·이어하기 조항 승계가 읽는 칸) 자르지 않는다.
         # 임의 dict 를 통째로 넘기지 않는 것은 그대로다. 첫 조각에만 싣는다.
         meta = m.get("meta")
+        mo: dict = {}
         if isinstance(meta, dict):
-            mo: dict = {}
             if meta.get("non_negotiable"):
                 mo["non_negotiable"] = str(meta["non_negotiable"])
             if isinstance(meta.get("rebut"), list):
@@ -2935,8 +3001,16 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
                       for r in meta["rebut"] if isinstance(r, dict)]
                 if rb:
                     mo["rebut"] = rb
-            if mo:
-                out[0]["meta"] = mo
+        # 도구 활동(WD-04) — 발언의 activity(없으면 meta.activity). 웹 중계와 같은 꼴로 meta.activity 에 — 포털 화면이 근거로 되살린다
+        raw_act = m.get("activity") if m.get("activity") is not None else (meta.get("activity") if isinstance(meta, dict) else None)
+        acts, dropped = _conv_activity(raw_act, i, now_ms)
+        if acts:
+            mo["activity"] = acts
+            act_saved.append(len(acts))
+        if dropped:
+            act_dropped.append(dropped)
+        if mo:
+            out[0]["meta"] = mo
         return out
 
     msgs: list[dict] = []
@@ -2968,7 +3042,7 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
         subject_dropped = (subject_dropped + " · " if subject_dropped else "") + "chair_template 은 소문자 · 숫자 · - 40자다"
     rest = msgs[CONV_BATCH_MAX:]
     note = " ".join(x for x in (f"split:{len(split)}" if split else "", f"clipped:{len(clipped)}" if clipped else "",
-                                f"appended:{len(rest)}" if rest else "") if x) or None
+                                f"appended:{len(rest)}" if rest else "", f"activity:{sum(act_saved)}" if act_saved else "") if x) or None
     hdrs = {"Authorization": auth}
 
     def _partial(cid, saved: int, why: str) -> types.CallToolResult:
@@ -3009,6 +3083,10 @@ async def _save_conversation(arguments: dict) -> types.CallToolResult:
             out["split"] = split      # 포털 한 칸(CONV_CONTENT_MAX)을 넘어 이어지는 메시지로 나눈 발언 — 글은 다 들어갔다
         if clipped:
             out["clipped"] = clipped  # 포털 한도로 자른 이름·제목(원문 길이 chars, 남긴 길이 kept)
+        if act_saved:
+            out["activity_saved"] = sum(act_saved)    # meta.activity 로 남긴 도구 활동 항목 수 — 웹에서 다시 열면 근거로 되살아난다
+        if act_dropped:
+            out["activity_dropped"] = act_dropped     # 뺀 활동(발언 차례 index · 수 · 까닭) — 결과를 자르지 않고 통째로 뺐다
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=json.dumps(out, ensure_ascii=False))],
         )

@@ -386,6 +386,84 @@ def test_save_conversation_meta_를_옮긴다(monkeypatch):
     assert out[1]["meta"]["non_negotiable"] == "양산 금형 변경 불가"
 
 
+def test_WD04_save_conversation_은_도구_활동을_웹_중계와_같은_꼴로_meta_activity_에_싣는다(monkeypatch):
+    """HWAXPortal docs/request-1125 WD-04 — MCP 로 저장한 대화는 meta 에 rebut · non_negotiable 만 남아 웹에서 열고 '원 도구 결과가 있니?' 라고
+    물으면 근거가 0건이었다. 활동을 웹 중계 꼴(ts · step · tool · call · ok · detail · result_preview · result_full)로 남기면 포털 화면이 앞 턴 근거로
+    되살린다. 결과는 자르지 않는다."""
+    big = "결과 원문 " * 3000
+    out = _drive_save(monkeypatch, [
+        {"role": "user", "content": "실드캔 두께?"},
+        {"role": "assistant", "content": "0.15 mm 입니다", "activity": [
+            {"tool": "heaxstep_forge_identify_part", "args": {"project_id": "p1", "part": "SHIELD_CAN_01"}, "result": big, "ok": True},
+            {"tool": "verify_answer", "args": '{"text":"0.15"}', "result": {"ok": True}},
+            {"args": {"x": 1}, "result": "이름 없는 항목"},
+        ]},
+        {"role": "assistant", "content": "둘째", "meta": {"non_negotiable": "조항", "activity": [{"tool": "t2", "result": "r"}]}},
+    ])
+    acts = out[1]["meta"]["activity"]
+    assert [a["tool"] for a in acts] == ["heaxstep_forge_identify_part", "verify_answer"], "도구 이름 없는 항목은 뺀다"
+    a = acts[0]
+    assert a["result_full"] == big and a["result_preview"] == big[:220], "결과는 자르지 않는다(근거는 result_full)"
+    assert json.loads(a["detail"]) == {"project_id": "p1", "part": "SHIELD_CAN_01"} and a["ok"] is True and a["call"] == "mcp-1-0"
+    assert isinstance(a["ts"], int) and a["step"]
+    assert acts[1]["detail"] == '{"text":"0.15"}' and json.loads(acts[1]["result_preview"]) == {"ok": True} and "ok" not in acts[1]
+    assert "result_full" not in acts[1], "짧은 결과는 미리보기가 곧 원문이다(웹 중계와 같다)"
+    assert "meta" not in out[0]
+    assert out[2]["meta"] == {"non_negotiable": "조항", "activity": [{**out[2]["meta"]["activity"][0]}]} and \
+        out[2]["meta"]["activity"][0]["result_preview"] == "r", "meta.activity 로 실어 와도 받는다"
+
+
+def test_WD04_활동_상한을_넘는_항목은_통째로_빼고_답에_센다(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace as NS
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+        def json(self): return {"id": "c-9"}
+
+    class _Cli:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None, headers=None):
+            sent["body"] = json
+            return _Resp()
+    monkeypatch.setattr(gw, "_portal_api_base", lambda: "http://portal")
+    monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
+    monkeypatch.setattr(gw, "_audit", lambda *a, **k: None)
+    monkeypatch.setattr(gw, "_low", NS(request_context=NS(request=NS(headers={"authorization": "Bearer t"}))))
+    monkeypatch.setattr(gw, "CONV_ACTIVITY_MAX", 3)
+    monkeypatch.setattr(gw, "CONV_ACTIVITY_CHARS", 1000)
+    msgs = [{"role": "assistant", "content": "a", "activity": [{"tool": f"t{k}", "result": "x" * 100} for k in range(5)]},
+            {"role": "assistant", "content": "b", "activity": [{"tool": "huge", "result": "y" * 2000}, {"tool": "small", "result": "z"}]},
+            {"role": "assistant", "content": "c", "activity": "목록이 아니다"}]
+    res = asyncio.run(gw._save_conversation({"title": "대화", "kind": "chat", "messages": msgs}))
+    body = json.loads(res.content[0].text)
+    got = sent["body"]["messages"]
+    assert [x["tool"] for x in got[0]["meta"]["activity"]] == ["t0", "t1", "t2"]
+    assert [x["tool"] for x in got[1]["meta"]["activity"]] == ["small"] and got[1]["meta"]["activity"][0]["result_preview"] == "z"
+    assert "meta" not in got[2]
+    assert body["ok"] is True and body["activity_saved"] == 4
+    assert [(d["index"], d["dropped"]) for d in body["activity_dropped"]] == [(0, 2), (1, 1), (2, 1)]
+    assert "통째로" in body["activity_dropped"][0]["why"] and "목록" in body["activity_dropped"][2]["why"]
+    res = asyncio.run(gw._save_conversation({"title": "대화", "messages": [{"role": "user", "content": "q"}]}))
+    assert "activity_saved" not in json.loads(res.content[0].text), "활동이 없으면 답이 종전과 같다"
+
+
+def test_WD04_포털_화면이_meta_activity_에서_근거를_되살리는_칸과_맞는다():
+    """게이트웨이가 남기는 칸 이름이 포털 화면이 읽는 칸과 같아야 한다 — 다시 열 때 activity 를 되살리는 곳(conversations.api.ts)과 앞 턴 근거로
+    모으는 곳(history.ts turnEvidence — 결과는 result_full ?? result_preview, 인자는 detail, 짝 키 call · 성패 ok)."""
+    root = gw.Path(gw.__file__).resolve().parent.parent / "HWAXPortal" / "frontend" / "src"
+    if not root.exists():
+        pytest.skip("형제 HWAXPortal 리포가 없다")
+    conv = (root / "api" / "conversations.api.ts").read_text(encoding="utf-8")
+    hist = (root / "components" / "chat" / "history.ts").read_text(encoding="utf-8")
+    assert "(m.meta as { activity?: ActivityItem[] } | null)?.activity" in conv
+    for want in ("a.result_full ?? a.result_preview", "a.detail", "a.call", "a.ok === false", "a.tool"):
+        assert want in hist, want
+
+
 def test_save_conversation_meta_는_알려진_칸만_자르지_않고(monkeypatch):
     """알려진 두 칸(rebut·non_negotiable)만 옮긴다 — 임의 dict 는 넘기지 않는다. 다만 자르지 않는다: 종전엔 웹 경로처럼
     반박 4건·요지 160자·조항 1,200자로 잘랐는데, 포털 입력 모델은 meta 에 한도가 없고 이어하기는 그 조항을 다음 심의에 넘긴다."""

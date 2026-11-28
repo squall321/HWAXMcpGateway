@@ -4305,6 +4305,47 @@ def test_레지스트리에서_빠진_앱은_열_패스째에_뗀다(monkeypatch
     assert len(seen) == 10 and seen == [True] * 9 + [False] and stopped == [1]
 
 
+def test_MEMORY1_부팅_집계_몇_초_뒤_새_판으로_뜬_앱의_도구가_첫_탐침에서_오른다(monkeypatch):
+    """HWAXPortal docs/request-1125 MEMORY-1 — 11-18 에 게이트웨이가 옛 에이전트(8도구)로 카탈로그를 지은 3초 뒤 새 판(13도구)이 떴는데, 재활 패스의
+    첫 탐침은 지문 씨앗만 뿌려 다음 변경 전까지 새 심의 도구가 안 보였다. 이제 재집계가 지은 목록으로 씨를 뿌리고, 씨앗이 없으면 카탈로그가 실은
+    목록과 견준다 — 첫 탐침에서 오르고(60초 한 패스 안), 같은 판이면 재집계하지 않는다."""
+    b = _B([_tool("delib_a"), _tool("delib_b")])
+    monkeypatch.setattr(gw, "HEAX", {})
+    monkeypatch.setattr(gw, "backends", {"hwax-deliberation": b})
+    for name in ("route", "alias_route", "_REAGG", "_FP", "_LAST_TOOLS", "_LIVENESS_MISS", "DISCOVERED_META", "POLICY"):
+        monkeypatch.setattr(gw, name, {})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+
+    async def go():
+        await gw._aggregate()                                  # 부팅 집계 — 옛 판(2도구)
+        boot = set(gw.route)
+        b.session = _Sess([_tool("delib_a"), _tool("delib_b"), _tool("delib_new")])   # 첫 탐침 전에 새 판이 떴다
+        changed = await gw._revive_once(object())             # 첫 탐침에서 바로 오른다
+        same = await gw._revive_once(object())                 # 같은 판 — 재집계 없음
+        return boot, changed, set(gw.route), same
+    boot, changed, after, same = asyncio.run(asyncio.wait_for(go(), 5))
+    assert boot == {"delib_a", "delib_b"}
+    assert changed is True and "delib_new" in after, "첫 탐침이 씨앗만 뿌리고 지나갔다(MEMORY-1)"
+    assert same is False and gw._FP["hwax-deliberation"] == gw._tools_fp(b.session._t)
+
+
+def test_MEMORY1_씨앗이_없으면_카탈로그가_실은_목록과_견준다(monkeypatch):
+    """재집계가 이 백엔드의 목록을 받은 적이 없다(지문 씨앗 없음) — 카탈로그가 실은 직전 목록(없으면 빈 목록)과 다르면 재집계, 같으면 씨앗만."""
+    b = _B([_tool("x1"), _tool("x2")])
+    monkeypatch.setattr(gw, "HEAX", {})
+    monkeypatch.setattr(gw, "backends", {"signalforge": b})
+    for name in ("route", "alias_route", "_REAGG", "_FP", "_LIVENESS_MISS", "DISCOVERED_META", "POLICY"):
+        monkeypatch.setattr(gw, name, {})
+    monkeypatch.setattr(gw, "exposed_tools", [])
+    monkeypatch.setattr(gw, "_LAST_TOOLS", {"signalforge": ([_tool("x1"), _tool("x2")], 0)})
+    assert asyncio.run(asyncio.wait_for(gw._revive_once(object()), 5)) is False, "카탈로그가 실은 목록과 같다 — 씨앗만"
+    assert gw._FP["signalforge"] == gw._tools_fp(b.session._t)
+    monkeypatch.setattr(gw, "_FP", {})
+    monkeypatch.setattr(gw, "_LAST_TOOLS", {})
+    assert asyncio.run(asyncio.wait_for(gw._revive_once(object()), 5)) is True, "카탈로그에 이 백엔드 도구가 없다 — 재집계"
+    assert {"x1", "x2"} <= set(gw.route)
+
+
 # ── save_conversation — 수 시간의 전사를 남기는 한 번의 쓰기(결정표 gateway-15) ──────────────────────────────
 def _save_kit(monkeypatch, post):
     """`_save_conversation` 을 실제로 태우고 포털 POST 만 `post` 로 바꾼다 → (결과, 클라이언트를 만든 timeout)."""

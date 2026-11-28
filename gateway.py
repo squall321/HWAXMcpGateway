@@ -1685,6 +1685,9 @@ async def _aggregate():
             continue
         _LIVENESS_MISS.pop(key, None)
         _LAST_TOOLS[key] = (list(res.tools), 0)
+        # 지문은 카탈로그를 지은 목록으로 씨를 뿌린다(MEMORY-1) — 종전엔 재활 패스의 첫 탐침이 씨앗만 뿌려, 부팅 집계 몇 초 뒤 새 판으로 뜬 앱
+        # (11-18 에이전트 서버 8 → 13 도구)의 새 도구가 다음 변경 전까지 카탈로그에 안 올라왔다. 이제 첫 탐침도 이 목록과 견준다.
+        _FP[key] = _tools_fp(res.tools)
         for t in res.tools:
             collected.append((key, t))
         log.info("backend %s -> %d tools", key, len(res.tools))
@@ -2148,12 +2151,20 @@ async def _revive_once_locked(tg) -> bool:
             #   /refresh 가 changed:false 를 냈다). 지문으로 비교한다.
             now = _tools_fp(res.tools)
             prev = _FP.get(key)
-            if prev != now:
-                _FP[key] = now
-                if prev is not None:
-                    log.info("backend %s 도구 구성·메타 변경 (%d→%d) — 재집계",
-                             key, len(prev), len(now))
+            if prev is None:
+                # 씨앗이 없다 — 이 백엔드의 목록으로 카탈로그를 지은 적이 없다(재집계가 지문을 뿌린다). 카탈로그가 실은 목록(직전 성공 —
+                # 없으면 빈 목록)과 견준다. 종전엔 여기서 씨앗만 뿌려, 부팅 집계 뒤 새 판으로 뜬 앱의 도구가 다음 변경까지 안 보였다(MEMORY-1).
+                last = _LAST_TOOLS.get(key)
+                prev = _tools_fp(last[0]) if last else {}
+                if prev != now:
+                    log.info("backend %s 첫 탐침의 목록이 카탈로그와 다르다 (%d→%d) — 재집계", key, len(prev), len(now))
                     revived = True
+                _FP[key] = now
+            elif prev != now:
+                _FP[key] = now
+                log.info("backend %s 도구 구성·메타 변경 (%d→%d) — 재집계",
+                         key, len(prev), len(now))
+                revived = True
         except Exception as exc:  # noqa: BLE001 — 죽은 세션 → 아래 재연결 루프가 처리
             _probe_missed(key, b, exc)
 

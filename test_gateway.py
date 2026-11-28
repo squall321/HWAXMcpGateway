@@ -15488,6 +15488,26 @@ def test_P1_조각을_그_사람_명의로_받아_ste_업로드에_흘려_넣고
     assert rec["mints"] == [("ste", "a@x.com")]
 
 
+@pytest.mark.parametrize("mb", [3.5, *([float(os.environ["GATEWAY_BIG_UPLOAD_MB"])] if os.environ.get("GATEWAY_BIG_UPLOAD_MB") else [])])
+def test_BG3_큰_파일도_StepForge_진짜_조각_크기로_흘려_sha256_이_맞는다(monkeypatch, mb):
+    """HWAXPortal docs/request-1125 BG-3 — 11-17 과제 전체 STEP(129.7 MB)급. StepForge 조각 상한(STEPFORGE_MCP_DOWNLOAD_MAX 기본 1,000,000 바이트)으로
+    받고, 조각 답은 진짜 _call_tool_body 가 거는 결과 손질(개인정보 가림 · 근거 원장)을 지난다 — 무작위 바이트의 base64 가 가림에 걸려 바뀌면
+    sha256 이 어긋난다. 기본은 3.5 MB(조각 넷), GATEWAY_BIG_UPLOAD_MB=130 이면 그 크기로 한 번 더 돈다(손으로 — 스위트에는 무겁다)."""
+    data = os.urandom(int(mb * 1_000_000)) + b"END;"
+    monkeypatch.setitem(globals(), "_STE_CHUNK", 1_000_000)
+    run, rec, data, sha = _a2s_kit(monkeypatch, data, ste_ver="new")
+    inner = gw._call_tool_body
+
+    async def real_shape(name, args):                       # 진짜 _call_tool_body 의 결과 손질 — _evid_keep(이름, _pii_mask(결과, tool=…))
+        return gw._evid_keep(name, gw._pii_mask(await inner(name, args), tool=("heax-step_forge", "download_artifact")))
+    monkeypatch.setattr(gw, "_call_tool_body", real_shape)
+    out, err = run(filename="project_full.step")
+    assert err is False and out["ok"] is True, out
+    assert out["bytes"] == len(data) and out["sha256"] == sha and out["ste_verified"] is True, "ste 가 디스크에 쓴 파일의 sha256 까지 맞는다"
+    assert hashlib.sha256(rec["stored"]["project_full.step"]).hexdigest() == sha
+    assert [a["offset"] for _n, a in rec["sf"]] == list(range(0, len(data), 1_000_000)), "조각을 차례로 · 한 번씩"
+
+
 def test_P1_full_을_모르는_StepForge_는_접힌_답이라_ste_를_열지_않는다(monkeypatch):
     def old(args, out):
         out = dict(out)

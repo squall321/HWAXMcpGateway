@@ -420,7 +420,6 @@ def test_WD04_save_conversation_은_도구_활동을_웹_중계와_같은_꼴로
 
 def test_WD04_활동_상한을_넘는_항목은_통째로_빼고_답에_센다(monkeypatch):
     import asyncio
-    from types import SimpleNamespace as NS
     sent = {}
 
     class _Resp:
@@ -434,10 +433,10 @@ def test_WD04_활동_상한을_넘는_항목은_통째로_빼고_답에_센다(m
         async def post(self, url, json=None, headers=None):
             sent["body"] = json
             return _Resp()
-    monkeypatch.setattr(gw, "_portal_api_base", lambda: "http://portal")
     monkeypatch.setattr(gw.httpx, "AsyncClient", _Cli)
     monkeypatch.setattr(gw, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(gw, "_low", NS(request_context=NS(request=NS(headers={"authorization": "Bearer t"}))))
+    # 요청 문맥 자리는 SDK 판마다 다르다(1.x _low.request_context · 2.x _request_context) — 넘기는 자격 하나만 바꿔 둘 다에서 돈다
+    monkeypatch.setattr(gw, "_portal_forward_auth", lambda: ("http://portal", "Bearer t", ""))
     monkeypatch.setattr(gw, "CONV_ACTIVITY_MAX", 3)
     monkeypatch.setattr(gw, "CONV_ACTIVITY_CHARS", 1000)
     msgs = [{"role": "assistant", "content": "a", "activity": [{"tool": f"t{k}", "result": "x" * 100} for k in range(5)]},

@@ -531,6 +531,8 @@ def test_knox_bridge_와_plm_defect_도구는_미분류로_떨어지지_않는�
     ("simengbay", "list_engines", "sim"), ("ste", "ste_submit_job", "sim"), ("dynaforge-prod", "dynaforgeprod_whoami", "system"),
     ("dynaforge-prod", "report_summary", "result"), ("stepforge-prod", "list_parts", "cad"),
     ("matnexus", "voc_breakdown", "voc"),                                  # voc_* 는 어느 앱이든 VOC
+    # 운영 쪽 앱 CircuitTrace(주인이 운영 쪽 — 값도 그쪽이 정했다) 도구 여섯이 미분류였다(HWAXPortal docs/request-1125 CT-01)
+    ("circuittrace", "trace_board_defects", "quality"),
 ])
 def test_HG05_코어_허브_읽기는_지식_검색이고_앱_기본값이_미분류를_메운다(monkeypatch, app, tool, want):
     monkeypatch.setattr(gw, "_AREAS_CACHE", {"mtime": None, "data": {}})     # 추적 파일 그대로

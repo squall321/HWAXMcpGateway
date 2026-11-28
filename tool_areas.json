@@ -54,6 +54,7 @@
     "matnexus": "material",
     "fmea": "quality",
     "siren": "quality",
+    "circuittrace": "quality",
     "odb-hub": "cad",
     "devlab-checklist": "cad",
     "arp": "result",
